@@ -25,6 +25,10 @@ env/
 **/site-packages/
 
 # Swift build artifacts
+.build/
+**/.build/
+.swiftpm/
+**/.swiftpm/
 AlfredMac/.build/
 AlfredMac/build/
 AlfredMac/*.xcodeproj/
