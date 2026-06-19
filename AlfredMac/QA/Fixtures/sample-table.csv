@@ -1,0 +1,5 @@
+capability,status,privacy_assertion
+diagnostics,local-only,no full paths in copied summary
+file-reading,explicit-only,no persisted extracted text
+file-writing,save-panel-only,no hidden writes
+folder-reading,bounded,no automatic recursion

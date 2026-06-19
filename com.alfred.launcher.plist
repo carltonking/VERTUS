@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Rewritten at install time by install_launchd.sh — do not edit manually -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.alfred.launcher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Alfred.app/Contents/MacOS/Alfred</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Safe now that the menu-bar status item provides Quit (which unloads this agent in
+         applicationWillTerminate). KeepAlive gives crash/reboot survival (Blueprint §6). -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/alfred.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/alfred.err</string>
+</dict>
+</plist>

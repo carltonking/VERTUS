@@ -1,0 +1,9 @@
+{
+  "fixture": "sample-data",
+  "purpose": "selected JSON file reading",
+  "safe": true,
+  "items": [
+    { "name": "diagnostics", "expected": "local only" },
+    { "name": "file reading", "expected": "explicit request only" }
+  ]
+}

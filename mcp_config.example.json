@@ -1,0 +1,31 @@
+{
+  "_comment": "Rename this file to mcp_config.json and customize. Alfred auto-loads it on startup. Each server is a separate stdio process.",
+
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/YOUR_USERNAME"]
+    },
+
+    "_github_example": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_REPLACE_ME"
+      }
+    },
+
+    "_brave_search_example": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+      "env": {
+        "BRAVE_API_KEY": "REPLACE_ME"
+      }
+    },
+
+    "_macos_automator_example": {
+      "command": "npx",
+      "args": ["-y", "macos-automator-mcp"]
+    }
+  }
+}

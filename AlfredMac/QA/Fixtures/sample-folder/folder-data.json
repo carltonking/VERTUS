@@ -1,0 +1,5 @@
+{
+  "fixture": "sample-folder",
+  "kind": "supported-json",
+  "expected": "included only during explicit bounded folder read"
+}

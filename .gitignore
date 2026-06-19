@@ -1,0 +1,47 @@
+# Secrets — NEVER commit
+.env
+.env.local
+
+# Generated state / runtime data (live in ~/.alfred/)
+*.db
+hud_history.jsonl
+me.md
+.kokoro_disabled
+.alfred_trash/
+.jarvis_trash/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+
+# Python virtualenvs — NEVER commit (huge, machine-specific)
+alfred_env/
+venv/
+.venv/
+env/
+**/site-packages/
+
+# Swift build artifacts
+AlfredMac/.build/
+AlfredMac/build/
+AlfredMac/*.xcodeproj/
+AlfredMac/.swiftpm/
+AlfredBar/AlfredBar
+AlfredBar/.build/
+AlfredBar/*.xcodeproj/
+
+# Local app/release artifacts
+*.app/
+*.dmg
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"
+                   xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>Alfred Updates</title>
+    <link>https://YOUR_DOMAIN/alfred/appcast.xml</link>
+    <description>Alfred release feed</description>
+    <language>en</language>
+
+    <item>
+      <title>Version 1.0.0</title>
+      <sparkle:version>1</sparkle:version>
+      <sparkle:shortVersionString>1.0.0</sparkle:shortVersionString>
+      <pubDate><!-- e.g. Mon, 16 Jun 2025 12:00:00 +0000 --></pubDate>
+      <sparkle:releaseNotesLink>https://YOUR_DOMAIN/alfred/release-notes/1.0.0.html</sparkle:releaseNotesLink>
+      <enclosure
+        url="https://YOUR_DOMAIN/releases/Alfred-1.0.0.dmg"
+        sparkle:edDSASignature="<!-- output of: sign_update Alfred-1.0.0.dmg -->"
+        length="0"
+        type="application/octet-stream" />
+    </item>
+
+  </channel>
+</rss>

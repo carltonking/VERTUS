@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Alfred — AI Assistant for Mac</title>
+  <style>
+    /* ── Reset ────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* ── Tokens ───────────────────────────────────────────────────── */
+    :root {
+      --bg:       #0a0a0f;
+      --surface:  #13131a;
+      --border:   rgba(255,255,255,0.07);
+      --accent:   #a78bfa;
+      --accent2:  #7c3aed;
+      --text:     #e2e2ef;
+      --muted:    #6b6b8a;
+      --radius:   14px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    /* ── Nav ──────────────────────────────────────────────────────── */
+    nav {
+      width: 100%;
+      max-width: 900px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 24px 32px;
+    }
+    .logo {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      color: var(--text);
+      text-decoration: none;
+    }
+    .logo span { color: var(--accent); }
+    nav a { color: var(--muted); text-decoration: none; font-size: 14px; transition: color .2s; }
+    nav a:hover { color: var(--text); }
+
+    /* ── Hero ─────────────────────────────────────────────────────── */
+    .hero {
+      text-align: center;
+      padding: 80px 24px 60px;
+      max-width: 680px;
+    }
+    .badge {
+      display: inline-block;
+      background: rgba(167,139,250,0.12);
+      border: 1px solid rgba(167,139,250,0.25);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 5px 14px;
+      border-radius: 99px;
+      margin-bottom: 28px;
+    }
+    h1 {
+      font-size: clamp(40px, 7vw, 68px);
+      font-weight: 800;
+      letter-spacing: -2px;
+      line-height: 1.05;
+      margin-bottom: 20px;
+    }
+    h1 em { font-style: normal; color: var(--accent); }
+    .subtitle {
+      font-size: 18px;
+      color: var(--muted);
+      line-height: 1.6;
+      margin-bottom: 44px;
+      max-width: 480px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    /* ── CTA buttons ──────────────────────────────────────────────── */
+    .cta-row {
+      display: flex;
+      gap: 14px;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin-bottom: 18px;
+    }
+    .btn-primary {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      background: var(--accent);
+      color: #0a0a0f;
+      font-size: 16px;
+      font-weight: 700;
+      padding: 15px 32px;
+      border-radius: 12px;
+      text-decoration: none;
+      transition: background .2s, transform .15s, box-shadow .2s;
+      box-shadow: 0 0 40px rgba(167,139,250,0.35);
+    }
+    .btn-primary:hover {
+      background: #c4b5fd;
+      transform: translateY(-2px);
+      box-shadow: 0 0 60px rgba(167,139,250,0.5);
+    }
+    .btn-primary svg { width: 18px; height: 18px; flex-shrink: 0; }
+    .btn-secondary {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: transparent;
+      color: var(--text);
+      font-size: 15px;
+      font-weight: 600;
+      padding: 15px 28px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      text-decoration: none;
+      transition: border-color .2s, background .2s, transform .15s;
+    }
+    .btn-secondary:hover {
+      border-color: rgba(255,255,255,0.18);
+      background: rgba(255,255,255,0.04);
+      transform: translateY(-2px);
+    }
+    .hint {
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .hint strong { color: var(--text); font-weight: 500; }
+
+    /* ── Preview bar mockup ───────────────────────────────────────── */
+    .preview {
+      width: 100%;
+      max-width: 580px;
+      margin: 60px auto 0;
+      padding: 0 24px;
+    }
+    .bar-mockup {
+      background: rgba(20,20,32,0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow:
+        0 40px 80px rgba(0,0,0,0.6),
+        0 0 0 1px rgba(255,255,255,0.04) inset;
+      backdrop-filter: blur(24px);
+    }
+    .bar-input-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 18px;
+    }
+    .bar-logo {
+      width: 22px; height: 22px;
+      background: var(--accent);
+      border-radius: 6px;
+      flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px; font-weight: 800; color: #0a0a0f;
+    }
+    .bar-dot { width: 7px; height: 7px; background: #22c55e; border-radius: 50%; flex-shrink: 0; }
+    .bar-placeholder { color: var(--muted); font-size: 14px; flex: 1; }
+    .bar-divider { height: 1px; background: var(--border); }
+    .bar-response {
+      padding: 14px 18px 16px;
+      font-size: 13px;
+      line-height: 1.7;
+      color: var(--text);
+    }
+    .bar-response .thinking { color: var(--accent); font-size: 12px; margin-bottom: 6px; }
+    .typing-cursor {
+      display: inline-block;
+      width: 2px; height: 14px;
+      background: var(--accent);
+      animation: blink 1s step-end infinite;
+      vertical-align: text-bottom;
+      margin-left: 2px;
+    }
+    @keyframes blink { 50% { opacity: 0; } }
+
+    /* ── Features grid ────────────────────────────────────────────── */
+    .features {
+      width: 100%;
+      max-width: 900px;
+      padding: 80px 24px;
+    }
+    .section-label {
+      text-align: center;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 48px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      transition: border-color .2s, transform .2s;
+    }
+    .card:hover { border-color: rgba(167,139,250,0.3); transform: translateY(-3px); }
+    .card-icon {
+      font-size: 22px;
+      margin-bottom: 14px;
+      display: block;
+    }
+    .card h3 { font-size: 15px; font-weight: 700; margin-bottom: 6px; }
+    .card p { font-size: 13px; color: var(--muted); line-height: 1.6; }
+
+    /* ── Shortcut pill ────────────────────────────────────────────── */
+    .shortcut-section {
+      text-align: center;
+      padding: 20px 24px 80px;
+    }
+    .kbd-row {
+      display: inline-flex;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+    kbd {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 8px 14px;
+      font-size: 15px;
+      font-family: inherit;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .shortcut-section p { color: var(--muted); font-size: 14px; }
+
+    /* ── Install steps ────────────────────────────────────────────── */
+    .install-section {
+      width: 100%;
+      max-width: 680px;
+      padding: 0 24px 80px;
+    }
+    .steps {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      margin-top: 36px;
+    }
+    .step {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+    }
+    .step-num {
+      width: 32px; height: 32px;
+      background: rgba(167,139,250,0.12);
+      border: 1px solid rgba(167,139,250,0.25);
+      border-radius: 50%;
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 700;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+    .step-body h4 { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+    .step-body p { font-size: 13px; color: var(--muted); line-height: 1.6; }
+    code {
+      background: rgba(255,255,255,0.06);
+      padding: 2px 7px;
+      border-radius: 5px;
+      font-family: "SF Mono", "Fira Code", monospace;
+      font-size: 12px;
+      color: var(--accent);
+    }
+
+    /* ── Footer ───────────────────────────────────────────────────── */
+    footer {
+      width: 100%;
+      border-top: 1px solid var(--border);
+      padding: 28px 32px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    footer a { color: var(--muted); text-decoration: none; }
+    footer a:hover { color: var(--text); }
+  </style>
+</head>
+<body>
+
+<!-- Nav -->
+<nav>
+  <a class="logo" href="#"><span>▲</span> Alfred</a>
+  <div style="display:flex;gap:28px;">
+    <a href="#features">Features</a>
+    <a href="#install">Install</a>
+    <a href="https://github.com/YOUR_USERNAME/YOUR_REPO" target="_blank">GitHub</a>
+  </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+  <div class="badge">macOS · Powered by Claude</div>
+  <h1>Your AI,<br><em>always one key away</em></h1>
+  <p class="subtitle">
+    Alfred is a Spotlight-style AI bar for macOS. Press <strong>⌘⇧J</strong> anywhere
+    to ask Claude anything — in context, in seconds.
+  </p>
+  <div class="cta-row">
+    <!--
+      UPDATE THIS URL:
+      1. Run: bash release.sh
+      2. Create a GitHub release and upload Alfred-v1.0.zip
+      3. Replace the href below with the release download URL
+         e.g. https://github.com/YOUR_USER/YOUR_REPO/releases/download/v1.0/Alfred-v1.0.zip
+    -->
+    <a class="btn-primary" href="https://github.com/YOUR_USERNAME/YOUR_REPO/releases/latest/download/Alfred-v1.0.zip" id="download-btn">
+      <svg viewBox="0 0 20 20" fill="currentColor">
+        <path d="M10 2a1 1 0 011 1v8.586l2.293-2.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 111.414-1.414L9 11.586V3a1 1 0 011-1z"/>
+        <path d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z"/>
+      </svg>
+      Download Alfred
+    </a>
+    <a class="btn-secondary" href="https://github.com/YOUR_USERNAME/YOUR_REPO" target="_blank">
+      View source ↗
+    </a>
+  </div>
+  <p class="hint">macOS 12.3+ · <strong>Free</strong> · Requires Anthropic API key</p>
+</section>
+
+<!-- Bar mockup -->
+<div class="preview">
+  <div class="bar-mockup">
+    <div class="bar-input-row">
+      <div class="bar-logo">▲</div>
+      <div class="bar-dot"></div>
+      <div class="bar-placeholder">Summarize what's on my screen</div>
+    </div>
+    <div class="bar-divider"></div>
+    <div class="bar-response">
+      <div class="thinking">● Thinking · 1.2s</div>
+      You're looking at a pull request on GitHub adding authentication middleware.
+      The key change is a JWT validation layer on all <code>/api/</code> routes,
+      with a 7-day expiry. Two files changed: <code>middleware/auth.ts</code> and
+      <code>routes/index.ts</code>.<span class="typing-cursor"></span>
+    </div>
+  </div>
+</div>
+
+<!-- Features -->
+<section class="features" id="features">
+  <div class="section-label">Everything Alfred can do</div>
+  <div class="grid">
+    <div class="card">
+      <span class="card-icon">🧠</span>
+      <h3>Context-aware AI</h3>
+      <p>Reads your frontmost app, selected text, and browser URL. Every answer is in context.</p>
+    </div>
+    <div class="card">
+      <span class="card-icon">📋</span>
+      <h3>Clipboard history</h3>
+      <p>Last 50 clipboard items always one shortcut away. Tap to paste back into any app.</p>
+    </div>
+    <div class="card">
+      <span class="card-icon">🔍</span>
+      <h3>File + app search</h3>
+      <p>Type <code>/query</code> to search files. Type any app name to launch it instantly.</p>
+    </div>
+    <div class="card">
+      <span class="card-icon">🎨</span>
+      <h3>Image generation</h3>
+      <p>Type <code>/img prompt</code> to generate with DALL-E 3. Saved to your drive.</p>
+    </div>
+    <div class="card">
+      <span class="card-icon">⚡</span>
+      <h3>Instant calculator</h3>
+      <p>Math expressions and unit conversions answered instantly — no AI round-trip.</p>
+    </div>
+    <div class="card">
+      <span class="card-icon">🔔</span>
+      <h3>Smart notifications</h3>
+      <p>Meeting prep 30 min before events. Break reminders after 90 min in video calls.</p>
+    </div>
+    <div class="card">
+      <span class="card-icon">🎙️</span>
+      <h3>Voice wake word</h3>
+      <p>Say "Alfred" and the bar opens. No hands needed.</p>
+    </div>
+    <div class="card">
+      <span class="card-icon">📌</span>
+      <h3>Pin responses</h3>
+      <p>Star any answer. Browse your pinned responses anytime with <code>&gt; Pinned</code>.</p>
+    </div>
+    <div class="card">
+      <span class="card-icon">🌙</span>
+      <h3>System controls</h3>
+      <p>Dark mode, mute, Wi-Fi, brightness — all from the actions palette.</p>
+    </div>
+  </div>
+</section>
+
+<!-- Keyboard shortcut -->
+<section class="shortcut-section">
+  <div class="kbd-row">
+    <kbd>⌘</kbd><kbd>⇧</kbd><kbd>J</kbd>
+  </div>
+  <p>Press anywhere to open Alfred</p>
+</section>
+
+<!-- Install steps -->
+<section class="install-section" id="install">
+  <div class="section-label" style="text-align:left;margin-bottom:0;font-size:11px;">How to install</div>
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <h4>Download</h4>
+        <p>Click the Download button above. You'll get <code>Alfred-v1.0.zip</code>.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <h4>Unzip and run installer</h4>
+        <p>Open the zip, then double-click <code>Install Alfred.command</code>. It handles everything.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-body">
+        <h4>Enter your API key</h4>
+        <p>The installer will ask for your <a href="https://console.anthropic.com/" target="_blank" style="color:var(--accent)">Anthropic API key</a>.
+        Paste it in — takes 10 seconds.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <div class="step-body">
+        <h4>Press ⌘⇧J</h4>
+        <p>Alfred is in your menu bar. Press <kbd style="background:rgba(255,255,255,0.06);border:1px solid var(--border);border-radius:5px;padding:2px 8px;font-size:12px;">⌘⇧J</kbd> anywhere to open the bar.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Footer -->
+<footer>
+  <span>Alfred · Built with Claude · macOS only</span>
+  <div style="display:flex;gap:20px;">
+    <a href="https://github.com/YOUR_USERNAME/YOUR_REPO" target="_blank">GitHub</a>
+    <a href="https://console.anthropic.com/" target="_blank">Get API Key</a>
+  </div>
+</footer>
+
+<script>
+  // Track download clicks (optional analytics hook)
+  document.getElementById('download-btn').addEventListener('click', function() {
+    // You can add analytics here if needed
+    this.textContent = '⬇ Downloading…';
+    setTimeout(() => { this.innerHTML = `<svg viewBox="0 0 20 20" fill="currentColor" style="width:18px;height:18px"><path d="M10 2a1 1 0 011 1v8.586l2.293-2.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 111.414-1.414L9 11.586V3a1 1 0 011-1z"/><path d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z"/></svg> Download Alfred`; }, 3000);
+  });
+</script>
+
+</body>
+</html>

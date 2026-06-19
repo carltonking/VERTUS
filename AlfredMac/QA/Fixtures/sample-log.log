@@ -1,0 +1,4 @@
+2026-01-01T09:00:00Z INFO Alfred QA log fixture created
+2026-01-01T09:01:00Z INFO Selected file reading should be explicit
+2026-01-01T09:02:00Z WARN Unsupported file types should be refused cleanly
+2026-01-01T09:03:00Z INFO No secrets are present in this fixture

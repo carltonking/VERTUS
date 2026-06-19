@@ -1,0 +1,9 @@
+Alfred QA note
+
+This is a small plain-text fixture for selected-file reading.
+It contains no sensitive information and is safe to send through the normal manual QA flow.
+
+Expected summary points:
+- Alfred can read explicitly selected TXT files.
+- Alfred should not read this file until the user asks.
+- Alfred should not persist extracted file contents.

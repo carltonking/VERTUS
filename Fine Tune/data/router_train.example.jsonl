@@ -1,0 +1,6 @@
+{"prompt":"What is the weather like in New York today?","route":"daily_driver"}
+{"prompt":"Summarize this paragraph in plain English.","route":"daily_driver"}
+{"prompt":"Plan my morning: check calendar, find a free 30 minute slot, draft an email, then remind me after lunch.","route":"planner_model"}
+{"prompt":"Use my available tools to create a meeting, send the invite, and log the decision in Obsidian.","route":"planner_model"}
+{"prompt":"Write a Python script that scans a folder and renames files by date.","route":"coder_model"}
+{"prompt":"Debug this TypeScript error and patch the React component.","route":"coder_model"}

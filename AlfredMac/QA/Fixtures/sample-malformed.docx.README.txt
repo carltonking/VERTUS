@@ -1,0 +1,12 @@
+Malformed DOCX fixture note
+
+Do not commit a binary malformed DOCX by hand.
+Run:
+
+  ./scripts/generate_qa_fixtures.sh
+
+The script creates:
+
+  QA/Fixtures/Generated/sample-malformed.docx
+
+That generated file is intentionally not a valid DOCX package and is used only to verify Alfred's malformed-document failure message.
