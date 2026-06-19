@@ -19,6 +19,7 @@ actor AssistantCore {
     private let router: LLMRouter
     private let memory: MemoryStore
     private let screen = ScreenCapability()
+    private let screenText = ScreenTextCapability()
     private let web = WebSearchCapability()
     private let emailReader = EmailReadService()
     private let shell = ShellCapability()
@@ -288,7 +289,7 @@ actor AssistantCore {
         // 1. Gather context in parallel where independent
         async let memoriesTask = relevantMemories(for: query)
         async let historyTask = conversationHistoryEnabled ? conversationHistory() : ""
-        async let screenshotTask = maybeScreenshot(intent: intent, enabled: screenContextEnabled, supportsVision: router.activeProvider.supportsVision)
+        async let screenContextTask = maybeScreenContext(intent: intent, enabled: screenContextEnabled, supportsVision: router.activeProvider.supportsVision)
         async let webResultTask  = maybeWebSearch(query: query, intent: intent)
         async let emailResultTask = maybeEmailSummary(query: query)
         async let shellResultTask = maybeShell(intent: intent, enabled: shellExecutionEnabled)
@@ -298,7 +299,12 @@ actor AssistantCore {
 
         let memories      = (try? await memoriesTask) ?? []
         let history       = (try? await historyTask) ?? ""
-        let screenshotB64 = try? await screenshotTask
+        let screenContext = await screenContextTask
+        // Only vision-capable providers get the image; text/failure are injected as prompt context below.
+        let screenshotB64: String? = switch screenContext {
+            case .image(let b64): b64
+            default: nil
+        }
         let webResult     = try? await webResultTask
         let emailResult   = await emailResultTask
         let shellResult   = try? await shellResultTask
@@ -450,6 +456,14 @@ actor AssistantCore {
             await CapabilityEventLogger.shared.record("folder read", "allowed")
             userContent += "\n\n[Selected folder context]\n\(content)"
         }
+        // Non-vision models can't take the screenshot, so feed Accessibility-extracted screen text
+        // instead. A capture failure (e.g. missing permission) is surfaced so the model can relay it.
+        if case .text(let onScreen)? = screenContext {
+            await CapabilityEventLogger.shared.record("screen text", "allowed")
+            userContent += "\n\n\(onScreen)"
+        } else if case .failed(let reason)? = screenContext {
+            userContent += "\n\n[Screen access note — tell the user: \(reason)]"
+        }
 
         var messages: [LLMMessage] = [.user(userContent)]
 
@@ -600,11 +614,49 @@ actor AssistantCore {
         return result
     }
 
-    private func maybeScreenshot(intent: QueryIntent, enabled: Bool, supportsVision: Bool) async throws -> String? {
-        guard enabled else { return nil }
-        guard supportsVision else { return nil }
-        guard intent.wantsScreenContext else { return nil }
-        return try await screen.captureScreenAsBase64()
+    /// Result of trying to read the screen for an explicit "look at my screen" request.
+    private enum ScreenContextResult {
+        case image(String)   // base64 JPEG — only for vision-capable providers
+        case text(String)    // Accessibility-extracted on-screen text — works with any model
+        case failed(String)  // human-readable reason (e.g. missing permission) to relay to the user
+    }
+
+    /// Gathers screen context for an explicit screen request. Vision-capable providers get the
+    /// actual pixels; every other model falls back to Accessibility-extracted text so local/free
+    /// models can still "see" what's on screen. Never throws — a capture failure becomes `.failed`
+    /// so the user learns about a missing permission instead of getting a blind answer.
+    private func maybeScreenContext(intent: QueryIntent, enabled: Bool, supportsVision: Bool) async -> ScreenContextResult? {
+        guard enabled, intent.wantsScreenContext else { return nil }
+
+        if supportsVision {
+            do {
+                return .image(try await screen.captureScreenAsBase64())
+            } catch {
+                // Image capture failed (usually Screen Recording permission). Try text before giving up.
+                if let cap = screenText.captureFrontmost() {
+                    return .text(formatScreenText(cap))
+                }
+                let reason: String
+                switch error {
+                case let LLMError.networkError(msg): reason = msg
+                default: reason = error.localizedDescription
+                }
+                return .failed(reason)
+            }
+        }
+
+        // Non-vision model: read on-screen text via Accessibility instead of pixels.
+        if let cap = screenText.captureFrontmost() {
+            return .text(formatScreenText(cap))
+        }
+        return .failed("I couldn't read your screen. Grant Accessibility access in System Settings → Privacy & Security → Accessibility (and Screen Recording for image capture), then ask again.")
+    }
+
+    private func formatScreenText(_ capture: ScreenTextCapability.Capture) -> String {
+        var header = "[On-screen text — \(capture.appName)"
+        if !capture.windowTitle.isEmpty { header += ": \(capture.windowTitle)" }
+        header += "]"
+        return "\(header)\n\(capture.text)"
     }
 
     private func maybeWebSearch(query: String, intent: QueryIntent) async throws -> String? {
