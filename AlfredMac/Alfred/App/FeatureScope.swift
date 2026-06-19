@@ -11,8 +11,10 @@ enum FeatureScope {
 
     /// Behavioral learning, relationship/reflection memory, habits, reflections,
     /// proactive suggestions, plus the background learning timers/observers.
-    /// Blueprint v1: OFF.
-    static let learningEnabled = false
+    /// Blueprint v1 amendment (2026-06-16): the Hermes learning system brings this
+    /// into scope — learning is now ON, with all profiling pinned on-device (Ollama,
+    /// see `LocalLearningLLM`) so captured data never leaves the Mac.
+    static let learningEnabled = true
 
     /// Writing-style personalization ONLY (a narrow slice of the learning stack,
     /// independent of `learningEnabled`): record the user's messages on-device to

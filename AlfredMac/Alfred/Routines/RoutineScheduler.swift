@@ -1,5 +1,11 @@
 import Foundation
 
+extension Notification.Name {
+    /// Posted (object = routine id as Int64) when a routine run finishes — success, failure, or
+    /// blocked — so an open panel can refresh its rows + output live.
+    static let alfredRoutineRunDidFinish = Notification.Name("alfredRoutineRunDidFinish")
+}
+
 private struct RoutineTimeout: Error {}
 
 /// The single sanctioned background scheduler (Blueprint v1 §6).
@@ -71,6 +77,13 @@ final class RoutineScheduler {
         }
     }
 
+    /// External-trigger entry (the `alfred://run?routine=<id>` URL scheme). Loads the routine and
+    /// runs it through the same headless gate + audit + notification path as Run-now.
+    func runRoutine(byId id: Int64) {
+        guard let routine = store.routine(id: id), routine.enabled else { return }
+        runNow(routine)
+    }
+
     // MARK: - Tick
 
     private func tick() {
@@ -79,6 +92,8 @@ final class RoutineScheduler {
 
         var due: [RoutineRecord] = []
         for routine in store.enabledRoutines() {
+            // Only schedule-type routines auto-fire; manual/api routines run on demand only.
+            guard routine.trigger_type == "schedule" else { continue }
             guard let id = routine.id,
                   let cron = CronSchedule(routine.schedule_cron) else { continue }
             let tz = TimeZone(identifier: routine.timezone) ?? .current
@@ -150,6 +165,7 @@ final class RoutineScheduler {
             store.recordRoutineRun(id: id, ranAt: Date().timeIntervalSince1970, nextRunAt: nextRun,
                                    status: "blocked", summary: reason)
             await notify(title: "Routine blocked: \(routine.title)", body: reason)
+            await postFinished(id)
             return
         }
 
@@ -181,6 +197,15 @@ final class RoutineScheduler {
             title: status == "success" ? "Routine done: \(routine.title)" : "Routine failed: \(routine.title)",
             body: status == "success" ? summary : (errorText ?? "Unknown error")
         )
+        await postFinished(id)
+    }
+
+    /// Signals the UI that a run finished so an open panel can refresh live. Posted on the main
+    /// actor because observers (SwiftUI views) update on the main thread.
+    private static func postFinished(_ id: Int64) async {
+        await MainActor.run {
+            NotificationCenter.default.post(name: .alfredRoutineRunDidFinish, object: id)
+        }
     }
 
     /// Runs the routine prompt headless through AssistantCore, retrying once after ~10s on a

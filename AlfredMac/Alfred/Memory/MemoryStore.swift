@@ -65,6 +65,7 @@ struct RoutineRecord: Codable, FetchableRecord, MutablePersistableRecord {
     var timezone: String                // IANA id, e.g. "America/New_York"
     var enabled: Bool
     var policy_class: String            // e.g. "unattended-safe"
+    var trigger_type: String            // "schedule" | "manual" | "api"
     var last_run_at: Double?
     var next_run_at: Double?
     var last_status: String?            // "success" | "failed" | "blocked"
@@ -74,6 +75,31 @@ struct RoutineRecord: Codable, FetchableRecord, MutablePersistableRecord {
     mutating func didInsert(_ inserted: InsertionSuccess) {
         id = inserted.rowID
     }
+}
+
+/// Hermes Tier‑2: structured screen text captured on-device via Accessibility, FTS5-searchable.
+struct ScreenTextRecord: Codable, FetchableRecord, MutablePersistableRecord {
+    static let databaseTableName = "screen_text_log"
+    var id: Int64?
+    var timestamp: Double
+    var app_name: String
+    var bundle_id: String
+    var window_title: String
+    var text: String
+    mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
+}
+
+/// Hermes Tier‑2: a captured meeting/conversation — on-device transcript + local summary.
+struct MeetingRecord: Codable, FetchableRecord, MutablePersistableRecord {
+    static let databaseTableName = "meeting_transcripts"
+    var id: Int64?
+    var started_at: Double
+    var ended_at: Double?
+    var title: String
+    var transcript: String
+    var summary: String?
+    var action_items: String?
+    mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
 }
 
 // MARK: - Store
@@ -416,6 +442,46 @@ final class MemoryStore {
             try db.create(index: "idx_audit_runs_routine", on: "runs", columns: ["routine_id"])
         }
 
+        // Trigger type per routine: "schedule" (auto-fires on cron), "manual" (Run-now only),
+        // or "api" (external alfred:// URL trigger). Existing rows default to "schedule" so
+        // behavior is preserved.
+        migrator.registerMigration("v13_routine_trigger") { db in
+            try db.execute(sql: "ALTER TABLE routines ADD COLUMN trigger_type TEXT NOT NULL DEFAULT 'schedule'")
+        }
+
+        // Hermes capture (local-only): structured screen text + meeting transcripts, each with an
+        // FTS5 index so Alfred can search weeks-old context with natural-language queries.
+        migrator.registerMigration("v14_hermes_capture") { db in
+            try db.create(table: "screen_text_log", ifNotExists: true) { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("timestamp", .double).notNull()
+                t.column("app_name", .text).notNull().defaults(to: "")
+                t.column("bundle_id", .text).notNull().defaults(to: "")
+                t.column("window_title", .text).notNull().defaults(to: "")
+                t.column("text", .text).notNull().defaults(to: "")
+            }
+            try db.create(index: "idx_screen_text_ts", on: "screen_text_log", columns: ["timestamp"])
+            try db.create(virtualTable: "screen_text_fts", ifNotExists: true, using: FTS5()) { t in
+                t.synchronize(withTable: "screen_text_log")
+                t.column("text")
+            }
+
+            try db.create(table: "meeting_transcripts", ifNotExists: true) { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("started_at", .double).notNull()
+                t.column("ended_at", .double)
+                t.column("title", .text).notNull().defaults(to: "")
+                t.column("transcript", .text).notNull().defaults(to: "")
+                t.column("summary", .text)
+                t.column("action_items", .text)
+            }
+            try db.create(index: "idx_meeting_started", on: "meeting_transcripts", columns: ["started_at"])
+            try db.create(virtualTable: "meeting_fts", ifNotExists: true, using: FTS5()) { t in
+                t.synchronize(withTable: "meeting_transcripts")
+                t.column("transcript")
+            }
+        }
+
         try migrator.migrate(db)
     }
 
@@ -575,6 +641,74 @@ final class MemoryStore {
                 arguments: [ranAt, nextRunAt, status, summary, id]
             )
         }
+    }
+
+    /// Audit rows for a single routine, newest first — backs the per-routine output dropdown.
+    func runsForRoutine(id: Int64, limit: Int = 20) -> [RunRecord] {
+        (try? db.read { db in
+            try RunRecord
+                .filter(Column("routine_id") == id)
+                .order(Column("started_at").desc)
+                .limit(limit)
+                .fetchAll(db)
+        }) ?? []
+    }
+
+    /// Loads a single routine by id (used by the external URL-scheme trigger).
+    func routine(id: Int64) -> RoutineRecord? {
+        try? db.read { db in try RoutineRecord.fetchOne(db, key: id) }
+    }
+
+    // MARK: - Hermes capture (screen text + meetings, local-only)
+
+    @discardableResult
+    func insertScreenText(timestamp: Double, appName: String, bundleId: String,
+                          windowTitle: String, text: String) -> Int64? {
+        var rec = ScreenTextRecord(id: nil, timestamp: timestamp, app_name: appName,
+                                   bundle_id: bundleId, window_title: windowTitle, text: text)
+        do { try db.write { db in try rec.insert(db) }; return rec.id }
+        catch { Self.logger.error("insertScreenText failed: \(error.localizedDescription, privacy: .public)"); return nil }
+    }
+
+    /// Natural-language search over captured screen text (FTS5), newest match first.
+    func searchScreenText(_ query: String, limit: Int = 30) -> [ScreenTextRecord] {
+        (try? db.read { db -> [ScreenTextRecord] in
+            if let pattern = FTS5Pattern(matchingAllTokensIn: query) {
+                return try ScreenTextRecord
+                    .joining(required: ScreenTextRecord.hasOne(
+                        Table("screen_text_fts"), using: ForeignKey(["rowid"], to: ["rowid"])))
+                    .filter(sql: "screen_text_fts MATCH ?", arguments: [pattern])
+                    .order(Column("timestamp").desc).limit(limit).fetchAll(db)
+            }
+            return try ScreenTextRecord.order(Column("timestamp").desc).limit(limit).fetchAll(db)
+        }) ?? []
+    }
+
+    func recentScreenText(limit: Int = 50) -> [ScreenTextRecord] {
+        (try? db.read { db in
+            try ScreenTextRecord.order(Column("timestamp").desc).limit(limit).fetchAll(db)
+        }) ?? []
+    }
+
+    func pruneScreenText(olderThanDays days: Int) {
+        guard days > 0 else { return }
+        let cutoff = Date().timeIntervalSince1970 - Double(days * 86_400)
+        try? db.write { db in
+            try db.execute(sql: "DELETE FROM screen_text_log WHERE timestamp < ?", arguments: [cutoff])
+        }
+    }
+
+    @discardableResult
+    func insertMeeting(_ meeting: MeetingRecord) -> Int64? {
+        var rec = meeting
+        do { try db.write { db in try rec.insert(db) }; return rec.id }
+        catch { Self.logger.error("insertMeeting failed: \(error.localizedDescription, privacy: .public)"); return nil }
+    }
+
+    func recentMeetings(limit: Int = 50) -> [MeetingRecord] {
+        (try? db.read { db in
+            try MeetingRecord.order(Column("started_at").desc).limit(limit).fetchAll(db)
+        }) ?? []
     }
 
     // MARK: - Memory operations

@@ -1,6 +1,17 @@
 import EventKit
 import Foundation
 
+/// A reminder flattened into a UI-friendly value (the Reminders tab renders these instead of
+/// raw `EKReminder`s or the text strings the assistant consumes).
+struct ReminderItem: Identifiable, Hashable {
+    let id: String          // EKReminder.calendarItemIdentifier (stable, global)
+    let title: String
+    let due: Date?          // resolved from dueDateComponents; nil = undated
+    let notes: String?
+    let isCompleted: Bool
+    let listName: String
+}
+
 struct CalendarRemindersCapability {
     private let store: EKEventStore
 
@@ -84,6 +95,54 @@ struct CalendarRemindersCapability {
             }()
             return "\(i + 1). \(title)\(due)\(notes)"
         }.joined(separator: "\n")
+    }
+
+    // MARK: - Reminders (structured, for UI)
+
+    /// Fetches reminders as structured `ReminderItem`s for the Reminders tab. Incomplete only by
+    /// default. Read path mirrors `readReminders` but returns models instead of formatted text.
+    func fetchReminders(includeCompleted: Bool = false) async throws -> [ReminderItem] {
+        try await ensureRemindersAccess()
+        let predicate = includeCompleted
+            ? store.predicateForReminders(in: nil)
+            : store.predicateForIncompleteReminders(withDueDateStarting: nil, ending: nil, calendars: nil)
+        let fetched: [EKReminder] = await withCheckedContinuation { continuation in
+            store.fetchReminders(matching: predicate) { continuation.resume(returning: $0 ?? []) }
+        }
+        return fetched.map { r in
+            ReminderItem(
+                id: r.calendarItemIdentifier,
+                title: r.title ?? "Untitled",
+                due: r.dueDateComponents.flatMap { Calendar.current.date(from: $0) },
+                notes: r.notes,
+                isCompleted: r.isCompleted,
+                listName: r.calendar?.title ?? ""
+            )
+        }
+    }
+
+    /// Marks a reminder complete/incomplete by identifier, writing back to Apple Reminders.
+    func setReminderCompleted(id: String, completed: Bool) async throws {
+        try await ensureRemindersAccess()
+        guard let reminder = store.calendarItem(withIdentifier: id) as? EKReminder else { return }
+        reminder.isCompleted = completed
+        try store.save(reminder, commit: true)
+    }
+
+    /// Requests Reminders access only when undetermined (re-requesting an already-resolved status
+    /// is unnecessary and, for some EventKit stores, can stall). Throws if denied/restricted.
+    private func ensureRemindersAccess() async throws {
+        switch EKEventStore.authorizationStatus(for: .reminder) {
+        case .denied, .restricted:
+            throw LLMError.networkError("Reminders access denied. Grant access in System Settings → Privacy & Security → Reminders.")
+        case .notDetermined:
+            let granted = try await store.requestFullAccessToReminders()
+            guard granted else {
+                throw LLMError.networkError("Reminders access denied. Grant access in System Settings → Privacy & Security → Reminders.")
+            }
+        default:
+            return   // .fullAccess / .authorized (legacy) / .writeOnly
+        }
     }
 
     // MARK: - Create Event

@@ -141,6 +141,10 @@ ${APP_ICON_PLIST}
   <string>Alfred needs Accessibility access for app context, app interaction, and typing into apps.</string>
   <key>NSScreenCaptureUsageDescription</key>
   <string>Alfred reads your screen when you ask about visible screen context.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Alfred records meetings you start so it can transcribe them on-device.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>Alfred transcribes recorded meetings on-device using the Speech framework.</string>
   <key>NSContactsUsageDescription</key>
   <string>Alfred looks up contacts to text the person you name.</string>
   <key>NSCalendarsUsageDescription</key>
@@ -151,6 +155,17 @@ ${APP_ICON_PLIST}
   <string>Alfred reads and creates reminders when you ask.</string>
   <key>NSRemindersFullAccessUsageDescription</key>
   <string>Alfred reads and creates reminders when you ask.</string>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>${BUNDLE_ID}</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>alfred</string>
+      </array>
+    </dict>
+  </array>
 ${SPARKLE_FEED_PLIST}
 ${SPARKLE_PUBLIC_KEY_PLIST}
 </dict>
@@ -164,9 +179,23 @@ fi
 ok "Created $APP_BUNDLE"
 
 step "Signing $APP_NAME.app for local development"
-codesign --force --deep --sign - "$APP_BUNDLE"
-codesign --verify --deep --strict "$APP_BUNDLE"
-ok "Ad-hoc signature verified"
+# Prefer a STABLE self-signed identity so macOS permission grants (Accessibility, Automation,
+# Microphone, …) persist across rebuilds. Ad-hoc signatures change every build and force macOS
+# to re-prompt for everything. Create the identity once with scripts/create_signing_cert.sh.
+SIGN_IDENTITY="${SIGN_IDENTITY:-Alfred Local Signing}"
+# NOTE: no `-v` — a self-signed local identity is untrusted (so not "valid" for Gatekeeper), but
+# codesign signs with it fine and TCC permissions key on its stable cert, which is what we want.
+if security find-identity -p codesigning 2>/dev/null | grep -q "$SIGN_IDENTITY"; then
+  codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
+  codesign --verify --deep --strict "$APP_BUNDLE"
+  ok "Signed with stable identity '$SIGN_IDENTITY' (permissions persist across rebuilds)"
+else
+  codesign --force --deep --sign - "$APP_BUNDLE"
+  codesign --verify --deep --strict "$APP_BUNDLE"
+  ok "Ad-hoc signature verified"
+  echo "  ⚠ No stable signing identity found — macOS will RE-PROMPT for permissions on every"
+  echo "    rebuild. Fix it once: ./scripts/create_signing_cert.sh && ./scripts/build_app.sh --install"
+fi
 
 if [[ "$INSTALL" == true ]]; then
   step "Installing to $INSTALL_PATH"

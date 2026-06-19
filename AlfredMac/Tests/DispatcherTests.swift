@@ -16,11 +16,13 @@ final class DispatcherTests: XCTestCase {
         XCTAssertTrue(d.confirmRequired)
     }
 
-    func testSendEmailIsHighRiskAndConfirms() {
+    func testSendEmailIsHighRiskButDoesNotConfirm() {
+        // User preference: only destructive actions confirm. Send stays high-risk in the audit
+        // log (commandClass) but no longer blocks on a confirmation dialog.
         let d = dispatcher.decide(query: "send email to bob about the meeting", providerIsCloud: false)
         XCTAssertEqual(d.actionType, .sendMessage)
         XCTAssertEqual(d.commandClass, .highRiskWrite)
-        XCTAssertTrue(d.confirmRequired)
+        XCTAssertFalse(d.confirmRequired)
     }
 
     func testCreateFileIsLowRiskNoConfirm() {

@@ -48,7 +48,18 @@ struct QuickCommands {
             openApp(bundleId: nil, path: "/Applications/\(capitalized).app")
             return "Opening \(capitalized)..."
         }
-        
+
+        // "What do you know about me?" and close variants — answer from the local Hermes profile
+        // (honest when empty), bypassing the LLM so there's no chance to fabricate.
+        if lower.contains("what do you know about me")
+            || lower.contains("what have you learned about me")
+            || lower.contains("tell me about myself")
+            || lower.contains("what's my profile") || lower.contains("what is my profile")
+            || lower.contains("describe me")
+            || lower == "what do you know" {
+            return ProfileDigest.whatDoYouKnow()
+        }
+
         return nil
     }
     

@@ -37,6 +37,7 @@ struct PresenceRootView: View {
                 activeProject: activeProject,
                 contextLabel: contextLabel,
                 contextStatus: contextStatus,
+                focusToken: barState.focusToken,
                 onSubmit: onSubmit,
                 onSuggestionTap: onSuggestionTap,
                 onEscape: onCollapse

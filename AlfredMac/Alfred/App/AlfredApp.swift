@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Combine
 import OSLog
+import CoreServices
 
 private let logger = Logger(subsystem: "com.alfred.app", category: "AlfredApp")
 
@@ -18,6 +19,9 @@ final class BarState: ObservableObject {
     @Published var contextLabel: String = ""
     @Published var contextStatus: String = ""
     @Published var presenceState: AssistantPresenceState = .hidden
+    /// Bumped each time the bar is presented so the input field re-grabs focus (so you can type
+    /// immediately on ⌘⇧J without clicking the field).
+    @Published var focusToken: Int = 0
 }
 
 // MARK: - Bridge view
@@ -95,6 +99,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var chatHostingController: NSHostingController<ChatWindowView>?
     private var chatViewModel: ChatViewModel?
     private var routineScheduler: RoutineScheduler?
+    private var screenTextMonitor: ScreenTextMonitor?
+    private var meetingManager: MeetingCaptureManager?
 
     private var hotkeyListener: HotkeyListener?
     private var statusItem: NSStatusItem?
@@ -139,6 +145,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastShownSuggestions: [ProactiveSuggestion] = []
     private var learningProfileTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
+
+    // MARK: - URL scheme (external/API trigger)
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // Register the alfred:// URL scheme so external systems (Shortcuts, a webhook relay,
+        // GitHub Actions via `open`) can fire a routine: alfred://run?routine=<id>.
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleURLEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL)
+        )
+    }
+
+    /// Handles `alfred://run?routine=<id>` (and `?name=<title>` as a convenience). Routed through
+    /// RoutineScheduler so the read-only safety gate + audit logging still apply to external runs.
+    @objc private func handleURLEvent(_ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {
+        guard let urlString = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
+              let url = URL(string: urlString),
+              url.scheme == "alfred", url.host == "run",
+              let store = memoryStore else { return }
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        if let value = items.first(where: { $0.name == "routine" })?.value, let id = Int64(value) {
+            routineScheduler?.runRoutine(byId: id)
+        } else if let name = items.first(where: { $0.name == "name" })?.value,
+                  let match = store.allRoutines().first(where: { $0.title.caseInsensitiveCompare(name) == .orderedSame }),
+                  let id = match.id {
+            routineScheduler?.runRoutine(byId: id)
+        }
+    }
 
     // MARK: - Launch
 
@@ -317,6 +353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startContextMonitor()
         appActivityMonitor?.start()
 
+        startHermesCapture()
         startLearningProfileTimer()
 
         if appState.isOnboardingComplete {
@@ -390,7 +427,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Directory setup
 
     private func ensureAppDirectories() {
-        let dirs = [".alfred/db", ".alfred/wiki", ".alfred/logs"]
+        let dirs = [".alfred/db", ".alfred/wiki", ".alfred/logs", ".alfred/profile"]
         let home = FileManager.default.homeDirectoryForCurrentUser
         for dir in dirs {
             let url = home.appending(path: dir, directoryHint: .isDirectory)
@@ -769,13 +806,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - Hermes capture (screen text + meetings, local-only)
+
+    private func startHermesCapture() {
+        guard let store = memoryStore else { return }
+        ProfileDigest.ensureDir()
+        let monitor = ScreenTextMonitor(store: store)
+        screenTextMonitor = monitor
+        meetingManager = MeetingCaptureManager(store: store)
+        if appState.screenTextCaptureEnabled { monitor.start() }
+    }
+
+    /// Rebuilds the bounded USER.md / MEMORY.md profile from recent local signals (screen text +
+    /// meetings), consolidated entirely on-device via Ollama. Runs off the main actor.
+    private func regenerateHermesProfile() {
+        guard let store = memoryStore else { return }
+        let owner = appState.ownerName
+        let recent = store.recentScreenText(limit: 40)
+        let meetings = store.recentMeetings(limit: 3)
+        // Don't build a profile from nothing — prevents the model inventing traits/projects/people.
+        guard ProfileDigest.hasEnoughData(screenTextCount: recent.count, meetingCount: meetings.count) else { return }
+
+        var signals: [String] = []
+        if !recent.isEmpty {
+            let apps = Array(Set(recent.map(\.app_name))).prefix(8)
+            signals.append("Apps used recently: \(apps.joined(separator: ", "))")
+            let titles = recent.compactMap { $0.window_title.isEmpty ? nil : $0.window_title }.prefix(8)
+            if !titles.isEmpty { signals.append("Recent window titles: \(titles.joined(separator: " | "))") }
+            for snippet in recent.prefix(3) { signals.append("Screen excerpt: \(String(snippet.text.prefix(300)))") }
+        }
+        for meeting in meetings where (meeting.summary?.isEmpty == false) {
+            signals.append("Meeting summary: \(meeting.summary!)")
+        }
+        let screenCount = recent.count
+        let meetingCount = meetings.count
+        Task.detached {
+            await ProfileDigest.regenerate(ownerName: owner, signals: signals,
+                                           screenTextCount: screenCount, meetingCount: meetingCount)
+        }
+    }
+
     // MARK: - Learning profile
 
     private func startLearningProfileTimer() {
         learningProfileTimer?.invalidate()
         learningProfileTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self, let learningService else { return }
+                guard let self else { return }
+                self.regenerateHermesProfile()
+                guard let learningService else { return }
                 learningService.generateProfileUpdate()
                 self.projectAwareness?.refreshProjects()
 
@@ -1353,8 +1432,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let store = memoryStore else { return }
         let panel = AlfredPanelView(
             store: store,
+            screenTextMonitor: screenTextMonitor,
+            meetingManager: meetingManager,
+            ownerName: appState.ownerName,
             onRunNow: { [weak self] routine in self?.routineScheduler?.runNow(routine) },
-            onQuit: { [weak self] in self?.quitFromMenu() }
+            onQuit: { [weak self] in self?.quitFromMenu() },
+            onScreenTextToggle: { [weak self] on in
+                self?.appState.screenTextCaptureEnabled = on
+                if on { self?.screenTextMonitor?.start() } else { self?.screenTextMonitor?.stop() }
+            }
         )
         let pop = NSPopover()
         pop.behavior = .transient
@@ -1383,6 +1469,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             isProcessing: barState.isProcessing,
             suggestions: barState.suggestions
         ))
+        barState.focusToken += 1
     }
 
     private func toggleBar() {
@@ -1396,6 +1483,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 isProcessing: barState.isProcessing,
                 suggestions: barState.suggestions
             ))
+            barState.focusToken += 1
         case .collapsed:
             barState.presenceState = .expanded
             window.expand(toHeight: expandedBarHeight(
@@ -1403,6 +1491,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 isProcessing: barState.isProcessing,
                 suggestions: barState.suggestions
             ))
+            barState.focusToken += 1
         case .expanded, .thinking, .responding, .listening:
             hideBar()
         }
@@ -1752,13 +1841,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if let command = QueryIntent.analyze(decision.query).shellCommand {
-            guard confirmShellCommand(command) else {
-                barState.responseText = "Shell command cancelled."
-                barState.isProcessing = false
-                Task { await CapabilityEventLogger.shared.record("shell", "cancelled by user") }
-                return
+            // Only destructive shell (rm/drop/format…) prompts; routine commands run automatically
+            // (decision.confirmRequired is destructive-only per the Dispatcher).
+            if decision.confirmRequired {
+                guard confirmShellCommand(command) else {
+                    barState.responseText = "Shell command cancelled."
+                    barState.isProcessing = false
+                    Task { await CapabilityEventLogger.shared.record("shell", "cancelled by user") }
+                    return
+                }
+                Task { await CapabilityEventLogger.shared.record("shell", "confirmed") }
+            } else {
+                Task { await CapabilityEventLogger.shared.record("shell", "auto-run") }
             }
-            Task { await CapabilityEventLogger.shared.record("shell", "confirmed") }
         }
 
         Task {

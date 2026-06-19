@@ -19,6 +19,7 @@ struct ExpandedPresenceView: View {
     let activeProject: String?
     let contextLabel: String
     let contextStatus: String
+    let focusToken: Int
     let onSubmit: (String) -> Void
     let onSuggestionTap: (ProactiveSuggestion) -> Void
     let onEscape: () -> Void
@@ -83,7 +84,8 @@ struct ExpandedPresenceView: View {
                 .stroke(.white.opacity(0.12), lineWidth: 0.5)
         )
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
-        .onAppear { inputFocused = true }
+        .onAppear { focusInput() }
+        .onChange(of: focusToken) { _, _ in focusInput() }
         .onKeyPress(.escape) {
             onEscape()
             return .handled
@@ -215,6 +217,14 @@ struct ExpandedPresenceView: View {
             .help(didCopy ? "Copied!" : "Copy")
             .padding(8)
         }
+    }
+
+    /// Focus the input so the user can type immediately on activation. A programmatically-shown
+    /// NSPanel isn't key yet when `onAppear` fires, so an immediate set is dropped — re-assert a
+    /// beat later once the panel is key.
+    private func focusInput() {
+        inputFocused = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { inputFocused = true }
     }
 
     private func copyResponse() {

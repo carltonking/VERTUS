@@ -16,6 +16,7 @@ final class RoutineRecordTests: XCTestCase {
                 t.column("timezone", .text).notNull().defaults(to: "")
                 t.column("enabled", .boolean).notNull().defaults(to: true)
                 t.column("policy_class", .text).notNull().defaults(to: "unattended-safe")
+                t.column("trigger_type", .text).notNull().defaults(to: "schedule")
                 t.column("last_run_at", .double)
                 t.column("next_run_at", .double)
                 t.column("last_status", .text)
@@ -26,7 +27,8 @@ final class RoutineRecordTests: XCTestCase {
         return db
     }
 
-    private func sample(title: String = "Morning summary", enabled: Bool = true) -> RoutineRecord {
+    private func sample(title: String = "Morning summary", enabled: Bool = true,
+                        trigger: String = "schedule") -> RoutineRecord {
         RoutineRecord(
             id: nil,
             title: title,
@@ -35,6 +37,7 @@ final class RoutineRecordTests: XCTestCase {
             timezone: "America/New_York",
             enabled: enabled,
             policy_class: "unattended-safe",
+            trigger_type: trigger,
             last_run_at: nil,
             next_run_at: 123_456,
             last_status: nil,
@@ -56,6 +59,28 @@ final class RoutineRecordTests: XCTestCase {
         XCTAssertEqual(fetched?.timezone, "America/New_York")
         XCTAssertEqual(fetched?.enabled, true)
         XCTAssertEqual(fetched?.policy_class, "unattended-safe")
+    }
+
+    func testTriggerTypePersistsAndDefaults() throws {
+        let db = try makeDB()
+        // Explicit trigger type round-trips.
+        var manual = sample(title: "manual one", trigger: "manual")
+        try db.write { db in try manual.insert(db) }
+        let fetched = try db.read { db in try RoutineRecord.fetchOne(db, key: manual.id!) }
+        XCTAssertEqual(fetched?.trigger_type, "manual")
+
+        // A row inserted without trigger_type (pre-v13 style) gets the "schedule" default —
+        // mirrors the `ALTER TABLE ... ADD COLUMN trigger_type ... DEFAULT 'schedule'` migration.
+        try db.write { db in
+            try db.execute(sql: """
+                INSERT INTO routines (title, prompt_text, schedule_cron, timezone, enabled, policy_class, created_at)
+                VALUES ('legacy', 'p', '0 9 * * *', 'UTC', 1, 'unattended-safe', 1)
+                """)
+        }
+        let legacy = try db.read { db in
+            try RoutineRecord.filter(Column("title") == "legacy").fetchOne(db)
+        }
+        XCTAssertEqual(legacy?.trigger_type, "schedule")
     }
 
     func testEnabledFilter() throws {

@@ -77,12 +77,12 @@ struct Dispatcher {
         // 4. Map to the blueprint's five command classes.
         let commandClass = Self.commandClass(for: actionType, sensitive: sensitive, destructive: destructive)
 
-        // 5. Confirmation: high-risk writes always confirm (delete/send/bulk + shell).
-        //    Derived from the action + destructive signal, NOT from the display class, so
-        //    a cloud-sensitive delete still confirms.
+        // 5. Confirmation. User preference (2026-06-16): only DESTRUCTIVE actions
+        //    (delete/remove/erase/trash/wipe/rm -rf/drop table/format) prompt for confirmation.
+        //    Send-message and shell/system commands now run without a confirmation dialog. The
+        //    command *class* (mapped below) is unchanged — send/shell stay high-risk in the audit
+        //    log; they simply no longer block on a prompt.
         let confirmRequired = destructive
-            || actionType == .sendMessage
-            || actionType == .systemCommand
 
         // 6. Route. The blueprint dispatcher decides local-vs-cloud; with a user-selected
         //    provider in M1, the active provider determines reachability and a manual

@@ -789,6 +789,10 @@ actor AssistantCore {
         var parts: [String] = []
         parts.append(AssistantPersona.systemIntro(ownerName: ownerName, currentDate: now))
 
+        // Hermes Tier‑1: inject the bounded local profile (USER.md / MEMORY.md) if present.
+        let profileBlock = ProfileDigest.injectedSystemText()
+        if !profileBlock.isEmpty { parts.append(profileBlock) }
+
         if let personalContext, !personalContext.isEmpty {
             parts.append("PERSONAL CONTEXT:\n\(personalContext)")
         }
