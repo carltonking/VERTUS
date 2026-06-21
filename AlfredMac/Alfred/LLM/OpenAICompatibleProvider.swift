@@ -126,7 +126,13 @@ final class OpenAICompatibleProvider: LLMProvider {
                 let arguments: String?
             }
 
-            guard let event = try? JSONDecoder().decode(Event.self, from: data),
+            // The JSON keys are snake_case (tool_calls, finish_reason) but the structs are camelCase.
+            // Without this strategy those keys silently decode to nil — which dropped EVERY streamed
+            // tool call (the model's open-app calls vanished → blank replies). `content` has no
+            // underscore so it always worked, masking the bug for plain answers.
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            guard let event = try? decoder.decode(Event.self, from: data),
                   let choice = event.choices.first else { continue }
 
             if let text = choice.delta.content {
@@ -165,20 +171,32 @@ final class OpenAICompatibleProvider: LLMProvider {
         var allMessages = messages
         allMessages.append(assistantMsg)
 
+        var toolResultTexts: [String] = []
         for tc in toolCalls {
             let result = await executor(tc.function.name, tc.function.arguments)
-            // Try to parse the tool result from the executor; it returns status text
+            // The executor returns user-ready status text (e.g. "Opened Obsidian.").
+            toolResultTexts.append(result)
             allMessages.append(.toolResult(result, toolCallID: tc.id))
         }
 
-        // Follow-up stream WITHOUT tools, so the LLM just responds with natural language
-        return try await streamWithTools(
+        // Follow-up stream WITHOUT tools, so the LLM just responds with natural language.
+        let followup = try await streamWithTools(
             messages: allMessages,
             system: system,
             tools: nil,
             executeToolCall: nil,
             onToken: onToken
         )
+
+        // The model sometimes returns NO prose after a tool runs (e.g. a bare "yes" → open-app call).
+        // Never leave the user with a blank turn (which surfaces as "I don't have an answer") — fall
+        // back to the tool's own status text, which is already user-readable, and stream it out.
+        if followup.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let fallback = toolResultTexts.joined(separator: "\n")
+            if !fallback.isEmpty { onToken(fallback) }
+            return fallback
+        }
+        return followup
     }
 
     // MARK: - Private

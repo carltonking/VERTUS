@@ -81,17 +81,23 @@ final class EmailReadService: ReadOnlyIntegrationProtocol {
     /// Unlike `performSearch`, this launches Mail via `tell` if it isn't running, so it works
     /// from a headless routine. Throws on AppleScript/permission failure so the caller can react.
     func fetchRecentUnread(limit: Int = 20) async throws -> [IntegrationSearchResult] {
+        // Robust script: filter only by read status (the compound `where (date … and …)` whose-clause
+        // is buggy/slow and the old version also carried a stray backslash that mangled it). Limit in
+        // AppleScript, try-wrap each message, and build a single linefeed-delimited string so Swift's
+        // `split(separator: "\\n")` parsing is deterministic (a returned list coerces to comma-joined).
         let scriptSource = """
         tell application "Mail"
-            set recentMessages to messages of inbox where \\(date received > ((current date) - 24 * hours) and read status is false)
-            set outputLines to {}
-            repeat with msg in recentMessages
-                set subj to subject of msg
-                set sndr to sender of msg
-                set msgDate to date received of msg
-                set end of outputLines to subj & tab & sndr & tab & (msgDate as text)
+            set out to ""
+            set unreadMsgs to (messages of inbox whose read status is false)
+            set n to (count of unreadMsgs)
+            if n > 20 then set n to 20
+            repeat with i from 1 to n
+                try
+                    set msg to item i of unreadMsgs
+                    set out to out & (subject of msg) & tab & (sender of msg) & tab & ((date received of msg) as string) & linefeed
+                end try
             end repeat
-            return outputLines
+            return out
         end tell
         """
         var errorDict: NSDictionary?

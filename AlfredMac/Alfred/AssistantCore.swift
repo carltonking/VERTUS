@@ -21,6 +21,10 @@ actor AssistantCore {
     private let screen = ScreenCapability()
     private let screenText = ScreenTextCapability()
     private let web = WebSearchCapability()
+    private let github = GitHubCapability()
+    private let notion = NotionCapability()
+    private let obsidian = ObsidianCapability()
+    private let stylePrefs = ResponseStylePreferenceStore()
     private let emailReader = EmailReadService()
     private let shell = ShellCapability()
     private let inserter = TextInserter()
@@ -244,9 +248,120 @@ actor AssistantCore {
         headless: Bool = false,
         onToken: @escaping @Sendable (String) -> Void
     ) async throws -> String {
+        // GitHub write confirmation gate — MUST be the first thing checked. If a write is armed from
+        // the previous turn, this turn can only be its yes/no answer: "yes" runs it, anything else
+        // drops it (default-deny) and falls through to normal handling. Running this before every
+        // other interceptor stops an armed write from surviving into an unrelated later message (e.g.
+        // "open safari") and then being fired by a stray "yes". Interactive only — a headless routine
+        // must never touch or consume the interactive user's pending confirmation.
+        if !headless, await GitHubWriteGate.shared.hasPending {
+            let answer = query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+            if GitHubWriteCapability.isAffirmative(answer), let action = await GitHubWriteGate.shared.take() {
+                await CapabilityEventLogger.shared.record("github write", "confirmed")
+                let result = await GitHubWriteCapability.execute(action)
+                onToken(result)
+                return result
+            }
+            await GitHubWriteGate.shared.clear()
+            if GitHubWriteCapability.isNegative(answer) {
+                let m = "Cancelled — nothing was changed on GitHub."
+                onToken(m)
+                return m
+            }
+            // Neither yes nor no → write dropped; fall through and handle this as a fresh request.
+        }
+
         if let quickResponse = QuickCommands.handle(query) {
             onToken(quickResponse)
             return quickResponse
+        }
+
+        // Messages read — needs async to request Contacts access (for name resolution) before the
+        // synchronous chat.db read. Handled before the LLM.
+        if MessagesReadCapability.detect(query.lowercased()) {
+            await MessagesReadCapability.ensureContactsAccess()
+            let result = MessagesReadCapability.recent()
+            onToken(result)
+            return result
+        }
+
+        // Spotify "play <song>" — needs an async search (Web API) then local AppleScript playback.
+        // Handled before the LLM so the model can't invent a fake result. Only fires when the user
+        // has set Spotify credentials; otherwise QuickCommands already returned the setup message.
+        if SpotifyCapability.hasCredentials,
+           SpotifyCapability.detect(query.lowercased()) == .searchUnsupported {
+            let result = await SpotifyCapability.searchAndPlay(query: query)
+            onToken(result)
+            return result
+        }
+
+        // New GitHub write request → parse, stash, and ask for confirmation before doing anything.
+        // The confirmation answer is handled by the gate at the very top of process(). Interactive
+        // only — a headless routine must never arm a write it can't confirm.
+        if !headless, let prepared = await GitHubWriteCapability.prepare(query) {
+            switch prepared {
+            case .ready(let action):
+                await GitHubWriteGate.shared.set(action)
+                await CapabilityEventLogger.shared.record("github write", "awaiting-confirm")
+                let prompt = action.confirmationPrompt
+                onToken(prompt)
+                return prompt
+            case .message(let msg):
+                onToken(msg)
+                return msg
+            }
+        }
+
+        // Outlook / Microsoft — device-code login ("connect outlook") and reading mail. Handled
+        // before the LLM so the auth flow and Graph call are deterministic.
+        if let outlook = await OutlookCapability.handle(query) {
+            await CapabilityEventLogger.shared.record("outlook", "requested")
+            onToken(outlook)
+            return outlook
+        }
+
+        // Gmail / Google — loopback-OAuth login ("connect gmail") and reading mail, before the LLM.
+        if let gmail = await GmailCapability.handle(query) {
+            await CapabilityEventLogger.shared.record("gmail", "requested")
+            onToken(gmail)
+            return gmail
+        }
+
+        // Contacts lookup ("what's Mom's number") — exact phone/email, before the LLM can guess.
+        if let contact = await ContactsCapability.handle(query) {
+            await CapabilityEventLogger.shared.record("contacts", "requested")
+            onToken(contact)
+            return contact
+        }
+
+        // Spotlight file search ("find my file about X") — real paths, never invented.
+        if let files = SpotlightCapability.handle(query) {
+            await CapabilityEventLogger.shared.record("spotlight", "requested")
+            onToken(files)
+            return files
+        }
+
+        // Clipboard read ("what's in my clipboard") — verbatim, before the LLM.
+        if let clip = ClipboardCapability.handle(query) {
+            await CapabilityEventLogger.shared.record("clipboard", "requested")
+            onToken(clip)
+            return clip
+        }
+
+        // Browser tabs ("what am I reading", "what tabs are open") — exact URL/title from Safari/Chrome.
+        if let browser = BrowserCapability.handle(query) {
+            await CapabilityEventLogger.shared.record("browser", "requested")
+            onToken(browser)
+            return browser
+        }
+
+        // Reminder create ("remind me to call mom tomorrow at 5") — safe local write, no confirm.
+        if let r = ReminderCreateCapability.detect(query) {
+            let result = (try? await calendarReminders.createReminder(title: r.title, notes: nil, dueDate: r.dueDate))
+                ?? "Couldn't create the reminder — Alfred may need Reminders access (System Settings → Privacy & Security → Reminders → Alfred)."
+            await CapabilityEventLogger.shared.record("reminder", "created", detail: r.title)
+            onToken(result)
+            return result
         }
 
         let lowered = query.lowercased()
@@ -291,6 +406,9 @@ actor AssistantCore {
         async let historyTask = conversationHistoryEnabled ? conversationHistory() : ""
         async let screenContextTask = maybeScreenContext(intent: intent, enabled: screenContextEnabled, supportsVision: router.activeProvider.supportsVision)
         async let webResultTask  = maybeWebSearch(query: query, intent: intent)
+        async let githubResultTask = maybeGitHub(query: query)
+        async let notionResultTask = maybeNotion(query: query)
+        async let obsidianResultTask = maybeObsidian(query: query)
         async let emailResultTask = maybeEmailSummary(query: query)
         async let shellResultTask = maybeShell(intent: intent, enabled: shellExecutionEnabled)
         async let appResultTask = maybeAppControl(intent: intent, headless: headless)
@@ -306,6 +424,9 @@ actor AssistantCore {
             default: nil
         }
         let webResult     = try? await webResultTask
+        let githubResult  = await githubResultTask
+        let notionResult  = await notionResultTask
+        let obsidianResult = await obsidianResultTask
         let emailResult   = await emailResultTask
         let shellResult   = try? await shellResultTask
         let appResult     = try? await appResultTask
@@ -439,6 +560,9 @@ actor AssistantCore {
         // 3. Build messages
         var userContent = query
         if let web = webResult { userContent += "\n\n[Search results]\n\(web)" }
+        if let gh = githubResult { userContent += "\n\n[GitHub]\n\(gh)" }
+        if let nt = notionResult { userContent += "\n\n[Notion]\n\(nt)" }
+        if let ob = obsidianResult { userContent += "\n\n[Obsidian]\n\(ob)" }
         if let email = emailResult { userContent += "\n\n[Email inbox — unread, last 24h]\n\(email)" }
         if let sh  = shellResult { userContent += "\n\n[Shell output]\n\(sh)" }
         if let app = appResult { userContent += "\n\n[App actions]\n\(app)" }
@@ -472,14 +596,31 @@ actor AssistantCore {
         }
 
         // 4. Stream LLM response (with tool calling support)
-        // Headless routines don't expose tools (no unattended app-opening).
-        let fullResponse = try await router.streamWithTools(
+        // Headless routines don't expose tools (no unattended app-opening). Also withhold the
+        // open-app tool when a read-data capability already supplied an answer (e.g. GitHub):
+        // otherwise smaller models hijack the turn into a bogus open_application call (treating a
+        // PR URL as an app name) and return no text. With the data present and no tool, they answer.
+        // Withhold the open-app tool whenever ANY read-data capability supplied content. Otherwise
+        // smaller models hijack the turn into a bogus open_application call and return no text
+        // (the empty-response bug). With data present, they should just answer.
+        let suppressTools = githubResult != nil || notionResult != nil || obsidianResult != nil
+            || emailResult != nil || webResult != nil || shellResult != nil
+            || youtubeTranscript != nil || calendarResult != nil
+        var fullResponse = try await router.streamWithTools(
             messages: messages,
             system: system,
-            tools: headless ? nil : [LLMTool.openApplication.payload],
+            tools: (headless || suppressTools) ? nil : [LLMTool.openApplication.payload],
             executeToolCall: AppControlCapability.executeToolCall,
             onToken: onToken
         )
+
+        // Safety net: small models occasionally return a completely empty completion (notably on
+        // terse inputs like "yes"). Rather than surface a blank turn ("I'm sorry, I don't have an
+        // answer"), retry once as a plain text completion (no tools) so the user always gets a real
+        // reply. The recent conversation is in `system`, so the model can still resolve the "yes".
+        if fullResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            fullResponse = try await router.stream(messages: messages, system: system, onToken: onToken)
+        }
 
         // 5. Post-processing (fire-and-forget; don't block the return)
         Task {
@@ -530,8 +671,11 @@ actor AssistantCore {
     }
 
     private func conversationHistory() throws -> String {
-        // Keep ~8 recent exchanges so the bar holds a real back-and-forth conversation.
-        let rows = try memory.loadHistory(limit: 16)
+        // Keep only the last few exchanges. A long window let stale, unrelated topics bleed into
+        // short follow-ups ("yes" resolving against an old "open Safari" turn). Also drop blank
+        // assistant turns (past empty replies) — they add noise and confuse reference resolution.
+        let rows = try memory.loadHistory(limit: 8)
+            .filter { !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !rows.isEmpty else { return "" }
         return rows.map { row in
             "\(row.role): \(row.content.prefix(300))"
@@ -664,6 +808,32 @@ actor AssistantCore {
         return try await web.search(query: query)
     }
 
+    /// Pulls GitHub context (PRs, issues, notifications, profile) when the user mentions GitHub.
+    /// Read-only and self-contained — `summary` never throws (returns a helpful note when the
+    /// token is missing or a call fails), so it can't break the rest of the pipeline.
+    private func maybeGitHub(query: String) async -> String? {
+        guard query.lowercased().contains("github") else { return nil }
+        await CapabilityEventLogger.shared.record("github", "requested")
+        return await github.summary(query: query)
+    }
+
+    /// Searches Notion when the user mentions it. Same read-only, never-throws contract as GitHub.
+    private func maybeNotion(query: String) async -> String? {
+        guard query.lowercased().contains("notion") else { return nil }
+        await CapabilityEventLogger.shared.record("notion", "requested")
+        return await notion.summary(query: query)
+    }
+
+    /// Searches the local Obsidian vault(s) when the user mentions it. Pure local file reads — no
+    /// API, no token. PRIVACY: the Redactor does not scrub free-form note bodies, so when a cloud
+    /// model is active we send titles + paths only (`includeBodies: false`); full snippets go out
+    /// only to a local model. Same read-only, never-throws contract as GitHub/Notion.
+    private func maybeObsidian(query: String) async -> String? {
+        guard query.lowercased().contains("obsidian") else { return nil }
+        await CapabilityEventLogger.shared.record("obsidian", "requested")
+        return await obsidian.summary(query: query, includeBodies: !router.isActiveProviderCloud)
+    }
+
     /// Fetches unread inbox messages when the user asks about email, so the model can summarize
     /// real mail instead of saying it lacks access. Read-only — runs in interactive + headless
     /// (routine) paths. Needs Automation permission for Mail (prompted on first use).
@@ -675,10 +845,25 @@ actor AssistantCore {
                         "my emails", "my inbox", "what emails", "any emails", "email summary"]
         guard triggers.contains(where: { q.contains($0) }) else { return nil }
 
-        guard let results = try? await emailReader.fetchRecentUnread() else {
-            return "Couldn't read Mail — Alfred needs Automation permission for Mail (System Settings → Privacy & Security → Automation → Alfred → Mail)."
+        let results: [IntegrationSearchResult]
+        do {
+            results = try await emailReader.fetchRecentUnread()
+        } catch {
+            // Don't blame permission blindly — surface the real AppleScript error. Only -1743 is the
+            // actual "not authorized" code; anything else (Mail not running, script error) is reported
+            // as-is so the user isn't sent to toggle a permission that's already granted.
+            var inner = error as NSError
+            if case IntegrationError.underlying(let e) = error { inner = e as NSError }
+            let asCode = inner.userInfo["NSAppleScriptErrorNumber"] as? Int
+            if asCode == -1743 {
+                return "Couldn't read Mail — Alfred needs Automation permission for Mail (System Settings → Privacy & Security → Automation → Alfred → Mail)."
+            }
+            let brief = inner.userInfo["NSAppleScriptErrorBriefMessage"] as? String
+                ?? inner.userInfo[NSLocalizedDescriptionKey] as? String
+                ?? error.localizedDescription
+            return "Couldn't read Mail: \(brief). (Make sure Mail is open and has your account configured.)"
         }
-        guard !results.isEmpty else { return "No unread emails in the last 24 hours." }
+        guard !results.isEmpty else { return "No unread emails right now." }
         return results.map { r in
             "• \(r.metadata["subject"] ?? r.title) — from \(r.metadata["sender"] ?? r.subtitle)"
         }.joined(separator: "\n")
@@ -845,6 +1030,11 @@ actor AssistantCore {
         let profileBlock = ProfileDigest.injectedSystemText()
         if !profileBlock.isEmpty { parts.append(profileBlock) }
 
+        // Explicit response-style preferences the user has taught Alfred ("just give me a list").
+        // High in the prompt so they're followed by default.
+        let styleBlock = stylePrefs.systemPromptBlock(ownerName: ownerName)
+        if !styleBlock.isEmpty { parts.append(styleBlock) }
+
         if let personalContext, !personalContext.isEmpty {
             parts.append("PERSONAL CONTEXT:\n\(personalContext)")
         }
@@ -986,6 +1176,9 @@ actor AssistantCore {
         // Record writing sample from user's query
         writingStyle?.recordWritingSample(text: query, source: .chat)
 
+        // Learn explicit response-style feedback ("just give me a list", "that was too long").
+        Task { await self.maybeLearnStylePreference(query: query) }
+
         // Generate reward signals from this interaction
         rewardEngine?.generateRewardSignals()
 
@@ -1025,5 +1218,38 @@ actor AssistantCore {
         for fact in lines.prefix(3) {
             try? memory.save(content: fact, tags: ["auto", "extracted"])
         }
+    }
+
+    /// Detects when the user is telling Alfred HOW to respond (format/length/detail/tone) and saves
+    /// it as a persistent style rule applied to future answers. A cheap keyword pre-filter avoids an
+    /// LLM call on ordinary queries; the LLM then disambiguates ("make a list of groceries" is a
+    /// content request, not a style rule → NONE) and normalizes the feedback into one imperative rule.
+    private func maybeLearnStylePreference(query: String) async {
+        let lowered = query.lowercased()
+        let cues = ["list", "bullet", "short", "long", "concise", "brief", "detail", "summar",
+                    "format", "prefer", "tone", "casual", "formal", "tldr", "shorter", "longer",
+                    "verbose", "wordy", "paragraph", "next time", "respond", "answer", "reply"]
+        guard cues.contains(where: { lowered.contains($0) }) else { return }
+        // Style feedback is short; skip long task-style requests that merely mention a cue word.
+        guard query.split(separator: " ").count <= 20 else { return }
+
+        let prompt = """
+            The user said: "\(query)"
+
+            Is this an instruction about HOW they want Alfred to FORMAT or STYLE its answers — length,
+            list vs prose, level of detail, or tone? If YES, rewrite it as ONE short imperative rule
+            Alfred should follow from now on, e.g. "Respond with a short bulleted list.", "Keep answers
+            to 1–2 sentences.", "Use a casual, friendly tone." If it is NOT about response style (it's a
+            normal task or question), output exactly NONE. Output only the rule or NONE.
+            """
+        guard let raw = try? await router.complete(
+            prompt: prompt,
+            system: "You extract response-style preferences. Output one imperative rule, or NONE."
+        ) else { return }
+
+        let rule = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rule.isEmpty, rule.uppercased() != "NONE", rule.count > 5, rule.count < 160 else { return }
+        stylePrefs.add(rule)
+        await CapabilityEventLogger.shared.record("style", "learned", detail: rule)
     }
 }

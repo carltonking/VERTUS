@@ -15,10 +15,14 @@ struct QueryIntent: Equatable {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let lowered = trimmed.lowercased()
 
+        // A calendar/reminders query ("what's on my calendar this week") must not also trigger a web
+        // search just because it contains a time word like "this week" — that pollutes the answer with
+        // generic links. Calendar intent wins.
+        let calendarContext = detectsCalendarContext(lowered)
         return QueryIntent(
-            wantsWebSearch: detectsWebSearch(lowered),
+            wantsWebSearch: detectsWebSearch(lowered) && !calendarContext,
             wantsScreenContext: detectsScreenContext(lowered),
-            wantsCalendarContext: detectsCalendarContext(lowered),
+            wantsCalendarContext: calendarContext,
             appControlQuery: extractAppControlQuery(from: trimmed, lowered: lowered),
             shellCommand: extractShellCommand(from: trimmed)
         )

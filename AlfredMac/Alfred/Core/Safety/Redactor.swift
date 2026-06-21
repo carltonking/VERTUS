@@ -19,6 +19,9 @@ struct Redactor {
         let sources = [
             // Labelled secrets: "password: hunter2", "api key = abc123", "token=..."
             #"(?i)\b(?:passwords?|passcode|api[ _-]?key|secret|token)\b\s*[:=]\s*\S+"#,
+            // Space-separated secret values: "set github token ghp_xxx", "token <ghp_xxx>".
+            // Requires a long-ish value so ordinary prose ("the token in the contract") is left alone.
+            #"(?i)\b(?:passcode|api[ _-]?key|secret|token)\b\s+<?\S{12,}>?"#,
             // US SSN: 123-45-6789
             #"\b\d{3}-\d{2}-\d{4}\b"#,
             // Credit-card-shaped: 4 groups of 4 digits with optional spaces/hyphens

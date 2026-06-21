@@ -1689,8 +1689,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Open the Routines manager (Blueprint §3) from the bar.
+        // Real conversation reset. Typing "clear" previously fell through to the LLM, which only
+        // *said* "starting fresh" while the stale history stayed in the DB and kept polluting later
+        // replies (e.g. a bare "yes" resolving against an old, unrelated topic). Actually wipe it.
         let normalizedQuery = cmd.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if ["clear", "new chat", "new conversation", "reset", "start over", "start fresh",
+            "forget this", "clear chat", "clear conversation"].contains(normalizedQuery) {
+            try? memoryStore?.clearHistory()
+            // Also drop any armed GitHub write so it can't survive a reset and fire on a later "yes".
+            Task { await GitHubWriteGate.shared.clear() }
+            barState.responseText = "Cleared — starting fresh. What can I do for you?"
+            barState.isProcessing = false
+            barState.presenceState = .expanded
+            return
+        }
+
+        // Open the Routines manager (Blueprint §3) from the bar.
         if ["routines", "show routines", "manage routines", "open routines", "my routines", "panel"].contains(normalizedQuery) {
             barState.responseText = "Opening the Alfred panel from the menu bar…"
             barState.isProcessing = false
@@ -1804,7 +1818,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             query: cmd,
             providerIsCloud: llmRouter?.isActiveProviderCloud ?? false
         )
-        let runId = memoryStore?.startRun(source: "bar", prompt: text)
+        // Redact secrets (e.g. "set github token …") before they reach the audit row.
+        let auditPrompt = Redactor().redact(text).text
+        let runId = memoryStore?.startRun(source: "bar", prompt: auditPrompt)
         let alreadyConfirmsElsewhere =
             QueryIntent.analyze(decision.query).shellCommand != nil
             || QueryIntent.analyze(decision.query).appControlQuery != nil
