@@ -240,6 +240,18 @@ final class ComputerControlCapability {
         }
     }
 
+    /// Extract key tokens from a `press key …` / `hotkey …` line, tolerating quotes and a stray
+    /// literal "key" token that small models sometimes emit.
+    private func keyTokens(after prefixPattern: String, in line: String) -> [String] {
+        line
+            .replacingOccurrences(of: prefixPattern, with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\"", with: " ")
+            .replacingOccurrences(of: "'", with: " ")
+            .split { $0 == "+" || $0 == " " || $0 == "," }
+            .map { String($0).lowercased() }
+            .filter { !$0.isEmpty && $0 != "key" }
+    }
+
     private func normalizedActionText(from query: String) -> String {
         let separators = ["actions:", "action:", "then:"]
         for separator in separators {
@@ -263,16 +275,15 @@ final class ComputerControlCapability {
         if lowered.hasPrefix("click") {
             return coordinates(from: line).map { .click(x: $0.x, y: $0.y) }
         }
-        if lowered.hasPrefix("press key") {
-            let key = line.replacingOccurrences(of: #"(?i)^press key\s+"#, with: "", options: .regularExpression)
-            return key.isEmpty ? nil : .pressKey(key)
+        if lowered.hasPrefix("press key") || lowered.hasPrefix("presskey") {
+            // Small models sometimes emit `press key "command" KEY "t"` for cmd+t. Strip quotes and
+            // the literal word "key"; one token is a key press, multiple tokens are a hotkey combo.
+            let tokens = keyTokens(after: #"(?i)^press\s*key\s+"#, in: line)
+            if tokens.isEmpty { return nil }
+            return tokens.count == 1 ? .pressKey(tokens[0]) : .hotkey(tokens)
         }
         if lowered.hasPrefix("hotkey") {
-            let keys = line
-                .replacingOccurrences(of: #"(?i)^hotkey\s+"#, with: "", options: .regularExpression)
-                .split { $0 == "+" || $0 == " " || $0 == "," }
-                .map(String.init)
-                .filter { !$0.isEmpty }
+            let keys = keyTokens(after: #"(?i)^hotkey\s+"#, in: line)
             return keys.isEmpty ? nil : .hotkey(keys)
         }
         if lowered.hasPrefix("type text") || lowered.hasPrefix("type ") {

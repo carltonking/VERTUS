@@ -30,20 +30,12 @@ struct LLMComputerControlPlanner {
     private static let stepSystem = """
     You operate a Mac toward a GOAL over multiple steps. The screen changes after every action, so
     each turn you are shown the CURRENT clickable ELEMENTS and the actions already taken.
-    Output ONLY the NEXT 1-3 actions that make progress, in this grammar (one per line, no prose):
-      click element N
-      double click element N
-      click "label"
-      type "text"
-      hotkey key1 key2
-      press key KEY
-      wait SECONDS
-    Or output exactly:
+    Output ONLY the NEXT 1-3 actions that make progress (no prose), using this grammar:
+    \(grammar)
+    Or output exactly one of:
       DONE                      (the goal is already achieved — nothing left to do)
       CANNOT: <short reason>    (the goal can't be reached with these actions/elements)
-    Rules: use only element numbers/labels from the current list; never invent them. Don't repeat an
-    action that clearly had no effect last turn. Never type passwords/secrets/payments. Never do
-    destructive/irreversible actions (delete, erase, buy, send money). Keep each step minimal.
+    Also: don't repeat an action that clearly had no effect last turn.
     """
 
     /// Ask for the next step given the goal, the freshly-captured object map, and what's been done.
@@ -81,21 +73,34 @@ struct LLMComputerControlPlanner {
         return cleaned.isEmpty ? .done : .actions(cleaned)
     }
 
-    private static let system = """
-    You operate a Mac for the user by emitting an ACTION SCRIPT: one action per line, no prose, no markdown.
-    Allowed actions ONLY:
-      click element N
+    private static let grammar = """
+    Allowed actions ONLY (one per line, exactly this format):
+      click element N         (N is a number from the ELEMENTS list)
       double click element N
       click "label"
       type "text"
-      hotkey key1 key2        (e.g. hotkey cmd t, hotkey cmd l)
-      press key KEY           (e.g. press key return, press key escape)
-      wait SECONDS
-    Rules:
+      hotkey cmd t            (a key combination — list the real keys; use cmd/shift/option/control + one key)
+      press key return        (a SINGLE key — use the real key name: return, escape, tab, space, up, down…)
+      wait 1
+    Format rules — follow EXACTLY:
+    - For key COMBINATIONS use `hotkey` with real key names, e.g. `hotkey cmd t`, `hotkey cmd l`.
+      NEVER write the literal word KEY, and NEVER put quotes around key names.
+    - For a single key use `press key <name>`, e.g. `press key return`. Never `press key "x" KEY "y"`.
     - Use element numbers/labels strictly from the ELEMENTS list; never invent numbers.
     - Keep it minimal; at most 20 actions.
     - NEVER type passwords, payment details, or secrets. NEVER do destructive or irreversible actions (delete, erase, buy, send money, transfer).
-    - If the task cannot be accomplished with these actions and the listed elements, output exactly one line: CANNOT: <short reason>
+
+    EXAMPLES (task → script):
+    - open a new tab → hotkey cmd t
+    - focus the address bar and go to github.com → hotkey cmd l ; type "github.com" ; press key return
+    - save the document → hotkey cmd s
+    - click the Submit button (it is element 4) → click element 4
+    """
+
+    private static let system = """
+    You operate a Mac for the user by emitting an ACTION SCRIPT: one action per line, no prose, no markdown.
+    \(grammar)
+    If the task cannot be accomplished with these actions and the listed elements, output exactly one line: CANNOT: <short reason>
     Output ONLY the action script, or the CANNOT line. No explanation.
     """
 

@@ -58,6 +58,27 @@ final class ComputerControlAgentTests: XCTestCase {
     }
 
     @MainActor
+    func testMalformedKeyComboIsRecovered() throws {
+        // Regression: llama3.1:8b emitted `press key "command" KEY "t"` for cmd+t. The parser must
+        // strip the quotes + literal "key" and treat the two keys as a hotkey instead of failing.
+        let plan = try ComputerControlCapability().planFromActionScript("press key \"command\" KEY \"t\"")
+        XCTAssertEqual(plan.actions.count, 1)
+        guard case .hotkey(let keys) = plan.actions[0] else {
+            return XCTFail("expected a hotkey, got \(plan.actions[0])")
+        }
+        XCTAssertEqual(keys, ["command", "t"])
+    }
+
+    @MainActor
+    func testSingleKeyStillPressed() throws {
+        let plan = try ComputerControlCapability().planFromActionScript("press key return")
+        guard case .pressKey(let key) = plan.actions[0] else {
+            return XCTFail("expected a key press, got \(plan.actions[0])")
+        }
+        XCTAssertEqual(key, "return")
+    }
+
+    @MainActor
     func testActionCapEnforced() {
         let script = Array(repeating: "wait 1", count: 25).joined(separator: "\n")
         XCTAssertThrowsError(try ComputerControlCapability().planFromActionScript(script)) { error in
