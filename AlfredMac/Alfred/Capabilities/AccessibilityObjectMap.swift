@@ -27,12 +27,25 @@ enum AccessibilityObjectMap {
         "AXDisclosureTriangle", "AXToolbarButton", "AXSegmentedControl", "AXIncrementor",
     ]
 
-    /// Enumerate actionable elements of the frontmost app's focused window, in tree order.
-    /// Bounded for battery/latency. Returns [] if Accessibility is denied or there is no window.
+    /// Enumerate actionable elements of a window, in tree order. Bounded for battery/latency.
+    /// Returns [] if Accessibility is denied or there is no window.
+    ///
+    /// `targetBundleId` matters because Alfred's own floating bar is usually frontmost while the
+    /// user is typing — pass the app they actually want to inspect/control (e.g. ContextMonitor's
+    /// last non-Alfred app) instead of capturing Alfred's own UI. Defaults to the frontmost app.
     @MainActor
-    static func capture(maxElements: Int = 60, maxDepth: Int = 45) -> [AccessibilityElement] {
-        guard AXIsProcessTrusted(), let front = NSWorkspace.shared.frontmostApplication else { return [] }
-        let app = AXUIElementCreateApplication(front.processIdentifier)
+    static func capture(maxElements: Int = 60, maxDepth: Int = 45, targetBundleId: String? = nil) -> [AccessibilityElement] {
+        guard AXIsProcessTrusted() else { return [] }
+
+        let target: NSRunningApplication?
+        if let targetBundleId, targetBundleId != Bundle.main.bundleIdentifier {
+            target = NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == targetBundleId }
+        } else {
+            target = NSWorkspace.shared.frontmostApplication
+        }
+        guard let target else { return [] }
+
+        let app = AXUIElementCreateApplication(target.processIdentifier)
         guard let window = copyElement(app, kAXFocusedWindowAttribute) ?? copyElement(app, kAXMainWindowAttribute)
         else { return [] }
 

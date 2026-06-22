@@ -10,10 +10,12 @@ final class ComputerControlCapability {
     /// references in a plan resolve against this so the indices the model saw stay stable.
     private var lastObjectMap: [AccessibilityElement] = []
 
-    /// Numbered list of clickable on-screen elements, for injection into the model's prompt so it
-    /// can ask to "click element N" / "click <label>" instead of guessing pixel coordinates.
-    func semanticObjectMapText(maxElements: Int = 60) -> String {
-        let map = AccessibilityObjectMap.capture(maxElements: maxElements)
+    /// Numbered list of clickable on-screen elements, so the user/model can address them by
+    /// "click element N" / "click <label>" instead of guessing pixel coordinates. Pass the target
+    /// app's bundle id (e.g. the last non-Alfred frontmost app) so it doesn't enumerate Alfred's
+    /// own bar. Caches the map so a subsequent element click resolves against the same indices.
+    func semanticObjectMapText(maxElements: Int = 60, targetBundleId: String? = nil) -> String {
+        let map = AccessibilityObjectMap.capture(maxElements: maxElements, targetBundleId: targetBundleId)
         lastObjectMap = map
         return AccessibilityObjectMap.render(map)
     }

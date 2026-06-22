@@ -1730,6 +1730,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let selectedFiles = selectedFileContext.snapshot()
 
+        // Read-only inspector: list the clickable elements of the app the user was just in (not
+        // Alfred's own bar). Pure observation, so it's available even while the gated click
+        // feature is off; it also primes the Semantic Object Map for an "click element N" action.
+        let lowercasedText = text.lowercased()
+        if lowercasedText.contains("clickable")
+            || lowercasedText.contains("what can i click")
+            || (lowercasedText.contains("list") && lowercasedText.contains("element")) {
+            let targetBundleId = contextMonitor?.context?.bundleIdentifier
+            let map = computerControl.semanticObjectMapText(targetBundleId: targetBundleId)
+            barState.responseText = map.isEmpty
+                ? (computerControl.hasAccessibilityPermission
+                    ? "No clickable elements found in the front window."
+                    : "Enable Accessibility (System Settings ▸ Privacy & Security ▸ Accessibility) so I can read on-screen elements.")
+                : "Clickable elements:\n\(map)"
+            barState.isProcessing = false
+            barState.presenceState = .expanded
+            return
+        }
+
         do {
             let planner = WorkflowPlanner(computerControl: computerControl)
             if let workflowPlan = try planner.makePlan(
