@@ -2189,6 +2189,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         barState.responseText = "Working on: \(task)…"
         barState.presenceState = .thinking
         Task { await CapabilityEventLogger.shared.record("computer control", "session started", detail: task) }
+        AgentDebugLog.log("=== SESSION · target=\(targetApp.localizedName ?? "?") (\(targetBundleId)) · goal=\(task)")
 
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -2206,18 +2207,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.contextMonitor?.refresh(forceBrowserRead: true)
                 let objectMap = self.computerControl.semanticObjectMapText(targetBundleId: targetBundleId)
                 let windowContext = self.currentWindowContext()
+                let elementCount = objectMap.isEmpty ? 0 : objectMap.split(separator: "\n").count
+                AgentDebugLog.log("step \(step): window=\(windowContext.isEmpty ? "?" : windowContext) · \(elementCount) elements")
                 let outcome = await planner.nextStep(goal: task, objectMap: objectMap, windowContext: windowContext, history: history, router: router)
 
                 switch outcome {
                 case .done:
+                    AgentDebugLog.log("step \(step): model says DONE")
                     self.barState.responseText = successes == 0 ? "That already looks done." : "Done — \(successes) step\(successes == 1 ? "" : "s") completed."
                     await CapabilityEventLogger.shared.record("computer control", "completed", detail: "\(successes) steps")
                     return
                 case .cannot(let reason):
+                    AgentDebugLog.log("step \(step): model says CANNOT: \(reason)")
                     self.barState.responseText = "I can't finish that on screen: \(reason)"
                     await CapabilityEventLogger.shared.record("computer control", "planner declined", detail: reason)
                     return
                 case .actions(let script):
+                    AgentDebugLog.log("step \(step): script=\(script.replacingOccurrences(of: "\n", with: " | "))")
                     // The agent can't always see the result (empty element map, no page text). If it
                     // proposes the same action it just ran, it's stuck or the goal is already met —
                     // stop instead of re-doing it (e.g. re-typing a URL into a page that already loaded).
@@ -2234,6 +2240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         _ = try await self.computerControl.execute(plan) { [weak self] desc in
                             self?.barState.contextStatus = "Step \(step): \(desc)"
                         }
+                        AgentDebugLog.log("step \(step): ran OK — \(plan.summary)")
                         history.append("Step \(step): \(plan.summary) — done")
                         successes += 1
                         consecutiveFailures = 0
@@ -2245,6 +2252,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         // Don't kill the session on one bad step — feed the failure back so the model
                         // can adjust (e.g. use a keyboard shortcut instead of clicking a missing element).
                         consecutiveFailures += 1
+                        AgentDebugLog.log("step \(step): FAILED — \(error.localizedDescription)")
                         history.append("Step \(step) FAILED: \(error.localizedDescription). Use a different approach — prefer keyboard actions (hotkey / type / press key) over clicking elements that aren't in the list.")
                         self.barState.contextStatus = "Step \(step) didn't work — adjusting…"
                         if consecutiveFailures >= 3 {
