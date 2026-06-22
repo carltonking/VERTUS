@@ -2174,9 +2174,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let targetBundleId = contextMonitor?.context?.bundleIdentifier
-        let targetName = NSWorkspace.shared.runningApplications
-            .first { $0.bundleIdentifier == targetBundleId }?.localizedName ?? "the current app"
+        // A real target app is required — otherwise the Semantic Object Map would capture Alfred's
+        // own bar. ContextMonitor tracks the last non-Alfred frontmost app.
+        guard let targetBundleId = contextMonitor?.context?.bundleIdentifier,
+              let targetApp = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == targetBundleId }) else {
+            barState.responseText = "Open or click the app you want me to control first (for example Safari), then ask again."
+            barState.isProcessing = false
+            return
+        }
+        let targetName = targetApp.localizedName ?? "the app"
 
         guard confirmComputerControlSession(goal: task, appName: targetName) else {
             barState.responseText = "Computer control cancelled."
@@ -2195,21 +2201,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             defer { self.barState.isProcessing = false; self.barState.presenceState = .expanded }
             let planner = LLMComputerControlPlanner()
             var history: [String] = []
+            var successes = 0
+            var consecutiveFailures = 0
 
             for step in 1...maxSteps {
                 // Bring the target app forward and read its CURRENT elements (they change each step).
-                if let bid = targetBundleId,
-                   let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bid }) {
-                    app.activate()
-                    try? await Task.sleep(nanoseconds: 250_000_000)
-                }
+                targetApp.activate()
+                try? await Task.sleep(nanoseconds: 400_000_000)
                 let objectMap = self.computerControl.semanticObjectMapText(targetBundleId: targetBundleId)
                 let outcome = await planner.nextStep(goal: task, objectMap: objectMap, history: history, router: router)
 
                 switch outcome {
                 case .done:
-                    self.barState.responseText = history.isEmpty ? "Nothing to do — that already looks done." : "Done. \(history.count) step\(history.count == 1 ? "" : "s") completed."
-                    await CapabilityEventLogger.shared.record("computer control", "completed", detail: "\(history.count) steps")
+                    self.barState.responseText = successes == 0 ? "That already looks done." : "Done — \(successes) step\(successes == 1 ? "" : "s") completed."
+                    await CapabilityEventLogger.shared.record("computer control", "completed", detail: "\(successes) steps")
                     return
                 case .cannot(let reason):
                     self.barState.responseText = "I can't finish that on screen: \(reason)"
@@ -2222,15 +2227,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         _ = try await self.computerControl.execute(plan) { [weak self] desc in
                             self?.barState.contextStatus = "Step \(step): \(desc)"
                         }
-                        history.append("Step \(step): \(plan.summary)")
+                        history.append("Step \(step): \(plan.summary) — done")
+                        successes += 1
+                        consecutiveFailures = 0
                     } catch let error as ComputerControlCapability.ControlError where Self.isCancellation(error) {
-                        self.barState.responseText = "Stopped. \(history.count) step\(history.count == 1 ? "" : "s") completed before you cancelled."
+                        self.barState.responseText = "Stopped — you cancelled."
                         await CapabilityEventLogger.shared.record("computer control", "stopped")
                         return
                     } catch {
-                        self.barState.responseText = "Computer control stopped: \(error.localizedDescription)"
-                        await CapabilityEventLogger.shared.record("computer control", "refused", detail: error.localizedDescription)
-                        return
+                        // Don't kill the session on one bad step — feed the failure back so the model
+                        // can adjust (e.g. use a keyboard shortcut instead of clicking a missing element).
+                        consecutiveFailures += 1
+                        history.append("Step \(step) FAILED: \(error.localizedDescription). Use a different approach — prefer keyboard actions (hotkey / type / press key) over clicking elements that aren't in the list.")
+                        self.barState.contextStatus = "Step \(step) didn't work — adjusting…"
+                        if consecutiveFailures >= 3 {
+                            self.barState.responseText = "Computer control stopped after repeated failures: \(error.localizedDescription)"
+                            await CapabilityEventLogger.shared.record("computer control", "stopped", detail: "repeated failures")
+                            return
+                        }
                     }
                 }
                 try? await Task.sleep(nanoseconds: 300_000_000)

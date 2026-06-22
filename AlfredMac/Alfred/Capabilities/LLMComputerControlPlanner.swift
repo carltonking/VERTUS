@@ -83,10 +83,14 @@ struct LLMComputerControlPlanner {
       press key return        (a SINGLE key — use the real key name: return, escape, tab, space, up, down…)
       wait 1
     Format rules — follow EXACTLY:
+    - PREFER keyboard shortcuts (hotkey / type / press key) over clicking when they do the same job —
+      they're far more reliable and don't depend on the elements list. E.g. to go to a URL use
+      `hotkey cmd l` then `type "..."` then `press key return`, instead of clicking the address bar.
     - For key COMBINATIONS use `hotkey` with real key names, e.g. `hotkey cmd t`, `hotkey cmd l`.
       NEVER write the literal word KEY, and NEVER put quotes around key names.
     - For a single key use `press key <name>`, e.g. `press key return`. Never `press key "x" KEY "y"`.
-    - Use element numbers/labels strictly from the ELEMENTS list; never invent numbers.
+    - Only use `click element N` when the ELEMENTS list is non-empty and contains N. If the list is
+      empty or the target isn't listed, use a keyboard action instead.
     - Keep it minimal; at most 20 actions.
     - NEVER type passwords, payment details, or secrets. NEVER do destructive or irreversible actions (delete, erase, buy, send money, transfer).
 
