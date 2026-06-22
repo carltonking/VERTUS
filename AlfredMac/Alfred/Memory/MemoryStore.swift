@@ -149,12 +149,18 @@ final class MemoryStore {
         return svc
     }()
 
-    init() throws {
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appending(path: ".alfred/db", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-
-        let dbPath = dir.appending(path: "memory.db").path
+    /// `path` defaults to the real on-disk store; tests pass a temp path to exercise
+    /// save/search against an isolated database.
+    init(path: String? = nil) throws {
+        let dbPath: String
+        if let path {
+            dbPath = path
+        } else {
+            let dir = FileManager.default.homeDirectoryForCurrentUser
+                .appending(path: ".alfred/db", directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            dbPath = dir.appending(path: "memory.db").path
+        }
         db = try DatabaseQueue(path: dbPath)
         try migrate()
     }
@@ -482,6 +488,17 @@ final class MemoryStore {
             }
         }
 
+        // The two hottest tables were the only ones missing indexes on their sort columns:
+        // conversation_history.timestamp is ordered + range-deleted on every query (loadHistory,
+        // prune, and the row-cap subquery), and memories.accessed_at is used as the retrieval
+        // tiebreak. Without these, both incur a full scan + sort that grows with history size.
+        migrator.registerMigration("v15_hot_indexes") { db in
+            try db.create(index: "idx_conversation_history_timestamp", on: "conversation_history",
+                          columns: ["timestamp"], ifNotExists: true)
+            try db.create(index: "idx_memories_accessed_at", on: "memories",
+                          columns: ["accessed_at"], ifNotExists: true)
+        }
+
         try migrator.migrate(db)
     }
 
@@ -714,16 +731,42 @@ final class MemoryStore {
     // MARK: - Memory operations
 
     func save(content: String, tags: [String] = []) throws {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
         let now = Date().timeIntervalSince1970
-        let record = MemoryRecord(
-            id: nil,
-            content: content,
-            tags: tags.joined(separator: ", "),
-            created_at: now,
-            accessed_at: now
-        )
+        let norm = trimmed.lowercased()
+
         try db.write { db in
-            try record.insert(db)
+            // ponytail: dedup-on-write. Auto-extraction re-saves the same fact every time
+            // it's reaffirmed, so `memories` fills with near-duplicates that then crowd the
+            // top-5 retrieval. Catch verbatim matches and one-contains-the-other cases, and
+            // just refresh recency instead of inserting. Token-overlap scoring is the upgrade
+            // path if this misses paraphrases.
+            let existing = try MemoryRecord.fetchAll(db, sql: """
+                SELECT * FROM memories
+                WHERE lower(trim(content)) = ?
+                   OR (length(?) > 15 AND instr(lower(content), ?) > 0)
+                   OR (length(content) > 15 AND instr(?, lower(content)) > 0)
+                LIMIT 1
+                """, arguments: [norm, norm, norm, norm])
+
+            if let dup = existing.first, let id = dup.id {
+                // Keep the longer, more-informative phrasing as canonical; refresh recency.
+                let keep = trimmed.count > dup.content.count ? trimmed : dup.content
+                try db.execute(
+                    sql: "UPDATE memories SET content = ?, accessed_at = ? WHERE id = ?",
+                    arguments: [keep, now, id]
+                )
+                return
+            }
+
+            try MemoryRecord(
+                id: nil,
+                content: trimmed,
+                tags: tags.joined(separator: ", "),
+                created_at: now,
+                accessed_at: now
+            ).insert(db)
         }
     }
 
@@ -733,13 +776,17 @@ final class MemoryStore {
             let ftsPattern = FTS5Pattern(matchingAllTokensIn: query)
 
             if let pattern = ftsPattern {
+                // Rank by FTS relevance (bm25, lower = better match) first, recency as the
+                // tiebreak. Previously ordered by accessed_at alone, which ignored how well a
+                // memory actually matched the query and — because every retrieved row's
+                // accessed_at is bumped to now below — flattened the signal over time.
                 return try MemoryRecord
                     .joining(required: MemoryRecord.hasOne(
                         Table("memories_fts"),
                         using: ForeignKey(["rowid"], to: ["rowid"])
                     ))
                     .filter(sql: "memories_fts MATCH ?", arguments: [pattern])
-                    .order(Column("accessed_at").desc)
+                    .order(sql: "bm25(memories_fts), memories.accessed_at DESC")
                     .limit(limit)
                     .fetchAll(db)
             } else {

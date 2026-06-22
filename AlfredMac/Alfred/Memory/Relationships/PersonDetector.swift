@@ -1,6 +1,11 @@
 import Foundation
 
 struct PersonDetector {
+    // Compiled once. This regex was rebuilt on every detectEmailLikeNames call (and the
+    // force-unwrap re-evaluated each time); the pattern is a constant, so compile it once.
+    private static let emailNamePattern = try! NSRegularExpression(
+        pattern: #"([a-zA-Z]+\.[a-zA-Z]+)@[a-zA-Z]+\.(edu|com|org|net)"#)
+
     private let knownPrefixes: Set<String> = [
         "professor", "prof", "dr", "doctor", "mr", "mrs", "ms", "mx",
         "captain", "coach", "sir", "madam",
@@ -111,9 +116,8 @@ struct PersonDetector {
     // MARK: - Email-like patterns
 
     private func detectEmailLikeNames(_ text: String) -> [DetectedPerson] {
-        let pattern = try! NSRegularExpression(pattern: #"([a-zA-Z]+\.[a-zA-Z]+)@[a-zA-Z]+\.(edu|com|org|net)"#)
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        let matches = pattern.matches(in: text, range: range)
+        let matches = Self.emailNamePattern.matches(in: text, range: range)
 
         return matches.compactMap { match -> DetectedPerson? in
             guard let nameRange = Range(match.range(at: 1), in: text) else { return nil }

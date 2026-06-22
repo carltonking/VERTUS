@@ -2,6 +2,14 @@ import Foundation
 import AppKit
 
 final class ProjectAwarenessService {
+    // Compiled once. These constant patterns were rebuilt on every candidate-detection call.
+    private static let properNounPattern = try! NSRegularExpression(
+        pattern: "\\b([A-Z][a-z]+[A-Z][A-Za-z]*)\\b|\\b([A-Z][A-Z]+)\\b")
+    private static let titlePathPatterns = [
+        try! NSRegularExpression(pattern: "^([A-Z][A-Za-z0-9]*)/"),
+        try! NSRegularExpression(pattern: " — ([A-Z][A-Za-z0-9]*)"),
+    ]
+
     private let memory: MemoryStore
     private let store: ProjectStore
     private var projects: [Project] = []
@@ -181,8 +189,7 @@ final class ProjectAwarenessService {
         }
 
         // Capitalized proper noun detection (multi-word)
-        let properNounPattern = try! NSRegularExpression(pattern: "\\b([A-Z][a-z]+[A-Z][A-Za-z]*)\\b|\\b([A-Z][A-Z]+)\\b", options: [])
-        let nounMatches = properNounPattern.matches(in: query, options: [], range: NSRange(query.startIndex..., in: query))
+        let nounMatches = Self.properNounPattern.matches(in: query, options: [], range: NSRange(query.startIndex..., in: query))
         for match in nounMatches {
             for groupIdx in [1, 2] {
                 let r = match.range(at: groupIdx)
@@ -217,11 +224,7 @@ final class ProjectAwarenessService {
 
         for title in windowTitles {
             // Pattern: "ProjectName/Path/File.swift — Xcode"
-            let pathPatterns = [
-                try! NSRegularExpression(pattern: "^([A-Z][A-Za-z0-9]*)/", options: []),
-                try! NSRegularExpression(pattern: " — ([A-Z][A-Za-z0-9]*)", options: []),
-            ]
-            for pattern in pathPatterns {
+            for pattern in Self.titlePathPatterns {
                 if let match = pattern.firstMatch(in: title, options: [], range: NSRange(title.startIndex..., in: title)) {
                     let r = match.range(at: 1)
                     if r.location != NSNotFound, let range = Range(r, in: title) {
