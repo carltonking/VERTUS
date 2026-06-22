@@ -10,6 +10,16 @@ struct LLMComputerControlPlanner {
         case cannot(String)
     }
 
+    /// Turn a provider error into something actionable. The most common failure is the local model
+    /// (Ollama) not running, which otherwise surfaced as a useless "the model did not respond".
+    static func friendlyError(_ error: Error) -> String {
+        if let urlError = error as? URLError,
+           [.cannotConnectToHost, .cannotFindHost, .timedOut, .networkConnectionLost].contains(urlError.code) {
+            return "couldn't reach the AI provider — if you're using the local model, make sure Ollama is running (run `ollama serve`); otherwise check your API key and connection"
+        }
+        return error.localizedDescription
+    }
+
     /// One iteration of the plan-act-observe loop.
     enum StepOutcome {
         case actions(String)   // the next 1-3 actions toward the goal
@@ -50,8 +60,11 @@ struct LLMComputerControlPlanner {
         NEXT:
         """
 
-        guard let raw = try? await router.complete(prompt: prompt, system: Self.stepSystem) else {
-            return .cannot("the model did not respond")
+        let raw: String
+        do {
+            raw = try await router.complete(prompt: prompt, system: Self.stepSystem)
+        } catch {
+            return .cannot(Self.friendlyError(error))
         }
 
         let cleaned = raw
@@ -96,8 +109,11 @@ struct LLMComputerControlPlanner {
         ACTION SCRIPT:
         """
 
-        guard let raw = try? await router.complete(prompt: prompt, system: Self.system) else {
-            return .cannot("the model did not respond")
+        let raw: String
+        do {
+            raw = try await router.complete(prompt: prompt, system: Self.system)
+        } catch {
+            return .cannot(Self.friendlyError(error))
         }
 
         var cleaned = raw
