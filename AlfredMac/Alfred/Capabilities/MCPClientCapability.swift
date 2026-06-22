@@ -27,7 +27,7 @@ struct MCPClientCapability {
         guard let config = loadConfig(), let serverConfig = config.mcpServers[server] else {
             throw LLMError.networkError("MCP server \"\(server)\" not found in config.")
         }
-        let request = MCPRequest(method: "tools/list", params: [:])
+        let request = MCPRequest(id: 2, method: "tools/list", params: [:])
         let response = try await send(request: request, config: serverConfig)
         return response
     }
@@ -36,7 +36,7 @@ struct MCPClientCapability {
         guard let config = loadConfig(), let serverConfig = config.mcpServers[server] else {
             throw LLMError.networkError("MCP server \"\(server)\" not found in config.")
         }
-        let request = MCPRequest(method: "tools/call", params: ["name": name, "arguments": arguments])
+        let request = MCPRequest(id: 2, method: "tools/call", params: ["name": name, "arguments": arguments])
         let response = try await send(request: request, config: serverConfig)
         return response
     }
@@ -48,6 +48,10 @@ struct MCPClientCapability {
         return config
     }
 
+    // ponytail: one process per call, correct over fast. The handshake (initialize ->
+    // notifications/initialized -> request) is required by the MCP spec; spec-compliant
+    // servers reject a bare tools/list. Upgrade path if call latency matters: keep one
+    // long-lived Process per server keyed by JSON-RPC id and cache tools/list.
     private func send(request: MCPRequest, config: MCPServerConfig) async throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -69,80 +73,155 @@ struct MCPClientCapability {
         process.standardError = stderrPipe
 
         return try await withCheckedThrowingContinuation { continuation in
+            let state = MCPCallState(process: process, stdout: stdoutPipe, stderr: stderrPipe, continuation: continuation)
+
+            // Collect stderr only for diagnostics — npx-based servers log to stderr in normal
+            // operation, so it must NOT be treated as a failure on its own (the old code did).
+            stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+                state.appendStderr(handle.availableData)
+            }
+
+            // MCP stdio transport is newline-delimited JSON-RPC. Buffer stdout, parse complete
+            // lines, and resolve on the first response whose id matches the real request.
+            stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                if chunk.isEmpty {
+                    state.finishClosedBeforeResponse()
+                    return
+                }
+                state.consume(chunk, matchingId: request.id)
+            }
+
+            DispatchQueue.global().asyncAfter(deadline: .now() + 15) {
+                state.finishTimeout()
+            }
+
             do {
                 try process.run()
-
-                let requestData = try JSONEncoder().encode(request)
-                stdinPipe.fileHandleForWriting.write(requestData)
-                try stdinPipe.fileHandleForWriting.close()
-
-                let group = DispatchGroup()
-                var outputData = Data()
-                var errorData = Data()
-
-                group.enter()
-                stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-                    let data = handle.availableData
-                    if data.isEmpty {
-                        stdoutPipe.fileHandleForReading.readabilityHandler = nil
-                        group.leave()
-                    } else {
-                        outputData.append(data)
-                    }
-                }
-
-                group.enter()
-                stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-                    let data = handle.availableData
-                    if data.isEmpty {
-                        stderrPipe.fileHandleForReading.readabilityHandler = nil
-                        group.leave()
-                    } else {
-                        errorData.append(data)
-                    }
-                }
-
-                DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
-                    if process.isRunning {
-                        process.terminate()
-                    }
-                    group.leave()
-                }
-
-                group.wait()
-                process.waitUntilExit()
-
-                if !errorData.isEmpty, let errorString = String(data: errorData, encoding: .utf8), !errorString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    continuation.resume(throwing: LLMError.networkError("MCP stderr: \(errorString.trimmingCharacters(in: .whitespacesAndNewlines))"))
-                    return
-                }
-
-                guard let responseString = String(data: outputData, encoding: .utf8) else {
-                    continuation.resume(throwing: LLMError.networkError("MCP response was not valid UTF-8."))
-                    return
-                }
-
-                continuation.resume(returning: responseString.trimmingCharacters(in: .whitespacesAndNewlines))
+                let stdin = stdinPipe.fileHandleForWriting
+                try stdin.write(contentsOf: MCPRequest.initialize().encodedLine())
+                try stdin.write(contentsOf: MCPNotification.initialized().encodedLine())
+                try stdin.write(contentsOf: request.encodedLine())
+                try? stdin.close()
             } catch {
-                continuation.resume(throwing: LLMError.networkError("MCP process launch failed: \(error.localizedDescription)"))
+                state.finish(.failure(LLMError.networkError("MCP process launch failed: \(error.localizedDescription)")))
             }
         }
     }
 }
 
-private struct MCPRequest: Codable {
-    let jsonrpc = "2.0"
-    let id = 1
-    let method: String
-    let params: [String: AnyJSON]
+/// Owns the single-resume / cleanup bookkeeping for one MCP call so the read handlers,
+/// EOF, and timeout can all race to finish exactly once.
+private final class MCPCallState {
+    private let process: Process
+    private let stdout: Pipe
+    private let stderr: Pipe
+    private let continuation: CheckedContinuation<String, Error>
+    private let lock = NSLock()
+    private var resumed = false
+    private var buffer = Data()
+    private var errorData = Data()
 
-    init(method: String, params: [String: Any]) {
-        self.method = method
-        self.params = params.mapValues { AnyJSON(wrapped: $0) }
+    init(process: Process, stdout: Pipe, stderr: Pipe, continuation: CheckedContinuation<String, Error>) {
+        self.process = process
+        self.stdout = stdout
+        self.stderr = stderr
+        self.continuation = continuation
+    }
+
+    func appendStderr(_ data: Data) {
+        lock.lock(); errorData.append(data); lock.unlock()
+    }
+
+    func consume(_ chunk: Data, matchingId targetId: Int) {
+        lock.lock()
+        buffer.append(chunk)
+        while let nl = buffer.firstIndex(of: 0x0A) {
+            let lineData = buffer.subdata(in: buffer.startIndex..<nl)
+            buffer = buffer.subdata(in: buffer.index(after: nl)..<buffer.endIndex)
+            guard !lineData.isEmpty,
+                  let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  let id = obj["id"] as? Int, id == targetId
+            else { continue }  // initialize response (id 1) and notifications are ignored
+
+            lock.unlock()
+            if let err = obj["error"] as? [String: Any] {
+                let message = (err["message"] as? String) ?? "\(err)"
+                finish(.failure(LLMError.networkError("MCP error: \(message)")))
+            } else if let result = obj["result"],
+                      let data = try? JSONSerialization.data(withJSONObject: result) {
+                finish(.success(String(data: data, encoding: .utf8) ?? ""))
+            } else {
+                finish(.success(String(data: lineData, encoding: .utf8) ?? ""))
+            }
+            return
+        }
+        lock.unlock()
+    }
+
+    func finishClosedBeforeResponse() {
+        lock.lock(); let stderrText = String(data: errorData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""; lock.unlock()
+        let suffix = stderrText.isEmpty ? "" : ": \(stderrText)"
+        finish(.failure(LLMError.networkError("MCP server closed before responding\(suffix)")))
+    }
+
+    func finishTimeout() {
+        finish(.failure(LLMError.networkError("MCP request timed out.")))
+    }
+
+    func finish(_ result: Result<String, Error>) {
+        lock.lock()
+        guard !resumed else { lock.unlock(); return }
+        resumed = true
+        lock.unlock()
+        stdout.fileHandleForReading.readabilityHandler = nil
+        stderr.fileHandleForReading.readabilityHandler = nil
+        if process.isRunning { process.terminate() }
+        continuation.resume(with: result)
     }
 }
 
-private struct AnyJSON: Codable {
+struct MCPRequest: Codable {
+    let jsonrpc = "2.0"
+    let id: Int
+    let method: String
+    let params: [String: AnyJSON]
+
+    init(id: Int, method: String, params: [String: Any]) {
+        self.id = id
+        self.method = method
+        self.params = params.mapValues { AnyJSON(wrapped: $0) }
+    }
+
+    /// MCP `initialize` request (id 1) — the mandatory first message of the handshake.
+    static func initialize() -> MCPRequest {
+        MCPRequest(id: 1, method: "initialize", params: [
+            "protocolVersion": "2025-06-18",
+            "capabilities": [String: Any](),
+            "clientInfo": ["name": "Alfred", "version": "1.0"],
+        ])
+    }
+
+    /// Serialize as one newline-delimited JSON-RPC frame for the stdio transport.
+    func encodedLine() -> Data {
+        (try? JSONEncoder().encode(self)).map { $0 + Data([0x0A]) } ?? Data([0x0A])
+    }
+}
+
+/// A JSON-RPC notification (no id, no response). Used for `notifications/initialized`,
+/// which the client must send after `initialize` to complete the handshake.
+struct MCPNotification: Codable {
+    let jsonrpc = "2.0"
+    let method: String
+
+    static func initialized() -> MCPNotification { MCPNotification(method: "notifications/initialized") }
+
+    func encodedLine() -> Data {
+        (try? JSONEncoder().encode(self)).map { $0 + Data([0x0A]) } ?? Data([0x0A])
+    }
+}
+
+struct AnyJSON: Codable {
     let wrapped: Any
 
     init(wrapped: Any) {

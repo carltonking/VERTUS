@@ -811,7 +811,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startHermesCapture() {
         guard let store = memoryStore else { return }
         ProfileDigest.ensureDir()
-        let monitor = ScreenTextMonitor(store: store)
+        // Drive capture off ContextMonitor's app/window/URL change signal (started just before
+        // this), so text is captured when context actually changes rather than on a blind timer.
+        let monitor = ScreenTextMonitor(
+            store: store,
+            contextChanges: contextMonitor?.$context.eraseToAnyPublisher()
+        )
         screenTextMonitor = monitor
         meetingManager = MeetingCaptureManager(store: store)
         if appState.screenTextCaptureEnabled { monitor.start() }
