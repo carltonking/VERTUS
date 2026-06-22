@@ -43,4 +43,10 @@ jobs:
           python-version: "3.11"
 
       - name: Check Python syntax
-        run: python3 -m py_compile "Fine tuned model for alfred/local_alfred_server.py"
+        run: |
+          files=$(find . -name '*.py' \
+            -not -path '*/.build/*' -not -path '*/build/*' \
+            -not -path '*/venv/*' -not -path '*/.venv/*' \
+            -not -path '*/alfred_env/*' -not -path '*/node_modules/*')
+          if [ -z "$files" ]; then echo "No Python files to check."; exit 0; fi
+          echo "$files" | xargs -I{} python3 -m py_compile "{}"
