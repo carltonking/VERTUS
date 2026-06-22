@@ -2182,15 +2182,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             barState.isProcessing = false
             return
         }
-        let targetName = targetApp.localizedName ?? "the app"
-
-        guard confirmComputerControlSession(goal: task, appName: targetName) else {
-            barState.responseText = "Computer control cancelled."
-            barState.isProcessing = false
-            Task { await CapabilityEventLogger.shared.record("computer control", "cancelled by user") }
-            return
-        }
-
+        // No per-action confirmation: enabling Computer control in Settings is the standing consent.
+        // Sensitive/destructive actions are still BLOCKED outright (not merely confirmed), and Esc /
+        // Stop Computer Control aborts at any time.
         let maxSteps = 8
         barState.responseText = "Working on: \(task)…"
         barState.presenceState = .thinking
@@ -2203,13 +2197,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var history: [String] = []
             var successes = 0
             var consecutiveFailures = 0
+            var lastScript = ""
 
             for step in 1...maxSteps {
                 // Bring the target app forward and read its CURRENT elements (they change each step).
                 targetApp.activate()
                 try? await Task.sleep(nanoseconds: 400_000_000)
+                self.contextMonitor?.refresh(forceBrowserRead: true)
                 let objectMap = self.computerControl.semanticObjectMapText(targetBundleId: targetBundleId)
-                let outcome = await planner.nextStep(goal: task, objectMap: objectMap, history: history, router: router)
+                let windowContext = self.currentWindowContext()
+                let outcome = await planner.nextStep(goal: task, objectMap: objectMap, windowContext: windowContext, history: history, router: router)
 
                 switch outcome {
                 case .done:
@@ -2221,6 +2218,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     await CapabilityEventLogger.shared.record("computer control", "planner declined", detail: reason)
                     return
                 case .actions(let script):
+                    // The agent can't always see the result (empty element map, no page text). If it
+                    // proposes the same action it just ran, it's stuck or the goal is already met —
+                    // stop instead of re-doing it (e.g. re-typing a URL into a page that already loaded).
+                    let normalized = script.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    if normalized == lastScript {
+                        self.barState.responseText = successes == 0 ? "That already looks done." : "Done — \(successes) step\(successes == 1 ? "" : "s") completed."
+                        await CapabilityEventLogger.shared.record("computer control", "completed", detail: "repeat-stop after \(successes) steps")
+                        return
+                    }
+                    lastScript = normalized
                     do {
                         let plan = try self.computerControl.planFromActionScript(script)
                         self.barState.contextStatus = "Step \(step): \(plan.summary)"
@@ -2259,21 +2266,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
-    /// One up-front authorization for an autonomous multi-step session (its individual actions can't
-    /// be shown in advance because they depend on intermediate screen states).
-    private func confirmComputerControlSession(goal: String, appName: String) -> Bool {
-        let alert = NSAlert()
-        alert.messageText = "Let Alfred work toward this on your Mac?"
-        alert.informativeText = """
-        Goal: \(goal)
-
-        Alfred will take up to 8 steps in \(appName), showing each action as it goes. It stops at anything sensitive or destructive, and you can press Esc or use Stop Computer Control from the menu at any time.
-        """
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Start")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        return alert.runModal() == .alertFirstButtonReturn
+    /// Best-effort description of the target app's current window/URL, so the agent can tell when a
+    /// goal is already achieved (e.g. the address bar already shows the requested site).
+    private func currentWindowContext() -> String {
+        guard let ctx = contextMonitor?.context else { return "" }
+        var parts = [ctx.appName]
+        if let url = ctx.browserURL, !url.isEmpty { parts.append(url) }
+        else if let title = ctx.windowTitle, !title.isEmpty { parts.append(title) }
+        return parts.joined(separator: " — ")
     }
 
     private func handleComputerControl(plan: ComputerControlCapability.Plan, originalQuery: String, targetBundleId: String? = nil) {
@@ -2285,14 +2285,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        guard confirmComputerControl(plan: plan) else {
-            barState.responseText = "Computer control cancelled."
-            barState.isProcessing = false
-            Task { await CapabilityEventLogger.shared.record("computer control", "cancelled by user") }
-            return
-        }
-
-        Task { await CapabilityEventLogger.shared.record("computer control", "confirmed", detail: "\(plan.actions.count) action(s)") }
+        // No confirmation prompt — Settings opt-in is the consent; destructive actions are blocked.
+        Task { await CapabilityEventLogger.shared.record("computer control", "running", detail: "\(plan.actions.count) action(s)") }
         barState.responseText = "Running computer control...\n\(plan.summary)"
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -2317,23 +2311,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await CapabilityEventLogger.shared.record("computer control", "stopped")
             }
         }
-    }
-
-    private func confirmComputerControl(plan: ComputerControlCapability.Plan) -> Bool {
-        let alert = NSAlert()
-        alert.messageText = "Allow Alfred to control this Mac?"
-        alert.informativeText = """
-        Alfred will run these bounded actions now:
-
-        \(plan.summary)
-
-        Press Esc or use Stop Computer Control from the menu to cancel while actions are running.
-        """
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Run Actions")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        return alert.runModal() == .alertFirstButtonReturn
     }
 
     // MARK: - Onboarding
