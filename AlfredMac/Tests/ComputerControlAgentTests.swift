@@ -11,6 +11,14 @@ final class ComputerControlAgentTests: XCTestCase {
         XCTAssertEqual(ComputerControlIntent.task(in: "Control the Mac: click the New button"), "click the New button")
     }
 
+    func testMultiStepControlQueryIsDetected() {
+        // Regression: this multi-"and" query was swallowed by the workflow planner and failed with
+        // "No supported computer-control actions". It must be recognized as a control task so it
+        // routes to the agent before the workflow planner.
+        let task = ComputerControlIntent.task(in: "control my mac and open a new tab and go to github.com")
+        XCTAssertEqual(task, "open a new tab and go to github.com")
+    }
+
     func testNonControlQueriesAreNotHijacked() {
         XCTAssertNil(ComputerControlIntent.task(in: "what is the capital of France?"))
         XCTAssertNil(ComputerControlIntent.task(in: "summarize this article for me"))
