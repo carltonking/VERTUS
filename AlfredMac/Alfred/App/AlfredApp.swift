@@ -1406,7 +1406,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onScreenTextToggle: { [weak self] on in
                 self?.appState.screenTextCaptureEnabled = on
                 if on { self?.screenTextMonitor?.start() } else { self?.screenTextMonitor?.stop() }
-            }
+            },
+            appState: appState
         )
         let pop = NSPopover()
         pop.behavior = .transient
@@ -1770,7 +1771,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         do {
-            if FeatureScope.computerControlEnabled {
+            if appState.computerControlEnabled {
                 // Natural-language "control my mac …" → LLM action planner over the Semantic Object
                 // Map. Provider-agnostic (cloud key or local model, via LLMRouter).
                 if let task = ComputerControlIntent.task(in: text) {
@@ -2017,6 +2018,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     screenContextEnabled: screenContextEnabled,
                     shellExecutionEnabled: shellExecutionEnabled,
                     memoryExtractionEnabled: memoryExtractionEnabled,
+                    computerControlEnabled: appState.computerControlEnabled,
                     selectedFiles: selectedFiles,
                     conversationHistoryEnabled: conversationHistoryEnabled,
                     memoryRetentionDays: memoryRetentionDays
@@ -2146,8 +2148,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return alert.runModal() == .alertFirstButtonReturn
     }
 
-    /// Natural-language computer control: capture the target app's Semantic Object Map, ask the
-    /// active LLM (cloud or local) to plan an action script over it, validate, confirm, and run.
+    /// Natural-language computer control as a bounded plan-act-observe loop. Because the screen
+    /// changes after every action, the Semantic Object Map is re-captured each step and the LLM
+    /// (cloud or local) decides the next 1-3 actions until it reports DONE / CANNOT or the step cap
+    /// is hit. The user authorizes the autonomous session once; every step still passes the
+    /// sensitive/destructive guards, progress is shown live, and Esc / Stop Computer Control aborts.
     private func planAndRunComputerControl(task: String, originalQuery: String) {
         guard computerControl.hasAccessibilityPermission else {
             computerControl.requestAccessibilityPermission()
@@ -2161,33 +2166,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Target the app the user was just in, not Alfred's own bar.
         let targetBundleId = contextMonitor?.context?.bundleIdentifier
-        barState.responseText = "Planning actions…"
+        let targetName = NSWorkspace.shared.runningApplications
+            .first { $0.bundleIdentifier == targetBundleId }?.localizedName ?? "the current app"
+
+        guard confirmComputerControlSession(goal: task, appName: targetName) else {
+            barState.responseText = "Computer control cancelled."
+            barState.isProcessing = false
+            Task { await CapabilityEventLogger.shared.record("computer control", "cancelled by user") }
+            return
+        }
+
+        let maxSteps = 8
+        barState.responseText = "Working on: \(task)…"
         barState.presenceState = .thinking
+        Task { await CapabilityEventLogger.shared.record("computer control", "session started", detail: task) }
 
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let objectMap = self.computerControl.semanticObjectMapText(targetBundleId: targetBundleId)
-            let outcome = await LLMComputerControlPlanner().plan(task: task, objectMap: objectMap, router: router)
-            switch outcome {
-            case .cannot(let reason):
-                self.barState.responseText = "I can't do that on screen: \(reason)"
-                self.barState.isProcessing = false
-                self.barState.presenceState = .expanded
-                await CapabilityEventLogger.shared.record("computer control", "planner declined", detail: reason)
-            case .script(let script):
-                do {
-                    let plan = try self.computerControl.planFromActionScript(script)
-                    self.handleComputerControl(plan: plan, originalQuery: originalQuery, targetBundleId: targetBundleId)
-                } catch {
-                    self.barState.responseText = "Computer control not run: \(error.localizedDescription)"
-                    self.barState.isProcessing = false
-                    self.barState.presenceState = .expanded
-                    await CapabilityEventLogger.shared.record("computer control", "refused", detail: error.localizedDescription)
+            defer { self.barState.isProcessing = false; self.barState.presenceState = .expanded }
+            let planner = LLMComputerControlPlanner()
+            var history: [String] = []
+
+            for step in 1...maxSteps {
+                // Bring the target app forward and read its CURRENT elements (they change each step).
+                if let bid = targetBundleId,
+                   let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bid }) {
+                    app.activate()
+                    try? await Task.sleep(nanoseconds: 250_000_000)
                 }
+                let objectMap = self.computerControl.semanticObjectMapText(targetBundleId: targetBundleId)
+                let outcome = await planner.nextStep(goal: task, objectMap: objectMap, history: history, router: router)
+
+                switch outcome {
+                case .done:
+                    self.barState.responseText = history.isEmpty ? "Nothing to do — that already looks done." : "Done. \(history.count) step\(history.count == 1 ? "" : "s") completed."
+                    await CapabilityEventLogger.shared.record("computer control", "completed", detail: "\(history.count) steps")
+                    return
+                case .cannot(let reason):
+                    self.barState.responseText = "I can't finish that on screen: \(reason)"
+                    await CapabilityEventLogger.shared.record("computer control", "planner declined", detail: reason)
+                    return
+                case .actions(let script):
+                    do {
+                        let plan = try self.computerControl.planFromActionScript(script)
+                        self.barState.contextStatus = "Step \(step): \(plan.summary)"
+                        _ = try await self.computerControl.execute(plan) { [weak self] desc in
+                            self?.barState.contextStatus = "Step \(step): \(desc)"
+                        }
+                        history.append("Step \(step): \(plan.summary)")
+                    } catch let error as ComputerControlCapability.ControlError where Self.isCancellation(error) {
+                        self.barState.responseText = "Stopped. \(history.count) step\(history.count == 1 ? "" : "s") completed before you cancelled."
+                        await CapabilityEventLogger.shared.record("computer control", "stopped")
+                        return
+                    } catch {
+                        self.barState.responseText = "Computer control stopped: \(error.localizedDescription)"
+                        await CapabilityEventLogger.shared.record("computer control", "refused", detail: error.localizedDescription)
+                        return
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 300_000_000)
             }
+            self.barState.responseText = "Stopped after \(maxSteps) steps. Ask me to continue if it's not finished."
+            await CapabilityEventLogger.shared.record("computer control", "step cap reached")
         }
+    }
+
+    private static func isCancellation(_ error: ComputerControlCapability.ControlError) -> Bool {
+        if case .cancelled = error { return true }
+        return false
+    }
+
+    /// One up-front authorization for an autonomous multi-step session (its individual actions can't
+    /// be shown in advance because they depend on intermediate screen states).
+    private func confirmComputerControlSession(goal: String, appName: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Let Alfred work toward this on your Mac?"
+        alert.informativeText = """
+        Goal: \(goal)
+
+        Alfred will take up to 8 steps in \(appName), showing each action as it goes. It stops at anything sensitive or destructive, and you can press Esc or use Stop Computer Control from the menu at any time.
+        """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Start")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     private func handleComputerControl(plan: ComputerControlCapability.Plan, originalQuery: String, targetBundleId: String? = nil) {

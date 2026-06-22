@@ -11,8 +11,9 @@ struct AlfredPanelView: View {
     var onRunNow: (RoutineRecord) -> Void
     var onQuit: () -> Void
     var onScreenTextToggle: (Bool) -> Void = { _ in }
+    @ObservedObject var appState: AppState
 
-    enum Tab: String, CaseIterable { case routines = "Routines", reminders = "Reminders", profile = "Profile" }
+    enum Tab: String, CaseIterable { case routines = "Routines", reminders = "Reminders", profile = "Profile", settings = "Settings" }
 
     @State private var tab: Tab = .routines
     @State private var routines: [RoutineRecord] = []
@@ -77,6 +78,50 @@ struct AlfredPanelView: View {
         case .profile: HermesDashboardView(store: store, screenTextMonitor: screenTextMonitor,
                                             meetingManager: meetingManager, ownerName: ownerName,
                                             onScreenTextToggle: onScreenTextToggle)
+        case .settings: settingsContent
+        }
+    }
+
+    private var settingsContent: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Toggle(isOn: $appState.computerControlEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Computer control").font(.system(size: 13, weight: .semibold))
+                        Text("Let Alfred operate this Mac when you say “control my mac …”. It reads the on-screen controls and plans the actions with your AI provider.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .toggleStyle(.switch)
+
+                if appState.computerControlEnabled {
+                    Label("Every run shows the exact actions and asks you to confirm before anything happens. Requires Accessibility permission. Passwords, payments and destructive actions are always refused.",
+                          systemImage: "shield.lefthalf.filled")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .labelStyle(.titleAndIcon)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Divider()
+
+                Toggle(isOn: $appState.shellExecutionEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Shell execution").font(.system(size: 13, weight: .semibold))
+                        Text("Run explicit shell commands you type with `run:` or backticks.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .toggleStyle(.switch)
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
         }
     }
 

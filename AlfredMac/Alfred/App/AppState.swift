@@ -70,6 +70,13 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(shellExecutionEnabled, forKey: "shellExecutionEnabled") }
     }
 
+    /// Opt-in: let Alfred drive the Mac's UI ("control my mac …") via the LLM action planner.
+    /// Off by default — every run still requires the confirmation dialog and Accessibility, but a
+    /// powerful capability shouldn't be on until the user explicitly turns it on.
+    @Published var computerControlEnabled: Bool {
+        didSet { UserDefaults.standard.set(computerControlEnabled, forKey: "computerControlEnabled") }
+    }
+
     @Published var screenContextEnabled: Bool {
         didSet { UserDefaults.standard.set(screenContextEnabled, forKey: "screenContextEnabled") }
     }
@@ -167,6 +174,7 @@ final class AppState: ObservableObject {
         // user to grant Screen Recording permission, and can be turned off in the Profile tab.
         screenTextCaptureEnabled = UserDefaults.standard.object(forKey: "screenTextCaptureEnabled") as? Bool ?? true
         focusSensitivity = UserDefaults.standard.string(forKey: "focusSensitivity") ?? "medium"
+        computerControlEnabled = UserDefaults.standard.object(forKey: "computerControlEnabled") as? Bool ?? false
         memoryExtractionEnabled = UserDefaults.standard.object(forKey: "memoryExtractionEnabled") as? Bool ?? false
         conversationHistoryEnabled = UserDefaults.standard.object(forKey: "conversationHistoryEnabled") as? Bool ?? true
         memoryRetentionDays = UserDefaults.standard.object(forKey: "memoryRetentionDays") as? Int ?? 90

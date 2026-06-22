@@ -97,6 +97,7 @@ actor AssistantCore {
         screenContextEnabled: Bool,
         shellExecutionEnabled: Bool,
         memoryExtractionEnabled: Bool,
+        computerControlEnabled: Bool = false,
         selectedFiles: SelectedFileSnapshot = .empty,
         conversationHistoryEnabled: Bool = true,
         memoryRetentionDays: Int = 90,
@@ -185,8 +186,8 @@ actor AssistantCore {
                     contextBlocks.append("[Shell output]\n\(output)")
                     visibleOutputs.append("Shell output:\n\(output)")
                 case .computerControl(let controlPlan):
-                    guard FeatureScope.computerControlEnabled else {
-                        throw LLMError.networkError("Computer control is disabled in this build (Blueprint v1 scope).")
+                    guard computerControlEnabled else {
+                        throw LLMError.networkError("Computer control is off. Turn it on in Alfred's Settings tab.")
                     }
                     let result = try await ComputerControlCapability().execute(controlPlan)
                     contextBlocks.append("[Computer control]\n\(result)")
