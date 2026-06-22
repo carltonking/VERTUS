@@ -25,6 +25,12 @@ final class ComputerControlAgentTests: XCTestCase {
         XCTAssertNil(ComputerControlIntent.task(in: "how do I control inflation?")) // 'control' but not an opener
     }
 
+    func testFriendlyErrorForUnreachableProvider() {
+        let connectionError = URLError(.cannotConnectToHost)
+        let msg = LLMComputerControlPlanner.friendlyError(connectionError)
+        XCTAssertTrue(msg.lowercased().contains("ollama"), "connection failures should hint at the local model: \(msg)")
+    }
+
     // MARK: - Script validation guards (the safety net before confirmation)
 
     @MainActor
