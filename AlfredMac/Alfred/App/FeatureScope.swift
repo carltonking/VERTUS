@@ -25,7 +25,9 @@ enum FeatureScope {
     /// amendment (2026-06-10): personalization brought into scope, cloud-capable.
     static let personalizationEnabled = true
 
-    /// Accessibility-driven computer control (CGEvent mouse/keyboard automation).
-    /// Blueprint v1: gated Phase 2 capability, OFF by default.
-    static let computerControlEnabled = false
+    /// Accessibility-driven computer control (CGEvent mouse/keyboard automation), now driven by
+    /// the LLM action planner over the Semantic Object Map ("control my mac …"). Enabled: every run
+    /// still passes the sensitive/destructive/20-action guards AND an explicit confirmation dialog
+    /// before any action executes, and requires Accessibility permission.
+    static let computerControlEnabled = true
 }

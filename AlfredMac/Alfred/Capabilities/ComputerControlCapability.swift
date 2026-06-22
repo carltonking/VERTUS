@@ -132,8 +132,22 @@ final class ComputerControlCapability {
             throw ControlError.potentiallyDestructive
         }
 
-        let actionText = normalizedActionText(from: query)
-        let lines = actionText
+        return try buildPlan(fromScript: normalizedActionText(from: query))
+    }
+
+    /// Build a plan from an action script produced by the LLM action planner (one action per line,
+    /// in the same grammar `makePlan` parses). Unlike `makePlan` there's no trigger gate — the
+    /// planner already decided to act — but the sensitive/destructive/cap guards still apply, so a
+    /// model that emits "type <password>" or "delete ..." is still rejected before confirmation.
+    func planFromActionScript(_ script: String) throws -> Plan {
+        let lowered = script.lowercased()
+        if containsSensitiveEntryRequest(lowered) { throw ControlError.unsafeSensitiveText }
+        if containsDestructiveRequest(lowered) { throw ControlError.potentiallyDestructive }
+        return try buildPlan(fromScript: script)
+    }
+
+    private func buildPlan(fromScript script: String) throws -> Plan {
+        let lines = script
             .components(separatedBy: CharacterSet(charactersIn: "\n;"))
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }

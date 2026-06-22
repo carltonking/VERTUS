@@ -1770,12 +1770,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         do {
-            // Blueprint v1 scope: computer control is a gated Phase 2 capability.
-            if FeatureScope.computerControlEnabled,
-               let computerPlan = try computerControl.makePlan(from: text) {
-                Task { await CapabilityEventLogger.shared.record("computer control", "requested") }
-                handleComputerControl(plan: computerPlan, originalQuery: text)
-                return
+            if FeatureScope.computerControlEnabled {
+                // Natural-language "control my mac …" → LLM action planner over the Semantic Object
+                // Map. Provider-agnostic (cloud key or local model, via LLMRouter).
+                if let task = ComputerControlIntent.task(in: text) {
+                    Task { await CapabilityEventLogger.shared.record("computer control", "requested", detail: "nl-plan") }
+                    planAndRunComputerControl(task: task, originalQuery: text)
+                    return
+                }
+                // Explicit literal action script ("click 100 200", "hotkey cmd t").
+                if let computerPlan = try computerControl.makePlan(from: text) {
+                    Task { await CapabilityEventLogger.shared.record("computer control", "requested") }
+                    handleComputerControl(plan: computerPlan, originalQuery: text)
+                    return
+                }
             }
         } catch {
             Task { await CapabilityEventLogger.shared.record("computer control", "refused") }
@@ -2138,7 +2146,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return alert.runModal() == .alertFirstButtonReturn
     }
 
-    private func handleComputerControl(plan: ComputerControlCapability.Plan, originalQuery: String) {
+    /// Natural-language computer control: capture the target app's Semantic Object Map, ask the
+    /// active LLM (cloud or local) to plan an action script over it, validate, confirm, and run.
+    private func planAndRunComputerControl(task: String, originalQuery: String) {
+        guard computerControl.hasAccessibilityPermission else {
+            computerControl.requestAccessibilityPermission()
+            barState.responseText = "Accessibility permission is required for computer control. Grant access in System Settings, then try again."
+            barState.isProcessing = false
+            return
+        }
+        guard let router = llmRouter else {
+            barState.responseText = "No AI provider is configured for planning actions."
+            barState.isProcessing = false
+            return
+        }
+
+        // Target the app the user was just in, not Alfred's own bar.
+        let targetBundleId = contextMonitor?.context?.bundleIdentifier
+        barState.responseText = "Planning actions…"
+        barState.presenceState = .thinking
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let objectMap = self.computerControl.semanticObjectMapText(targetBundleId: targetBundleId)
+            let outcome = await LLMComputerControlPlanner().plan(task: task, objectMap: objectMap, router: router)
+            switch outcome {
+            case .cannot(let reason):
+                self.barState.responseText = "I can't do that on screen: \(reason)"
+                self.barState.isProcessing = false
+                self.barState.presenceState = .expanded
+                await CapabilityEventLogger.shared.record("computer control", "planner declined", detail: reason)
+            case .script(let script):
+                do {
+                    let plan = try self.computerControl.planFromActionScript(script)
+                    self.handleComputerControl(plan: plan, originalQuery: originalQuery, targetBundleId: targetBundleId)
+                } catch {
+                    self.barState.responseText = "Computer control not run: \(error.localizedDescription)"
+                    self.barState.isProcessing = false
+                    self.barState.presenceState = .expanded
+                    await CapabilityEventLogger.shared.record("computer control", "refused", detail: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func handleComputerControl(plan: ComputerControlCapability.Plan, originalQuery: String, targetBundleId: String? = nil) {
         guard computerControl.hasAccessibilityPermission else {
             computerControl.requestAccessibilityPermission()
             barState.responseText = "Accessibility permission is required for computer control. Grant access in System Settings, then try again."
@@ -2160,6 +2212,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             defer { self.barState.isProcessing = false }
             do {
+                // Bring the target app to the front (post-confirm) so clicks and typing land there
+                // rather than on Alfred's bar.
+                if let bid = targetBundleId,
+                   let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bid }) {
+                    app.activate()
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                }
                 let message = try await self.computerControl.execute(plan) { [weak self] step in
                     self?.barState.contextStatus = "Computer control: \(step)"
                 }
