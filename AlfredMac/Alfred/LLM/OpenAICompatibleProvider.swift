@@ -23,6 +23,15 @@ final class OpenAICompatibleProvider: LLMProvider {
         return KeychainHelper.load(service: "com.alfred.app", account: keychainAccount) ?? ""
     }
 
+    /// Warm the TLS/keep-alive connection to the host so the first real request reuses it instead
+    /// of paying the ~100-400ms handshake. Fire-and-forget; the response is discarded.
+    func prewarmConnection() {
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 4
+        Task.detached { _ = try? await URLSession.shared.data(for: request) }
+    }
+
     // MARK: - LLMProvider
 
     func complete(messages: [LLMMessage], system: String) async throws -> String {

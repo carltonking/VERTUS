@@ -5,7 +5,10 @@ struct WebSearchCapability {
 
     init() {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 15
+        // Web/search is awaited before the first token streams, so this timeout is a direct
+        // floor on time-to-first-token for any query that triggers a search. 15s was the worst
+        // TTFT cliff; 4s bounds it while still completing the overwhelming majority of searches.
+        config.timeoutIntervalForRequest = 4
         session = URLSession(configuration: config)
     }
 

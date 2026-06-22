@@ -429,6 +429,10 @@ actor AssistantCore {
             default: nil
         }
         let webResult     = try? await webResultTask
+        // If the user asked for current info but the (bounded) search returned nothing in time,
+        // tell the model so it answers from general knowledge with a caveat instead of confidently
+        // presenting stale training data as live.
+        let webSearchFailed = intent.wantsWebSearch && webResult == nil
         let githubResult  = await githubResultTask
         let notionResult  = await notionResultTask
         let obsidianResult = await obsidianResultTask
@@ -552,6 +556,7 @@ actor AssistantCore {
             memories: memories,
             recentHistory: history,
             webResult: webResult,
+            webSearchFailed: webSearchFailed,
             shellResult: shellResult,
             selectedFileContentIncluded: selectedFileResult != nil,
             selectedFolderContentIncluded: selectedFolderResult != nil,
@@ -1019,6 +1024,7 @@ actor AssistantCore {
         memories: [MemoryRecord],
         recentHistory: String = "",
         webResult: String?,
+        webSearchFailed: Bool = false,
         shellResult: String?,
         selectedFileContentIncluded: Bool,
         selectedFolderContentIncluded: Bool,
@@ -1060,7 +1066,9 @@ actor AssistantCore {
 
         if !memories.isEmpty {
             let memorySummary = memories.enumerated()
-                .map { i, m in "[\(i+1)] \(m.content)" }
+                // Cap each memory: an unbounded auto-extracted fact could otherwise dominate the
+                // prompt and inflate prefill (and thus TTFT) on every query.
+                .map { i, m in "[\(i+1)] \(String(m.content.prefix(280)))" }
                 .joined(separator: "\n")
             parts.append("RELEVANT MEMORIES:\n\(memorySummary)")
         }
@@ -1071,6 +1079,8 @@ actor AssistantCore {
 
         if webResult != nil {
             parts.append("Web search results (each with its source URL) are included in the user message. Synthesize them into your answer using current information, and include the relevant source URLs verbatim as plain text (e.g. https://example.com) so the user can click them. If the user asked for links, list the URLs.")
+        } else if webSearchFailed {
+            parts.append("A live web search was attempted for this query but returned no results in time. Answer from general knowledge and briefly note that the information may be out of date.")
         }
 
         if shellResult != nil {

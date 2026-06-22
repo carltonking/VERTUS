@@ -106,6 +106,15 @@ protocol LLMProvider {
         system: String,
         onToken: @escaping @Sendable (String) -> Void
     ) async throws -> String
+
+    /// Open a keep-alive connection to the provider host ahead of the first real request, so the
+    /// first turn after launch / provider switch doesn't pay the TLS handshake. No-op by default
+    /// (e.g. local providers don't benefit).
+    func prewarmConnection()
+}
+
+extension LLMProvider {
+    func prewarmConnection() {}
 }
 
 extension LLMProvider {
