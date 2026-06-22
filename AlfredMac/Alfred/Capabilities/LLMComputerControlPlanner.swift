@@ -38,16 +38,21 @@ struct LLMComputerControlPlanner {
     Also: don't repeat an action that clearly had no effect last turn.
     """
 
-    /// Ask for the next step given the goal, the freshly-captured object map, and what's been done.
-    func nextStep(goal: String, objectMap: String, history: [String], router: LLMRouter) async -> StepOutcome {
+    /// Ask for the next step given the goal, the current screen state, and what's been done.
+    func nextStep(goal: String, objectMap: String, windowContext: String = "", history: [String], router: LLMRouter) async -> StepOutcome {
         let prompt = """
         GOAL: \(goal)
+
+        CURRENT WINDOW: \(windowContext.isEmpty ? "(unknown)" : windowContext)
 
         ACTIONS TAKEN SO FAR:
         \(history.isEmpty ? "(none yet)" : history.joined(separator: "\n"))
 
         CURRENT ELEMENTS (clickable, in the front window):
         \(objectMap.isEmpty ? "(none detected)" : objectMap)
+
+        If the GOAL already appears achieved (e.g. CURRENT WINDOW already shows the requested app/page,
+        or the actions taken already accomplished it), output DONE. Otherwise output the next actions.
 
         NEXT:
         """
