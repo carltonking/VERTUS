@@ -19,6 +19,8 @@ final class ScreenTextMonitor: ObservableObject {
 
     private let store: MemoryStore
     private let capability = ScreenTextCapability()
+    private let screen = ScreenCapability()
+    private let ocr = VisionOCRCapability()
     private let idleFallback: TimeInterval
     private let excluded: Set<String>
     private let contextChanges: AnyPublisher<AppContext?, Never>?
@@ -88,22 +90,44 @@ final class ScreenTextMonitor: ObservableObject {
     }
 
     private func captureOnce() {
-        guard let cap = capability.captureFrontmost() else { return }
-        let bid = cap.bundleId.lowercased()
-        let name = cap.appName.lowercased()
+        guard let front = NSWorkspace.shared.frontmostApplication else { return }
+        let bid = (front.bundleIdentifier ?? "").lowercased()
+        let name = (front.localizedName ?? "").lowercased()
         if excluded.contains(where: { bid.contains($0) || name.contains($0) }) { return }
 
+        if let cap = capability.captureFrontmost() {
+            insertIfNew(appName: cap.appName, bundleId: cap.bundleId, windowTitle: cap.windowTitle, text: cap.text)
+        } else {
+            // Accessibility yielded no text (canvas/PDF-in-browser/Electron/remote-desktop/image).
+            // Fall back to on-device Vision OCR of a screenshot. Gated to the empty-a11y case so it
+            // stays rare and cheap, and routed through the same exclusion + Redactor + dedup guards.
+            ocrFallback(appName: front.localizedName ?? "Unknown", bundleId: front.bundleIdentifier ?? "")
+        }
+    }
+
+    /// Redact, dedup, and persist. Shared by the Accessibility and OCR paths so OCR rows get the
+    /// same PII filtering and consecutive-duplicate suppression.
+    private func insertIfNew(appName: String, bundleId: String, windowTitle: String, text: String) {
         // Client-side PII filter using the same non-removable patterns as the cloud egress gate.
-        let clean = Redactor().redact(cap.text).text
-        // Skip near-identical consecutive captures (e.g. user idle on one window).
-        guard clean != lastText else { return }
+        let clean = Redactor().redact(text).text
+        guard clean.count > 2, clean != lastText else { return }
         lastText = clean
 
         store.insertScreenText(
             timestamp: Date().timeIntervalSince1970,
-            appName: cap.appName, bundleId: cap.bundleId,
-            windowTitle: cap.windowTitle, text: clean
+            appName: appName, bundleId: bundleId,
+            windowTitle: windowTitle, text: clean
         )
         captureCount += 1
+    }
+
+    private func ocrFallback(appName: String, bundleId: String) {
+        Task { [weak self] in
+            guard let self,
+                  let jpeg = try? await self.screen.captureScreen() else { return }
+            let text = await self.ocr.recognizeText(in: jpeg)
+            guard !text.isEmpty else { return }
+            self.insertIfNew(appName: appName, bundleId: bundleId, windowTitle: "", text: text)
+        }
     }
 }
