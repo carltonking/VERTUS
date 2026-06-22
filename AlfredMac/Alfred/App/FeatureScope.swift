@@ -25,9 +25,6 @@ enum FeatureScope {
     /// amendment (2026-06-10): personalization brought into scope, cloud-capable.
     static let personalizationEnabled = true
 
-    /// Accessibility-driven computer control (CGEvent mouse/keyboard automation), now driven by
-    /// the LLM action planner over the Semantic Object Map ("control my mac …"). Enabled: every run
-    /// still passes the sensitive/destructive/20-action guards AND an explicit confirmation dialog
-    /// before any action executes, and requires Accessibility permission.
-    static let computerControlEnabled = true
+    // Computer control is now a user-facing runtime setting (`AppState.computerControlEnabled`,
+    // Settings tab) rather than a build flag, so it can be toggled without recompiling.
 }
