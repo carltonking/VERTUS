@@ -796,11 +796,29 @@ final class MemoryStore {
         }
     }
 
-    func pruneConversationHistory(olderThanDays days: Int) throws {
-        guard days > 0 else { return }
-        let cutoff = Date().timeIntervalSince1970 - TimeInterval(days * 86_400)
+    /// Prune conversation history by age and enforce a hard row cap.
+    /// The day-based cutoff alone is unbounded within a single retention window
+    /// (a heavy day can write thousands of rows), so `maxRows` caps total growth
+    /// by keeping only the most recent rows regardless of age.
+    func pruneConversationHistory(olderThanDays days: Int, maxRows: Int = 5_000) throws {
         try db.write { db in
-            try db.execute(sql: "DELETE FROM conversation_history WHERE timestamp < ?", arguments: [cutoff])
+            if days > 0 {
+                let cutoff = Date().timeIntervalSince1970 - TimeInterval(days * 86_400)
+                try db.execute(sql: "DELETE FROM conversation_history WHERE timestamp < ?", arguments: [cutoff])
+            }
+            if maxRows > 0 {
+                try db.execute(
+                    sql: """
+                    DELETE FROM conversation_history
+                    WHERE id NOT IN (
+                        SELECT id FROM conversation_history
+                        ORDER BY timestamp DESC, id DESC
+                        LIMIT ?
+                    )
+                    """,
+                    arguments: [maxRows]
+                )
+            }
         }
     }
 

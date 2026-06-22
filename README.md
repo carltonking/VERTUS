@@ -289,12 +289,33 @@ through `AlfredMac/Alfred/App/UpdaterManager.swift`.
 
 **SwiftPM reports a missing `Sparkle.xcframework`**
 
-If the local `.build` directory has stale absolute paths, clear SwiftPM build
-artifacts and rebuild:
+If the local `.build` directory has stale absolute paths (common after renaming
+or moving the project folder), clear SwiftPM build artifacts and rebuild:
 
 ```bash
 cd AlfredMac
 rm -rf .build
+swift build
+```
+
+**`swift build` fails with `cannot use bare repository ... (safe.bareRepository is 'explicit')`**
+
+Recent Git refuses to operate on the bare repositories SwiftPM keeps under
+`.build` and `~/Library/Caches/org.swift.swiftpm`. Allow them, then rebuild:
+
+```bash
+cd AlfredMac
+git config --global safe.bareRepository all
+rm -rf .build
+swift build
+```
+
+If a per-repo override still forces `explicit`, prefer scoping it to SwiftPM's
+Git subprocesses for a single build instead of changing global config:
+
+```bash
+GIT_CONFIG_COUNT=1 \
+GIT_CONFIG_KEY_0=safe.bareRepository GIT_CONFIG_VALUE_0=all \
 swift build
 ```
 

@@ -610,7 +610,9 @@ actor AssistantCore {
             messages: messages,
             system: system,
             tools: (headless || suppressTools) ? nil : [LLMTool.openApplication.payload],
-            executeToolCall: AppControlCapability.executeToolCall,
+            executeToolCall: { @Sendable name, args in
+                await AppControlCapability.executeToolCall(toolName: name, argumentsJSON: args)
+            },
             onToken: onToken
         )
 
