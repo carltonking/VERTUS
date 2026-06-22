@@ -1752,6 +1752,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // Natural-language "control my mac …" routes to the computer-control agent BEFORE the
+        // workflow planner — otherwise its multi-step "and"/"then" detection swallows the request
+        // and fails with "No supported computer-control actions". Provider-agnostic via LLMRouter.
+        if let task = ComputerControlIntent.task(in: text) {
+            guard appState.computerControlEnabled else {
+                barState.responseText = "Computer control is off. Turn it on in Alfred’s Settings tab (menu-bar Alfred icon ▸ Settings), then try again."
+                barState.isProcessing = false
+                barState.presenceState = .expanded
+                return
+            }
+            Task { await CapabilityEventLogger.shared.record("computer control", "requested", detail: "nl-plan") }
+            planAndRunComputerControl(task: task, originalQuery: text)
+            return
+        }
+
         do {
             let planner = WorkflowPlanner(computerControl: computerControl)
             if let workflowPlan = try planner.makePlan(
@@ -1771,20 +1786,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         do {
-            if appState.computerControlEnabled {
-                // Natural-language "control my mac …" → LLM action planner over the Semantic Object
-                // Map. Provider-agnostic (cloud key or local model, via LLMRouter).
-                if let task = ComputerControlIntent.task(in: text) {
-                    Task { await CapabilityEventLogger.shared.record("computer control", "requested", detail: "nl-plan") }
-                    planAndRunComputerControl(task: task, originalQuery: text)
-                    return
-                }
-                // Explicit literal action script ("click 100 200", "hotkey cmd t").
-                if let computerPlan = try computerControl.makePlan(from: text) {
-                    Task { await CapabilityEventLogger.shared.record("computer control", "requested") }
-                    handleComputerControl(plan: computerPlan, originalQuery: text)
-                    return
-                }
+            // Explicit literal action script ("click 100 200", "hotkey cmd t"). The natural-language
+            // "control my mac …" path is handled above, before the workflow planner.
+            if appState.computerControlEnabled,
+               let computerPlan = try computerControl.makePlan(from: text) {
+                Task { await CapabilityEventLogger.shared.record("computer control", "requested") }
+                handleComputerControl(plan: computerPlan, originalQuery: text)
+                return
             }
         } catch {
             Task { await CapabilityEventLogger.shared.record("computer control", "refused") }
