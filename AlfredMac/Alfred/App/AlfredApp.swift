@@ -1733,10 +1733,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Read-only inspector: list the clickable elements of the app the user was just in (not
         // Alfred's own bar). Pure observation, so it's available even while the gated click
         // feature is off; it also primes the Semantic Object Map for an "click element N" action.
+        // Require an explicit "clickable" intent. The old loose `list && element` clause fired on
+        // unrelated queries ("list the elements of good design") and triggered an unbounded
+        // synchronous Accessibility tree walk on the main thread, stalling the bar.
         let lowercasedText = text.lowercased()
         if lowercasedText.contains("clickable")
-            || lowercasedText.contains("what can i click")
-            || (lowercasedText.contains("list") && lowercasedText.contains("element")) {
+            || lowercasedText.contains("what can i click") {
             let targetBundleId = contextMonitor?.context?.bundleIdentifier
             let map = computerControl.semanticObjectMapText(targetBundleId: targetBundleId)
             barState.responseText = map.isEmpty

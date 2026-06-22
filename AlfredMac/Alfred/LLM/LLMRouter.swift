@@ -38,6 +38,8 @@ final class LLMRouter: ObservableObject {
         cloudDisabled = appState.cloudDisabled
         activeProvider = Self.provider(for: appState.selectedProvider)
         activeProvider.model = appState.selectedModel
+        // Warm the connection at launch so the first query doesn't pay the TLS handshake.
+        activeProvider.prewarmConnection()
 
         // Stay in sync when the user changes providers in settings
         appState.$selectedProvider
@@ -47,6 +49,7 @@ final class LLMRouter: ObservableObject {
                 var provider = Self.provider(for: id)
                 provider.model = self.appState.selectedModel
                 self.activeProvider = provider
+                provider.prewarmConnection()
             }
             .store(in: &cancellables)
 

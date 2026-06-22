@@ -55,6 +55,10 @@ final class ContextCompiler {
         static let maxHabitsPct: Double = 0.25
         static let maxRelationshipsPct: Double = 0.25
         static let maxTimelinePct: Double = 0.20
+        /// Absolute ceiling (chars) for the combined learning context. The percentage budget only
+        /// rebalances proportionally, so without this the block grows unbounded as the user's
+        /// writing/habits/relationships/timeline accumulate — a prefill tax paid on every query.
+        static let maxTotalChars: Int = 4000
     }
 
     init(
@@ -315,6 +319,17 @@ final class ContextCompiler {
             }
 
             if !anyTruncated { break }
+        }
+
+        // Hard absolute ceiling after the proportional pass: scale every block down so the combined
+        // learning context never exceeds maxTotalChars regardless of how much has accumulated.
+        let total = w.count + h.count + r.count + t.count
+        if total > BudgetConfig.maxTotalChars {
+            let scale = Double(BudgetConfig.maxTotalChars) / Double(total)
+            w = truncate(w, to: Int(Double(w.count) * scale))
+            h = truncate(h, to: Int(Double(h.count) * scale))
+            r = truncate(r, to: Int(Double(r.count) * scale))
+            t = truncate(t, to: Int(Double(t.count) * scale))
         }
 
         return (w, h, r, t)
