@@ -6,6 +6,19 @@ import Foundation
 final class ComputerControlCapability {
     private static let maxActions = 20
     private var isCancelled = false
+    /// Last Semantic Object Map surfaced to the model (via `semanticObjectMapText`). Element
+    /// references in a plan resolve against this so the indices the model saw stay stable.
+    private var lastObjectMap: [AccessibilityElement] = []
+
+    /// Numbered list of clickable on-screen elements, so the user/model can address them by
+    /// "click element N" / "click <label>" instead of guessing pixel coordinates. Pass the target
+    /// app's bundle id (e.g. the last non-Alfred frontmost app) so it doesn't enumerate Alfred's
+    /// own bar. Caches the map so a subsequent element click resolves against the same indices.
+    func semanticObjectMapText(maxElements: Int = 60, targetBundleId: String? = nil) -> String {
+        let map = AccessibilityObjectMap.capture(maxElements: maxElements, targetBundleId: targetBundleId)
+        lastObjectMap = map
+        return AccessibilityObjectMap.render(map)
+    }
 
     struct Plan {
         let actions: [Action]
@@ -21,6 +34,9 @@ final class ComputerControlCapability {
         case moveMouse(x: CGFloat, y: CGFloat)
         case click(x: CGFloat, y: CGFloat)
         case doubleClick(x: CGFloat, y: CGFloat)
+        /// Click a Semantic Object Map element by its resolved frame — reliable across
+        /// resolutions/layouts, unlike a guessed (x, y).
+        case clickElement(index: Int, frame: CGRect, label: String)
         case pressKey(String)
         case hotkey([String])
         case typeText(String)
@@ -34,6 +50,8 @@ final class ComputerControlCapability {
                 return "Click at (\(Int(x)), \(Int(y)))"
             case .doubleClick(let x, let y):
                 return "Double click at (\(Int(x)), \(Int(y)))"
+            case .clickElement(let index, _, let label):
+                return "Click element \(index): \(label)"
             case .pressKey(let key):
                 return "Press key: \(key)"
             case .hotkey(let keys):
@@ -122,6 +140,13 @@ final class ComputerControlCapability {
 
         var actions: [Action] = []
         for line in lines {
+            // Element clicks ("click element 7", "click #3", "click the Submit button") resolve
+            // against the Semantic Object Map before the coordinate parser, which only handles
+            // raw "click x y".
+            if let ref = AccessibilityObjectMap.parseClickReference(line) {
+                actions.append(try resolveElementClick(ref))
+                continue
+            }
             guard let action = parseAction(line) else {
                 if line.lowercased().contains("control") || line.lowercased().contains("please") {
                     continue
@@ -138,6 +163,23 @@ final class ComputerControlCapability {
 
     func cancel() {
         isCancelled = true
+    }
+
+    private func resolveElementClick(_ ref: AccessibilityObjectMap.ClickReference) throws -> Action {
+        // Prefer the map the model was shown; fall back to a fresh capture if none was surfaced.
+        let map = lastObjectMap.isEmpty ? AccessibilityObjectMap.capture() : lastObjectMap
+        guard !map.isEmpty else {
+            throw ControlError.invalidAction("no clickable on-screen elements were found")
+        }
+        guard let element = AccessibilityObjectMap.resolve(ref, in: map) else {
+            switch ref {
+            case .index(let n):
+                throw ControlError.invalidAction("element \(n) (only \(map.count) elements are on screen)")
+            case .label(let label):
+                throw ControlError.invalidAction("no on-screen element matching \"\(label)\"")
+            }
+        }
+        return .clickElement(index: element.index, frame: element.frame, label: element.label)
     }
 
     func execute(_ plan: Plan, onStep: ((String) -> Void)? = nil) async throws -> String {
@@ -166,6 +208,8 @@ final class ComputerControlCapability {
             postMouse(at: CGPoint(x: x, y: y), clickCount: 1)
         case .doubleClick(let x, let y):
             postMouse(at: CGPoint(x: x, y: y), clickCount: 2)
+        case .clickElement(_, let frame, _):
+            postMouse(at: CGPoint(x: frame.midX, y: frame.midY), clickCount: 1)
         case .pressKey(let key):
             guard let keyCode = Self.keyCode(for: key) else {
                 throw ControlError.invalidAction("press key \(key)")

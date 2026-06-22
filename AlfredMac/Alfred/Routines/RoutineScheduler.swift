@@ -256,6 +256,6 @@ final class RoutineScheduler {
     }
 
     private static func notify(title: String, body: String) async {
-        try? await NotificationManager.shared.send(title: title, body: body)
+        _ = try? await NotificationManager.shared.send(title: title, body: body)
     }
 }

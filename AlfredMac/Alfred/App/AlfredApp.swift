@@ -686,7 +686,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateScreenMonitoringIndicator(isActive: Bool) {
         let hasProactive = (proactiveSurfacingService?.getAvailableSuggestions().isEmpty == false)
-        let icon = Self.makeMenuBarIcon()
+        let icon = MenuBarIcon.make()
         if hasProactive {
             icon.lockFocus()
             NSColor.systemBlue.setFill()
@@ -811,7 +811,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startHermesCapture() {
         guard let store = memoryStore else { return }
         ProfileDigest.ensureDir()
-        let monitor = ScreenTextMonitor(store: store)
+        // Drive capture off ContextMonitor's app/window/URL change signal (started just before
+        // this), so text is captured when context actually changes rather than on a blind timer.
+        let monitor = ScreenTextMonitor(
+            store: store,
+            contextChanges: contextMonitor?.$context.eraseToAnyPublisher()
+        )
         screenTextMonitor = monitor
         meetingManager = MeetingCaptureManager(store: store)
         if appState.screenTextCaptureEnabled { monitor.start() }
@@ -896,45 +901,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Menu bar icon
-
-    private static func makeMenuBarIcon() -> NSImage {
-        if let url = Bundle.main.url(forResource: "alfred-small-logo", withExtension: "png"),
-           let sourceImage = NSImage(contentsOf: url) {
-            sourceImage.size = NSSize(width: 18, height: 18)
-            sourceImage.isTemplate = false
-            sourceImage.accessibilityDescription = "Alfred"
-            return sourceImage
-        }
-
-        let size = NSSize(width: 18, height: 18)
-        let image = NSImage(size: size)
-
-        image.lockFocus()
-        defer { image.unlockFocus() }
-
-        NSColor.black.setFill()
-
-        let path = NSBezierPath()
-        path.windingRule = .evenOdd
-
-        // Outer triangle
-        path.move(to: NSPoint(x: 9, y: 17))
-        path.line(to: NSPoint(x: 17, y: 1))
-        path.line(to: NSPoint(x: 1, y: 1))
-        path.close()
-
-        // Inner triangular counterform
-        path.move(to: NSPoint(x: 9, y: 9.8))
-        path.line(to: NSPoint(x: 5.4, y: 3.5))
-        path.line(to: NSPoint(x: 12.6, y: 3.5))
-        path.close()
-
-        path.fill()
-
-        image.isTemplate = true
-        image.accessibilityDescription = "Alfred"
-        return image
-    }
 
     @objc private func showAlfredFromMenu() {
         contextMonitor?.refresh(forceBrowserRead: true)
@@ -1393,7 +1359,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard statusItem == nil else { return }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
-            button.image = Self.makeMenuBarIcon()
+            button.image = MenuBarIcon.make()
             button.toolTip = "Alfred"
             button.target = self
             button.action = #selector(statusItemClicked)
@@ -1764,6 +1730,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let selectedFiles = selectedFileContext.snapshot()
 
+        // Read-only inspector: list the clickable elements of the app the user was just in (not
+        // Alfred's own bar). Pure observation, so it's available even while the gated click
+        // feature is off; it also primes the Semantic Object Map for an "click element N" action.
+        let lowercasedText = text.lowercased()
+        if lowercasedText.contains("clickable")
+            || lowercasedText.contains("what can i click")
+            || (lowercasedText.contains("list") && lowercasedText.contains("element")) {
+            let targetBundleId = contextMonitor?.context?.bundleIdentifier
+            let map = computerControl.semanticObjectMapText(targetBundleId: targetBundleId)
+            barState.responseText = map.isEmpty
+                ? (computerControl.hasAccessibilityPermission
+                    ? "No clickable elements found in the front window."
+                    : "Enable Accessibility (System Settings ▸ Privacy & Security ▸ Accessibility) so I can read on-screen elements.")
+                : "Clickable elements:\n\(map)"
+            barState.isProcessing = false
+            barState.presenceState = .expanded
+            return
+        }
+
         do {
             let planner = WorkflowPlanner(computerControl: computerControl)
             if let workflowPlan = try planner.makePlan(
@@ -1910,7 +1895,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         messages: [.user(text)],
                         system: AssistantPersona.systemIntro(ownerName: ownerName, currentDate: now),
                         tools: [LLMTool.openApplication.payload],
-                        executeToolCall: AppControlCapability.executeToolCall
+                        executeToolCall: { @Sendable name, args in
+                            await AppControlCapability.executeToolCall(toolName: name, argumentsJSON: args)
+                        }
                     ) { [weak self] token in
                         Task { @MainActor [weak self] in
                             guard let self else { return }

@@ -16,6 +16,11 @@ struct CalendarEventDetails: Decodable {
 // memory retrieval → context building → capability dispatch → LLM stream → post-processing.
 
 actor AssistantCore {
+    // Shared ISO8601 formatter. Allocating one was happening on every query (buildSystem)
+    // and several capability paths; the allocation is costly. Formatting/parsing with the
+    // default options is thread-safe, and we never mutate its formatOptions here.
+    nonisolated(unsafe) private static let iso8601 = ISO8601DateFormatter()
+
     private let router: LLMRouter
     private let memory: MemoryStore
     private let screen = ScreenCapability()
@@ -610,7 +615,9 @@ actor AssistantCore {
             messages: messages,
             system: system,
             tools: (headless || suppressTools) ? nil : [LLMTool.openApplication.payload],
-            executeToolCall: AppControlCapability.executeToolCall,
+            executeToolCall: { @Sendable name, args in
+                await AppControlCapability.executeToolCall(toolName: name, argumentsJSON: args)
+            },
             onToken: onToken
         )
 
@@ -644,7 +651,7 @@ actor AssistantCore {
         contextBlocks: [String],
         ownerName: String
     ) async throws -> String {
-        let now = ISO8601DateFormatter().string(from: Date())
+        let now = Self.iso8601.string(from: Date())
         let context = contextBlocks.isEmpty ? "No additional context was available." : contextBlocks.joined(separator: "\n\n")
         let content = try await router.complete(
             messages: [.user("""
@@ -702,7 +709,7 @@ actor AssistantCore {
             return "Show the event details on your screen, then ask again."
         }
 
-        let now = ISO8601DateFormatter().string(from: Date())
+        let now = Self.iso8601.string(from: Date())
 
         let extractionPrompt = """
             Extract event details from any event information visible in the image.
@@ -734,9 +741,9 @@ actor AssistantCore {
         }
 
         let startDate: Date
-        if let iso = ISO8601DateFormatter().date(from: details.startDate) {
+        if let iso = Self.iso8601.date(from: details.startDate) {
             startDate = iso
-        } else if let dateOnly = ISO8601DateFormatter().date(from: details.startDate + "T19:00:00Z") {
+        } else if let dateOnly = Self.iso8601.date(from: details.startDate + "T19:00:00Z") {
             startDate = dateOnly
         } else {
             let formatter = ISO8601DateFormatter()
@@ -914,7 +921,7 @@ actor AssistantCore {
         lowered: String,
         memoryExtractionEnabled: Bool
     ) async throws -> String {
-        let now = ISO8601DateFormatter().string(from: Date())
+        let now = Self.iso8601.string(from: Date())
         let content = try await router.complete(
             messages: [.user("""
                 Create the exact file contents requested by the user.
@@ -1021,7 +1028,7 @@ actor AssistantCore {
         unifiedContext: UnifiedContext? = nil,
         actionSuggestionBlock: String = ""
     ) -> String {
-        let now = ISO8601DateFormatter().string(from: Date())
+        let now = Self.iso8601.string(from: Date())
 
         var parts: [String] = []
         parts.append(AssistantPersona.systemIntro(ownerName: ownerName, currentDate: now))

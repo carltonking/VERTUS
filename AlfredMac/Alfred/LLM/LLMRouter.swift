@@ -1,7 +1,18 @@
 import Foundation
 import Combine
+import os
 
 final class LLMRouter: ObservableObject {
+
+    // ponytail: token COUNTS only (no content) — rough chars/4 estimate, good enough to
+    // spot a runaway background service. Swap in real provider usage fields when a bill surprises you.
+    private static let costLog = Logger(subsystem: "com.alfred.llm", category: "cost")
+
+    private func logCost(messages: [LLMMessage], system: String, output: String) {
+        let inTokens = (messages.reduce(system.count) { $0 + $1.content.count }) / 4
+        let outTokens = output.count / 4
+        Self.costLog.info("llm \(self.activeProvider.id, privacy: .public): ~\(inTokens, privacy: .public) in + ~\(outTokens, privacy: .public) out tokens")
+    }
 
     @Published var activeProvider: any LLMProvider
 
@@ -105,7 +116,9 @@ final class LLMRouter: ObservableObject {
 
     func complete(messages: [LLMMessage], system: String = "") async throws -> String {
         let (m, s) = try guardEgress(messages, system)
-        return try await activeProvider.complete(messages: m, system: s)
+        let out = try await activeProvider.complete(messages: m, system: s)
+        logCost(messages: m, system: s, output: out)
+        return out
     }
 
     func stream(
@@ -114,7 +127,9 @@ final class LLMRouter: ObservableObject {
         onToken: @escaping @Sendable (String) -> Void
     ) async throws -> String {
         let (m, s) = try guardEgress(messages, system)
-        return try await activeProvider.stream(messages: m, system: s, onToken: onToken)
+        let out = try await activeProvider.stream(messages: m, system: s, onToken: onToken)
+        logCost(messages: m, system: s, output: out)
+        return out
     }
 
     /// Stream with tool‑calling support. Pass `tools` definitions and an `executeToolCall`
@@ -129,15 +144,19 @@ final class LLMRouter: ObservableObject {
     ) async throws -> String {
         let (m, s) = try guardEgress(messages, system)
         guard let provider = activeProvider as? OpenAICompatibleProvider else {
-            return try await activeProvider.stream(messages: m, system: s, onToken: onToken)
+            let out = try await activeProvider.stream(messages: m, system: s, onToken: onToken)
+            logCost(messages: m, system: s, output: out)
+            return out
         }
-        return try await provider.streamWithTools(
+        let out = try await provider.streamWithTools(
             messages: m,
             system: s,
             tools: tools,
             executeToolCall: executeToolCall,
             onToken: onToken
         )
+        logCost(messages: m, system: s, output: out)
+        return out
     }
 
     // Convenience single-turn wrappers
