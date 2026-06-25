@@ -70,8 +70,8 @@
     }
     header.scrolled { border-bottom: 1px solid var(--border); }
     nav { display: flex; align-items: center; justify-content: space-between; height: 70px; }
-    .brand { display: flex; align-items: center; gap: 11px; font-weight: 800; font-size: 19px; letter-spacing: -0.4px; }
-    .brand img { width: 30px; height: 30px; border-radius: 8px; object-fit: cover; }
+    .brand { display: flex; align-items: center; }
+    .brand .wordmark { height: 30px; width: auto; display: block; }
     .nav-links { display: flex; align-items: center; gap: 34px; }
     .nav-links a { color: var(--muted); font-size: 14.5px; font-weight: 500; transition: color .2s; }
     .nav-links a:hover { color: var(--white); }
@@ -84,7 +84,8 @@
     .menu-btn { display: none; background: none; border: 0; color: var(--white); font-size: 22px; cursor: pointer; }
 
     /* ── Hero ──────────────────────────────────────────────────────── */
-    .hero { text-align: center; padding: 96px 0 72px; }
+    .hero { text-align: center; padding: 72px 0 72px; }
+    .hero-logo { width: min(380px, 72vw); height: auto; margin: 0 auto 34px; display: block; opacity: 0.96; }
     .eyebrow {
       display: inline-flex; align-items: center; gap: 9px;
       background: rgba(29,78,216,0.10);
@@ -231,8 +232,8 @@
     /* ── Footer ────────────────────────────────────────────────────── */
     footer { border-top: 1px solid var(--border); padding: 40px 0; margin-top: 20px; }
     .foot-inner { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; }
-    .foot-brand { display: flex; align-items: center; gap: 10px; font-weight: 700; }
-    .foot-brand img { width: 26px; height: 26px; border-radius: 7px; }
+    .foot-brand { display: flex; align-items: center; gap: 11px; font-weight: 700; font-size: 17px; letter-spacing: -0.3px; }
+    .foot-brand img { height: 30px; width: auto; }
     .foot-links { display: flex; gap: 26px; }
     .foot-links a { color: var(--muted); font-size: 14px; transition: color .2s; }
     .foot-links a:hover { color: var(--white); }
@@ -258,7 +259,7 @@
 <header id="hdr">
   <div class="wrap">
     <nav>
-      <a class="brand" href="#top"><img src="logo.png" alt="Alfred" /> Alfred</a>
+      <a class="brand" href="#top"><img class="wordmark" src="logo-large.png" alt="Alfred" /></a>
       <div class="nav-links">
         <a href="#features">Features</a>
         <a href="#how">How it works</a>
@@ -275,6 +276,7 @@
 <!-- ── Hero ──────────────────────────────────────────────────────── -->
 <section class="hero">
   <div class="wrap">
+    <img class="hero-logo reveal" src="logo-large.png" alt="Alfred" />
     <div class="eyebrow reveal"><span class="dot"></span> Your personal AI, that actually knows you</div>
     <h1 class="reveal">The assistant that <span class="grad">learns you</span> and gets your day done</h1>
     <p class="lede reveal">Alfred learns who you are — your voice, your contacts, your habits — and quietly handles your digital life. Replying to emails, texting people back, putting events on your calendar. Done the way <em>you</em> would do it.</p>
@@ -396,7 +398,7 @@
       -->
       <div class="founder reveal">
         <img class="avatar" src="founders/carlton.jpg" alt="Carlton King"
-             onerror="this.outerHTML='&lt;div class=\'avatar\'&gt;C&lt;/div&gt;'" />
+             onerror="if(!this.dataset.f){this.dataset.f=1;this.src='founders/carlton.png';}else{this.outerHTML='&lt;div class=\'avatar\'&gt;C&lt;/div&gt;';}" />
         <h4>Carlton King</h4>
         <div class="role">Founder</div>
         <p>Building the product and the AI that makes Alfred feel like a second brain.</p>
