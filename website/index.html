@@ -3,481 +3,482 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Alfred — AI Assistant for Mac</title>
+  <title>Alfred — The AI assistant that learns you</title>
+  <meta name="description" content="Alfred is a personal AI assistant that learns who you are — your voice, your contacts, your habits — and handles your digital life: replying to emails and texts, scheduling your calendar, and more." />
+  <meta property="og:title" content="Alfred — The AI assistant that learns you" />
+  <meta property="og:description" content="A personal AI that learns how you work and gets your day done — email, texts, and calendar, handled the way you would." />
+  <meta property="og:type" content="website" />
+  <link rel="icon" type="image/png" href="logo.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
   <style>
-    /* ── Reset ────────────────────────────────────────────────────── */
+    /* ── Reset ─────────────────────────────────────────────────────── */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-    /* ── Tokens ───────────────────────────────────────────────────── */
+    /* ── Tokens: black · white · dark-blue accents ─────────────────── */
     :root {
-      --bg:       #0a0a0f;
-      --surface:  #13131a;
-      --border:   rgba(255,255,255,0.07);
-      --accent:   #a78bfa;
-      --accent2:  #7c3aed;
-      --text:     #e2e2ef;
-      --muted:    #6b6b8a;
-      --radius:   14px;
+      --black:     #05070d;
+      --bg:        #070a12;
+      --surface:   #0d1220;
+      --surface-2: #111829;
+      --border:    rgba(255,255,255,0.08);
+      --border-2:  rgba(255,255,255,0.14);
+      --white:     #f5f7fb;
+      --muted:     #8a93a8;
+      --muted-2:   #5d6680;
+      --navy:      #1e3a8a;   /* dark blue */
+      --navy-2:    #1d4ed8;   /* brighter blue accent */
+      --navy-glow: rgba(37,99,235,0.45);
+      --radius:    16px;
+      --maxw:      1120px;
     }
 
+    html { scroll-behavior: smooth; }
     body {
       background: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
+      color: var(--white);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+    a { color: inherit; text-decoration: none; }
+    ::selection { background: var(--navy-2); color: #fff; }
+
+    /* Ambient blue glow behind the page */
+    body::before {
+      content: "";
+      position: fixed;
+      top: -300px; left: 50%;
+      transform: translateX(-50%);
+      width: 1100px; height: 800px;
+      background: radial-gradient(50% 50% at 50% 50%, rgba(29,78,216,0.18) 0%, rgba(29,78,216,0) 70%);
+      pointer-events: none;
+      z-index: 0;
     }
 
-    /* ── Nav ──────────────────────────────────────────────────────── */
-    nav {
-      width: 100%;
-      max-width: 900px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 24px 32px;
-    }
-    .logo {
-      font-size: 18px;
-      font-weight: 700;
-      letter-spacing: -0.5px;
-      color: var(--text);
-      text-decoration: none;
-    }
-    .logo span { color: var(--accent); }
-    nav a { color: var(--muted); text-decoration: none; font-size: 14px; transition: color .2s; }
-    nav a:hover { color: var(--text); }
+    .wrap { width: 100%; max-width: var(--maxw); margin: 0 auto; padding: 0 28px; position: relative; z-index: 1; }
 
-    /* ── Hero ─────────────────────────────────────────────────────── */
-    .hero {
-      text-align: center;
-      padding: 80px 24px 60px;
-      max-width: 680px;
+    /* ── Nav ───────────────────────────────────────────────────────── */
+    header {
+      position: sticky; top: 0; z-index: 50;
+      backdrop-filter: blur(16px);
+      background: rgba(7,10,18,0.72);
+      border-bottom: 1px solid transparent;
+      transition: border-color .3s, background .3s;
     }
-    .badge {
-      display: inline-block;
-      background: rgba(167,139,250,0.12);
-      border: 1px solid rgba(167,139,250,0.25);
-      color: var(--accent);
-      font-size: 12px;
-      font-weight: 600;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      padding: 5px 14px;
-      border-radius: 99px;
-      margin-bottom: 28px;
+    header.scrolled { border-bottom: 1px solid var(--border); }
+    nav { display: flex; align-items: center; justify-content: space-between; height: 70px; }
+    .brand { display: flex; align-items: center; gap: 11px; font-weight: 800; font-size: 19px; letter-spacing: -0.4px; }
+    .brand img { width: 30px; height: 30px; border-radius: 8px; object-fit: cover; }
+    .nav-links { display: flex; align-items: center; gap: 34px; }
+    .nav-links a { color: var(--muted); font-size: 14.5px; font-weight: 500; transition: color .2s; }
+    .nav-links a:hover { color: var(--white); }
+    .nav-cta {
+      background: var(--white); color: var(--black);
+      padding: 9px 18px; border-radius: 9px; font-size: 14px; font-weight: 700;
+      transition: transform .15s, box-shadow .2s;
     }
+    .nav-cta:hover { transform: translateY(-1px); box-shadow: 0 8px 24px rgba(255,255,255,0.12); }
+    .menu-btn { display: none; background: none; border: 0; color: var(--white); font-size: 22px; cursor: pointer; }
+
+    /* ── Hero ──────────────────────────────────────────────────────── */
+    .hero { text-align: center; padding: 96px 0 72px; }
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: 9px;
+      background: rgba(29,78,216,0.10);
+      border: 1px solid rgba(37,99,235,0.30);
+      color: #9cc0ff;
+      font-size: 12.5px; font-weight: 600; letter-spacing: 0.02em;
+      padding: 7px 15px; border-radius: 999px; margin-bottom: 30px;
+    }
+    .eyebrow .dot { width: 7px; height: 7px; border-radius: 50%; background: #3b82f6; box-shadow: 0 0 10px #3b82f6; }
     h1 {
-      font-size: clamp(40px, 7vw, 68px);
-      font-weight: 800;
-      letter-spacing: -2px;
-      line-height: 1.05;
-      margin-bottom: 20px;
+      font-size: clamp(42px, 6.4vw, 78px);
+      font-weight: 900; letter-spacing: -2.6px; line-height: 1.02;
+      max-width: 14ch; margin: 0 auto 26px;
     }
-    h1 em { font-style: normal; color: var(--accent); }
-    .subtitle {
-      font-size: 18px;
-      color: var(--muted);
-      line-height: 1.6;
-      margin-bottom: 44px;
-      max-width: 480px;
-      margin-left: auto;
-      margin-right: auto;
+    h1 .grad {
+      background: linear-gradient(120deg, #60a5fa 0%, #2563eb 50%, #1e3a8a 100%);
+      -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
     }
-
-    /* ── CTA buttons ──────────────────────────────────────────────── */
-    .cta-row {
-      display: flex;
-      gap: 14px;
-      justify-content: center;
-      flex-wrap: wrap;
-      margin-bottom: 18px;
+    .lede {
+      font-size: clamp(17px, 2vw, 20px); color: var(--muted);
+      max-width: 600px; margin: 0 auto 40px; line-height: 1.6;
     }
+    .cta-row { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
     .btn-primary {
-      display: inline-flex;
-      align-items: center;
-      gap: 10px;
-      background: var(--accent);
-      color: #0a0a0f;
-      font-size: 16px;
-      font-weight: 700;
-      padding: 15px 32px;
-      border-radius: 12px;
-      text-decoration: none;
-      transition: background .2s, transform .15s, box-shadow .2s;
-      box-shadow: 0 0 40px rgba(167,139,250,0.35);
+      display: inline-flex; align-items: center; gap: 9px;
+      background: var(--navy-2); color: #fff;
+      font-size: 15.5px; font-weight: 700; padding: 15px 30px; border-radius: 11px;
+      box-shadow: 0 10px 40px var(--navy-glow);
+      transition: transform .15s, box-shadow .25s, background .2s;
     }
-    .btn-primary:hover {
-      background: #c4b5fd;
-      transform: translateY(-2px);
-      box-shadow: 0 0 60px rgba(167,139,250,0.5);
+    .btn-primary:hover { background: #2563eb; transform: translateY(-2px); box-shadow: 0 16px 54px var(--navy-glow); }
+    .btn-ghost {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: rgba(255,255,255,0.04); color: var(--white);
+      border: 1px solid var(--border-2);
+      font-size: 15px; font-weight: 600; padding: 15px 26px; border-radius: 11px;
+      transition: background .2s, border-color .2s, transform .15s;
     }
-    .btn-primary svg { width: 18px; height: 18px; flex-shrink: 0; }
-    .btn-secondary {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      background: transparent;
-      color: var(--text);
-      font-size: 15px;
-      font-weight: 600;
-      padding: 15px 28px;
-      border-radius: 12px;
-      border: 1px solid var(--border);
-      text-decoration: none;
-      transition: border-color .2s, background .2s, transform .15s;
-    }
-    .btn-secondary:hover {
-      border-color: rgba(255,255,255,0.18);
-      background: rgba(255,255,255,0.04);
-      transform: translateY(-2px);
-    }
-    .hint {
-      font-size: 13px;
-      color: var(--muted);
-    }
-    .hint strong { color: var(--text); font-weight: 500; }
+    .btn-ghost:hover { background: rgba(255,255,255,0.08); border-color: rgba(255,255,255,0.28); transform: translateY(-2px); }
+    .hero-note { margin-top: 22px; font-size: 13.5px; color: var(--muted-2); }
 
-    /* ── Preview bar mockup ───────────────────────────────────────── */
-    .preview {
-      width: 100%;
-      max-width: 580px;
-      margin: 60px auto 0;
-      padding: 0 24px;
+    /* ── Product mockup ────────────────────────────────────────────── */
+    .mock {
+      max-width: 760px; margin: 64px auto 0;
+      background: linear-gradient(180deg, var(--surface) 0%, var(--black) 100%);
+      border: 1px solid var(--border); border-radius: 20px; overflow: hidden;
+      box-shadow: 0 50px 120px rgba(0,0,0,0.7), 0 0 0 1px rgba(37,99,235,0.10);
     }
-    .bar-mockup {
-      background: rgba(20,20,32,0.9);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      overflow: hidden;
-      box-shadow:
-        0 40px 80px rgba(0,0,0,0.6),
-        0 0 0 1px rgba(255,255,255,0.04) inset;
-      backdrop-filter: blur(24px);
-    }
-    .bar-input-row {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      padding: 14px 18px;
-    }
-    .bar-logo {
-      width: 22px; height: 22px;
-      background: var(--accent);
-      border-radius: 6px;
-      flex-shrink: 0;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 12px; font-weight: 800; color: #0a0a0f;
-    }
-    .bar-dot { width: 7px; height: 7px; background: #22c55e; border-radius: 50%; flex-shrink: 0; }
-    .bar-placeholder { color: var(--muted); font-size: 14px; flex: 1; }
-    .bar-divider { height: 1px; background: var(--border); }
-    .bar-response {
-      padding: 14px 18px 16px;
-      font-size: 13px;
-      line-height: 1.7;
-      color: var(--text);
-    }
-    .bar-response .thinking { color: var(--accent); font-size: 12px; margin-bottom: 6px; }
-    .typing-cursor {
-      display: inline-block;
-      width: 2px; height: 14px;
-      background: var(--accent);
-      animation: blink 1s step-end infinite;
-      vertical-align: text-bottom;
-      margin-left: 2px;
-    }
+    .mock-top { display: flex; align-items: center; gap: 8px; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+    .mock-top .tl { width: 11px; height: 11px; border-radius: 50%; background: #2a3142; }
+    .mock-title { margin-left: 10px; font-size: 12.5px; color: var(--muted-2); }
+    .mock-body { padding: 26px 26px 30px; }
+    .chat { display: flex; flex-direction: column; gap: 16px; }
+    .msg { display: flex; gap: 12px; align-items: flex-start; }
+    .msg .av { width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 13px; }
+    .msg.user .av { background: var(--surface-2); color: var(--muted); border: 1px solid var(--border); }
+    .msg.alf .av { background: var(--navy-2); color: #fff; }
+    .bubble { font-size: 14.5px; line-height: 1.65; padding-top: 4px; }
+    .msg.user .bubble { color: var(--white); }
+    .msg.alf .bubble { color: var(--muted); }
+    .bubble b { color: var(--white); font-weight: 600; }
+    .typed::after { content: "▋"; color: var(--navy-2); animation: blink 1s steps(1) infinite; margin-left: 1px; }
     @keyframes blink { 50% { opacity: 0; } }
 
-    /* ── Features grid ────────────────────────────────────────────── */
-    .features {
-      width: 100%;
-      max-width: 900px;
-      padding: 80px 24px;
-    }
-    .section-label {
-      text-align: center;
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--muted);
-      margin-bottom: 48px;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 16px;
-    }
+    /* ── Section primitives ────────────────────────────────────────── */
+    section { position: relative; z-index: 1; }
+    .section-pad { padding: 92px 0; }
+    .kicker { color: #6f8fd6; font-size: 13px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; text-align: center; margin-bottom: 16px; }
+    .section-title { font-size: clamp(30px, 4vw, 46px); font-weight: 800; letter-spacing: -1.4px; text-align: center; max-width: 18ch; margin: 0 auto 16px; line-height: 1.08; }
+    .section-sub { text-align: center; color: var(--muted); font-size: 17px; max-width: 560px; margin: 0 auto 56px; }
+
+    /* ── Feature grid ──────────────────────────────────────────────── */
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; }
     .card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 24px;
-      transition: border-color .2s, transform .2s;
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 28px; transition: border-color .25s, transform .25s, background .25s;
     }
-    .card:hover { border-color: rgba(167,139,250,0.3); transform: translateY(-3px); }
-    .card-icon {
-      font-size: 22px;
-      margin-bottom: 14px;
-      display: block;
-    }
-    .card h3 { font-size: 15px; font-weight: 700; margin-bottom: 6px; }
-    .card p { font-size: 13px; color: var(--muted); line-height: 1.6; }
-
-    /* ── Shortcut pill ────────────────────────────────────────────── */
-    .shortcut-section {
-      text-align: center;
-      padding: 20px 24px 80px;
-    }
-    .kbd-row {
-      display: inline-flex;
-      gap: 6px;
-      margin-bottom: 12px;
-    }
-    kbd {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 7px;
-      padding: 8px 14px;
-      font-size: 15px;
-      font-family: inherit;
-      font-weight: 600;
-      color: var(--text);
-    }
-    .shortcut-section p { color: var(--muted); font-size: 14px; }
-
-    /* ── Install steps ────────────────────────────────────────────── */
-    .install-section {
-      width: 100%;
-      max-width: 680px;
-      padding: 0 24px 80px;
-    }
-    .steps {
-      display: flex;
-      flex-direction: column;
-      gap: 14px;
-      margin-top: 36px;
-    }
-    .step {
-      display: flex;
-      gap: 16px;
-      align-items: flex-start;
-    }
-    .step-num {
-      width: 32px; height: 32px;
-      background: rgba(167,139,250,0.12);
-      border: 1px solid rgba(167,139,250,0.25);
-      border-radius: 50%;
-      color: var(--accent);
-      font-size: 13px;
-      font-weight: 700;
+    .card:hover { border-color: rgba(37,99,235,0.4); transform: translateY(-4px); background: var(--surface-2); }
+    .card .ic {
+      width: 46px; height: 46px; border-radius: 12px; margin-bottom: 18px;
       display: flex; align-items: center; justify-content: center;
-      flex-shrink: 0;
-      margin-top: 2px;
+      background: rgba(29,78,216,0.14); border: 1px solid rgba(37,99,235,0.28);
     }
-    .step-body h4 { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
-    .step-body p { font-size: 13px; color: var(--muted); line-height: 1.6; }
-    code {
-      background: rgba(255,255,255,0.06);
-      padding: 2px 7px;
-      border-radius: 5px;
-      font-family: "SF Mono", "Fira Code", monospace;
-      font-size: 12px;
-      color: var(--accent);
-    }
+    .card .ic svg { width: 22px; height: 22px; stroke: #7aa6ff; fill: none; stroke-width: 1.8; }
+    .card h3 { font-size: 17.5px; font-weight: 700; margin-bottom: 8px; letter-spacing: -0.3px; }
+    .card p { font-size: 14.5px; color: var(--muted); line-height: 1.62; }
 
-    /* ── Footer ───────────────────────────────────────────────────── */
-    footer {
-      width: 100%;
-      border-top: 1px solid var(--border);
-      padding: 28px 32px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 12px;
-      font-size: 13px;
-      color: var(--muted);
+    /* ── How it works ──────────────────────────────────────────────── */
+    .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px,1fr)); gap: 22px; margin-top: 12px; }
+    .step { position: relative; padding: 30px 26px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+    .step .num {
+      font-size: 13px; font-weight: 800; color: #fff;
+      width: 34px; height: 34px; border-radius: 10px; background: var(--navy);
+      display: flex; align-items: center; justify-content: center; margin-bottom: 18px;
     }
-    footer a { color: var(--muted); text-decoration: none; }
-    footer a:hover { color: var(--text); }
+    .step h4 { font-size: 18px; font-weight: 700; margin-bottom: 8px; letter-spacing: -0.3px; }
+    .step p { color: var(--muted); font-size: 14.5px; line-height: 1.6; }
+
+    /* ── Founders ──────────────────────────────────────────────────── */
+    .founders { display: flex; gap: 28px; justify-content: center; flex-wrap: wrap; margin-top: 20px; }
+    .founder {
+      width: 320px; background: var(--surface); border: 1px solid var(--border); border-radius: 20px;
+      padding: 30px; text-align: center; transition: border-color .25s, transform .25s;
+    }
+    .founder:hover { border-color: rgba(37,99,235,0.4); transform: translateY(-4px); }
+    .avatar {
+      width: 104px; height: 104px; border-radius: 50%; margin: 0 auto 18px; object-fit: cover;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 36px; font-weight: 800; color: #fff;
+      background: linear-gradient(135deg, var(--navy-2), var(--navy));
+      border: 2px solid rgba(122,166,255,0.35); box-shadow: 0 0 0 6px rgba(29,78,216,0.10);
+    }
+    .founder h4 { font-size: 20px; font-weight: 700; letter-spacing: -0.3px; }
+    .founder .role { color: #7aa6ff; font-size: 13.5px; font-weight: 600; margin: 4px 0 14px; }
+    .founder p { color: var(--muted); font-size: 14px; line-height: 1.6; }
+    .founder .socials { margin-top: 16px; display: flex; gap: 14px; justify-content: center; }
+    .founder .socials a { color: var(--muted-2); transition: color .2s; }
+    .founder .socials a:hover { color: var(--white); }
+    .founder .socials svg { width: 19px; height: 19px; fill: currentColor; }
+
+    /* ── CTA band ──────────────────────────────────────────────────── */
+    .cta-band {
+      background: linear-gradient(135deg, var(--navy) 0%, #0b1638 60%, var(--black) 100%);
+      border: 1px solid rgba(37,99,235,0.25); border-radius: 24px;
+      padding: 64px 40px; text-align: center; overflow: hidden; position: relative;
+    }
+    .cta-band h2 { font-size: clamp(28px, 4vw, 44px); font-weight: 800; letter-spacing: -1.4px; margin-bottom: 14px; }
+    .cta-band p { color: #b9c6e6; font-size: 17px; max-width: 500px; margin: 0 auto 30px; }
+    .waitlist { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; max-width: 460px; margin: 0 auto; }
+    .waitlist input {
+      flex: 1; min-width: 220px; padding: 14px 18px; border-radius: 11px;
+      background: rgba(0,0,0,0.35); border: 1px solid var(--border-2); color: var(--white);
+      font-size: 15px; font-family: inherit; outline: none; transition: border-color .2s;
+    }
+    .waitlist input:focus { border-color: var(--navy-2); }
+    .waitlist input::placeholder { color: var(--muted-2); }
+    .waitlist button {
+      background: var(--white); color: var(--black); border: 0; cursor: pointer;
+      padding: 14px 26px; border-radius: 11px; font-size: 15px; font-weight: 700; font-family: inherit;
+      transition: transform .15s, box-shadow .2s;
+    }
+    .waitlist button:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(255,255,255,0.18); }
+
+    /* ── Footer ────────────────────────────────────────────────────── */
+    footer { border-top: 1px solid var(--border); padding: 40px 0; margin-top: 20px; }
+    .foot-inner { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; }
+    .foot-brand { display: flex; align-items: center; gap: 10px; font-weight: 700; }
+    .foot-brand img { width: 26px; height: 26px; border-radius: 7px; }
+    .foot-links { display: flex; gap: 26px; }
+    .foot-links a { color: var(--muted); font-size: 14px; transition: color .2s; }
+    .foot-links a:hover { color: var(--white); }
+    .copyright { color: var(--muted-2); font-size: 13px; width: 100%; text-align: center; margin-top: 26px; }
+
+    /* ── Reveal animation ──────────────────────────────────────────── */
+    .reveal { opacity: 0; transform: translateY(22px); transition: opacity .7s ease, transform .7s ease; }
+    .reveal.in { opacity: 1; transform: none; }
+
+    /* ── Responsive ────────────────────────────────────────────────── */
+    @media (max-width: 760px) {
+      .nav-links { display: none; }
+      .menu-btn { display: block; }
+      .hero { padding: 64px 0 48px; }
+      .section-pad { padding: 68px 0; }
+      .cta-band { padding: 48px 24px; }
+    }
   </style>
 </head>
 <body>
 
-<!-- Nav -->
-<nav>
-  <a class="logo" href="#"><span>▲</span> Alfred</a>
-  <div style="display:flex;gap:28px;">
-    <a href="#features">Features</a>
-    <a href="#install">Install</a>
-    <a href="https://github.com/YOUR_USERNAME/YOUR_REPO" target="_blank">GitHub</a>
+<!-- ── Nav ───────────────────────────────────────────────────────── -->
+<header id="hdr">
+  <div class="wrap">
+    <nav>
+      <a class="brand" href="#top"><img src="logo.png" alt="Alfred" /> Alfred</a>
+      <div class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#how">How it works</a>
+        <a href="#founders">Team</a>
+        <a class="nav-cta" href="#waitlist">Join waitlist</a>
+      </div>
+      <button class="menu-btn" onclick="document.querySelector('.nav-links').style.display='flex';this.style.display='none'">☰</button>
+    </nav>
   </div>
-</nav>
+</header>
 
-<!-- Hero -->
+<span id="top"></span>
+
+<!-- ── Hero ──────────────────────────────────────────────────────── -->
 <section class="hero">
-  <div class="badge">macOS · Powered by Claude</div>
-  <h1>Your AI,<br><em>always one key away</em></h1>
-  <p class="subtitle">
-    Alfred is a Spotlight-style AI bar for macOS. Press <strong>⌘⇧J</strong> anywhere
-    to ask Claude anything — in context, in seconds.
-  </p>
-  <div class="cta-row">
-    <!--
-      UPDATE THIS URL:
-      1. Run: bash release.sh
-      2. Create a GitHub release and upload Alfred-v1.0.zip
-      3. Replace the href below with the release download URL
-         e.g. https://github.com/YOUR_USER/YOUR_REPO/releases/download/v1.0/Alfred-v1.0.zip
-    -->
-    <a class="btn-primary" href="https://github.com/YOUR_USERNAME/YOUR_REPO/releases/latest/download/Alfred-v1.0.zip" id="download-btn">
-      <svg viewBox="0 0 20 20" fill="currentColor">
-        <path d="M10 2a1 1 0 011 1v8.586l2.293-2.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 111.414-1.414L9 11.586V3a1 1 0 011-1z"/>
-        <path d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z"/>
-      </svg>
-      Download Alfred
-    </a>
-    <a class="btn-secondary" href="https://github.com/YOUR_USERNAME/YOUR_REPO" target="_blank">
-      View source ↗
-    </a>
+  <div class="wrap">
+    <div class="eyebrow reveal"><span class="dot"></span> Your personal AI, that actually knows you</div>
+    <h1 class="reveal">The assistant that <span class="grad">learns you</span> and gets your day done</h1>
+    <p class="lede reveal">Alfred learns who you are — your voice, your contacts, your habits — and quietly handles your digital life. Replying to emails, texting people back, putting events on your calendar. Done the way <em>you</em> would do it.</p>
+    <div class="cta-row reveal">
+      <a class="btn-primary" href="#waitlist">
+        Join the waitlist
+        <svg width="17" height="17" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 10h12M11 5l5 5-5 5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </a>
+      <a class="btn-ghost" href="#how">See how it works</a>
+    </div>
+    <p class="hero-note">Private by design · Built for macOS · Early access opening soon</p>
   </div>
-  <p class="hint">macOS 12.3+ · <strong>Free</strong> · Requires Anthropic API key</p>
-</section>
 
-<!-- Bar mockup -->
-<div class="preview">
-  <div class="bar-mockup">
-    <div class="bar-input-row">
-      <div class="bar-logo">▲</div>
-      <div class="bar-dot"></div>
-      <div class="bar-placeholder">Summarize what's on my screen</div>
-    </div>
-    <div class="bar-divider"></div>
-    <div class="bar-response">
-      <div class="thinking">● Thinking · 1.2s</div>
-      You're looking at a pull request on GitHub adding authentication middleware.
-      The key change is a JWT validation layer on all <code>/api/</code> routes,
-      with a 7-day expiry. Two files changed: <code>middleware/auth.ts</code> and
-      <code>routes/index.ts</code>.<span class="typing-cursor"></span>
-    </div>
-  </div>
-</div>
-
-<!-- Features -->
-<section class="features" id="features">
-  <div class="section-label">Everything Alfred can do</div>
-  <div class="grid">
-    <div class="card">
-      <span class="card-icon">🧠</span>
-      <h3>Context-aware AI</h3>
-      <p>Reads your frontmost app, selected text, and browser URL. Every answer is in context.</p>
-    </div>
-    <div class="card">
-      <span class="card-icon">📋</span>
-      <h3>Clipboard history</h3>
-      <p>Last 50 clipboard items always one shortcut away. Tap to paste back into any app.</p>
-    </div>
-    <div class="card">
-      <span class="card-icon">🔍</span>
-      <h3>File + app search</h3>
-      <p>Type <code>/query</code> to search files. Type any app name to launch it instantly.</p>
-    </div>
-    <div class="card">
-      <span class="card-icon">🎨</span>
-      <h3>Image generation</h3>
-      <p>Type <code>/img prompt</code> to generate with DALL-E 3. Saved to your drive.</p>
-    </div>
-    <div class="card">
-      <span class="card-icon">⚡</span>
-      <h3>Instant calculator</h3>
-      <p>Math expressions and unit conversions answered instantly — no AI round-trip.</p>
-    </div>
-    <div class="card">
-      <span class="card-icon">🔔</span>
-      <h3>Smart notifications</h3>
-      <p>Meeting prep 30 min before events. Break reminders after 90 min in video calls.</p>
-    </div>
-    <div class="card">
-      <span class="card-icon">🎙️</span>
-      <h3>Voice wake word</h3>
-      <p>Say "Alfred" and the bar opens. No hands needed.</p>
-    </div>
-    <div class="card">
-      <span class="card-icon">📌</span>
-      <h3>Pin responses</h3>
-      <p>Star any answer. Browse your pinned responses anytime with <code>&gt; Pinned</code>.</p>
-    </div>
-    <div class="card">
-      <span class="card-icon">🌙</span>
-      <h3>System controls</h3>
-      <p>Dark mode, mute, Wi-Fi, brightness — all from the actions palette.</p>
-    </div>
-  </div>
-</section>
-
-<!-- Keyboard shortcut -->
-<section class="shortcut-section">
-  <div class="kbd-row">
-    <kbd>⌘</kbd><kbd>⇧</kbd><kbd>J</kbd>
-  </div>
-  <p>Press anywhere to open Alfred</p>
-</section>
-
-<!-- Install steps -->
-<section class="install-section" id="install">
-  <div class="section-label" style="text-align:left;margin-bottom:0;font-size:11px;">How to install</div>
-  <div class="steps">
-    <div class="step">
-      <div class="step-num">1</div>
-      <div class="step-body">
-        <h4>Download</h4>
-        <p>Click the Download button above. You'll get <code>Alfred-v1.0.zip</code>.</p>
+  <!-- Product mockup -->
+  <div class="wrap">
+    <div class="mock reveal">
+      <div class="mock-top">
+        <span class="tl"></span><span class="tl"></span><span class="tl"></span>
+        <span class="mock-title">Alfred</span>
       </div>
-    </div>
-    <div class="step">
-      <div class="step-num">2</div>
-      <div class="step-body">
-        <h4>Unzip and run installer</h4>
-        <p>Open the zip, then double-click <code>Install Alfred.command</code>. It handles everything.</p>
-      </div>
-    </div>
-    <div class="step">
-      <div class="step-num">3</div>
-      <div class="step-body">
-        <h4>Enter your API key</h4>
-        <p>The installer will ask for your <a href="https://console.anthropic.com/" target="_blank" style="color:var(--accent)">Anthropic API key</a>.
-        Paste it in — takes 10 seconds.</p>
-      </div>
-    </div>
-    <div class="step">
-      <div class="step-num">4</div>
-      <div class="step-body">
-        <h4>Press ⌘⇧J</h4>
-        <p>Alfred is in your menu bar. Press <kbd style="background:rgba(255,255,255,0.06);border:1px solid var(--border);border-radius:5px;padding:2px 8px;font-size:12px;">⌘⇧J</kbd> anywhere to open the bar.</p>
+      <div class="mock-body">
+        <div class="chat">
+          <div class="msg user">
+            <div class="av">You</div>
+            <div class="bubble">Reply to Sarah about the Thursday meeting and move it to 3pm.</div>
+          </div>
+          <div class="msg alf">
+            <div class="av">A</div>
+            <div class="bubble typed">Done. I replied to <b>Sarah Chen</b> in your usual tone confirming <b>3:00 PM Thursday</b>, updated the calendar invite, and let the other two attendees know about the change.</div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
 </section>
 
-<!-- Footer -->
+<!-- ── Features ──────────────────────────────────────────────────── -->
+<section class="section-pad" id="features">
+  <div class="wrap">
+    <div class="kicker reveal">What Alfred does</div>
+    <h2 class="section-title reveal">One assistant for your whole digital life</h2>
+    <p class="section-sub reveal">Not another chatbot you have to babysit. Alfred takes real actions across the tools you already use.</p>
+    <div class="grid">
+      <div class="card reveal">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M3 7l9 6 9-6M3 7v10a1 1 0 001 1h16a1 1 0 001-1V7M3 7a1 1 0 011-1h16a1 1 0 011 1" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h3>Email, handled</h3>
+        <p>Drafts and sends replies that sound exactly like you. Clears your inbox, flags what needs a human, and never misses a thread.</p>
+      </div>
+      <div class="card reveal">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 01-.9 3.8 8.5 8.5 0 01-7.6 4.7 8.38 8.38 0 01-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 01-.9-3.8 8.5 8.5 0 014.7-7.6 8.38 8.38 0 013.8-.9h.5a8.48 8.48 0 018 8v.5z" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h3>Texts, answered</h3>
+        <p>Keeps your conversations warm — replying to messages, confirming plans, and following up so nothing slips through the cracks.</p>
+      </div>
+      <div class="card reveal">
+        <div class="ic"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h3>Calendar, managed</h3>
+        <p>Schedules, reschedules, and protects your time. Tell Alfred what you need and the invites, reminders, and prep just appear.</p>
+      </div>
+      <div class="card reveal">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M12 2a5 5 0 00-5 5v2a5 5 0 0010 0V7a5 5 0 00-5-5zM5 11a7 7 0 0014 0M12 18v3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h3>Learns your voice</h3>
+        <p>The more you use it, the more it sounds like you — your phrasing, your tone, who you're formal with and who you're not.</p>
+      </div>
+      <div class="card reveal">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M12 2l2.4 7.4H22l-6 4.6 2.3 7.4-6.3-4.6L5.7 21.4 8 14 2 9.4h7.6z" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h3>Knows your people</h3>
+        <p>Remembers your contacts, relationships, and history — so it always replies with the right context to the right person.</p>
+      </div>
+      <div class="card reveal">
+        <div class="ic"><svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h3>Private by design</h3>
+        <p>Your data is yours. Alfred works on your machine and asks before it does anything that leaves a mark.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── How it works ──────────────────────────────────────────────── -->
+<section class="section-pad" id="how">
+  <div class="wrap">
+    <div class="kicker reveal">How it works</div>
+    <h2 class="section-title reveal">Set it up once. It gets better every day.</h2>
+    <p class="section-sub reveal">Alfred starts helpful on day one and becomes genuinely <em>you</em> over time.</p>
+    <div class="steps">
+      <div class="step reveal">
+        <div class="num">1</div>
+        <h4>Connect</h4>
+        <p>Link your mail, messages, and calendar in a couple of clicks. Everything stays on your device.</p>
+      </div>
+      <div class="step reveal">
+        <div class="num">2</div>
+        <h4>It learns you</h4>
+        <p>Alfred studies how you write and who matters to you — building a private model of how you actually work.</p>
+      </div>
+      <div class="step reveal">
+        <div class="num">3</div>
+        <h4>You delegate</h4>
+        <p>Ask in plain English. Alfred drafts, schedules, and replies — checking in only when it should.</p>
+      </div>
+      <div class="step reveal">
+        <div class="num">4</div>
+        <h4>It gets your time back</h4>
+        <p>The busywork disappears. You stay in control; Alfred handles the rest in the background.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Founders ──────────────────────────────────────────────────── -->
+<section class="section-pad" id="founders">
+  <div class="wrap">
+    <div class="kicker reveal">The team</div>
+    <h2 class="section-title reveal">Built by two people who hate busywork</h2>
+    <p class="section-sub reveal">We're building the assistant we always wished we had.</p>
+    <div class="founders">
+      <!--
+        TO ADD REAL PHOTOS: drop square images at
+          website/founders/carlton.jpg   and   website/founders/rohan.jpg
+        They'll replace the initials automatically. (onerror falls back to initials.)
+      -->
+      <div class="founder reveal">
+        <img class="avatar" src="founders/carlton.jpg" alt="Carlton King"
+             onerror="this.outerHTML='&lt;div class=\'avatar\'&gt;C&lt;/div&gt;'" />
+        <h4>Carlton King</h4>
+        <div class="role">Co-founder</div>
+        <p>Builds the product and the AI that makes Alfred feel like a second brain.</p>
+        <div class="socials">
+          <a href="https://github.com/carltonking" target="_blank" aria-label="GitHub"><svg viewBox="0 0 24 24"><path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.2.8-.5v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 016 0C17.3 4.6 18.3 5 18.3 5c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.6.8.5A11.5 11.5 0 0023.5 12C23.5 5.7 18.3.5 12 .5z"/></svg></a>
+        </div>
+      </div>
+      <div class="founder reveal">
+        <!-- TODO: update Rohan's full name + links -->
+        <img class="avatar" src="founders/rohan.jpg" alt="Rohan"
+             onerror="this.outerHTML='&lt;div class=\'avatar\'&gt;R&lt;/div&gt;'" />
+        <h4>Rohan</h4>
+        <div class="role">Co-founder</div>
+        <p>Shapes how Alfred works and feels, so delegating to it is effortless and trustworthy.</p>
+        <div class="socials">
+          <a href="#" aria-label="GitHub"><svg viewBox="0 0 24 24"><path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.2.8-.5v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 016 0C17.3 4.6 18.3 5 18.3 5c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.6.8.5A11.5 11.5 0 0023.5 12C23.5 5.7 18.3.5 12 .5z"/></svg></a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── CTA / Waitlist ────────────────────────────────────────────── -->
+<section class="section-pad" id="waitlist">
+  <div class="wrap">
+    <div class="cta-band reveal">
+      <h2>Get early access to Alfred</h2>
+      <p>Be among the first to hand off your inbox, your texts, and your calendar. We're onboarding early users now.</p>
+      <form class="waitlist" id="waitlist-form">
+        <input type="email" id="email" placeholder="you@example.com" required />
+        <button type="submit">Request access</button>
+      </form>
+      <p id="wl-msg" style="color:#9cc0ff;font-size:14px;margin-top:16px;min-height:18px;"></p>
+    </div>
+  </div>
+</section>
+
+<!-- ── Footer ────────────────────────────────────────────────────── -->
 <footer>
-  <span>Alfred · Built with Claude · macOS only</span>
-  <div style="display:flex;gap:20px;">
-    <a href="https://github.com/YOUR_USERNAME/YOUR_REPO" target="_blank">GitHub</a>
-    <a href="https://console.anthropic.com/" target="_blank">Get API Key</a>
+  <div class="wrap">
+    <div class="foot-inner">
+      <div class="foot-brand"><img src="logo.png" alt="Alfred" /> Alfred</div>
+      <div class="foot-links">
+        <a href="#features">Features</a>
+        <a href="#how">How it works</a>
+        <a href="#founders">Team</a>
+        <a href="#waitlist">Early access</a>
+        <a href="https://github.com/carltonking/ALFRED" target="_blank">GitHub</a>
+      </div>
+    </div>
+    <div class="copyright">© 2026 Alfred. Your personal AI assistant. Built for macOS.</div>
   </div>
 </footer>
 
 <script>
-  // Track download clicks (optional analytics hook)
-  document.getElementById('download-btn').addEventListener('click', function() {
-    // You can add analytics here if needed
-    this.textContent = '⬇ Downloading…';
-    setTimeout(() => { this.innerHTML = `<svg viewBox="0 0 20 20" fill="currentColor" style="width:18px;height:18px"><path d="M10 2a1 1 0 011 1v8.586l2.293-2.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 111.414-1.414L9 11.586V3a1 1 0 011-1z"/><path d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z"/></svg> Download Alfred`; }, 3000);
+  // Sticky nav border on scroll
+  const hdr = document.getElementById('hdr');
+  addEventListener('scroll', () => hdr.classList.toggle('scrolled', scrollY > 8));
+
+  // Scroll reveal
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach((e, i) => {
+      if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+    });
+  }, { threshold: 0.12 });
+  document.querySelectorAll('.reveal').forEach((el, i) => {
+    el.style.transitionDelay = (Math.min(i % 6, 5) * 60) + 'ms';
+    io.observe(el);
+  });
+
+  // Waitlist — opens a pre-filled email to the founders.
+  // TODO: swap to Formspree/your form endpoint when ready.
+  const FOUNDER_EMAIL = 'dc5889@nyu.edu';
+  document.getElementById('waitlist-form').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    const email = document.getElementById('email').value.trim();
+    if (!email) return;
+    document.getElementById('wl-msg').textContent = 'Opening your email app to confirm…';
+    const subject = encodeURIComponent('Alfred early access request');
+    const body = encodeURIComponent('Hi Alfred team,\n\nI\'d like early access. My email is: ' + email + '\n\nThanks!');
+    window.location.href = 'mailto:' + FOUNDER_EMAIL + '?subject=' + subject + '&body=' + body;
   });
 </script>
 
