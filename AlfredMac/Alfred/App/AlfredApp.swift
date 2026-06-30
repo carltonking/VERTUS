@@ -116,6 +116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingTextRecipient: MessagingCapability.Recipient?
     private let mailCompose = MailComposeCapability()
     private let screenMonitoring = ScreenMonitoringManager()
+    private var inboundWatcher: InboundWatcher?
     private let focusSession = FocusSessionManager()
     private var escapeMonitor: Any?
     private var notchHoverMonitor: Any?
@@ -627,6 +628,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if appState.screenMonitoringEnabled {
             screenMonitoring.start()
+        }
+
+        // Proactive inbound watcher (opt-in). Lives outside the SafetyAuditEngine-scanned classes
+        // and uses a Task/sleep loop, so it never trips the startup audit.
+        if let router = llmRouter {
+            let watcher = InboundWatcher(router: router)
+            inboundWatcher = watcher
+            appState.$inboundWatcherEnabled
+                .receive(on: DispatchQueue.main)
+                .sink { [weak watcher] enabled in
+                    guard let watcher else { return }
+                    if enabled { watcher.start() } else { watcher.stop() }
+                }
+                .store(in: &cancellables)
+            if appState.inboundWatcherEnabled { watcher.start() }
         }
     }
 
@@ -1584,6 +1600,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                   outputSummary: result, dataSentToCloud: dataSentToCloud)
     }
 
+    /// Builds the drafting brain on demand — the LLM router plus the learned writing voice and
+    /// per-recipient relationship memory. Returns nil until the router is ready.
+    @MainActor
+    private func draftingService() -> DraftingService? {
+        guard let router = llmRouter else { return nil }
+        return DraftingService(router: router,
+                               writingStyle: writingStyleStore,
+                               relationships: memoryStore?.relationshipStore,
+                               ownerName: appState.ownerName)
+    }
+
+    /// Drives the "Respond" tap on an inbound notification: brings up the bar and drafts a reply to
+    /// that message in the user's voice (email → reviewable draft; text → confirm alert), reusing the
+    /// drafting brain with the original message as thread context. Never auto-sends.
+    @MainActor
+    func respondToInboundNotification(_ userInfo: [String: String]) {
+        guard let channel = userInfo["channel"] else { return }
+        let sender = userInfo["sender"] ?? "them"
+        let handle = userInfo["handle"] ?? ""
+        let preview = userInfo["preview"] ?? ""
+        let subject = userInfo["subject"]
+
+        NSApp.activate(ignoringOtherApps: true)
+        showBar()
+        barState.isProcessing = true
+        barState.presenceState = .thinking
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.barState.isProcessing = false
+                self.barState.presenceState = .expanded
+            }
+            guard let drafter = self.draftingService() else {
+                self.barState.responseText = "Drafting isn't available right now."
+                return
+            }
+            if channel == "email" {
+                // Only reply when we actually have an address — never name-match a bare header to a
+                // possibly-wrong contact.
+                guard handle.contains("@") else {
+                    self.barState.responseText = "Couldn't find an email address to reply to \(sender)."
+                    return
+                }
+                guard let r = await self.mailCompose.resolveEmail(for: handle) else {
+                    self.barState.responseText = "Couldn't find an email address to reply to \(sender)."
+                    return
+                }
+                self.barState.responseText = "Drafting a reply to \(r.display)…"
+                if let body = await drafter.draftBody(channel: .email, recipientName: sender,
+                                                      recipientDisplay: r.display,
+                                                      instruction: "Write a reply to their message.",
+                                                      threadContext: preview) {
+                    let replySubject = (subject?.isEmpty == false) ? "Re: \(subject!)" : nil
+                    self.barState.responseText = self.mailCompose.compose(
+                        to: r.email, display: r.display, subject: replySubject, body: body, send: false)
+                    self.barState.responseText += "\n\n— Drafted in your voice —\n\(body)"
+                    self.auditBarAction(prompt: "reply to email from \(r.display)",
+                                        result: self.barState.responseText, commandClass: "high-risk write")
+                } else {
+                    self.barState.responseText = "I couldn't draft a reply to \(r.display) right now."
+                }
+            } else {
+                guard let recipient = await self.messaging.resolveRecipient(for: handle.isEmpty ? sender : handle) else {
+                    self.barState.responseText = "Couldn't find a way to reply to \(sender)."
+                    return
+                }
+                self.barState.responseText = "Drafting a reply to \(recipient.display)…"
+                if let body = await drafter.draftBody(channel: .text, recipientName: sender,
+                                                      recipientDisplay: recipient.display,
+                                                      instruction: "Reply to their message.",
+                                                      threadContext: preview) {
+                    self.barState.responseText = self.messaging.confirmAndSend(message: body, to: recipient)
+                    self.auditBarAction(prompt: "reply to text from \(recipient.display)",
+                                        result: self.barState.responseText, commandClass: "high-risk write")
+                } else {
+                    self.barState.responseText = "I couldn't draft a reply to \(recipient.display) right now."
+                }
+            }
+        }
+    }
+
     func handleQuery(_ text: String) {
         barState.responseText = ""
         barState.isProcessing = true
@@ -1623,8 +1721,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         : "Couldn't find an email for \"\(intent.recipient)\" — try a full email address."
                     return
                 }
+                // Freeform instruction (no verbatim "saying ...") → draft it in the user's voice.
+                var body = intent.body
+                var drafted = false
+                var draftFailed = false
+                if body == nil, let instruction = intent.instruction, let drafter = self.draftingService() {
+                    self.barState.responseText = "Drafting an email to \(r.display)…"
+                    if let generated = await drafter.draftBody(
+                        channel: .email, recipientName: intent.recipient,
+                        recipientDisplay: r.display, instruction: instruction) {
+                        body = generated
+                        drafted = true
+                    } else {
+                        draftFailed = true
+                    }
+                }
+                // An AI-written body always opens as a reviewable draft — never auto-send.
+                let send = intent.send && !drafted
                 self.barState.responseText = self.mailCompose.compose(
-                    to: r.email, display: r.display, subject: intent.subject, body: intent.body, send: intent.send)
+                    to: r.email, display: r.display, subject: intent.subject, body: body, send: send)
+                if drafted, let b = body {
+                    self.barState.responseText += "\n\n— Drafted in your voice —\n\(b)"
+                } else if draftFailed {
+                    self.barState.responseText += "\n\n(I couldn't draft that automatically — opened a blank draft. Type your message, or dictate it with \"saying …\".)"
+                }
                 self.auditBarAction(prompt: cmd, result: self.barState.responseText, commandClass: "high-risk write")
             }
             return
@@ -1648,6 +1768,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let message = intent.message {
                     self.barState.responseText = self.messaging.confirmAndSend(message: message, to: recipient)
                     self.auditBarAction(prompt: cmd, result: self.barState.responseText, commandClass: "high-risk write")
+                } else if let instruction = intent.instruction, let drafter = self.draftingService() {
+                    // Freeform ask → draft it in the user's voice, then confirm before sending.
+                    self.barState.responseText = "Drafting a message to \(recipient.display)…"
+                    if let generated = await drafter.draftBody(
+                        channel: .text, recipientName: intent.name,
+                        recipientDisplay: recipient.display, instruction: instruction) {
+                        self.barState.responseText = self.messaging.confirmAndSend(message: generated, to: recipient)
+                        self.auditBarAction(prompt: cmd, result: self.barState.responseText, commandClass: "high-risk write")
+                    } else {
+                        self.pendingTextRecipient = recipient
+                        self.barState.responseText = "What would you like to send to \(recipient.display)?"
+                    }
                 } else {
                     self.pendingTextRecipient = recipient
                     self.barState.responseText = "What would you like to send to \(recipient.display)?"

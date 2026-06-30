@@ -11,7 +11,8 @@ struct MessagingCapability {
 
     struct Intent: Equatable {
         let name: String
-        let message: String?
+        let message: String?       // verbatim text the user dictated — sent as-is
+        let instruction: String?   // freeform ask ("telling her I'm running late") — drafted by the LLM
     }
 
     struct Recipient {
@@ -30,30 +31,43 @@ struct MessagingCapability {
         for t in triggers where lower.hasPrefix(t) {
             let rest = String(trimmed.dropFirst(t.count)).trimmingCharacters(in: .whitespaces)
             guard !rest.isEmpty else { return nil }
-            let (name, message) = splitNameMessage(rest)
+            let (name, message, instruction) = splitNameMessage(rest)
             guard !name.isEmpty else { return nil }
-            return Intent(name: name, message: message)
+            return Intent(name: name, message: message, instruction: instruction)
         }
         return nil
     }
 
-    /// Splits "bob saying hi" / "bob: hi" into (name, message). With no delimiter the whole
-    /// string is the name and message is nil (the caller then asks for the message).
-    static func splitNameMessage(_ rest: String) -> (name: String, message: String?) {
-        let lower = rest.lowercased()
-        // Comma is the most natural split ("text carlton, hey").
-        let delimiters = [", ", ",", " saying ", " that says ", " telling them ", " tell them ",
-                          " message: ", ": ", " - ", " about "]
-        for d in delimiters {
-            if let r = lower.range(of: d) {
-                let offset = lower.distance(from: lower.startIndex, to: r.lowerBound)
-                let endOffset = lower.distance(from: lower.startIndex, to: r.upperBound)
-                let name = String(rest.prefix(offset)).trimmingCharacters(in: .whitespaces)
-                let msg = String(rest.dropFirst(endOffset)).trimmingCharacters(in: .whitespaces)
-                return (name, msg.isEmpty ? nil : msg)
-            }
+    /// Splits "<name> [, hi | saying hi | telling them I'm late | about dinner]" into parts. A
+    /// comma / "saying" / "message:" clause is the user's VERBATIM text; a "telling/about/that"
+    /// clause is an INSTRUCTION the drafting brain writes. With no delimiter the whole string is the
+    /// name and both are nil (the caller then asks what to send). Verbatim wins on overlap.
+    static func splitNameMessage(_ rest: String) -> (name: String, message: String?, instruction: String?) {
+        // Search the original string (case-insensitively) so every index is valid on `rest`;
+        // indices from a separate lowercased copy can shift and trap on length-changing characters.
+        func firstRange(_ keys: [String]) -> Range<String.Index>? {
+            keys.compactMap { rest.range(of: $0, options: .caseInsensitive) }.min { $0.lowerBound < $1.lowerBound }
         }
-        return (rest, nil)
+        let verbatim = firstRange([", ", ",", " saying ", " that says ", " message: ", ": ", " - "])
+        let instr = firstRange([" telling them ", " tell them ", " to tell them ", " telling ", " tell ",
+                                " letting them know ", " let them know ", " asking ", " to ask ",
+                                " to say ", " about ", " that "])
+
+        var cut = rest.endIndex
+        for m in [verbatim, instr].compactMap({ $0 }) { cut = min(cut, m.lowerBound) }
+        let name = String(rest[rest.startIndex..<cut]).trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return (rest.trimmingCharacters(in: .whitespaces), nil, nil) }
+
+        var message: String?
+        var instruction: String?
+        if let v = verbatim, instr == nil || v.lowerBound <= instr!.lowerBound {
+            let m = String(rest[v.upperBound...]).trimmingCharacters(in: .whitespaces)
+            message = m.isEmpty ? nil : m
+        } else if let i = instr {
+            let m = String(rest[i.upperBound...]).trimmingCharacters(in: .whitespaces)
+            instruction = m.isEmpty ? nil : m
+        }
+        return (name, message, stripLeadingObjectPronoun(instruction))
     }
 
     // MARK: - Contact resolution

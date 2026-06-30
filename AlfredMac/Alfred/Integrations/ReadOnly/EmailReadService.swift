@@ -80,21 +80,36 @@ final class EmailReadService: ReadOnlyIntegrationProtocol {
     /// All recent unread inbox messages (no query filter) — backs "summarize my emails".
     /// Unlike `performSearch`, this launches Mail via `tell` if it isn't running, so it works
     /// from a headless routine. Throws on AppleScript/permission failure so the caller can react.
-    func fetchRecentUnread(limit: Int = 20) async throws -> [IntegrationSearchResult] {
+    func fetchRecentUnread(limit: Int = 20, includeBody: Bool = false) async throws -> [IntegrationSearchResult] {
         // Robust script: filter only by read status (the compound `where (date … and …)` whose-clause
-        // is buggy/slow and the old version also carried a stray backslash that mangled it). Limit in
-        // AppleScript, try-wrap each message, and build a single linefeed-delimited string so Swift's
-        // `split(separator: "\\n")` parsing is deterministic (a returned list coerces to comma-joined).
+        // is buggy/slow and the old version also carried a stray backslash that mangled it). `limit`
+        // doubles as the AppleScript cap (callers pass a large value to baseline the whole backlog).
+        // When includeBody, each message's content is fetched, truncated, and stripped of
+        // tabs/newlines so the tab/linefeed-delimited parse stays deterministic — wrapped in its own
+        // `try` so a body-fetch failure degrades to an empty body, never breaking the whole fetch.
+        let bodyClause = includeBody ? """
+                    set bodyText to ""
+                    try
+                        set rawBody to content of msg
+                        if (count of rawBody) > 600 then set rawBody to text 1 thru 600 of rawBody
+                        set AppleScript's text item delimiters to {return, linefeed, tab}
+                        set bodyParts to text items of rawBody
+                        set AppleScript's text item delimiters to " "
+                        set bodyText to bodyParts as text
+                        set AppleScript's text item delimiters to ""
+                    end try
+        """ : "                    set bodyText to \"\""
         let scriptSource = """
         tell application "Mail"
             set out to ""
             set unreadMsgs to (messages of inbox whose read status is false)
             set n to (count of unreadMsgs)
-            if n > 20 then set n to 20
+            if n > \(limit) then set n to \(limit)
             repeat with i from 1 to n
                 try
                     set msg to item i of unreadMsgs
-                    set out to out & (subject of msg) & tab & (sender of msg) & tab & ((date received of msg) as string) & linefeed
+        \(bodyClause)
+                    set out to out & (subject of msg) & tab & (sender of msg) & tab & ((date received of msg) as string) & tab & bodyText & linefeed
                 end try
             end repeat
             return out
@@ -116,9 +131,12 @@ final class EmailReadService: ReadOnlyIntegrationProtocol {
             let subject = parts.count > 0 && !parts[0].isEmpty ? parts[0] : "(no subject)"
             let sender = parts.count > 1 ? parts[1] : "Unknown"
             let dateStr = parts.count > 2 ? parts[2] : ""
+            let body = parts.count > 3 ? parts[3] : ""
+            var metadata = ["subject": subject, "sender": sender, "date": dateStr]
+            if !body.isEmpty { metadata["body"] = body }
             return IntegrationSearchResult(
                 title: subject, subtitle: sender, source: "Email", icon: "envelope",
-                metadata: ["subject": subject, "sender": sender, "date": dateStr]
+                metadata: metadata
             )
         }
     }

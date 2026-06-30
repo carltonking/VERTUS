@@ -108,6 +108,77 @@ struct MessagesReadCapability {
         return lines.joined(separator: "\n")
     }
 
+    // MARK: - New-message detection (InboundWatcher)
+
+    struct Received { let rowid: Int64; let handle: String; let name: String; let text: String }
+
+    /// Highest ROWID among received messages — used to baseline the watcher's cursor on first run.
+    static func maxReceivedRowID() -> Int64? {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            sqlite3_close(db); return nil
+        }
+        defer { sqlite3_close(db) }
+        let sql = "SELECT MAX(ROWID) FROM message WHERE is_from_me = 0 AND associated_message_type = 0"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return sqlite3_column_type(stmt, 0) == SQLITE_NULL ? 0 : sqlite3_column_int64(stmt, 0)
+    }
+
+    /// Received messages with ROWID greater than `afterRowID`, oldest first. Returns [] if the store
+    /// can't be opened (Full Disk Access missing) — the watcher treats that as "nothing new".
+    static func recentReceived(afterRowID: Int64, limit: Int = 10) -> [Received] {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            sqlite3_close(db); return []
+        }
+        defer { sqlite3_close(db) }
+        let sql = """
+            SELECT m.ROWID, m.text, m.attributedBody, h.id
+            FROM message m
+            LEFT JOIN handle h ON m.handle_id = h.ROWID
+            WHERE m.is_from_me = 0 AND m.associated_message_type = 0 AND m.ROWID > ?
+            ORDER BY m.ROWID ASC
+            LIMIT \(limit)
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, afterRowID)
+
+        let index = contactIndex()
+        var out: [Received] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let rowid = sqlite3_column_int64(stmt, 0)
+            var body = ""
+            if let cText = sqlite3_column_text(stmt, 1) { body = String(cString: cText) }
+            if body.isEmpty, sqlite3_column_type(stmt, 2) != SQLITE_NULL {
+                let bytes = sqlite3_column_bytes(stmt, 2)
+                if let blob = sqlite3_column_blob(stmt, 2), bytes > 0 {
+                    body = decodeAttributedBody(Data(bytes: blob, count: Int(bytes))) ?? ""
+                }
+            }
+            if body.isEmpty { body = "[attachment]" }
+            let handle = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "Unknown"
+            out.append(Received(rowid: rowid, handle: handle,
+                                name: nameForHandle(handle, index: index),
+                                text: body.replacingOccurrences(of: "\n", with: " ")))
+        }
+        return out
+    }
+
+    private static func nameForHandle(_ handle: String, index: [String: String]) -> String {
+        let h = handle.lowercased()
+        if h.contains("@") {
+            let clean = h.split(separator: "(").first.map(String.init) ?? h
+            return index[clean] ?? handle
+        }
+        let key = normalizePhone(handle)
+        return index[key] ?? handle
+    }
+
     /// Builds a lookup of every contact phone (last-10-digits) and email → display name.
     private static func contactIndex() -> [String: String] {
         var index: [String: String] = [:]

@@ -49,3 +49,4 @@ AlfredBar/*.xcodeproj/
 .idea/
 *.swp
 *~
+.vercel

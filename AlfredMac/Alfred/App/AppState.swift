@@ -83,6 +83,13 @@ final class AppState: ObservableObject {
 
     @Published var screenMonitoringEnabled: Bool
 
+    /// Opt-in proactive watcher: scans new inbound mail/texts, triages whether they need a reply,
+    /// and posts a "want me to respond?" notification. Off by default; nothing is ever sent without
+    /// an explicit tap + the usual confirm/draft step.
+    @Published var inboundWatcherEnabled: Bool {
+        didSet { UserDefaults.standard.set(inboundWatcherEnabled, forKey: "inboundWatcherEnabled") }
+    }
+
     /// Hermes: opt-in passive screen-TEXT capture (Accessibility) persisted to the local FTS5
     /// log. Off by default; nothing leaves the Mac.
     @Published var screenTextCaptureEnabled: Bool {
@@ -170,6 +177,7 @@ final class AppState: ObservableObject {
         screenContextEnabled = UserDefaults.standard.object(forKey: "screenContextEnabled") as? Bool ?? true
         UserDefaults.standard.removeObject(forKey: "screenMonitoringEnabled")
         screenMonitoringEnabled = false
+        inboundWatcherEnabled = UserDefaults.standard.bool(forKey: "inboundWatcherEnabled")
         // Default ON: Alfred is meant to learn from your activity. Capture still requires the
         // user to grant Screen Recording permission, and can be turned off in the Profile tab.
         screenTextCaptureEnabled = UserDefaults.standard.object(forKey: "screenTextCaptureEnabled") as? Bool ?? true

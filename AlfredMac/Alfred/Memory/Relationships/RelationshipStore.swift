@@ -266,6 +266,44 @@ final class RelationshipStore {
         return lines.joined(separator: "\n")
     }
 
+    /// Compact context for drafting a message TO one person — their relationship to the user, how
+    /// often they talk, when they last spoke, and any remembered notes. Returns nil when the person
+    /// isn't known yet, so the drafter can fall back to the global writing voice alone.
+    /// `includeNotes` controls whether the free-text `notes` field is appended. Callers pass
+    /// `false` when the draft is going to a cloud LLM, so private notes never leave the device.
+    func contextForPerson(name: String, includeNotes: Bool = true) -> String? {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+
+        let matches = searchPeople(query: trimmed, limit: 5)
+        guard !matches.isEmpty else { return nil }
+        // Prefer an exact name/alias hit; otherwise the most-interacted fuzzy match (searchPeople
+        // already orders by interactionCount desc).
+        let lowered = trimmed.lowercased()
+        let person = matches.first { p in
+            p.name.lowercased() == lowered || p.aliases.contains { $0.lowercased() == lowered }
+        } ?? matches[0]
+
+        var parts: [String] = []
+        if let type = person.primaryRelationship?.type.rawValue, type != "unknown" {
+            parts.append("your \(type)")
+        }
+        switch person.interactionCount {
+        case ..<3:  parts.append("you talk occasionally")
+        case ..<10: parts.append("you talk regularly")
+        default:    parts.append("you talk frequently")
+        }
+        let daysAgo = Calendar.current.dateComponents([.day], from: person.lastSeen, to: Date()).day ?? 0
+        parts.append(daysAgo == 0 ? "last spoke today" : "last spoke \(daysAgo) day\(daysAgo == 1 ? "" : "s") ago")
+
+        var line = "\(person.name) — \(parts.joined(separator: ", "))."
+        if includeNotes {
+            let notes = person.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !notes.isEmpty { line += " Notes: \(notes)" }
+        }
+        return line
+    }
+
     // MARK: - Private helpers
 
     private func bestRelationship(for personId: Int64) throws -> Relationship? {
