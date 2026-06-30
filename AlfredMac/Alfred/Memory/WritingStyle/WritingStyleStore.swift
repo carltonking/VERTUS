@@ -371,6 +371,72 @@ final class WritingStyleStore {
             "Voice learning from Gmail needs Google connected — say \"connect gmail\" to enable it.")
     }
 
+    // MARK: - Voice learning from sent Apple Mail (iCloud + IMAP)
+
+    private static let appleMailSeenKey = "voiceLearning.appleMailSeenIds"
+    private static let appleMailBackfillFlag = "voiceLearning.appleMailBackfillDone"
+    private static var didLogAppleMailHint = false
+
+    /// Imports recent SENT messages from Apple Mail (iCloud + non-Gmail IMAP accounts) as `.email`
+    /// writing samples. Gmail accounts are skipped (covered by the Gmail API path). De-dupes by RFC
+    /// message id (bounded UserDefaults seen-set). One-time backfill of ~200, then ~50 incrementally.
+    /// Runs only when Mail is already running; no-op + one-time hint if it isn't, or Automation is
+    /// denied. Bodies are stripped of quotes/signatures before recording. The caller runs this
+    /// off the main thread.
+    func importSentAppleMail() {
+        guard AppleMailSentReader.isMailRunning() else { Self.logAppleMailHintOnce(); return }
+
+        let defaults = UserDefaults.standard
+        let isBackfill = !defaults.bool(forKey: Self.appleMailBackfillFlag)
+        let overallLimit = isBackfill ? 200 : 50
+
+        guard let output = AppleMailSentReader.readSent(limitPerAccount: 50) else {
+            Self.logAppleMailHintOnce()   // Mail not scriptable / Automation denied / timed out
+            return
+        }
+
+        // Parse → drop Gmail accounts → drop already-seen ids.
+        let records = AppleMailSentReader.parse(output)
+            .filter { !AppleMailSentReader.isGmailAccount(email: $0.accountEmail) }
+        let seenArray = defaults.stringArray(forKey: Self.appleMailSeenKey) ?? []
+        let seen = Set(seenArray)
+        let unseen = AppleMailSentReader.filterUnseen(records, seen: seen)
+
+        var newSamples: [(text: String, source: WritingSource)] = []
+        var newlySeen: [String] = []
+        for rec in unseen {
+            guard newSamples.count < overallLimit else { break }
+            newlySeen.append(rec.id)
+            let cleaned = EmailBodyCleaner.ownTextOnly(rec.body)
+            if !cleaned.isEmpty { newSamples.append((cleaned, .email)) }
+        }
+
+        if !newSamples.isEmpty { recordWritingSamples(newSamples) }   // batch: one profile rebuild
+
+        // Persist the seen-set. Refresh the recency of EVERY id read this run (newest-last), not just
+        // the newly-imported ones, so the always-re-read newest window is never evicted by the 2000
+        // cap — a stable mailbox then truly imports nothing on re-run. Over-budget unseen ids are
+        // intentionally left out so they're picked up next time.
+        let decided = records.map(\.id).filter { seen.contains($0) } + newlySeen
+        if !decided.isEmpty {
+            let decidedSet = Set(decided)
+            let prior = seenArray.filter { !decidedSet.contains($0) }
+            defaults.set(Array((prior + decided).suffix(2000)), forKey: Self.appleMailSeenKey)
+        }
+
+        // Mark the one-time backfill done only once it actually produced samples (mirrors the
+        // iMessage path) — otherwise stay in backfill mode with the larger limit.
+        if isBackfill && !newSamples.isEmpty { defaults.set(true, forKey: Self.appleMailBackfillFlag) }
+    }
+
+    private static func logAppleMailHintOnce() {
+        messagesHintLock.lock(); defer { messagesHintLock.unlock() }
+        guard !didLogAppleMailHint else { return }
+        didLogAppleMailHint = true
+        Logger(subsystem: "com.alfred.writing-style", category: "store").notice(
+            "Voice learning from Apple Mail needs Mail running and Automation permission for Mail (System Settings → Privacy & Security → Automation).")
+    }
+
     private static func logMessagesHintOnce() {
         messagesHintLock.lock(); defer { messagesHintLock.unlock() }
         guard !didLogMessagesHint else { return }

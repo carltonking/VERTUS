@@ -664,6 +664,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task.detached(priority: .utility) { [weak wss] in
             wss?.importSentMessages()      // iMessage (local, synchronous)
             await wss?.importSentEmails()  // Gmail (network, gated on Google being connected)
+            wss?.importSentAppleMail()     // Apple Mail iCloud + IMAP (osascript, only if Mail running)
         }
     }
 
