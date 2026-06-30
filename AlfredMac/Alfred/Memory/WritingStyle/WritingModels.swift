@@ -8,6 +8,7 @@ enum WritingSource: String, Codable, CaseIterable {
     case notes
     case chat
     case document
+    case imessage
     case other
 }
 

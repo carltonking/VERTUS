@@ -62,9 +62,9 @@ final class DraftingService {
         // Few-shot the model with REAL writing samples — far stronger imitation than the statistics
         // alone. Exemplars are first-party (the owner's own words), so unlike relationship notes
         // they are NOT gated to local providers; the router's egress redaction still applies. Prefer
-        // the channel's source (email samples for email, chat samples for text).
-        let preferredSource: WritingSource = channel == .email ? .email : .chat
-        let exemplars = writingStyle?.voiceExemplars(preferredSource: preferredSource) ?? []
+        // the channel's source: real sent iMessages (then Alfred-chat) for texts, email for email.
+        let preferredSources: [WritingSource] = channel == .email ? [.email] : [.imessage, .chat]
+        let exemplars = writingStyle?.voiceExemplars(preferredSources: preferredSources) ?? []
         // Free-text relationship notes stay on-device: only include them for a local provider.
         let who = relationships?.contextForPerson(name: recipientName,
                                                   includeNotes: !router.isActiveProviderCloud)

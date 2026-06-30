@@ -201,10 +201,10 @@ final class WritingStyleStore {
 
     /// Up to `limit` representative REAL writing samples — substantive (≥ `minWords`),
     /// de-duplicated, each whitespace-normalized and capped to `maxChars`. Soft-prefers
-    /// `preferredSource`, falling back to any substantive sample (samples are mostly `.chat`).
-    /// LLMs imitate concrete examples far better than the statistics in `generateStyleContext()`,
-    /// which this leaves untouched — it's purely additive and used only by the drafting path.
-    func voiceExemplars(preferredSource: WritingSource? = nil,
+    /// `preferredSources` in priority order (e.g. [.imessage, .chat] for texts), falling back to any
+    /// substantive sample. LLMs imitate concrete examples far better than the statistics in
+    /// `generateStyleContext()`, which this leaves untouched — additive, drafting-path only.
+    func voiceExemplars(preferredSources: [WritingSource] = [],
                         limit: Int = 3,
                         minWords: Int = 8,
                         maxChars: Int = 220) -> [String] {
@@ -221,12 +221,19 @@ final class WritingStyleStore {
         let substantive = pool.filter { Self.wordCount($0.text) >= minWords }
         guard !substantive.isEmpty else { return [] }
 
-        // Soft-prefer the requested source: same-source first, then everything else (recency kept).
+        // Soft-prefer the requested sources in priority order, then everything else (recency kept).
         let ordered: [WritingSampleRecord]
-        if let src = preferredSource?.rawValue {
-            ordered = substantive.filter { $0.source == src } + substantive.filter { $0.source != src }
-        } else {
+        if preferredSources.isEmpty {
             ordered = substantive
+        } else {
+            let prefRaw = preferredSources.map(\.rawValue)
+            let prefSet = Set(prefRaw)
+            var result: [WritingSampleRecord] = []
+            for raw in prefRaw {
+                result += substantive.filter { $0.source == raw }
+            }
+            result += substantive.filter { !prefSet.contains($0.source) }
+            ordered = result
         }
 
         var out: [String] = []
@@ -262,5 +269,46 @@ final class WritingStyleStore {
     private static func dedupKey(_ text: String) -> String {
         let normalized = text.lowercased().split { $0.isWhitespace }.joined(separator: " ")
         return String(normalized.prefix(80))
+    }
+
+    // MARK: - Voice learning from sent iMessages
+
+    private static let sentWatermarkKey = "voiceLearning.lastImportedMessageRowID"
+    private static let sentBackfillFlag = "voiceLearning.imessageBackfillDone"
+    private static let messagesHintLock = NSLock()
+    private static var didLogMessagesHint = false
+
+    /// Imports the user's REAL sent iMessages as `.imessage` writing samples (feeding both the style
+    /// stats and the exemplar pool). One-time backfill of up to 500 recent sent texts (gated by a
+    /// flag), then incremental imports of anything with ROWID greater than the stored watermark — so
+    /// samples never duplicate. Reads chat.db read-only and bounded; the CALLER runs this off the
+    /// main thread (recordWritingSample also enqueues its own writes on a background queue).
+    func importSentMessages() {
+        let defaults = UserDefaults.standard
+        let isBackfill = !defaults.bool(forKey: Self.sentBackfillFlag)
+        let watermark = Int64(defaults.integer(forKey: Self.sentWatermarkKey))
+        let limit = isBackfill ? 500 : 200
+
+        let sent = MessagesReadCapability.recentSentMessages(afterRowID: watermark, limit: limit)
+        guard !sent.isEmpty else {
+            // Nothing imported — most often Full Disk Access isn't granted. Hint once, non-fatally.
+            if isBackfill { Self.logMessagesHintOnce() }
+            return
+        }
+
+        for msg in sent {
+            recordWritingSample(text: msg.text, source: .imessage)   // 20-char guard skips trivial ones
+        }
+        let newWatermark = sent.map(\.rowid).max() ?? watermark
+        defaults.set(Int(newWatermark), forKey: Self.sentWatermarkKey)
+        if isBackfill { defaults.set(true, forKey: Self.sentBackfillFlag) }
+    }
+
+    private static func logMessagesHintOnce() {
+        messagesHintLock.lock(); defer { messagesHintLock.unlock() }
+        guard !didLogMessagesHint else { return }
+        didLogMessagesHint = true
+        Logger(subsystem: "com.alfred.writing-style", category: "store").notice(
+            "Voice learning from Messages needs Full Disk Access — grant it in System Settings → Privacy & Security → Full Disk Access.")
     }
 }

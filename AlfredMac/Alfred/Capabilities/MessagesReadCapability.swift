@@ -108,6 +108,57 @@ struct MessagesReadCapability {
         return lines.joined(separator: "\n")
     }
 
+    // MARK: - Sent-message read (voice learning)
+
+    struct SentMessage { let rowid: Int64; let text: String }
+
+    /// Recent SENT messages (is_from_me = 1) for learning the user's real writing voice, newest first.
+    static func recentSentMessages(afterRowID: Int64 = 0, limit: Int = 500) -> [SentMessage] {
+        sentMessages(afterRowID: afterRowID, limit: limit, dbPath: dbPath)
+    }
+
+    /// Core sent-message query against an explicit `dbPath` (so tests can point at a synthetic
+    /// chat.db). Real messages only (associated_message_type = 0 → no tapbacks/reactions), non-empty
+    /// body, ROWID > `afterRowID`, capped at `limit`, newest first. Opens read-only so the live
+    /// Messages DB is never locked, and reuses `decodeAttributedBody` for Ventura+ rows where `text`
+    /// is NULL and the body lives in the `attributedBody` typedstream blob.
+    static func sentMessages(afterRowID: Int64, limit: Int, dbPath: String) -> [SentMessage] {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            sqlite3_close(db); return []
+        }
+        defer { sqlite3_close(db) }
+
+        let sql = """
+            SELECT m.ROWID, m.text, m.attributedBody
+            FROM message m
+            WHERE m.is_from_me = 1 AND m.associated_message_type = 0 AND m.ROWID > ?
+            ORDER BY m.ROWID DESC
+            LIMIT \(max(0, limit))
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, afterRowID)
+
+        var out: [SentMessage] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let rowid = sqlite3_column_int64(stmt, 0)
+            var body = ""
+            if let cText = sqlite3_column_text(stmt, 1) { body = String(cString: cText) }
+            if body.isEmpty, sqlite3_column_type(stmt, 2) != SQLITE_NULL {
+                let bytes = sqlite3_column_bytes(stmt, 2)
+                if let blob = sqlite3_column_blob(stmt, 2), bytes > 0 {
+                    body = decodeAttributedBody(Data(bytes: blob, count: Int(bytes))) ?? ""
+                }
+            }
+            let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed != "[attachment]" else { continue }
+            out.append(SentMessage(rowid: rowid, text: trimmed))
+        }
+        return out
+    }
+
     // MARK: - New-message detection (InboundWatcher)
 
     struct Received { let rowid: Int64; let handle: String; let name: String; let text: String }

@@ -66,7 +66,7 @@ final class VoiceExemplarsTests: XCTestCase {
         // Very long sample — must be length-capped.
         try insert(db, "Just circling back on the roadmap " + String(repeating: "and the next milestone ", count: 20), .email)
 
-        let ex = store.voiceExemplars(preferredSource: .email, limit: 3, minWords: 8, maxChars: 220)
+        let ex = store.voiceExemplars(preferredSources: [.email], limit: 3, minWords: 8, maxChars: 220)
 
         XCTAssertEqual(ex.count, 3, "respects the limit")
         XCTAssertFalse(ex.contains("ok"))
@@ -85,8 +85,25 @@ final class VoiceExemplarsTests: XCTestCase {
         try insert(db, "Hey, are we still on for lunch on Friday or should we push it to next week?", .chat)
         try insert(db, "I pushed the fix to the branch — can you take a look when you get a sec?", .chat)
 
-        let ex = store.voiceExemplars(preferredSource: .notes, limit: 3, minWords: 8)
+        let ex = store.voiceExemplars(preferredSources: [.notes], limit: 3, minWords: 8)
         XCTAssertEqual(ex.count, 2, "falls back to any substantive sample when the preferred source is scarce")
+    }
+
+    func testPrefersIMessageOverChatForTextChannel() throws {
+        let db = try makeDB()
+        let store = try WritingStyleStore(db: db)
+        // Insert the chat (Alfred-command-style) sample FIRST (older) and the real iMessage AFTER
+        // (newer), so a pure-recency order would put chat... no — newer wins recency. Force the test
+        // to depend on SOURCE preference, not recency: make the chat one NEWER.
+        try insert(db, "open mail and summarize my unread messages from this morning please", .imessage)
+        try insert(db, "hey sounds good, let's grab coffee thursday before the standup meeting", .chat)
+
+        // The .text channel maps to [.imessage, .chat]; the iMessage sample must rank first even
+        // though the chat sample is more recent.
+        let ex = store.voiceExemplars(preferredSources: [.imessage, .chat], limit: 2, minWords: 8)
+        XCTAssertEqual(ex.count, 2)
+        XCTAssertEqual(ex.first, "open mail and summarize my unread messages from this morning please",
+                       "the .imessage sample should rank above the more-recent .chat sample")
     }
 
     func testEmptyWhenAllTrivial() throws {

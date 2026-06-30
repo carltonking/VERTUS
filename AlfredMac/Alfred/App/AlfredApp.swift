@@ -644,6 +644,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .store(in: &cancellables)
             if appState.inboundWatcherEnabled { watcher.start() }
         }
+
+        // Voice learning from sent iMessages (opt-in). Detached + watermarked; a no-op (one-time
+        // hint) without Full Disk Access. Runs once at launch if enabled, and again when toggled on.
+        startVoiceLearningFromMessagesIfNeeded()
+        appState.$voiceLearningFromMessagesEnabled
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] enabled in
+                guard enabled else { return }
+                self?.startVoiceLearningFromMessagesIfNeeded()
+            }
+            .store(in: &cancellables)
+    }
+
+    /// Imports Carlton's sent iMessages into the writing-style sample pool when the opt-in is on.
+    /// Off the main thread; the watermark makes it idempotent and incremental.
+    private func startVoiceLearningFromMessagesIfNeeded() {
+        guard appState.voiceLearningFromMessagesEnabled, let wss = writingStyleStore else { return }
+        Task.detached(priority: .utility) { [weak wss] in
+            wss?.importSentMessages()
+        }
     }
 
     private func observeFocusSession() {

@@ -90,6 +90,13 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(inboundWatcherEnabled, forKey: "inboundWatcherEnabled") }
     }
 
+    /// Opt-in: learn Carlton's real writing voice from his SENT iMessages (needs Full Disk Access).
+    /// Off by default. When on (and FDA granted), sent texts are imported as `.imessage` writing
+    /// samples so drafts sound like his actual texting, not the commands he types to Alfred.
+    @Published var voiceLearningFromMessagesEnabled: Bool {
+        didSet { UserDefaults.standard.set(voiceLearningFromMessagesEnabled, forKey: "voiceLearningFromMessagesEnabled") }
+    }
+
     /// Hermes: opt-in passive screen-TEXT capture (Accessibility) persisted to the local FTS5
     /// log. Off by default; nothing leaves the Mac.
     @Published var screenTextCaptureEnabled: Bool {
@@ -178,6 +185,7 @@ final class AppState: ObservableObject {
         UserDefaults.standard.removeObject(forKey: "screenMonitoringEnabled")
         screenMonitoringEnabled = false
         inboundWatcherEnabled = UserDefaults.standard.bool(forKey: "inboundWatcherEnabled")
+        voiceLearningFromMessagesEnabled = UserDefaults.standard.bool(forKey: "voiceLearningFromMessagesEnabled")
         // Default ON: Alfred is meant to learn from your activity. Capture still requires the
         // user to grant Screen Recording permission, and can be turned off in the Profile tab.
         screenTextCaptureEnabled = UserDefaults.standard.object(forKey: "screenTextCaptureEnabled") as? Bool ?? true
