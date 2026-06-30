@@ -12,6 +12,9 @@ struct MemoryRecord: Codable, FetchableRecord, PersistableRecord {
     var tags: String
     var created_at: Double
     var accessed_at: Double
+    /// On-device sentence-embedding vector ([Float] serialized to a BLOB), or nil for rows written
+    /// before the embedding column existed (filled in by the one-time backfill). See v16 migration.
+    var embedding: Data?
 
     var tagList: [String] {
         tags.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
@@ -163,6 +166,58 @@ final class MemoryStore {
         }
         db = try DatabaseQueue(path: dbPath)
         try migrate()
+        // Only the real on-disk store backfills; tests pass an explicit path and stay deterministic.
+        if path == nil { startEmbeddingBackfillIfNeeded() }
+    }
+
+    // MARK: - Embedding backfill (one-time, idempotent, off the main thread)
+
+    /// Kicks off a one-time background pass that (re-)embeds memories with the current model. The
+    /// flag key is versioned to the backend (Apple → Ollama/nomic), so switching models forces a
+    /// full re-embed — old vectors are a different model and not cosine-comparable. Cursor-based and
+    /// idempotent; an interrupted run safely re-runs next launch. Detached → never blocks startup.
+    func startEmbeddingBackfillIfNeeded() {
+        let flag = "memoryEmbeddingBackfill_nomic_v1"
+        guard !UserDefaults.standard.bool(forKey: flag) else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            // Probe Ollama once OFF the launch thread. If unavailable, leave the flag unset so we
+            // retry next launch (the hint log already fired from the probe).
+            guard Self.documentEmbedding(for: "ping") != nil else { return }
+            do {
+                try self.backfillEmbeddings()
+                UserDefaults.standard.set(true, forKey: flag)
+            } catch {
+                Self.logger.error("Embedding backfill failed: \(error.localizedDescription, privacy: .public)")
+                // Flag stays unset → retried next launch (idempotent).
+            }
+        }
+    }
+
+    /// Re-embeds ALL rows in id-ordered batches (the embedding model changed, so existing vectors
+    /// are stale). The id cursor advances past every row it visits — even ones that can't be
+    /// embedded — so the loop always terminates. Idempotent: re-running reproduces the same vectors.
+    private func backfillEmbeddings() throws {
+        var lastID: Int64 = 0
+        while true {
+            let batch = try db.read { db in
+                try MemoryRecord
+                    .filter(sql: "id > ?", arguments: [lastID])
+                    .order(Column("id"))
+                    .limit(100)
+                    .fetchAll(db)
+            }
+            guard !batch.isEmpty else { break }
+            for rec in batch {
+                guard let id = rec.id else { continue }
+                lastID = id
+                guard let data = Self.documentEmbedding(for: rec.content).map(Self.embeddingData) else { continue }
+                try db.write { db in
+                    try db.execute(sql: "UPDATE memories SET embedding = ? WHERE id = ?",
+                                   arguments: [data, id])
+                }
+            }
+        }
     }
 
     // MARK: - Schema
@@ -499,6 +554,17 @@ final class MemoryStore {
                           columns: ["accessed_at"], ifNotExists: true)
         }
 
+        // On-device semantic retrieval: store a sentence-embedding vector per memory as a BLOB
+        // (currently from local Ollama / nomic-embed-text; see the embedding helpers).
+        // Nullable so existing rows migrate instantly (backfilled lazily in the background). This
+        // only ADDS a column — the memories_fts FTS5 index (which indexes only `content`) and its
+        // sync triggers are untouched.
+        migrator.registerMigration("v16_memory_embeddings") { db in
+            try db.alter(table: "memories") { t in
+                t.add(column: "embedding", .blob)
+            }
+        }
+
         try migrator.migrate(db)
     }
 
@@ -730,11 +796,110 @@ final class MemoryStore {
 
     // MARK: - Memory operations
 
+    // MARK: - Semantic embeddings (local Ollama, free + on-device)
+
+    /// Local Ollama model used for memory embeddings. nomic-embed-text is 768-dim and far stronger
+    /// on short text than Apple's NLEmbedding. Swap by changing this constant — and bump the
+    /// re-embed backfill flag below so existing vectors are regenerated with the new model.
+    static let embeddingModel = "nomic-embed-text"
+    static let embeddingDimensions = 768
+
+    /// Base URL of the local Ollama server. There's no shared Ollama-host setting in the app
+    /// (OllamaProvider hardcodes the same localhost default), so we match it here as a constant.
+    private static let ollamaBaseURL = "http://localhost:11434"
+
+    private static let hintLock = NSLock()
+    private static var didLogOllamaHint = false
+
+    /// Embedding for stored memory text — nomic's "search_document: " task prefix.
+    static func documentEmbedding(for text: String) -> [Float]? {
+        embed(prefix: "search_document: ", text)
+    }
+
+    /// Embedding for a search query — nomic's "search_query: " task prefix. Query and document
+    /// vectors come from the SAME model, so their cosine is comparable.
+    static func queryEmbedding(for text: String) -> [Float]? {
+        embed(prefix: "search_query: ", text)
+    }
+
+    /// Bounded, SYNCHRONOUS embedding via the local Ollama server. Returns nil on ANY failure
+    /// (server down / model not pulled / non-200 / parse error) so callers fall back to lexical
+    /// search — we never mix vectors from two models. Kept synchronous (rather than async) to avoid
+    /// rippling `async` through every save/search call site; localhost latency is low and the call
+    /// is hard-bounded (~2s) and always made OUTSIDE any DB transaction.
+    private static func embed(prefix: String, _ text: String) -> [Float]? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let url = URL(string: ollamaBaseURL + "/api/embeddings") else { return nil }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 2.0
+        guard let body = try? JSONSerialization.data(withJSONObject: [
+            "model": embeddingModel, "prompt": prefix + trimmed,
+        ]) else { return nil }
+        request.httpBody = body
+
+        var vector: [Float]?
+        let semaphore = DispatchSemaphore(value: 0)
+        let task = URLSession.shared.dataTask(with: request) { data, response, _ in
+            defer { semaphore.signal() }
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200, let data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let raw = json["embedding"] as? [NSNumber], !raw.isEmpty else { return }
+            vector = raw.map { $0.floatValue }
+        }
+        task.resume()
+        if semaphore.wait(timeout: .now() + 2.5) == .timedOut { task.cancel() }
+
+        if vector == nil { logOllamaHintOnce() }
+        return vector
+    }
+
+    private static func logOllamaHintOnce() {
+        hintLock.lock(); defer { hintLock.unlock() }
+        guard !didLogOllamaHint else { return }
+        didLogOllamaHint = true
+        logger.notice("Semantic memory unavailable — run `ollama pull nomic-embed-text` to enable semantic memory.")
+    }
+
+    /// Serializes a vector to a little-endian Float BLOB for the `embedding` column.
+    static func embeddingData(_ vector: [Float]) -> Data {
+        vector.withUnsafeBufferPointer { Data(buffer: $0) }
+    }
+
+    /// Deserializes an `embedding` BLOB back to `[Float]` (alignment-safe copy).
+    static func embeddingVector(_ data: Data) -> [Float] {
+        let count = data.count / MemoryLayout<Float>.size
+        guard count > 0 else { return [] }
+        var out = [Float](repeating: 0, count: count)
+        _ = out.withUnsafeMutableBytes { data.copyBytes(to: $0) }
+        return out
+    }
+
+    /// Cosine similarity in [-1, 1]; 0 for empty OR length-mismatched vectors (a mismatch means a
+    /// stale vector from a different model — the caller treats that as "no embedding").
+    static func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
+        guard a.count == b.count, !a.isEmpty else { return 0 }
+        var dot: Float = 0, na: Float = 0, nb: Float = 0
+        for i in 0..<a.count {
+            dot += a[i] * b[i]
+            na += a[i] * a[i]
+            nb += b[i] * b[i]
+        }
+        let denom = na.squareRoot() * nb.squareRoot()
+        return denom > 0 ? dot / denom : 0
+    }
+
     func save(content: String, tags: [String] = []) throws {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let now = Date().timeIntervalSince1970
         let norm = trimmed.lowercased()
+
+        // Compute the embedding BEFORE opening the transaction — it's network I/O (Ollama) and must
+        // never hold the DB write lock.
+        let newEmbedding = Self.documentEmbedding(for: trimmed).map(Self.embeddingData)
 
         try db.write { db in
             // ponytail: dedup-on-write. Auto-extraction re-saves the same fact every time
@@ -753,10 +918,20 @@ final class MemoryStore {
             if let dup = existing.first, let id = dup.id {
                 // Keep the longer, more-informative phrasing as canonical; refresh recency.
                 let keep = trimmed.count > dup.content.count ? trimmed : dup.content
-                try db.execute(
-                    sql: "UPDATE memories SET content = ?, accessed_at = ? WHERE id = ?",
-                    arguments: [keep, now, id]
-                )
+                // If we keep the NEW text, store its freshly-computed embedding. If we keep the
+                // existing (longer) text, its stored embedding is still correct — leave it untouched
+                // (also avoids NULLing an embedding when Ollama is unavailable).
+                if keep == trimmed, let emb = newEmbedding {
+                    try db.execute(
+                        sql: "UPDATE memories SET content = ?, accessed_at = ?, embedding = ? WHERE id = ?",
+                        arguments: [keep, now, emb, id]
+                    )
+                } else {
+                    try db.execute(
+                        sql: "UPDATE memories SET content = ?, accessed_at = ? WHERE id = ?",
+                        arguments: [keep, now, id]
+                    )
+                }
                 return
             }
 
@@ -765,37 +940,118 @@ final class MemoryStore {
                 content: trimmed,
                 tags: tags.joined(separator: ", "),
                 created_at: now,
-                accessed_at: now
+                accessed_at: now,
+                embedding: newEmbedding
             ).insert(db)
         }
     }
 
     func search(query: String, limit: Int = 20) throws -> [MemoryRecord] {
+        // Query embedding via local Ollama (computed once, outside the read txn). nil (Ollama down /
+        // model not pulled) → lexical-only behavior, byte-for-byte unchanged.
+        let queryVector = Self.queryEmbedding(for: query)
+
         // Fetch in a read transaction
         let results = try db.read { db -> [MemoryRecord] in
             let ftsPattern = FTS5Pattern(matchingAllTokensIn: query)
 
+            // No embedding available → original behavior, byte-for-byte unchanged.
+            guard let qVec = queryVector else {
+                if let pattern = ftsPattern {
+                    // Rank by FTS relevance (bm25, lower = better match) first, recency as the
+                    // tiebreak. Previously ordered by accessed_at alone, which ignored how well a
+                    // memory actually matched the query and — because every retrieved row's
+                    // accessed_at is bumped to now below — flattened the signal over time.
+                    return try MemoryRecord
+                        .joining(required: MemoryRecord.hasOne(
+                            Table("memories_fts"),
+                            using: ForeignKey(["rowid"], to: ["rowid"])
+                        ))
+                        .filter(sql: "memories_fts MATCH ?", arguments: [pattern])
+                        .order(sql: "bm25(memories_fts), memories.accessed_at DESC")
+                        .limit(limit)
+                        .fetchAll(db)
+                } else {
+                    return try MemoryRecord
+                        .filter(Column("content").like("%\(query)%"))
+                        .order(Column("accessed_at").desc)
+                        .limit(limit)
+                        .fetchAll(db)
+                }
+            }
+
+            // Embedding available → blend lexical (normalized BM25) with semantic (cosine).
+            // The existing FTS5 fetch stays the keyword candidate source (now capturing bm25 so we
+            // can normalize it). When it returns NOTHING, fall back to a bounded semantic-only pass
+            // so recall works beyond keyword overlap — without changing results for keyword queries.
+            let poolLimit = max(limit * 5, 50)
+            var bm25ByID: [Int64: Double] = [:]
+            var candidates: [MemoryRecord] = []
+
             if let pattern = ftsPattern {
-                // Rank by FTS relevance (bm25, lower = better match) first, recency as the
-                // tiebreak. Previously ordered by accessed_at alone, which ignored how well a
-                // memory actually matched the query and — because every retrieved row's
-                // accessed_at is bumped to now below — flattened the signal over time.
-                return try MemoryRecord
-                    .joining(required: MemoryRecord.hasOne(
-                        Table("memories_fts"),
-                        using: ForeignKey(["rowid"], to: ["rowid"])
+                let rows = try Row.fetchAll(db, sql: """
+                    SELECT memories.*, bm25(memories_fts) AS _bm25
+                    FROM memories
+                    JOIN memories_fts ON memories.rowid = memories_fts.rowid
+                    WHERE memories_fts MATCH ?
+                    ORDER BY bm25(memories_fts), memories.accessed_at DESC
+                    LIMIT ?
+                    """, arguments: [pattern, poolLimit])
+                for row in rows {
+                    let id: Int64 = row["id"]
+                    candidates.append(MemoryRecord(
+                        id: id,
+                        content: row["content"],
+                        tags: row["tags"],
+                        created_at: row["created_at"],
+                        accessed_at: row["accessed_at"],
+                        embedding: row["embedding"]
                     ))
-                    .filter(sql: "memories_fts MATCH ?", arguments: [pattern])
-                    .order(sql: "bm25(memories_fts), memories.accessed_at DESC")
-                    .limit(limit)
-                    .fetchAll(db)
-            } else {
-                return try MemoryRecord
-                    .filter(Column("content").like("%\(query)%"))
+                    let bm: Double? = row["_bm25"]
+                    if let bm { bm25ByID[id] = bm }
+                }
+            }
+
+            // No keyword hits → semantic recall over recent embedded rows (bounded for on-device cost).
+            if candidates.isEmpty {
+                candidates = try MemoryRecord
+                    .filter(sql: "embedding IS NOT NULL")
                     .order(Column("accessed_at").desc)
-                    .limit(limit)
+                    .limit(200)
                     .fetchAll(db)
             }
+            guard !candidates.isEmpty else { return [] }
+
+            // Normalize bm25 across the keyword matches (lower bm25 = better match → maps to 1).
+            let bmMin = bm25ByID.values.min() ?? 0
+            let bmMax = bm25ByID.values.max() ?? 0
+            let bmRange = bmMax - bmMin
+            let wBM25: Float = 0.5
+            let wEmb: Float = 0.5
+
+            let ranked = candidates
+                .map { rec -> (rec: MemoryRecord, score: Float) in
+                    let normBM25: Float
+                    if let id = rec.id, let bm = bm25ByID[id] {
+                        normBM25 = bmRange > 0 ? Float((bmMax - bm) / bmRange) : 1
+                    } else {
+                        normBM25 = 0   // semantic-only candidate (no keyword match)
+                    }
+                    var cosNorm: Float = 0
+                    if let data = rec.embedding {
+                        let vec = Self.embeddingVector(data)
+                        // Length mismatch ⇒ stale vector from a different model ⇒ treat as no embedding.
+                        if vec.count == qVec.count {
+                            cosNorm = (Self.cosineSimilarity(qVec, vec) + 1) / 2
+                        }
+                    }
+                    return (rec, wBM25 * normBM25 + wEmb * cosNorm)
+                }
+                .sorted { $0.score > $1.score }
+                .prefix(limit)
+                .map(\.rec)
+
+            return Array(ranked)
         }
 
         // Update accessed_at in a separate write transaction (read connections reject writes)
