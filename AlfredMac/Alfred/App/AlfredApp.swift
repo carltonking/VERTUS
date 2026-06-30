@@ -662,7 +662,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startVoiceLearningFromMessagesIfNeeded() {
         guard appState.voiceLearningFromMessagesEnabled, let wss = writingStyleStore else { return }
         Task.detached(priority: .utility) { [weak wss] in
-            wss?.importSentMessages()
+            wss?.importSentMessages()      // iMessage (local, synchronous)
+            await wss?.importSentEmails()  // Gmail (network, gated on Google being connected)
         }
     }
 

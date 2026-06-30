@@ -113,4 +113,95 @@ enum GmailCapability {
         }
         return data
     }
+
+    // MARK: - Sent-mail read (voice learning)
+
+    struct SentEmail { let internalDate: Int64; let body: String }
+
+    /// Lists recent SENT messages (newest first), fetches and cleans each body. `afterInternalDate`
+    /// (epoch ms) narrows the server-side query for incremental runs; the precise watermark filter
+    /// is applied by the caller via `emailsNewerThan`. Reuses `get()` for authorized requests.
+    /// gmail.readonly already permits SENT — no re-auth.
+    static func recentSentEmails(afterInternalDate: Int64, limit: Int) async -> [SentEmail] {
+        guard let token = await GoogleAuth.accessToken() else { return [] }
+
+        var listComps = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages")!
+        var q = "in:sent"
+        if afterInternalDate > 0 { q += " after:\(afterInternalDate / 1000)" }   // Gmail `after:` is epoch SECONDS
+        listComps.queryItems = [
+            URLQueryItem(name: "maxResults", value: String(limit)),
+            URLQueryItem(name: "q", value: q),
+        ]
+        guard let listData = try? await get(listComps.url!, token: token) else { return [] }
+        struct ListResp: Decodable { struct Ref: Decodable { let id: String }; let messages: [Ref]? }
+        guard let ids = (try? JSONDecoder().decode(ListResp.self, from: listData))?.messages, !ids.isEmpty else {
+            return []
+        }
+
+        return await withTaskGroup(of: (Int, SentEmail?).self) { group -> [SentEmail] in
+            for (i, ref) in ids.enumerated() {
+                group.addTask { (i, await fetchSentBody(id: ref.id, token: token)) }
+            }
+            var collected = [SentEmail?](repeating: nil, count: ids.count)
+            for await (i, email) in group { collected[i] = email }
+            return collected.compactMap { $0 }
+        }
+    }
+
+    private static func fetchSentBody(id: String, token: String) async -> SentEmail? {
+        var comps = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages/\(id)")!
+        comps.queryItems = [URLQueryItem(name: "format", value: "full")]
+        guard let data = try? await get(comps.url!, token: token),
+              let msg = try? JSONDecoder().decode(FullMessage.self, from: data),
+              let internalMs = Int64(msg.internalDate ?? ""),
+              let raw = extractPlainText(from: msg.payload), !raw.isEmpty else { return nil }
+
+        let cleaned = EmailBodyCleaner.ownTextOnly(raw)
+        guard !cleaned.isEmpty else { return nil }
+        return SentEmail(internalDate: internalMs, body: cleaned)
+    }
+
+    private struct FullMessage: Decodable {
+        let internalDate: String?
+        let payload: Part?
+    }
+    private struct Part: Decodable {
+        let mimeType: String?
+        let body: Body?
+        let parts: [Part]?
+        struct Body: Decodable { let data: String? }
+    }
+
+    /// Pulls the first `text/plain` body out of the (possibly multipart) payload and base64url-decodes
+    /// it. HTML-only messages are skipped (returns nil).
+    private static func extractPlainText(from part: Part?) -> String? {
+        guard let part else { return nil }
+        if part.mimeType == "text/plain", let data = part.body?.data, let decoded = base64urlDecode(data) {
+            return decoded
+        }
+        for sub in part.parts ?? [] {
+            if let found = extractPlainText(from: sub) { return found }
+        }
+        return nil
+    }
+
+    static func base64urlDecode(_ s: String) -> String? {
+        var b64 = s.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        let pad = b64.count % 4
+        if pad > 0 { b64 += String(repeating: "=", count: 4 - pad) }
+        guard let data = Data(base64Encoded: b64) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    // MARK: - Watermark (pure, testable)
+
+    /// Keep only emails strictly newer than the watermark (epoch ms) — the idempotency guarantee.
+    static func emailsNewerThan(_ emails: [SentEmail], _ watermark: Int64) -> [SentEmail] {
+        emails.filter { $0.internalDate > watermark }
+    }
+
+    /// New watermark = the latest imported internalDate (never moves backwards).
+    static func newWatermark(_ emails: [SentEmail], current: Int64) -> Int64 {
+        max(current, emails.map(\.internalDate).max() ?? current)
+    }
 }

@@ -50,6 +50,38 @@ final class WritingStyleStore {
         }
     }
 
+    /// Bulk-record samples, rebuilding the aggregate profile ONCE (instead of once per sample). Used
+    /// by the sent-iMessage / Gmail backfills so a few-hundred-row import is O(n), not O(n²).
+    func recordWritingSamples(_ samples: [(text: String, source: WritingSource)]) {
+        let now = Date().timeIntervalSince1970
+        let prepared: [WritingSampleRecord] = samples.compactMap { item in
+            let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.count >= 20 else { return nil }
+            let capped = String(trimmed.prefix(2000))
+            let r = analyzer.analyze(capped)
+            return WritingSampleRecord(
+                id: nil, source: item.source.rawValue, text: capped,
+                wordCount: r.wordCount, sentenceCount: r.sentenceCount,
+                avgSentenceLength: r.avgSentenceLength, hasGreeting: r.greeting != nil,
+                hasClosing: r.closing != nil, formalityScore: r.formalityScore,
+                emojiCount: r.emojiCount, timestamp: now
+            )
+        }
+        guard !prepared.isEmpty else { return }
+
+        writeQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.db.write { db in
+                    for rec in prepared { try rec.insert(db) }
+                }
+                try self.rebuildProfile()   // ONCE for the whole batch
+            } catch {
+                Logger(subsystem: "com.alfred.writing-style", category: "store").error("Failed to record samples: \(error.localizedDescription)")
+            }
+        }
+    }
+
     // MARK: - Profile
 
     private func rebuildProfile() throws {
@@ -296,12 +328,47 @@ final class WritingStyleStore {
             return
         }
 
-        for msg in sent {
-            recordWritingSample(text: msg.text, source: .imessage)   // 20-char guard skips trivial ones
-        }
+        recordWritingSamples(sent.map { ($0.text, .imessage) })   // batch: rebuild the profile once
         let newWatermark = sent.map(\.rowid).max() ?? watermark
         defaults.set(Int(newWatermark), forKey: Self.sentWatermarkKey)
         if isBackfill { defaults.set(true, forKey: Self.sentBackfillFlag) }
+    }
+
+    // MARK: - Voice learning from sent Gmail
+
+    private static let gmailWatermarkKey = "voiceLearning.gmailLastInternalDate"
+    private static let gmailBackfillFlag = "voiceLearning.gmailBackfillDone"
+    private static var didLogGmailHint = false
+
+    /// Imports the user's REAL sent Gmail as `.email` writing samples. One-time backfill of up to 200
+    /// recent sent emails (gated flag) then incremental imports past the latest-imported internalDate
+    /// watermark. Quoted text + signatures are stripped before recording. Gated on Google being
+    /// connected (no-op + one-time hint otherwise). The caller runs this off the main thread.
+    func importSentEmails() async {
+        guard GoogleAuth.isConnected else {
+            Self.logGmailHintOnce()
+            return
+        }
+        let defaults = UserDefaults.standard
+        let isBackfill = !defaults.bool(forKey: Self.gmailBackfillFlag)
+        let watermark = Int64(defaults.integer(forKey: Self.gmailWatermarkKey))
+        let limit = isBackfill ? 200 : 50
+
+        let fetched = await GmailCapability.recentSentEmails(afterInternalDate: watermark, limit: limit)
+        let fresh = GmailCapability.emailsNewerThan(fetched, watermark)
+        guard !fresh.isEmpty else { return }
+
+        recordWritingSamples(fresh.map { ($0.body, .email) })
+        defaults.set(Int(GmailCapability.newWatermark(fresh, current: watermark)), forKey: Self.gmailWatermarkKey)
+        if isBackfill { defaults.set(true, forKey: Self.gmailBackfillFlag) }
+    }
+
+    private static func logGmailHintOnce() {
+        messagesHintLock.lock(); defer { messagesHintLock.unlock() }
+        guard !didLogGmailHint else { return }
+        didLogGmailHint = true
+        Logger(subsystem: "com.alfred.writing-style", category: "store").notice(
+            "Voice learning from Gmail needs Google connected — say \"connect gmail\" to enable it.")
     }
 
     private static func logMessagesHintOnce() {
