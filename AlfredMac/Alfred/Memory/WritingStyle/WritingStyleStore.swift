@@ -196,4 +196,71 @@ final class WritingStyleStore {
 
         return lines.joined(separator: "\n")
     }
+
+    // MARK: - Voice exemplars (few-shot real samples for the drafting path)
+
+    /// Up to `limit` representative REAL writing samples — substantive (≥ `minWords`),
+    /// de-duplicated, each whitespace-normalized and capped to `maxChars`. Soft-prefers
+    /// `preferredSource`, falling back to any substantive sample (samples are mostly `.chat`).
+    /// LLMs imitate concrete examples far better than the statistics in `generateStyleContext()`,
+    /// which this leaves untouched — it's purely additive and used only by the drafting path.
+    func voiceExemplars(preferredSource: WritingSource? = nil,
+                        limit: Int = 3,
+                        minWords: Int = 8,
+                        maxChars: Int = 220) -> [String] {
+        guard limit > 0 else { return [] }
+
+        // Pull a recent pool; filtering/dedup/ranking happens in Swift (the table is small).
+        let pool: [WritingSampleRecord] = (try? db.read { db in
+            try WritingSampleRecord.order(Column("timestamp").desc).limit(80).fetchAll(db)
+        }) ?? []
+        guard !pool.isEmpty else { return [] }
+
+        // Substantive only — count words from the actual text (don't trust the stored stat) so
+        // "ok" / "yes" / "do it" never appear as exemplars.
+        let substantive = pool.filter { Self.wordCount($0.text) >= minWords }
+        guard !substantive.isEmpty else { return [] }
+
+        // Soft-prefer the requested source: same-source first, then everything else (recency kept).
+        let ordered: [WritingSampleRecord]
+        if let src = preferredSource?.rawValue {
+            ordered = substantive.filter { $0.source == src } + substantive.filter { $0.source != src }
+        } else {
+            ordered = substantive
+        }
+
+        var out: [String] = []
+        var seen = Set<String>()
+        for rec in ordered {
+            if out.count >= limit { break }
+            let cleaned = Self.cleanSample(rec.text, maxChars: maxChars)
+            guard !cleaned.isEmpty else { continue }
+            let key = Self.dedupKey(cleaned)
+            if seen.insert(key).inserted { out.append(cleaned) }
+        }
+        return out
+    }
+
+    private static func wordCount(_ text: String) -> Int {
+        text.split { $0.isWhitespace }.filter { !$0.isEmpty }.count
+    }
+
+    /// Collapses internal whitespace and caps length at a word boundary (adds "…" when truncated).
+    /// The ellipsis is accounted for so the result never exceeds `maxChars`.
+    private static func cleanSample(_ text: String, maxChars: Int) -> String {
+        let collapsed = text.split { $0.isWhitespace }.joined(separator: " ")
+        guard collapsed.count > maxChars else { return collapsed }
+        let cut = collapsed.prefix(max(0, maxChars - 1))   // leave room for the "…"
+        if let space = cut.lastIndex(of: " ") {
+            return cut[..<space].trimmingCharacters(in: .whitespaces) + "…"
+        }
+        return cut.trimmingCharacters(in: .whitespaces) + "…"
+    }
+
+    /// Near-duplicate key: lowercased, whitespace-collapsed, first 80 chars — collapses re-saved
+    /// samples that differ only by trailing punctuation/length.
+    private static func dedupKey(_ text: String) -> String {
+        let normalized = text.lowercased().split { $0.isWhitespace }.joined(separator: " ")
+        return String(normalized.prefix(80))
+    }
 }
