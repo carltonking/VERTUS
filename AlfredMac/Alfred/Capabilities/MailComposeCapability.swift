@@ -16,6 +16,14 @@ struct MailComposeCapability {
         let body: String?          // verbatim text the user dictated ("saying ...") — sent as-is
         let instruction: String?   // freeform ask ("telling her I'll be late") — drafted by the LLM
         let send: Bool
+
+        init(recipient: String, subject: String?, body: String?, instruction: String? = nil, send: Bool) {
+            self.recipient = recipient
+            self.subject = subject
+            self.body = body
+            self.instruction = instruction
+            self.send = send
+        }
     }
 
     // MARK: - Detection

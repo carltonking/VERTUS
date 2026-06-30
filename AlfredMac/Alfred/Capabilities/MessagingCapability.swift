@@ -13,6 +13,12 @@ struct MessagingCapability {
         let name: String
         let message: String?       // verbatim text the user dictated — sent as-is
         let instruction: String?   // freeform ask ("telling her I'm running late") — drafted by the LLM
+
+        init(name: String, message: String?, instruction: String? = nil) {
+            self.name = name
+            self.message = message
+            self.instruction = instruction
+        }
     }
 
     struct Recipient {

@@ -6,7 +6,10 @@ final class MailComposeTests: XCTestCase {
 
     func testDraftToAddressWithSubject() {
         let intent = MailComposeCapability.detect(in: "draft an email to john@x.com about the meeting")
-        XCTAssertEqual(intent, .init(recipient: "john@x.com", subject: "the meeting", body: nil, send: false))
+        // "about <topic>" with no verbatim body now also becomes a drafting instruction so the body
+        // is written in the user's voice (Phase-1 drafting brain), not left blank.
+        XCTAssertEqual(intent, .init(recipient: "john@x.com", subject: "the meeting", body: nil,
+                                     instruction: "the meeting", send: false))
     }
 
     func testEmailNameWithSubjectAndBody() {
@@ -27,7 +30,7 @@ final class MailComposeTests: XCTestCase {
     }
 
     func testParseRecipientOnly() {
-        let (recipient, subject, body) = MailComposeCapability.parse("sarah@work.com")
+        let (recipient, subject, body, _) = MailComposeCapability.parse("sarah@work.com")
         XCTAssertEqual(recipient, "sarah@work.com")
         XCTAssertNil(subject)
         XCTAssertNil(body)
