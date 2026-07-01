@@ -23,6 +23,10 @@ struct AlfredPanelView: View {
     /// The routine whose output dropdown is expanded, plus its cached run history.
     @State private var expandedID: Int64?
     @State private var routineRuns: [Int64: [RunRecord]] = [:]
+    /// Telegram bot token entry (write-only: we never read the secret back into the field, so the
+    /// Keychain isn't touched during rendering). Saved via KeychainHelper so Alfred owns the item.
+    @State private var telegramTokenInput = ""
+    @State private var telegramTokenJustSaved = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -118,11 +122,149 @@ struct AlfredPanelView: View {
                 }
                 .toggleStyle(.switch)
 
+                Divider()
+
+                botsSection
+
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
         }
+    }
+
+    // MARK: - Assistant & bots settings
+
+    /// Exposes the opt-in "flagship" features (previously reachable only by editing UserDefaults):
+    /// the iMessage + Telegram bots, the proactive inbound watcher, and voice learning. Toggling a
+    /// flag flips the matching AppState @Published property, whose Combine sink in AlfredApp
+    /// starts/stops the corresponding service live.
+    private var botsSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("ASSISTANT & BOTS")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .kerning(0.5)
+
+            imessageBotGroup
+
+            Divider()
+
+            telegramBotGroup
+
+            Divider()
+
+            Toggle(isOn: $appState.inboundWatcherEnabled) {
+                settingLabel("Proactive inbound watcher",
+                             "Watches incoming messages and offers to draft a reply when one looks like it needs one. Needs Full Disk Access.")
+            }
+            .toggleStyle(.switch)
+
+            Divider()
+
+            voiceLearningGroup
+        }
+    }
+
+    private var imessageBotGroup: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle(isOn: $appState.imessageBotEnabled) {
+                settingLabel("iMessage bot",
+                             "Text Alfred from your phone in your own iMessage thread. Needs Full Disk Access + Automation for Messages.")
+            }
+            .toggleStyle(.switch)
+
+            if appState.imessageBotEnabled {
+                VStack(alignment: .leading, spacing: 8) {
+                    labeledField("Trigger word", "alfred", text: $appState.imessageBotTrigger)
+                    labeledField("Your iMessage handle", "+1… or you@icloud.com", text: $appState.imessageBotOwnerHandle)
+                }
+            }
+        }
+    }
+
+    private var telegramBotGroup: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle(isOn: $appState.telegramBotEnabled) {
+                settingLabel("Telegram bot",
+                             "Text Alfred over Telegram — faster than iMessage, replies only to your chat.")
+            }
+            .toggleStyle(.switch)
+
+            if appState.telegramBotEnabled {
+                VStack(alignment: .leading, spacing: 8) {
+                    labeledField("Your chat ID", "numeric id from @userinfobot", text: $appState.telegramOwnerChatID)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Bot token").font(.system(size: 11, weight: .semibold))
+                        SecureField("paste token from @BotFather", text: $telegramTokenInput)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 12, design: .monospaced))
+                            .onChange(of: telegramTokenInput) { _, _ in telegramTokenJustSaved = false }
+                        HStack(spacing: 8) {
+                            Button("Save token") { saveTelegramToken() }
+                                .controlSize(.small)
+                                .disabled(telegramTokenInput.trimmingCharacters(in: .whitespaces).isEmpty)
+                            if telegramTokenJustSaved {
+                                Label("Saved to Keychain", systemImage: "checkmark.circle.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.green)
+                                    .labelStyle(.titleAndIcon)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var voiceLearningGroup: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle(isOn: $appState.voiceLearningFromMessagesEnabled) {
+                settingLabel("Voice learning",
+                             "Learn your writing voice from your sent messages and emails, so drafts sound like you.")
+            }
+            .toggleStyle(.switch)
+
+            if appState.voiceLearningFromMessagesEnabled {
+                Label(AppState.voiceLearningDisclosure, systemImage: "info.circle.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .labelStyle(.titleAndIcon)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// Standard two-line label used inside the settings toggles (title + secondary description).
+    private func settingLabel(_ title: String, _ subtitle: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.system(size: 13, weight: .semibold))
+            Text(subtitle)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// A captioned rounded-border text field bound to an AppState string flag.
+    private func labeledField(_ label: String, _ placeholder: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label).font(.system(size: 11, weight: .semibold))
+            TextField(placeholder, text: text)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12))
+        }
+    }
+
+    private func saveTelegramToken() {
+        let token = telegramTokenInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return }
+        // Alfred writes the item itself → it owns the Keychain ACL, so the bot's later reads never
+        // trigger an access prompt (the failure mode that silently kept the bot from polling).
+        _ = KeychainHelper.save(service: "com.alfred.app", account: "telegram", value: token)
+        telegramTokenInput = ""
+        telegramTokenJustSaved = true
     }
 
     // MARK: - Routines tab
