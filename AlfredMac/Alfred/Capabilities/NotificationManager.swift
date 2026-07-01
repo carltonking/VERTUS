@@ -125,7 +125,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         }
         guard !info.isEmpty else { return }
         await MainActor.run {
-            (NSApp.delegate as? AppDelegate)?.respondToInboundNotification(info)
+            // NOT NSApp.delegate — SwiftUI's @NSApplicationDelegateAdaptor keeps its own object there;
+            // the real AppDelegate is reachable only via its static handle.
+            AppDelegate.shared?.respondToInboundNotification(info)
         }
     }
 }

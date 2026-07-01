@@ -83,6 +83,12 @@ struct AlfredApp: App {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Direct handle to the running delegate. With `@NSApplicationDelegateAdaptor`, SwiftUI installs
+    /// its own object as `NSApp.delegate` and forwards lifecycle calls here — so `NSApp.delegate as?
+    /// AppDelegate` is nil. Anything outside the SwiftUI graph (e.g. the notification-tap handler)
+    /// must reach the delegate through this instead.
+    static weak var shared: AppDelegate?
+
     let appState = AppState()
     let barState = BarState()
 
@@ -114,6 +120,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let fileOperation = FileOperationCapability()
     private let messaging = MessagingCapability()
     private var pendingTextRecipient: MessagingCapability.Recipient?
+    /// An in-progress reply started from an inbound "want me to respond?" notification tap. While set,
+    /// each bar submission is a turn in the reply conversation (draft → refine → confirm-to-send).
+    private struct InboundReplyContext {
+        let channel: String       // "text" or "email"
+        let sender: String
+        let handle: String
+        let subject: String?
+        let preview: String
+        var lastDraft: String?    // set once Alfred has drafted; an affirmative next turn sends it
+    }
+    private var pendingInboundReply: InboundReplyContext?
     private let mailCompose = MailComposeCapability()
     private let screenMonitoring = ScreenMonitoringManager()
     private var inboundWatcher: InboundWatcher?
@@ -182,6 +199,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Launch
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppDelegate.shared = self
         NSApp.setActivationPolicy(.accessory)
 
         ensureAppDirectories()
@@ -1497,6 +1515,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showBar() {
+        NSApp.activate(ignoringOtherApps: true)
+        barWindow?.orderFrontRegardless()
         barState.presenceState = .expanded
         barWindow?.expand(toHeight: expandedBarHeight(
             text: barState.responseText,
@@ -1537,6 +1557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         shownByHover = false
         hideOnLeaveTimer?.invalidate()
         barState.isProcessing = false
+        pendingInboundReply = nil   // leaving the bar exits any inbound-reply session
         barState.presenceState = .hidden
         barWindow?.hideImmediately()
     }
@@ -1544,6 +1565,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func dismissBar() {
         shownByHover = false
         hideOnLeaveTimer?.invalidate()
+        pendingInboundReply = nil   // leaving the bar exits any inbound-reply session
         barState.presenceState = .collapsed
         barWindow?.collapse()
     }
@@ -1662,9 +1684,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                ownerName: appState.ownerName)
     }
 
-    /// Drives the "Respond" tap on an inbound notification: brings up the bar and drafts a reply to
-    /// that message in the user's voice (email → reviewable draft; text → confirm alert), reusing the
-    /// drafting brain with the original message as thread context. Never auto-sends.
+    /// Drives a tap on an inbound "want me to respond?" notification. Instead of silently drafting a
+    /// one-shot reply, it opens the Alfred bar and starts an INTERACTIVE reply session: it seeds the
+    /// bar with the incoming message and arms `pendingInboundReply`, so the user's next bar input is
+    /// captured as a drafting instruction. Alfred drafts in the user's voice; the user can refine
+    /// ("make it warmer") or ask about it, and only an explicit "yes" sends. Never auto-sends.
     @MainActor
     func respondToInboundNotification(_ userInfo: [String: String]) {
         guard let channel = userInfo["channel"] else { return }
@@ -1673,67 +1697,115 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let preview = userInfo["preview"] ?? ""
         let subject = userInfo["subject"]
 
-        NSApp.activate(ignoringOtherApps: true)
-        showBar()
+        pendingTextRecipient = nil   // don't collide with the other two-turn flow
+        pendingInboundReply = InboundReplyContext(channel: channel, sender: sender, handle: handle,
+                                                  subject: subject, preview: preview, lastDraft: nil)
+
+        let verb = channel == "email" ? "emailed" : "texted"
+        barState.isProcessing = false
+        barState.responseText = "📩 \(sender) \(verb) you:\n“\(String(preview.prefix(500)))”\n\n"
+            + "What do you want to say back? I'll write it in your voice. (Press Esc to just chat instead.)"
+        showBar()   // showBar activates the app and orders the bar front
+    }
+
+    /// One turn of an active inbound-reply session (armed by `respondToInboundNotification`). Exit
+    /// words ("cancel", "nvm", …) drop the reply; once a draft exists a send word ("send", "yes")
+    /// sends it; anything else is a drafting instruction or a refinement applied to the current draft.
+    /// Leaving the bar (Esc) also clears the session — see hideBar/dismissBar.
+    @MainActor
+    private func handleInboundReplyTurn(_ text: String) {
+        guard var ctx = pendingInboundReply else { return }
+        let input = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !input.isEmpty else { return }
+        let lower = input.lowercased()
+
+        // Word-based escape hatch → drop the reply and go back to normal chatting.
+        let exitWords: Set<String> = ["cancel", "stop", "nvm", "nevermind", "never mind",
+                                      "forget it", "exit", "quit", "leave it", "not now"]
+        if exitWords.contains(lower) {
+            pendingInboundReply = nil
+            barState.responseText = "Okay, dropped that. What can I help with?"
+            barState.isProcessing = false
+            barState.presenceState = .expanded
+            return
+        }
+
+        // A pending draft + an explicit send word → send it. (Refinements are anything else.)
+        if let draft = ctx.lastDraft, Self.isSendWord(lower) {
+            pendingInboundReply = nil
+            barState.responseText = "Sending…"
+            barState.isProcessing = true
+            barState.presenceState = .thinking
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.barState.isProcessing = false; self.barState.presenceState = .expanded }
+                self.barState.responseText = await self.sendInboundReply(ctx, body: draft)
+                self.auditBarAction(prompt: "reply to \(ctx.channel) from \(ctx.sender)",
+                                    result: self.barState.responseText, commandClass: "high-risk write")
+            }
+            return
+        }
+
+        // First turn drafts from the gist; later turns revise the current draft with the change.
+        let priorDraft = ctx.lastDraft
+        barState.responseText = priorDraft == nil ? "Drafting…" : "Reworking…"
         barState.isProcessing = true
         barState.presenceState = .thinking
-
         Task { @MainActor [weak self] in
             guard let self else { return }
-            defer {
-                self.barState.isProcessing = false
-                self.barState.presenceState = .expanded
-            }
+            defer { self.barState.isProcessing = false; self.barState.presenceState = .expanded }
             guard let drafter = self.draftingService() else {
                 self.barState.responseText = "Drafting isn't available right now."
+                self.pendingInboundReply = nil
                 return
             }
-            if channel == "email" {
-                // Only reply when we actually have an address — never name-match a bare header to a
-                // possibly-wrong contact.
-                guard handle.contains("@") else {
-                    self.barState.responseText = "Couldn't find an email address to reply to \(sender)."
-                    return
-                }
-                guard let r = await self.mailCompose.resolveEmail(for: handle) else {
-                    self.barState.responseText = "Couldn't find an email address to reply to \(sender)."
-                    return
-                }
-                self.barState.responseText = "Drafting a reply to \(r.display)…"
-                if let body = await drafter.draftBody(channel: .email, recipientName: sender,
-                                                      recipientDisplay: r.display,
-                                                      instruction: "Write a reply to their message.",
-                                                      threadContext: preview) {
-                    let replySubject = (subject?.isEmpty == false) ? "Re: \(subject!)" : nil
-                    self.barState.responseText = self.mailCompose.compose(
-                        to: r.email, display: r.display, subject: replySubject, body: body, send: false)
-                    self.barState.responseText += "\n\n— Drafted in your voice —\n\(body)"
-                    self.auditBarAction(prompt: "reply to email from \(r.display)",
-                                        result: self.barState.responseText, commandClass: "high-risk write")
-                } else {
-                    self.barState.responseText = "I couldn't draft a reply to \(r.display) right now."
-                }
+            let instruction = priorDraft.map { "Revise this draft so it: \(input). Current draft: \"\($0)\"" } ?? input
+            let body = await drafter.draftBody(
+                channel: ctx.channel == "email" ? .email : .text,
+                recipientName: ctx.sender, recipientDisplay: ctx.sender,
+                instruction: instruction, threadContext: ctx.preview)
+            if let body {
+                ctx.lastDraft = body
+                self.pendingInboundReply = ctx
+                self.barState.responseText = "Draft to \(ctx.sender):\n\n\(body)\n\n"
+                    + "— reply “send” to send it, tell me a change, or press Esc to cancel."
             } else {
-                guard let recipient = await self.messaging.resolveRecipient(for: handle.isEmpty ? sender : handle) else {
-                    self.barState.responseText = "Couldn't find a way to reply to \(sender)."
-                    return
-                }
-                self.barState.responseText = "Drafting a reply to \(recipient.display)…"
-                if let body = await drafter.draftBody(channel: .text, recipientName: sender,
-                                                      recipientDisplay: recipient.display,
-                                                      instruction: "Reply to their message.",
-                                                      threadContext: preview) {
-                    self.barState.responseText = self.messaging.confirmAndSend(message: body, to: recipient)
-                    self.auditBarAction(prompt: "reply to text from \(recipient.display)",
-                                        result: self.barState.responseText, commandClass: "high-risk write")
-                } else {
-                    self.barState.responseText = "I couldn't draft a reply to \(recipient.display) right now."
-                }
+                self.barState.responseText = "I couldn't draft that. Tell me the gist again, or press Esc to cancel."
             }
         }
     }
 
+    /// Words that confirm sending the current draft (kept distinct from drafting instructions so a
+    /// refinement like "yeah make it shorter" isn't mistaken for a send).
+    private static func isSendWord(_ lower: String) -> Bool {
+        let words: Set<String> = ["send", "send it", "send that", "send it now", "yes", "yes send",
+                                  "yep", "yeah", "yup", "ok send", "okay send", "go", "do it", "perfect"]
+        return words.contains(lower)
+    }
+
+    /// Sends an approved inbound reply over the originating channel (already confirmed in the bar).
+    @MainActor
+    private func sendInboundReply(_ ctx: InboundReplyContext, body: String) async -> String {
+        if ctx.channel == "email" {
+            guard ctx.handle.contains("@"), let r = await mailCompose.resolveEmail(for: ctx.handle) else {
+                return "Couldn't find an email address to reply to \(ctx.sender)."
+            }
+            let replySubject = (ctx.subject?.isEmpty == false) ? "Re: \(ctx.subject!)" : nil
+            return mailCompose.compose(to: r.email, display: r.display, subject: replySubject,
+                                       body: body, send: true, confirmed: true)
+        } else {
+            guard let recipient = await messaging.resolveRecipient(for: ctx.handle.isEmpty ? ctx.sender : ctx.handle) else {
+                return "Couldn't find a way to reply to \(ctx.sender)."
+            }
+            return messaging.send(message: body, toHandle: recipient.handle)
+                ? "Sent to \(recipient.display)." : "Couldn't send to \(recipient.display)."
+        }
+    }
+
     func handleQuery(_ text: String) {
+        // Active inbound-reply session (from a notification tap) — each turn drafts/refines/sends.
+        if pendingInboundReply != nil { handleInboundReplyTurn(text); return }
+
         barState.responseText = ""
         barState.isProcessing = true
         barState.presenceState = .thinking
