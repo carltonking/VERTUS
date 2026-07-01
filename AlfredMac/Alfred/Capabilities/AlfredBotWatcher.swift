@@ -164,15 +164,21 @@ final class AlfredBotWatcher: ObservableObject {
         }
 
         // Safe read/query → run headless. iMessage can't stream, so collect and send once.
-        let reply = (try? await core.process(
-            query: cmd,
-            ownerName: appState.ownerName,
-            screenContextEnabled: false,
-            shellExecutionEnabled: appState.shellExecutionEnabled,
-            memoryExtractionEnabled: true,
-            headless: true,
-            onToken: { _ in }
-        )) ?? "Sorry, I hit an error handling that."
+        let reply: String
+        do {
+            reply = try await core.process(
+                query: cmd,
+                ownerName: appState.ownerName,
+                screenContextEnabled: false,
+                shellExecutionEnabled: appState.shellExecutionEnabled,
+                memoryExtractionEnabled: true,
+                headless: true,
+                onToken: { _ in }
+            )
+        } catch {
+            NSLog("[AlfredBot] process failed: \(error)")
+            reply = "Sorry, I hit an error handling that."
+        }
         send(reply.isEmpty ? "Done." : reply, to: ownerHandle)
     }
 
