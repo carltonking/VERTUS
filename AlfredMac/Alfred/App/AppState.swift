@@ -121,6 +121,16 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(imessageBotOwnerHandle, forKey: "imessageBotOwnerHandle") }
     }
 
+    /// Opt-in: text Alfred over Telegram (dedicated bot, official Bot API). Off by default. Token
+    /// lives in the Keychain (service com.alfred.app, account "telegram"); this is just the toggle.
+    @Published var telegramBotEnabled: Bool {
+        didSet { UserDefaults.standard.set(telegramBotEnabled, forKey: "telegramBotEnabled") }
+    }
+    /// The owner's Telegram chat id — the bot acts only on messages from this chat.
+    @Published var telegramOwnerChatID: String {
+        didSet { UserDefaults.standard.set(telegramOwnerChatID, forKey: "telegramOwnerChatID") }
+    }
+
     /// Hermes: opt-in passive screen-TEXT capture (Accessibility) persisted to the local FTS5
     /// log. Off by default; nothing leaves the Mac.
     @Published var screenTextCaptureEnabled: Bool {
@@ -213,6 +223,8 @@ final class AppState: ObservableObject {
         imessageBotEnabled = UserDefaults.standard.bool(forKey: "imessageBotEnabled")
         imessageBotTrigger = UserDefaults.standard.string(forKey: "imessageBotTrigger") ?? "alfred"
         imessageBotOwnerHandle = UserDefaults.standard.string(forKey: "imessageBotOwnerHandle") ?? ""
+        telegramBotEnabled = UserDefaults.standard.bool(forKey: "telegramBotEnabled")
+        telegramOwnerChatID = UserDefaults.standard.string(forKey: "telegramOwnerChatID") ?? ""
         // Default ON: Alfred is meant to learn from your activity. Capture still requires the
         // user to grant Screen Recording permission, and can be turned off in the Profile tab.
         screenTextCaptureEnabled = UserDefaults.standard.object(forKey: "screenTextCaptureEnabled") as? Bool ?? true

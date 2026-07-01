@@ -839,14 +839,21 @@ final class MemoryStore {
     /// search — we never mix vectors from two models. Kept synchronous (rather than async) to avoid
     /// rippling `async` through every save/search call site; localhost latency is low and the call
     /// is hard-bounded (~2s) and always made OUTSIDE any DB transaction.
+    /// Circuit breaker: after a failed/timed-out embed, skip embedding for this window so we don't
+    /// pay the localhost wait on every query when Ollama isn't reachable. Chat runs on a cloud model,
+    /// so a per-query embedding stall is pure waste; search transparently falls back to FTS/BM25.
+    private static var embedCircuitOpenUntil: Date?
+
     private static func embed(prefix: String, _ text: String) -> [Float]? {
+        if let until = embedCircuitOpenUntil, until > Date() { return nil }   // recently failed → skip fast
+
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let url = URL(string: ollamaBaseURL + "/api/embeddings") else { return nil }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 2.0
+        request.timeoutInterval = 1.5           // was 2.0 — bound the worst-case stall
         guard let body = try? JSONSerialization.data(withJSONObject: [
             "model": embeddingModel, "prompt": prefix + trimmed,
         ]) else { return nil }
@@ -862,9 +869,14 @@ final class MemoryStore {
             vector = raw.map { $0.floatValue }
         }
         task.resume()
-        if semaphore.wait(timeout: .now() + 2.5) == .timedOut { task.cancel() }
+        if semaphore.wait(timeout: .now() + 1.7) == .timedOut { task.cancel() }   // was 2.5
 
-        if vector == nil { logOllamaHintOnce() }
+        if vector == nil {
+            embedCircuitOpenUntil = Date().addingTimeInterval(30)   // back off ~30s before probing again
+            logOllamaHintOnce()
+        } else {
+            embedCircuitOpenUntil = nil
+        }
         return vector
     }
 

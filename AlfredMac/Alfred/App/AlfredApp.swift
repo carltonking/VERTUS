@@ -118,6 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let screenMonitoring = ScreenMonitoringManager()
     private var inboundWatcher: InboundWatcher?
     private var alfredBot: AlfredBotWatcher?
+    private var telegramBot: TelegramBotService?
     private let focusSession = FocusSessionManager()
     private var escapeMonitor: Any?
     private var notchHoverMonitor: Any?
@@ -670,6 +671,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 .store(in: &cancellables)
             if appState.imessageBotEnabled { bot.start() }
+
+            // Telegram bot (opt-in). Long-poll loop, also outside the SafetyAuditEngine-scanned set.
+            let telegram = TelegramBotService(core: core, appState: appState)
+            telegramBot = telegram
+            appState.$telegramBotEnabled
+                .receive(on: DispatchQueue.main)
+                .sink { [weak telegram] enabled in
+                    guard let telegram else { return }
+                    if enabled { telegram.start() } else { telegram.stop() }
+                }
+                .store(in: &cancellables)
+            if appState.telegramBotEnabled { telegram.start() }
         }
     }
 
