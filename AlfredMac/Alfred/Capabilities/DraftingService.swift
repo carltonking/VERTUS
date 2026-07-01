@@ -78,9 +78,22 @@ final class DraftingService {
             relationshipContext: who
         )
 
-        var user = "Write a \(channel.label) to \(recipientDisplay). The message should: \(instr)"
+        let me = ownerName.isEmpty ? "the user" : ownerName
+        let user: String
         if let thread = threadContext?.trimmingCharacters(in: .whitespacesAndNewlines), !thread.isEmpty {
-            user += "\n\nYou are replying to this message:\n\"\"\"\n\(String(thread.prefix(2000)))\n\"\"\""
+            // Reply: state the incoming message, then the user's answer on its own line, then ask for
+            // the reply. Verified to preserve polarity where the older "The message should: no" phrasing
+            // let the model "helpfully" reverse a terse "no" into a yes.
+            let verb = channel == .email ? "emailed" : "texted"
+            user = """
+            \(recipientDisplay) \(verb) \(me): "\(String(thread.prefix(2000)))"
+
+            \(me) wants the reply to say: \(instr)
+
+            Write \(me)'s reply conveying exactly that (\(instr)), in \(me)'s voice. Only the reply.
+            """
+        } else {
+            user = "Write a \(channel.label) to \(recipientDisplay). It must say exactly this, without changing the meaning: \(instr)"
         }
 
         do {
@@ -108,15 +121,19 @@ final class DraftingService {
         You are \(owner)'s personal assistant, writing a \(channel.label) on their behalf to \
         \(recipientDisplay). Write ONLY the message body, in \(owner)'s own voice — no preamble, no \
         explanation, no subject line, and no bracketed placeholders like [Name]. Do not wrap the \
-        message in quotes. Produce exactly what \(owner) would send.
+        message in quotes. Produce exactly what \(owner) would send. Convey \(owner)'s answer \
+        faithfully — NEVER reverse a yes/no or default to being agreeable; keep their exact meaning \
+        and answer, and do not add information they didn't give.
         """
 
         switch channel {
         case .email:
             system += "\nUse a natural greeting and sign-off consistent with the writing style below."
         case .text:
-            system += "\nKeep it short and conversational like a real text — usually 1–3 sentences, " +
-                      "with no greeting or sign-off unless the style clearly calls for one."
+            system += "\nWrite it EXACTLY how \(owner) texts — copy the casing, slang, abbreviations, " +
+                      "punctuation habits, and brevity of the examples below. If they text in lowercase " +
+                      "with no punctuation, do the same. Never make it more formal, polished, or wordy " +
+                      "than their real texts; usually just 1–2 short sentences, no greeting or sign-off."
         }
 
         if let voice = styleContext?.trimmingCharacters(in: .whitespacesAndNewlines), !voice.isEmpty {
