@@ -620,7 +620,11 @@ actor AssistantCore {
         var fullResponse = try await router.streamWithTools(
             messages: messages,
             system: system,
-            tools: (headless || suppressTools) ? nil : [LLMTool.openApplication.payload],
+            // Only attach the app-control tool when the query is actually an app-control request.
+            // Passing tools on every query makes the model slower and can force a second round-trip
+            // (tool call, or the empty-response retry below) — so plain questions now run tool-free
+            // and as fast as the headless bot path, while "open X" still gets the tool.
+            tools: (headless || suppressTools || intent.appControlQuery == nil) ? nil : [LLMTool.openApplication.payload],
             executeToolCall: { @Sendable name, args in
                 await AppControlCapability.executeToolCall(toolName: name, argumentsJSON: args)
             },
