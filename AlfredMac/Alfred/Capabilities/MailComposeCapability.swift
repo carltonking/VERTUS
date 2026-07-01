@@ -128,13 +128,16 @@ struct MailComposeCapability {
 
     // MARK: - Compose / send
 
-    func compose(to email: String, display: String, subject: String?, body: String?, send: Bool) -> String {
+    /// `confirmed: true` skips the interactive NSAlert — used by callers that already confirmed out
+    /// of band (e.g. the iMessage bot's text "yes" round-trip). The default keeps the bar's behavior.
+    func compose(to email: String, display: String, subject: String?, body: String?, send: Bool,
+                 confirmed: Bool = false) -> String {
         let subj = subject ?? ""
         let bodyText = body ?? ""
         // Never auto-send an empty message; fall back to a reviewable draft.
         let doSend = send && !bodyText.trimmingCharacters(in: .whitespaces).isEmpty
 
-        if doSend {
+        if doSend && !confirmed {
             guard Self.confirmSend(to: display, subject: subj, body: bodyText) else { return "Email cancelled." }
         }
 

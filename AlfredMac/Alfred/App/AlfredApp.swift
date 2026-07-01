@@ -117,6 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let mailCompose = MailComposeCapability()
     private let screenMonitoring = ScreenMonitoringManager()
     private var inboundWatcher: InboundWatcher?
+    private var alfredBot: AlfredBotWatcher?
     private let focusSession = FocusSessionManager()
     private var escapeMonitor: Any?
     private var notchHoverMonitor: Any?
@@ -655,6 +656,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.startVoiceLearningFromMessagesIfNeeded()
             }
             .store(in: &cancellables)
+
+        // iMessage bot (opt-in). Task/sleep loop like InboundWatcher — not a SafetyAuditEngine class,
+        // so the startup audit stays green. No-op without a configured handle / permissions.
+        if let core = assistantCore {
+            let bot = AlfredBotWatcher(core: core, appState: appState)
+            alfredBot = bot
+            appState.$imessageBotEnabled
+                .receive(on: DispatchQueue.main)
+                .sink { [weak bot] enabled in
+                    guard let bot else { return }
+                    if enabled { bot.start() } else { bot.stop() }
+                }
+                .store(in: &cancellables)
+            if appState.imessageBotEnabled { bot.start() }
+        }
     }
 
     /// Imports Carlton's sent iMessages into the writing-style sample pool when the opt-in is on.

@@ -106,6 +106,21 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(voiceLearningFromMessagesEnabled, forKey: "voiceLearningFromMessagesEnabled") }
     }
 
+    /// Opt-in: text Alfred over iMessage. Carlton texts "<trigger> <command>" to HIMSELF and Alfred
+    /// replies in the self-chat. Off by default. Needs Full Disk Access (read chat.db), Automation
+    /// for Messages (send), and his own iMessage address. Outward actions require a text "yes".
+    @Published var imessageBotEnabled: Bool {
+        didSet { UserDefaults.standard.set(imessageBotEnabled, forKey: "imessageBotEnabled") }
+    }
+    /// Trigger word (default "alfred"); a self-message must start with it to be treated as a command.
+    @Published var imessageBotTrigger: String {
+        didSet { UserDefaults.standard.set(imessageBotTrigger, forKey: "imessageBotTrigger") }
+    }
+    /// The owner's own iMessage address (phone/email) — identifies the self-chat and where replies go.
+    @Published var imessageBotOwnerHandle: String {
+        didSet { UserDefaults.standard.set(imessageBotOwnerHandle, forKey: "imessageBotOwnerHandle") }
+    }
+
     /// Hermes: opt-in passive screen-TEXT capture (Accessibility) persisted to the local FTS5
     /// log. Off by default; nothing leaves the Mac.
     @Published var screenTextCaptureEnabled: Bool {
@@ -195,6 +210,9 @@ final class AppState: ObservableObject {
         screenMonitoringEnabled = false
         inboundWatcherEnabled = UserDefaults.standard.bool(forKey: "inboundWatcherEnabled")
         voiceLearningFromMessagesEnabled = UserDefaults.standard.bool(forKey: "voiceLearningFromMessagesEnabled")
+        imessageBotEnabled = UserDefaults.standard.bool(forKey: "imessageBotEnabled")
+        imessageBotTrigger = UserDefaults.standard.string(forKey: "imessageBotTrigger") ?? "alfred"
+        imessageBotOwnerHandle = UserDefaults.standard.string(forKey: "imessageBotOwnerHandle") ?? ""
         // Default ON: Alfred is meant to learn from your activity. Capture still requires the
         // user to grant Screen Recording permission, and can be turned off in the Profile tab.
         screenTextCaptureEnabled = UserDefaults.standard.object(forKey: "screenTextCaptureEnabled") as? Bool ?? true

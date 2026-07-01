@@ -148,7 +148,9 @@ struct MessagingCapability {
             : "Couldn't send. Make sure Messages is signed in and Alfred has Automation permission for Messages (System Settings → Privacy & Security → Automation)."
     }
 
-    private func send(message: String, toHandle handle: String) -> Bool {
+    /// Raw send (no confirmation UI). The interactive path goes through `confirmAndSend`; the iMessage
+    /// bot reuses this directly after its own text-confirmation round-trip.
+    func send(message: String, toHandle handle: String) -> Bool {
         let script = """
         tell application "Messages"
             activate

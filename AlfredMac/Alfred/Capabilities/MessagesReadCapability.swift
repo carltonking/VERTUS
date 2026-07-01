@@ -2,6 +2,9 @@ import Foundation
 import SQLite3
 import Contacts
 
+// SQLite needs to copy bound Swift strings (their buffers don't outlive the bind call otherwise).
+private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
 // MARK: - MessagesReadCapability
 //
 // Local, zero-auth reading of recent iMessage/SMS history straight from the Messages SQLite store
@@ -159,6 +162,75 @@ struct MessagesReadCapability {
             out.append(SentMessage(rowid: rowid, text: trimmed))
         }
         return out
+    }
+
+    // MARK: - Self-chat read (iMessage bot)
+
+    /// New messages the OWNER sent in the SELF-CHAT — the 1:1 chat whose single participant is the
+    /// owner's own handle — is_from_me=1, real messages (no tapbacks), ROWID > `afterRowID`, oldest
+    /// first. Used by AlfredBotWatcher. Reuses the read-only open + attributedBody decode. Empty when
+    /// `ownerHandle` is blank / not found (so a missing handle is a safe no-op).
+    static func selfChatMessages(ownerHandle: String, afterRowID: Int64, limit: Int, dbPath: String) -> [SentMessage] {
+        var db: OpaquePointer?
+        guard !ownerHandle.isEmpty, sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            sqlite3_close(db); return []
+        }
+        defer { sqlite3_close(db) }
+
+        // Self-chat = chats whose ONLY participant handle is the owner (chat_handle_join, COUNT=1),
+        // then the owner's own messages in those chats (chat_message_join → message).
+        let sql = """
+            SELECT m.ROWID, m.text, m.attributedBody
+            FROM message m
+            JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+            WHERE cmj.chat_id IN (
+                SELECT chj.chat_id FROM chat_handle_join chj
+                JOIN handle h ON h.ROWID = chj.handle_id
+                GROUP BY chj.chat_id
+                HAVING COUNT(*) = 1 AND LOWER(MAX(h.id)) = ?
+            )
+            AND m.is_from_me = 1 AND m.associated_message_type = 0 AND m.ROWID > ?
+            ORDER BY m.ROWID ASC
+            LIMIT \(max(1, limit))
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, ownerHandle.lowercased(), -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(stmt, 2, afterRowID)
+
+        var out: [SentMessage] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let rowid = sqlite3_column_int64(stmt, 0)
+            var body = ""
+            if let cText = sqlite3_column_text(stmt, 1) { body = String(cString: cText) }
+            if body.isEmpty, sqlite3_column_type(stmt, 2) != SQLITE_NULL {
+                let bytes = sqlite3_column_bytes(stmt, 2)
+                if let blob = sqlite3_column_blob(stmt, 2), bytes > 0 {
+                    body = decodeAttributedBody(Data(bytes: blob, count: Int(bytes))) ?? ""
+                }
+            }
+            let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            out.append(SentMessage(rowid: rowid, text: trimmed))
+        }
+        return out
+    }
+
+    /// Highest self-chat message ROWID — baselines the bot cursor so it ignores pre-opt-in history.
+    /// nil only when `ownerHandle` is blank (bot can't run); 0 when the self-chat has no messages yet.
+    static func selfChatMaxRowID(ownerHandle: String, dbPath: String) -> Int64? {
+        guard !ownerHandle.isEmpty else { return nil }
+        return selfChatMessages(ownerHandle: ownerHandle, afterRowID: 0, limit: Int.max, dbPath: dbPath)
+            .map(\.rowid).max() ?? 0
+    }
+
+    /// Real-chat.db convenience wrappers for AlfredBotWatcher.
+    static func recentSelfChatMessages(ownerHandle: String, afterRowID: Int64, limit: Int = 20) -> [SentMessage] {
+        selfChatMessages(ownerHandle: ownerHandle, afterRowID: afterRowID, limit: limit, dbPath: dbPath)
+    }
+    static func currentSelfChatMaxRowID(ownerHandle: String) -> Int64? {
+        selfChatMaxRowID(ownerHandle: ownerHandle, dbPath: dbPath)
     }
 
     // MARK: - New-message detection (InboundWatcher)
