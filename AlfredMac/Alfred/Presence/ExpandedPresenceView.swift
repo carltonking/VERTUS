@@ -25,6 +25,7 @@ struct ExpandedPresenceView: View {
     let onEscape: () -> Void
 
     @State private var inputText: String = ""
+    @State private var mathResult: String?
     @FocusState private var inputFocused: Bool
     @State private var didCopy = false
 
@@ -146,7 +147,21 @@ struct ExpandedPresenceView: View {
                 .foregroundStyle(.white)
                 .focused($inputFocused)
                 .onSubmit { submit() }
+                .onChange(of: inputText) { _, newValue in
+                    mathResult = MathEvaluator.evaluate(newValue)
+                }
                 .tint(.white)
+
+            // Spotlight-style instant answer: appears live as you type a math expression,
+            // no Enter, no model. Enter copies it (see submit()).
+            if let mathResult {
+                Text("= \(mathResult)")
+                    .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .transition(.opacity)
+            }
 
             if isProcessing {
                 ProgressView()
@@ -260,6 +275,14 @@ struct ExpandedPresenceView: View {
     private func submit() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+        // If an inline math answer is showing, Enter copies it instead of asking the model.
+        if let mathResult {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(mathResult, forType: .string)
+            inputText = ""
+            self.mathResult = nil
+            return
+        }
         inputText = ""
         onSubmit(text)
     }
