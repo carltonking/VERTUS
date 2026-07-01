@@ -51,8 +51,12 @@ final class WritingStyleStore {
     }
 
     /// Bulk-record samples, rebuilding the aggregate profile ONCE (instead of once per sample). Used
-    /// by the sent-iMessage / Gmail backfills so a few-hundred-row import is O(n), not O(n²).
-    func recordWritingSamples(_ samples: [(text: String, source: WritingSource)]) {
+    /// by the sent-iMessage / Gmail / Apple Mail backfills so a few-hundred-row import is O(n), not
+    /// O(n²). SYNCHRONOUS and returns whether the write COMMITTED, so callers advance their cursor
+    /// only after a durable write — a crash in that window then never permanently skips samples.
+    /// (Callers run this off the main thread.) Returns true when there's nothing to write, too.
+    @discardableResult
+    func recordWritingSamples(_ samples: [(text: String, source: WritingSource)]) -> Bool {
         let now = Date().timeIntervalSince1970
         let prepared: [WritingSampleRecord] = samples.compactMap { item in
             let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -67,17 +71,18 @@ final class WritingStyleStore {
                 emojiCount: r.emojiCount, timestamp: now
             )
         }
-        guard !prepared.isEmpty else { return }
+        guard !prepared.isEmpty else { return true }   // nothing durable to write → safe to advance
 
-        writeQueue.async { [weak self] in
-            guard let self else { return }
+        return writeQueue.sync {
             do {
                 try self.db.write { db in
-                    for rec in prepared { try rec.insert(db) }
+                    for rec in prepared { try rec.insert(db) }   // INSERT OR IGNORE via conflict policy
                 }
                 try self.rebuildProfile()   // ONCE for the whole batch
+                return true
             } catch {
                 Logger(subsystem: "com.alfred.writing-style", category: "store").error("Failed to record samples: \(error.localizedDescription)")
+                return false
             }
         }
     }
@@ -317,21 +322,33 @@ final class WritingStyleStore {
     /// main thread (recordWritingSample also enqueues its own writes on a background queue).
     func importSentMessages() {
         let defaults = UserDefaults.standard
-        let isBackfill = !defaults.bool(forKey: Self.sentBackfillFlag)
         let watermark = Int64(defaults.integer(forKey: Self.sentWatermarkKey))
-        let limit = isBackfill ? 500 : 200
 
-        let sent = MessagesReadCapability.recentSentMessages(afterRowID: watermark, limit: limit)
-        guard !sent.isEmpty else {
-            // Nothing imported — most often Full Disk Access isn't granted. Hint once, non-fatally.
-            if isBackfill { Self.logMessagesHintOnce() }
-            return
+        if !defaults.bool(forKey: Self.sentBackfillFlag) {
+            // One-time backfill: the most-recent 500 sent texts (DESC). Watermark → the latest ROWID
+            // so the incremental path continues past it.
+            let sent = MessagesReadCapability.recentSentMessages(afterRowID: watermark, limit: 500)
+            guard !sent.isEmpty else {
+                Self.logMessagesHintOnce()   // usually Full Disk Access isn't granted
+                return
+            }
+            guard recordWritingSamples(sent.map { ($0.text, .imessage) }) else { return }   // don't advance on write failure
+            defaults.set(Int(sent.map(\.rowid).max() ?? watermark), forKey: Self.sentWatermarkKey)
+            defaults.set(true, forKey: Self.sentBackfillFlag)
+        } else {
+            // Incremental: DRAIN forward in ROWID-ASC pages so a burst larger than one page since the
+            // last launch isn't silently dropped. Advance the watermark only after each page commits.
+            let pageLimit = 200
+            var cursor = watermark
+            while true {
+                let page = MessagesReadCapability.recentSentMessages(afterRowID: cursor, limit: pageLimit, ascending: true)
+                guard !page.isEmpty else { break }
+                guard recordWritingSamples(page.map { ($0.text, .imessage) }) else { break }   // write failed → retry next run
+                cursor = page.map(\.rowid).max() ?? cursor
+                defaults.set(Int(cursor), forKey: Self.sentWatermarkKey)   // advance AFTER durable write
+                if page.count < pageLimit { break }
+            }
         }
-
-        recordWritingSamples(sent.map { ($0.text, .imessage) })   // batch: rebuild the profile once
-        let newWatermark = sent.map(\.rowid).max() ?? watermark
-        defaults.set(Int(newWatermark), forKey: Self.sentWatermarkKey)
-        if isBackfill { defaults.set(true, forKey: Self.sentBackfillFlag) }
     }
 
     // MARK: - Voice learning from sent Gmail
@@ -358,7 +375,7 @@ final class WritingStyleStore {
         let fresh = GmailCapability.emailsNewerThan(fetched, watermark)
         guard !fresh.isEmpty else { return }
 
-        recordWritingSamples(fresh.map { ($0.body, .email) })
+        guard recordWritingSamples(fresh.map { ($0.body, .email) }) else { return }   // don't advance on write failure
         defaults.set(Int(GmailCapability.newWatermark(fresh, current: watermark)), forKey: Self.gmailWatermarkKey)
         if isBackfill { defaults.set(true, forKey: Self.gmailBackfillFlag) }
     }
@@ -411,7 +428,11 @@ final class WritingStyleStore {
             if !cleaned.isEmpty { newSamples.append((cleaned, .email)) }
         }
 
-        if !newSamples.isEmpty { recordWritingSamples(newSamples) }   // batch: one profile rebuild
+        // Write first; only advance the seen-set/flag once the insert commits (a crash in that window
+        // then re-reads these ids next run instead of permanently skipping them).
+        if !newSamples.isEmpty {
+            guard recordWritingSamples(newSamples) else { return }   // write failed → don't advance
+        }
 
         // Persist the seen-set. Refresh the recency of EVERY id read this run (newest-last), not just
         // the newly-imported ones, so the always-re-read newest window is never evicted by the 2000

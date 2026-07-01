@@ -17,6 +17,12 @@ enum WritingSource: String, Codable, CaseIterable {
 struct WritingSampleRecord: Codable, FetchableRecord, PersistableRecord {
     static let databaseTableName = "writing_samples"
 
+    /// Idempotent inserts: with the UNIQUE(source, text) index (migration v17), re-importing the
+    /// same message is a silent no-op — so all three ingestion paths are naturally idempotent and a
+    /// message that reaches two paths (e.g. a Google Workspace account seen by both the Gmail API and
+    /// Apple Mail) is stored once.
+    static let persistenceConflictPolicy = PersistenceConflictPolicy(insert: .ignore, update: .abort)
+
     var id: Int64?
     var source: String
     var text: String

@@ -90,9 +90,18 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(inboundWatcherEnabled, forKey: "inboundWatcherEnabled") }
     }
 
-    /// Opt-in: learn Carlton's real writing voice from his SENT iMessages (needs Full Disk Access).
-    /// Off by default. When on (and FDA granted), sent texts are imported as `.imessage` writing
-    /// samples so drafts sound like his actual texting, not the commands he types to Alfred.
+    /// User-facing disclosure for the voice-learning opt-in — surface this wherever the toggle is
+    /// shown (there is no Settings UI yet; keep it in sync with the toggle's copy).
+    static let voiceLearningDisclosure =
+        "Learns your writing voice from your sent iMessages and emails, stored on your Mac. " +
+        "When Alfred drafts with a cloud model, short snippets of that writing can be sent to that " +
+        "model (redaction only removes obvious secrets like passwords or API keys). Use a local " +
+        "model (Ollama) to keep everything on-device."
+
+    /// Opt-in: learn Carlton's real writing voice from his SENT iMessages + emails (needs Full Disk
+    /// Access for Messages / Automation for Mail / a connected Google account). Off by default. When
+    /// on, sent messages are imported as writing samples so drafts sound like his actual voice, not
+    /// the commands he types to Alfred. See `voiceLearningDisclosure` for the egress note.
     @Published var voiceLearningFromMessagesEnabled: Bool {
         didSet { UserDefaults.standard.set(voiceLearningFromMessagesEnabled, forKey: "voiceLearningFromMessagesEnabled") }
     }

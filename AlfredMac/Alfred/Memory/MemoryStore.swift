@@ -565,6 +565,18 @@ final class MemoryStore {
             }
         }
 
+        // Idempotent writing-sample ingestion: a UNIQUE(source, text) index makes re-imports and
+        // cross-path double-imports (Gmail API + Apple Mail seeing the same Workspace email) no-ops.
+        // Must dedupe existing duplicate rows FIRST, or the unique-index creation would fail.
+        migrator.registerMigration("v17_writing_samples_unique") { db in
+            try db.execute(sql: """
+                DELETE FROM writing_samples
+                WHERE id NOT IN (SELECT MIN(id) FROM writing_samples GROUP BY source, text)
+                """)
+            try db.create(index: "idx_writing_samples_source_text", on: "writing_samples",
+                          columns: ["source", "text"], unique: true, ifNotExists: true)
+        }
+
         try migrator.migrate(db)
     }
 

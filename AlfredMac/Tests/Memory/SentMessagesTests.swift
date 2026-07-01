@@ -71,6 +71,24 @@ final class SentMessagesTests: XCTestCase {
                        "respects the LIMIT")
     }
 
+    func testAscendingDrainCoversBurstAcrossPages() throws {
+        let path = try makeChatDB()
+        for i in 1...5 {   // rowids 10,20,30,40,50
+            try insert(path, rowid: Int64(i * 10), text: "Sent burst message number \(i) with enough words", isFromMe: 1)
+        }
+        // Drain forward in ASC pages of 2 (a burst larger than one page) — mirrors importSentMessages.
+        var cursor: Int64 = 0
+        var collected: [Int64] = []
+        while true {
+            let page = MessagesReadCapability.sentMessages(afterRowID: cursor, limit: 2, dbPath: path, ascending: true)
+            if page.isEmpty { break }
+            collected += page.map(\.rowid)
+            cursor = page.map(\.rowid).max()!
+            if page.count < 2 { break }
+        }
+        XCTAssertEqual(collected, [10, 20, 30, 40, 50], "ASC drain imports the whole burst across pages, in order")
+    }
+
     func testWatermarkIdempotency() throws {
         let path = try makeChatDB()
         for i in 1...4 {

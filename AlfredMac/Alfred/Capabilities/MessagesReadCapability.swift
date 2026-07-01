@@ -113,8 +113,8 @@ struct MessagesReadCapability {
     struct SentMessage { let rowid: Int64; let text: String }
 
     /// Recent SENT messages (is_from_me = 1) for learning the user's real writing voice, newest first.
-    static func recentSentMessages(afterRowID: Int64 = 0, limit: Int = 500) -> [SentMessage] {
-        sentMessages(afterRowID: afterRowID, limit: limit, dbPath: dbPath)
+    static func recentSentMessages(afterRowID: Int64 = 0, limit: Int = 500, ascending: Bool = false) -> [SentMessage] {
+        sentMessages(afterRowID: afterRowID, limit: limit, dbPath: dbPath, ascending: ascending)
     }
 
     /// Core sent-message query against an explicit `dbPath` (so tests can point at a synthetic
@@ -122,18 +122,20 @@ struct MessagesReadCapability {
     /// body, ROWID > `afterRowID`, capped at `limit`, newest first. Opens read-only so the live
     /// Messages DB is never locked, and reuses `decodeAttributedBody` for Ventura+ rows where `text`
     /// is NULL and the body lives in the `attributedBody` typedstream blob.
-    static func sentMessages(afterRowID: Int64, limit: Int, dbPath: String) -> [SentMessage] {
+    static func sentMessages(afterRowID: Int64, limit: Int, dbPath: String, ascending: Bool = false) -> [SentMessage] {
         var db: OpaquePointer?
         guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
             sqlite3_close(db); return []
         }
         defer { sqlite3_close(db) }
 
+        // ASC drains forward from a watermark (incremental — never drop a burst); DESC takes the
+        // most-recent page (one-time backfill).
         let sql = """
             SELECT m.ROWID, m.text, m.attributedBody
             FROM message m
             WHERE m.is_from_me = 1 AND m.associated_message_type = 0 AND m.ROWID > ?
-            ORDER BY m.ROWID DESC
+            ORDER BY m.ROWID \(ascending ? "ASC" : "DESC")
             LIMIT \(max(0, limit))
             """
         var stmt: OpaquePointer?
