@@ -1859,12 +1859,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return
                 }
                 self.barState.responseText = "Reading your screen…"
-                let screen = ScreenTextCapability().captureFrontmost()?.text ?? ""
+                // Accessibility text (real text) + Vision OCR (text inside images/flyers) so events that
+                // live in a graphic — Instagram posts, screenshots — are readable too.
+                let axText = ScreenTextCapability().captureFrontmost()?.text ?? ""
+                let ocrText = await ScreenOCRCapability().recognizeScreenText() ?? ""
+                let screen = [axText, ocrText].filter { !$0.isEmpty }.joined(separator: "\n---\n")
+                guard !screen.isEmpty else {
+                    self.barState.responseText = "I couldn't read your screen — grant Accessibility + Screen Recording in System Settings → Privacy & Security, or just tell me the event details."
+                    return
+                }
                 guard let ev = await CalendarEventCapability.extract(
                     screenText: screen, query: text, now: Date(), router: router) else {
-                    self.barState.responseText = screen.isEmpty
-                        ? "I couldn't read your screen — grant Accessibility access in System Settings → Privacy & Security → Accessibility, or just tell me the event details."
-                        : "I couldn't find an event on screen. Tell me the title, date and time and I'll add it."
+                    self.barState.responseText = "I couldn't find an event on screen. Tell me the title, date and time and I'll add it."
                     return
                 }
                 do {

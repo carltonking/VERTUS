@@ -40,9 +40,10 @@ struct CalendarEventCapability {
         Times stay as written ("3pm" → 15:00). Reply with ONE JSON object and nothing else:
         {"found": true|false, "title": string, "date": "YYYY-MM-DD", "start": "HH:mm" (24h) or null, \
         "end": "HH:mm" or null, "allDay": true|false, "location": string or null, "notes": string or null}
-        Rules: "found" is false if there's no event. If a start time is present, allDay=false; if only a \
-        date is given, allDay=true and start=null. Keep the title short. Never invent details that aren't \
-        in the text.
+        Rules: "found" is false if there's no event. If several events appear, pick the one the user is \
+        looking at — the most prominent / foreground one. If a date has no year, use the next FUTURE \
+        occurrence. If a start time is present, allDay=false; if only a date is given, allDay=true and \
+        start=null. Keep the title short. Never invent details that aren't in the text.
         """
         var user = "ON-SCREEN TEXT:\n\"\"\"\n\(String(screenText.prefix(6000)))\n\"\"\""
         user += "\n\nUSER REQUEST: \(query)"

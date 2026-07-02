@@ -8,6 +8,12 @@ actor ScreenCapability {
     // MARK: - Public API
 
     func captureScreen() async throws -> Data {
+        try jpegData(from: try await captureCGImage())
+    }
+
+    /// The raw screenshot as a `CGImage` — used by on-device OCR (Vision) so callers don't pay a JPEG
+    /// round-trip.
+    func captureCGImage() async throws -> CGImage {
         let content = try await fetchShareableContent()
 
         guard let display = content.displays.first else {
@@ -23,12 +29,10 @@ actor ScreenCapability {
         config.captureResolution = .nominal
         config.showsCursor = false
 
-        let image = try await SCScreenshotManager.captureImage(
+        return try await SCScreenshotManager.captureImage(
             contentFilter: filter,
             configuration: config
         )
-
-        return try jpegData(from: image)
     }
 
     func captureScreenAsBase64() async throws -> String {
