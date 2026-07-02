@@ -40,7 +40,8 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
         res.end(JSON.stringify({ ok: false, error: "not authorized" }));
         return;
       }
-      const report = await diagnose().catch((e: any) => ({ error: String(e?.message ?? e) }));
+      const doPut = /[?&]put=1(&|$)/.test(req.url || "");
+      const report = await diagnose(doPut).catch((e: any) => ({ error: String(e?.message ?? e) }));
       res.end(JSON.stringify(report, null, 2));
       return;
     }

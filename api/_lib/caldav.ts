@@ -198,7 +198,7 @@ function resolve(base: string, href: string): string {
 
 // MARK: - Diagnostics (owner-gated; reports each discovery step + a test PUT, never the credentials)
 
-export async function diagnose(): Promise<Record<string, unknown>> {
+export async function diagnose(doPut = false): Promise<Record<string, unknown>> {
   const appleId = process.env.APPLE_ID;
   const appPassword = process.env.APPLE_APP_PASSWORD;
   const out: Record<string, unknown> = {
@@ -242,6 +242,7 @@ export async function diagnose(): Promise<Record<string, unknown>> {
   if (!calHref) { out.step3_body = list.body.slice(0, 1500); return out; }
   const calUrl = resolve(list.finalUrl || homeUrl, calHref);
   out.calUrl = calUrl;
+  if (!doPut) { out.putSkipped = "read-only diagnostic (add &put=1 to write a throwaway test event)"; return out; }
 
   // Test PUT of a throwaway event (safe to delete) to see iCloud's actual response.
   const now = new Date();
