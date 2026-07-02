@@ -160,13 +160,32 @@ function propHref(xml: string, prop: string): string | null {
   return m ? m[1].trim() : null;
 }
 
-/** First calendar collection that supports VEVENT (falls back to any calendar collection). */
-function pickCalendar(xml: string): string | null {
+interface CalEntry { href: string; name: string; vevent: boolean; isCalendar: boolean; }
+
+/** Parse each <response> into a calendar entry. "calendar" is detected inside <resourcetype> (NOT the
+ * href — the home container's path contains "calendars" and must not match), VEVENT inside the
+ * supported component set (so reminders lists, which are VTODO, are excluded). */
+function parseCalendars(xml: string): CalEntry[] {
   const blocks = xml.split(/<[^>]*\bresponse\b[^>]*>/i).slice(1);
-  const hrefOf = (b: string) => (/<[^>]*\bhref\b[^>]*>([^<]+)<\/[^>]*\bhref\b[^>]*>/i.exec(b) || [])[1]?.trim() || null;
-  for (const b of blocks) if (/calendar/i.test(b) && /VEVENT/i.test(b)) { const h = hrefOf(b); if (h) return h; }
-  for (const b of blocks) if (/<[^>]*\bcalendar\b[^>]*\/>/i.test(b)) { const h = hrefOf(b); if (h) return h; }
-  return null;
+  const entries: CalEntry[] = [];
+  for (const b of blocks) {
+    const href = (/<[^>]*\bhref\b[^>]*>([^<]+)<\/[^>]*\bhref\b[^>]*>/i.exec(b) || [])[1]?.trim();
+    if (!href) continue;
+    const rt = (/<[^>]*\bresourcetype\b[^>]*>([\s\S]*?)<\/[^>]*\bresourcetype\b[^>]*>/i.exec(b) || [])[1] || "";
+    const ccs = (/<[^>]*supported-calendar-component-set[^>]*>([\s\S]*?)<\/[^>]*supported-calendar-component-set[^>]*>/i.exec(b) || [])[1] || "";
+    const name = ((/<[^>]*\bdisplayname\b[^>]*>([^<]*)<\/[^>]*\bdisplayname\b[^>]*>/i.exec(b) || [])[1] || "").trim();
+    entries.push({ href, name, isCalendar: /\bcalendar\b/i.test(rt), vevent: /VEVENT/i.test(ccs) });
+  }
+  return entries;
+}
+
+/** A writable VEVENT calendar collection, preferring the user's primary over holiday/birthday feeds. */
+function pickCalendar(xml: string): string | null {
+  const cals = parseCalendars(xml).filter((c) => c.isCalendar && c.vevent);
+  if (!cals.length) return null;
+  const deprioritize = /holiday|birthday|siri|subscrib|shared|us holidays/i;
+  const preferred = cals.filter((c) => !deprioritize.test(c.name));
+  return (preferred.length ? preferred : cals)[0].href;
 }
 
 function resolve(base: string, href: string): string {
@@ -217,6 +236,7 @@ export async function diagnose(): Promise<Record<string, unknown>> {
     `<A:propfind xmlns:A="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><A:prop><A:resourcetype/><A:displayname/><C:supported-calendar-component-set/></A:prop></A:propfind>`);
   out.step3_list_ok = !!list;
   if (!list) return out;
+  out.calendars = parseCalendars(list.body).map((c) => ({ href: c.href, name: c.name, isCalendar: c.isCalendar, vevent: c.vevent }));
   const calHref = pickCalendar(list.body);
   out.calHref = calHref;
   if (!calHref) { out.step3_body = list.body.slice(0, 1500); return out; }
