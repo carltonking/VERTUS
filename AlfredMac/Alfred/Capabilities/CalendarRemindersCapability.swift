@@ -115,8 +115,7 @@ struct CalendarRemindersCapability {
         try store.save(event, span: .thisEvent)
 
         let df = DateFormatter()
-        df.dateStyle = .medium
-        df.timeStyle = allDay ? .none : .short
+        df.dateFormat = allDay ? "EEE, MMM d, yyyy" : "EEE, MMM d, yyyy 'at' HH:mm"
         let locStr = (location?.isEmpty == false) ? " · \(location!)" : ""
         return "✅ Added “\(title)” to your calendar — \(df.string(from: start))\(locStr)."
     }
@@ -287,13 +286,13 @@ struct CalendarRemindersCapability {
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "MMM d"
         let timeFormatter = DateFormatter()
-        timeFormatter.dateFormat = "h:mm a"
+        timeFormatter.dateFormat = "HH:mm"
         return "\(dateFormatter.string(from: date)) at \(timeFormatter.string(from: date))"
     }
 
     private func formatTime(_ date: Date) -> String {
         let formatter = DateFormatter()
-        formatter.dateFormat = "h:mm a"
+        formatter.dateFormat = "HH:mm"
         return formatter.string(from: date)
     }
 }

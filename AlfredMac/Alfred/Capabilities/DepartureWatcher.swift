@@ -90,6 +90,6 @@ final class DepartureWatcher: ObservableObject {
     }
 
     private static let timeFormatter: DateFormatter = {
-        let f = DateFormatter(); f.dateFormat = "h:mm a"; return f
+        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
     }()
 }
