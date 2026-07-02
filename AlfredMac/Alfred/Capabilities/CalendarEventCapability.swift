@@ -40,33 +40,68 @@ struct CalendarEventCapability {
         \(Self.dateReference(from: now))
         Times stay as written ("3pm" → 15:00). Reply with ONE JSON object and nothing else:
         {"found": true|false, "title": string, "date": "YYYY-MM-DD", "start": "HH:mm" (24h) or null, \
-        "end": "HH:mm" or null, "allDay": true|false, "location": string or null, "notes": string or null}
+        "end": "HH:mm" or null, "allDay": true|false, "yearMentioned": true|false, "location": string or \
+        null, "notes": string or null}
         Rules: "found" is false if there's no event. If several events appear, pick the one the user is \
-        looking at — the most prominent / foreground one. If a date has NO year, assume the current year \
-        (\(year)); if that date has already passed this year, use the next year (\(year + 1)). Do NOT pick \
-        a year by matching the weekday. If a start time is present, allDay=false; if only a date is given, \
-        allDay=true and start=null. Keep the title short. Never invent details that aren't in the text.
+        looking at — the most prominent / foreground one. Set "yearMentioned" true ONLY if the text \
+        explicitly states a year; otherwise false and just put \(year) as the year in "date" (the app \
+        will pick the correct year). Do NOT guess a far-future year or match weekdays. If a start time is \
+        present, allDay=false; if only a date is given, allDay=true and start=null. Keep the title short. \
+        Never invent details that aren't in the text.
         """
         var user = "ON-SCREEN TEXT:\n\"\"\"\n\(String(screenText.prefix(6000)))\n\"\"\""
         user += "\n\nUSER REQUEST: \(query)"
 
         guard let raw = try? await router.complete(prompt: user, system: system) else { return nil }
-        return parse(raw)
+        return parse(raw, now: now)
     }
 
     // MARK: - Parsing
 
-    private static func parse(_ raw: String) -> Extracted? {
+    private static func parse(_ raw: String, now: Date) -> Extracted? {
         guard let obj = jsonObject(from: raw), (obj["found"] as? Bool) == true,
               let title = (obj["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !title.isEmpty, let dateStr = obj["date"] as? String else { return nil }
 
         let allDay = (obj["allDay"] as? Bool) ?? false
-        guard let start = combine(date: dateStr, time: allDay ? nil : (obj["start"] as? String)) else { return nil }
+        // If the source didn't state a year, pick it deterministically here (not in the model, which
+        // gets it wrong): a past month/day rolls forward to its next future occurrence.
+        let yearMentioned = (obj["yearMentioned"] as? Bool) ?? false
+        guard let rawStart = combine(date: dateStr, time: allDay ? nil : (obj["start"] as? String)) else { return nil }
+        let start = snappedToFuture(rawStart, now: now, yearMentioned: yearMentioned)
+
         var end: Date? = nil
-        if !allDay, let endStr = obj["end"] as? String { end = combine(date: dateStr, time: endStr) }
+        if !allDay, let endStr = obj["end"] as? String, let rawEnd = combine(date: dateStr, time: endStr) {
+            end = alignYear(rawEnd, to: start)   // keep end on the same (possibly rolled-forward) year
+        }
         return Extracted(title: title, start: start, end: end,
                          location: nonEmpty(obj["location"]), notes: nonEmpty(obj["notes"]), allDay: allDay)
+    }
+
+    /// When no year was stated and the date is in the past, roll it forward to the next year whose
+    /// month/day is today or later. Explicit years and already-future dates are left untouched.
+    private static func snappedToFuture(_ date: Date, now: Date, yearMentioned: Bool) -> Date {
+        guard !yearMentioned else { return date }
+        var cal = Calendar.current
+        cal.timeZone = .current
+        let today = cal.startOfDay(for: now)
+        if cal.startOfDay(for: date) >= today { return date }
+        let mdhm = cal.dateComponents([.month, .day, .hour, .minute], from: date)
+        let baseYear = cal.component(.year, from: now)
+        for offset in 0...3 {
+            var c = mdhm; c.year = baseYear + offset
+            if let d = cal.date(from: c), cal.startOfDay(for: d) >= today { return d }
+        }
+        return date
+    }
+
+    /// Copies `anchor`'s year onto `date` (so a rolled-forward start keeps its end on the same year).
+    private static func alignYear(_ date: Date, to anchor: Date) -> Date {
+        var cal = Calendar.current
+        cal.timeZone = .current
+        var c = cal.dateComponents([.year, .month, .day, .hour, .minute], from: date)
+        c.year = cal.component(.year, from: anchor)
+        return cal.date(from: c) ?? date
     }
 
     private static func nonEmpty(_ v: Any?) -> String? {
