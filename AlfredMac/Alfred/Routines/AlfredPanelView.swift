@@ -27,6 +27,10 @@ struct AlfredPanelView: View {
     /// Keychain isn't touched during rendering). Saved via KeychainHelper so Alfred owns the item.
     @State private var telegramTokenInput = ""
     @State private var telegramTokenJustSaved = false
+    /// AI-provider API key entry (write-only, same reasoning). Saved to the Keychain under the
+    /// selected provider's account so Alfred owns the item (no access prompt on later reads).
+    @State private var providerKeyInput = ""
+    @State private var providerKeyJustSaved = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -124,6 +128,10 @@ struct AlfredPanelView: View {
 
                 Divider()
 
+                aiProviderSection
+
+                Divider()
+
                 botsSection
 
                 Spacer(minLength: 0)
@@ -131,6 +139,91 @@ struct AlfredPanelView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
         }
+    }
+
+    // MARK: - AI provider settings
+
+    /// The LLM backends Alfred can use. Changing provider or model takes effect live (LLMRouter
+    /// observes AppState); no relaunch needed.
+    private static let providerChoices: [(id: String, label: String)] = [
+        ("groq", "Groq"), ("openrouter", "OpenRouter"), ("gemini", "Gemini"), ("ollama", "Ollama (local)")
+    ]
+
+    private var aiProviderSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("AI PROVIDER")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .kerning(0.5)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Provider").font(.system(size: 11, weight: .semibold))
+                Picker("", selection: $appState.selectedProvider) {
+                    ForEach(Self.providerChoices, id: \.id) { Text($0.label).tag($0.id) }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+            }
+
+            labeledField("Model", "model id", text: $appState.selectedModel)
+
+            if appState.selectedProvider == "ollama" {
+                Label("Runs on your Mac — no key, unlimited, free.", systemImage: "checkmark.seal.fill")
+                    .font(.system(size: 11)).foregroundStyle(.secondary).labelStyle(.titleAndIcon)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                providerKeyField
+            }
+        }
+        .onChange(of: appState.selectedProvider) { _, _ in
+            providerKeyInput = ""; providerKeyJustSaved = false
+        }
+    }
+
+    private var providerKeyField: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("API key").font(.system(size: 11, weight: .semibold))
+            SecureField("paste your key", text: $providerKeyInput)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, design: .monospaced))
+                .onChange(of: providerKeyInput) { _, _ in providerKeyJustSaved = false }
+            HStack(spacing: 8) {
+                Button("Save key") { saveProviderKey() }
+                    .controlSize(.small)
+                    .disabled(providerKeyInput.trimmingCharacters(in: .whitespaces).isEmpty)
+                if providerKeyJustSaved {
+                    Label("Saved", systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 11)).foregroundStyle(.green).labelStyle(.titleAndIcon)
+                }
+                if let url = providerKeyURL {
+                    Link("Get key ↗", destination: url).font(.system(size: 11))
+                }
+            }
+            if appState.selectedProvider == "openrouter" {
+                Text("Tip: pick a model ending in “:free” (e.g. meta-llama/llama-3.3-70b-instruct:free). Free tier ≈ 50 requests/day.")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var providerKeyURL: URL? {
+        switch appState.selectedProvider {
+        case "openrouter": return URL(string: "https://openrouter.ai/keys")
+        case "gemini":     return URL(string: "https://aistudio.google.com/apikey")
+        case "groq":       return URL(string: "https://console.groq.com/keys")
+        default:           return nil
+        }
+    }
+
+    private func saveProviderKey() {
+        let key = providerKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+        // Alfred writes the item (SecItemAdd) under the provider's account, so it owns the Keychain
+        // ACL and the provider's later reads never trigger an access prompt.
+        _ = KeychainHelper.save(service: "com.alfred.app", account: appState.selectedProvider, value: key)
+        providerKeyInput = ""
+        providerKeyJustSaved = true
     }
 
     // MARK: - Assistant & bots settings

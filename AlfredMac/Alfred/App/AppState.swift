@@ -27,9 +27,9 @@ final class AppState: ObservableObject {
 
     private static let defaultProviderModels: [String: String] = [
         "local": "alfred",
-        "openrouter": "google/gemini-2.0-flash-exp:free",
+        "openrouter": "meta-llama/llama-3.3-70b-instruct:free",
         "ollama": "phi3:mini",
-        "gemini": "gemini-2.0-flash",
+        "gemini": "gemini-2.5-flash-lite",
         "groq": "llama-3.3-70b-versatile",
     ]
 
