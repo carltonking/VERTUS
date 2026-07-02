@@ -50,3 +50,4 @@ AlfredBar/*.xcodeproj/
 *.swp
 *~
 .vercel
+node_modules/

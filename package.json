@@ -1,0 +1,10 @@
+{
+  "name": "alfred-lite",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Alfred Lite — always-on cloud Telegram bot (Vercel serverless): chat + add calendar events on the go, independent of the Mac.",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}
