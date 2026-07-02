@@ -197,6 +197,12 @@ final class RoutineScheduler {
             title: status == "success" ? "Routine done: \(routine.title)" : "Routine failed: \(routine.title)",
             body: status == "success" ? summary : (errorText ?? "Unknown error")
         )
+        // Text the full result to Telegram (Alfred delivering your briefings first).
+        if status == "success" {
+            await TelegramNotifier.send("📋 \(routine.title)\n\n\(output)")
+        } else {
+            await TelegramNotifier.send("⚠️ Routine “\(routine.title)” failed: \(errorText ?? "unknown error")")
+        }
         await postFinished(id)
     }
 

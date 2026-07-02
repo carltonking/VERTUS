@@ -75,6 +75,7 @@ final class DepartureWatcher: ObservableObject {
                      + "to arrive early. Start wrapping up."
             _ = try? await NotificationManager.shared.send(title: "Time to head out", body: body,
                                                            identifier: "departure.\(event.id)")
+            await TelegramNotifier.send("🚶 \(body)")   // also text it (Alfred pinging you first)
             notified.insert(event.id)
         }
 
