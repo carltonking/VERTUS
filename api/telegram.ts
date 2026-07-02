@@ -20,23 +20,53 @@ const CHAT_SYSTEM =
   "debatable opinion or plan, push back with the counterargument instead of just agreeing. Always write " +
   "times in 24-hour format (14:30, not 2:30 PM).";
 
-export default async function handler(req: Request): Promise<Response> {
-  if (req.method !== "POST") return new Response("Alfred Lite is running.");
+import type { IncomingMessage, ServerResponse } from "http";
+
+export default async function handler(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== "POST") {
+    res.statusCode = 200;
+    res.end("Alfred Lite is running.");
+    return;
+  }
   const token = process.env.CLOUD_BOT_TOKEN;
   const owner = process.env.OWNER_CHAT_ID;
-  if (!token || !owner) return new Response("ok");
+  if (!token || !owner) {
+    res.statusCode = 200;
+    res.end("ok");
+    return;
+  }
   let update: any;
   try {
-    update = await req.json();
+    update = await readJson(req);
   } catch {
-    return new Response("ok");
+    res.statusCode = 200;
+    res.end("ok");
+    return;
   }
   try {
     await handleUpdate(update, token, owner);
   } catch {
     // Always ack so Telegram doesn't retry-storm; errors are surfaced to the user inside handlers.
   }
-  return new Response("ok");
+  res.statusCode = 200;
+  res.end("ok");
+}
+
+/** Read and JSON-parse the request body from the Node request stream. */
+function readJson(req: IncomingMessage): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => {
+      try {
+        const raw = Buffer.concat(chunks).toString("utf8").trim();
+        resolve(raw ? JSON.parse(raw) : {});
+      } catch (e) {
+        reject(e);
+      }
+    });
+    req.on("error", reject);
+  });
 }
 
 async function handleUpdate(update: any, token: string, owner: string): Promise<void> {

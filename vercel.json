@@ -1,3 +1,6 @@
 {
-  "outputDirectory": "website"
+  "outputDirectory": "website",
+  "rewrites": [
+    { "source": "/api/telegram", "destination": "/api/telegram" }
+  ]
 }
