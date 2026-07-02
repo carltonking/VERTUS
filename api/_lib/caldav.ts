@@ -28,13 +28,13 @@ const NY_VTIMEZONE = [
 export async function createEvent(ev: ExtractedEvent): Promise<{ ok: boolean; message: string }> {
   const appleId = process.env.APPLE_ID;
   const appPassword = process.env.APPLE_APP_PASSWORD;
-  const calUrl = process.env.CALDAV_CALENDAR_URL;
   if (!appleId || !appPassword) return { ok: false, message: "Apple ID / app-specific password isn't set up yet." };
-  if (!calUrl) return { ok: false, message: "The calendar URL isn't configured yet (run CalDAV discovery)." };
+  const auth = "Basic " + Buffer.from(`${appleId}:${appPassword}`).toString("base64");
+  const calUrl = await resolveCalendarUrl(auth);
+  if (!calUrl) return { ok: false, message: "Couldn't find your iCloud calendar — double-check the Apple ID + app-specific password." };
 
   const uid = `alfredlite-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
   const ics = buildICS(ev, uid);
-  const auth = "Basic " + Buffer.from(`${appleId}:${appPassword}`).toString("base64");
   const href = calUrl.replace(/\/+$/, "") + `/${uid}.ics`;
   try {
     const res = await fetch(href, {
@@ -102,4 +102,77 @@ function addHour(time: string): string {
 }
 function esc(s: string): string {
   return s.replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n");
+}
+
+// MARK: - iCloud calendar discovery (auto; cached per warm instance)
+
+let cachedCalUrl: string | null = null;
+
+/** Uses CALDAV_CALENDAR_URL if set, else discovers the user's iCloud calendar via PROPFIND. */
+async function resolveCalendarUrl(auth: string): Promise<string | null> {
+  if (process.env.CALDAV_CALENDAR_URL) return process.env.CALDAV_CALENDAR_URL;
+  if (cachedCalUrl) return cachedCalUrl;
+  cachedCalUrl = await discover(auth);
+  return cachedCalUrl;
+}
+
+async function discover(auth: string): Promise<string | null> {
+  const base = "https://caldav.icloud.com";
+  // 1. current-user-principal
+  const p = await propfind(`${base}/`, auth, "0",
+    `<A:propfind xmlns:A="DAV:"><A:prop><A:current-user-principal/></A:prop></A:propfind>`);
+  const principal = p && propHref(p.body, "current-user-principal");
+  if (!p || !principal) return null;
+  const principalUrl = resolve(p.finalUrl || `${base}/`, principal);
+  // 2. calendar-home-set
+  const h = await propfind(principalUrl, auth, "0",
+    `<A:propfind xmlns:A="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><A:prop><C:calendar-home-set/></A:prop></A:propfind>`);
+  const home = h && propHref(h.body, "calendar-home-set");
+  if (!h || !home) return null;
+  const homeUrl = resolve(h.finalUrl || principalUrl, home);
+  // 3. list calendars, pick a VEVENT-capable one
+  const list = await propfind(homeUrl, auth, "1",
+    `<A:propfind xmlns:A="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><A:prop><A:resourcetype/><A:displayname/><C:supported-calendar-component-set/></A:prop></A:propfind>`);
+  const calHref = list && pickCalendar(list.body);
+  if (!list || !calHref) return null;
+  return resolve(list.finalUrl || homeUrl, calHref);
+}
+
+async function propfind(url: string, auth: string, depth: string, body: string): Promise<{ body: string; finalUrl: string } | null> {
+  try {
+    const res = await fetch(url, {
+      method: "PROPFIND",
+      headers: { Authorization: auth, Depth: depth, "Content-Type": "application/xml; charset=utf-8" },
+      body,
+    });
+    if (res.status !== 207 && res.status !== 200) return null;
+    return { body: await res.text(), finalUrl: res.url || url };
+  } catch {
+    return null;
+  }
+}
+
+/** The <href> inside a given property element (namespace-agnostic, best-effort). */
+function propHref(xml: string, prop: string): string | null {
+  const block = new RegExp(`<[^>]*\\b${prop}\\b[^>]*>([\\s\\S]*?)</[^>]*\\b${prop}\\b[^>]*>`, "i").exec(xml);
+  const inner = block ? block[1] : "";
+  const m = /<[^>]*\bhref\b[^>]*>([^<]+)<\/[^>]*\bhref\b[^>]*>/i.exec(inner);
+  return m ? m[1].trim() : null;
+}
+
+/** First calendar collection that supports VEVENT (falls back to any calendar collection). */
+function pickCalendar(xml: string): string | null {
+  const blocks = xml.split(/<[^>]*\bresponse\b[^>]*>/i).slice(1);
+  const hrefOf = (b: string) => (/<[^>]*\bhref\b[^>]*>([^<]+)<\/[^>]*\bhref\b[^>]*>/i.exec(b) || [])[1]?.trim() || null;
+  for (const b of blocks) if (/calendar/i.test(b) && /VEVENT/i.test(b)) { const h = hrefOf(b); if (h) return h; }
+  for (const b of blocks) if (/<[^>]*\bcalendar\b[^>]*\/>/i.test(b)) { const h = hrefOf(b); if (h) return h; }
+  return null;
+}
+
+function resolve(base: string, href: string): string {
+  try {
+    return href.startsWith("http") ? href : new URL(href, base).toString();
+  } catch {
+    return href;
+  }
 }
