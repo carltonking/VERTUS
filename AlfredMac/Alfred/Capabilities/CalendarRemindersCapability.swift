@@ -92,6 +92,35 @@ struct CalendarRemindersCapability {
             .sorted { $0.start < $1.start }
     }
 
+    // MARK: - Create Event
+
+    /// Creates and saves an event on the user's default calendar. `end` defaults to +1h for timed
+    /// events; all-day events span the single day. Returns a human-readable confirmation.
+    func createEvent(title: String, start: Date, end: Date?, location: String?,
+                     notes: String?, allDay: Bool) async throws -> String {
+        guard (try? await store.requestFullAccessToEvents()) == true else {
+            throw LLMError.networkError("Calendar access denied. Grant it in System Settings → Privacy & Security → Calendars.")
+        }
+        guard let calendar = store.defaultCalendarForNewEvents else {
+            throw LLMError.networkError("No default calendar is set — open Calendar and choose one, then try again.")
+        }
+        let event = EKEvent(eventStore: store)
+        event.title = title
+        event.isAllDay = allDay
+        event.startDate = start
+        event.endDate = allDay ? start : (end ?? start.addingTimeInterval(3600))
+        if let location, !location.isEmpty { event.location = location }
+        if let notes, !notes.isEmpty { event.notes = notes }
+        event.calendar = calendar
+        try store.save(event, span: .thisEvent)
+
+        let df = DateFormatter()
+        df.dateStyle = .medium
+        df.timeStyle = allDay ? .none : .short
+        let locStr = (location?.isEmpty == false) ? " · \(location!)" : ""
+        return "✅ Added “\(title)” to your calendar — \(df.string(from: start))\(locStr)."
+    }
+
     // MARK: - Read Reminders
 
     func readReminders(limit: Int = 10) async throws -> String {

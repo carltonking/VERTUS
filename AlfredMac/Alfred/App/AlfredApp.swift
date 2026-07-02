@@ -1844,6 +1844,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // execution; the raw `text` is kept only for the audit log and the literal two-turn message.
         let cmd = QueryNormalizer.normalize(text)
 
+        // "Add this to my calendar" — read the event off the current screen (Accessibility text),
+        // extract the details with the LLM, and create it. The bar is a non-activating panel, so the
+        // app the user was looking at stays frontmost and captureFrontmost() reads THAT, not Alfred.
+        if CalendarEventCapability.detect(in: cmd) {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer {
+                    self.barState.isProcessing = false
+                    self.barState.presenceState = .expanded
+                }
+                guard let router = self.llmRouter else {
+                    self.barState.responseText = "No AI provider is configured."
+                    return
+                }
+                self.barState.responseText = "Reading your screen…"
+                let screen = ScreenTextCapability().captureFrontmost()?.text ?? ""
+                guard let ev = await CalendarEventCapability.extract(
+                    screenText: screen, query: text, now: Date(), router: router) else {
+                    self.barState.responseText = screen.isEmpty
+                        ? "I couldn't read your screen — grant Accessibility access in System Settings → Privacy & Security → Accessibility, or just tell me the event details."
+                        : "I couldn't find an event on screen. Tell me the title, date and time and I'll add it."
+                    return
+                }
+                do {
+                    let result = try await CalendarRemindersCapability().createEvent(
+                        title: ev.title, start: ev.start, end: ev.end,
+                        location: ev.location, notes: ev.notes, allDay: ev.allDay)
+                    self.barState.responseText = result
+                    self.auditBarAction(prompt: "add calendar event from screen: \(ev.title)",
+                                        result: result, commandClass: "write")
+                } catch {
+                    self.barState.responseText = "Couldn't add the event: \(error.localizedDescription)"
+                }
+            }
+            return
+        }
+
         // Email via Mail.app — default opens a reviewable draft; "send" + a body auto-sends (gated).
         if let intent = MailComposeCapability.detect(in: cmd) {
             Task { @MainActor [weak self] in
