@@ -31,6 +31,7 @@ struct CalendarEventCapability {
         let today = Self.isoDate.string(from: now)
         let weekday = Self.weekday.string(from: now)
         let tz = TimeZone.current.identifier
+        let year = Calendar.current.component(.year, from: now)
 
         let system = """
         You extract a single calendar event from on-screen text. Today is \(weekday), \(today) (timezone \
@@ -41,9 +42,10 @@ struct CalendarEventCapability {
         {"found": true|false, "title": string, "date": "YYYY-MM-DD", "start": "HH:mm" (24h) or null, \
         "end": "HH:mm" or null, "allDay": true|false, "location": string or null, "notes": string or null}
         Rules: "found" is false if there's no event. If several events appear, pick the one the user is \
-        looking at — the most prominent / foreground one. If a date has no year, use the next FUTURE \
-        occurrence. If a start time is present, allDay=false; if only a date is given, allDay=true and \
-        start=null. Keep the title short. Never invent details that aren't in the text.
+        looking at — the most prominent / foreground one. If a date has NO year, assume the current year \
+        (\(year)); if that date has already passed this year, use the next year (\(year + 1)). Do NOT pick \
+        a year by matching the weekday. If a start time is present, allDay=false; if only a date is given, \
+        allDay=true and start=null. Keep the title short. Never invent details that aren't in the text.
         """
         var user = "ON-SCREEN TEXT:\n\"\"\"\n\(String(screenText.prefix(6000)))\n\"\"\""
         user += "\n\nUSER REQUEST: \(query)"
