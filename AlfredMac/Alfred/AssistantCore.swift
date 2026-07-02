@@ -240,6 +240,26 @@ actor AssistantCore {
         }
     }
 
+    /// A human-readable list of the user's routines — the same data shown in the menu-bar Routines
+    /// tab — so the bots can text it back on request.
+    func routinesText() -> String {
+        let routines = memory.allRoutines()
+        guard !routines.isEmpty else { return "You don't have any routines set up yet." }
+        let df = DateFormatter()
+        df.dateStyle = .short
+        df.timeStyle = .short
+        let lines = routines.map { r -> String in
+            var parts = ["• \(r.title)"]
+            parts.append(r.enabled ? "on" : "off")
+            if let last = r.last_run_at {
+                parts.append("last run \(df.string(from: Date(timeIntervalSince1970: last)))")
+            }
+            if let status = r.last_status, !status.isEmpty { parts.append(status) }
+            return parts.joined(separator: " · ")
+        }
+        return "🗓 Your routines (\(routines.count)):\n" + lines.joined(separator: "\n")
+    }
+
     // MARK: - Main entry point
 
     func process(

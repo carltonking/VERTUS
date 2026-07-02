@@ -140,6 +140,12 @@ final class TelegramBotService: ObservableObject {
         let cmd = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cmd.isEmpty else { return }
 
+        // Routines → text back the routine list (same data as the menu-bar Routines tab).
+        if cmd.lowercased().contains("routine") {
+            await sendReply(await core.routinesText(), token: token)
+            return
+        }
+
         // Outward email → confirm before sending.
         if let intent = MailComposeCapability.detect(in: cmd) {
             guard let body = intent.body, !body.trimmingCharacters(in: .whitespaces).isEmpty else {
@@ -186,7 +192,7 @@ final class TelegramBotService: ObservableObject {
             )
         } catch {
             NSLog("[TelegramBot] process failed: \(error.localizedDescription)")
-            reply = "Sorry, I hit an error handling that."
+            reply = Self.friendlyError(error)
         }
         await sendReply(reply.isEmpty ? "Done." : reply, token: token)
     }
@@ -341,6 +347,19 @@ final class TelegramBotService: ObservableObject {
         let tail = String(remaining).trimmingCharacters(in: .whitespacesAndNewlines)
         if !tail.isEmpty { chunks.append(tail) }
         return chunks
+    }
+
+    /// Turns a process() error into a useful reply — names a rate limit (the common case) and points
+    /// at the fix, instead of a vague "hit an error".
+    static func friendlyError(_ error: Error) -> String {
+        if case LLMError.rateLimited = error {
+            return "That hit the AI provider's rate limit. In Alfred → Settings → AI Provider, switch to Gemini (1M tokens/min free) or Ollama (local, unlimited)."
+        }
+        let d = error.localizedDescription
+        if d.lowercased().contains("rate limit") || d.lowercased().contains("tokens per minute") {
+            return "That hit the AI provider's rate limit. Switch to Gemini (1M tokens/min free) or Ollama in Settings → AI Provider."
+        }
+        return "Sorry — I hit an error: \(d)"
     }
 
     private static func logHintOnce() {
