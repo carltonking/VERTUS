@@ -115,13 +115,47 @@ final class LLMRouter: ObservableObject {
         return (redacted.messages, redacted.system)
     }
 
+    // MARK: - Auto-fallback to local Ollama
+
+    /// When a CLOUD provider fails with a rate limit / server (5xx) / network error, silently retry on
+    /// local Ollama so the user never sees "hit an error". Ollama is on-device — no egress guard, no
+    /// redaction needed. Only for cloud providers (if Ollama itself fails there's nowhere to fall back).
+    private let fallbackOllama = OllamaProvider(model: "llama3.1:8b")
+
+    /// A thread-safe "did the stream emit any tokens yet" flag, so we only fall back on a clean upfront
+    /// failure (429/503 before any output) and never mid-stream (which would double the text).
+    private final class EmitFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var flag = false
+        func hit() { lock.lock(); flag = true; lock.unlock() }
+        var value: Bool { lock.lock(); defer { lock.unlock() }; return flag }
+    }
+
+    private func shouldFallback(_ error: Error) -> Bool {
+        if error is URLError { return true }
+        guard let llm = error as? LLMError else { return false }
+        switch llm {
+        case .rateLimited, .networkError: return true   // networkError carries 5xx/overload/timeout text
+        default: return false                           // invalidKey etc. surface so the user fixes config
+        }
+    }
+
+    private func fallbackModel() -> String { appState.providerModels["ollama"] ?? "llama3.1:8b" }
+
     // MARK: - Forwarding
 
     func complete(messages: [LLMMessage], system: String = "") async throws -> String {
         let (m, s) = try guardEgress(messages, system)
-        let out = try await activeProvider.complete(messages: m, system: s)
-        logCost(messages: m, system: s, output: out)
-        return out
+        do {
+            let out = try await activeProvider.complete(messages: m, system: s)
+            logCost(messages: m, system: s, output: out)
+            return out
+        } catch {
+            guard isActiveProviderCloud, shouldFallback(error) else { throw error }
+            NSLog("[LLMRouter] \(activeProvider.id) failed (\(error.localizedDescription)) — falling back to Ollama")
+            fallbackOllama.model = fallbackModel()
+            return try await fallbackOllama.complete(messages: messages, system: system)
+        }
     }
 
     func stream(
@@ -130,14 +164,23 @@ final class LLMRouter: ObservableObject {
         onToken: @escaping @Sendable (String) -> Void
     ) async throws -> String {
         let (m, s) = try guardEgress(messages, system)
-        let out = try await activeProvider.stream(messages: m, system: s, onToken: onToken)
-        logCost(messages: m, system: s, output: out)
-        return out
+        let emitted = EmitFlag()
+        do {
+            let out = try await activeProvider.stream(messages: m, system: s, onToken: { emitted.hit(); onToken($0) })
+            logCost(messages: m, system: s, output: out)
+            return out
+        } catch {
+            guard isActiveProviderCloud, shouldFallback(error), !emitted.value else { throw error }
+            NSLog("[LLMRouter] \(activeProvider.id) stream failed (\(error.localizedDescription)) — falling back to Ollama")
+            fallbackOllama.model = fallbackModel()
+            return try await fallbackOllama.stream(messages: messages, system: system, onToken: onToken)
+        }
     }
 
     /// Stream with tool‑calling support. Pass `tools` definitions and an `executeToolCall`
     /// closure that runs each tool synchronisation‑free. Only supported on OpenAI‑compatible
-    /// providers (local, Gemini); other providers fall back to plain streaming.
+    /// providers (local, Gemini); other providers fall back to plain streaming. On a cloud failure
+    /// it also falls back to Ollama (plain stream, no tools — degraded but responsive).
     func streamWithTools(
         messages: [LLMMessage],
         system: String = "",
@@ -146,20 +189,24 @@ final class LLMRouter: ObservableObject {
         onToken: @escaping @Sendable (String) -> Void
     ) async throws -> String {
         let (m, s) = try guardEgress(messages, system)
-        guard let provider = activeProvider as? OpenAICompatibleProvider else {
-            let out = try await activeProvider.stream(messages: m, system: s, onToken: onToken)
+        let emitted = EmitFlag()
+        let tracked: @Sendable (String) -> Void = { emitted.hit(); onToken($0) }
+        do {
+            guard let provider = activeProvider as? OpenAICompatibleProvider else {
+                let out = try await activeProvider.stream(messages: m, system: s, onToken: tracked)
+                logCost(messages: m, system: s, output: out)
+                return out
+            }
+            let out = try await provider.streamWithTools(
+                messages: m, system: s, tools: tools, executeToolCall: executeToolCall, onToken: tracked)
             logCost(messages: m, system: s, output: out)
             return out
+        } catch {
+            guard isActiveProviderCloud, shouldFallback(error), !emitted.value else { throw error }
+            NSLog("[LLMRouter] \(activeProvider.id) streamWithTools failed (\(error.localizedDescription)) — falling back to Ollama")
+            fallbackOllama.model = fallbackModel()
+            return try await fallbackOllama.stream(messages: messages, system: system, onToken: onToken)
         }
-        let out = try await provider.streamWithTools(
-            messages: m,
-            system: s,
-            tools: tools,
-            executeToolCall: executeToolCall,
-            onToken: onToken
-        )
-        logCost(messages: m, system: s, output: out)
-        return out
     }
 
     // Convenience single-turn wrappers
