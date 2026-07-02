@@ -1,5 +1,15 @@
+import CoreLocation
 import EventKit
 import Foundation
+
+/// An upcoming timed event that has a location — the input to the departure/travel-time watcher.
+struct LocatedEvent: Identifiable, Hashable {
+    let id: String              // eventIdentifier + start (recurring-safe)
+    let title: String
+    let start: Date
+    let location: String        // non-empty raw location text
+    let coordinate: CLLocation? // from EKStructuredLocation when the calendar provided one; else nil
+}
 
 /// A reminder flattened into a UI-friendly value (the Reminders tab renders these instead of
 /// raw `EKReminder`s or the text strings the assistant consumes).
@@ -58,6 +68,28 @@ struct CalendarRemindersCapability {
             let end = (!e.isAllDay && e.endDate != nil) ? " – \(formatTime(e.endDate))" : ""
             return "\(i + 1). \(e.title ?? "Untitled") — \(start)\(end) [\(e.calendar.title)]"
         }.joined(separator: "\n")
+    }
+
+    /// Upcoming timed (non-all-day) events that have a location, within `hours` from now — the input
+    /// to the departure watcher. Skips events with no location text; returns the structured coordinate
+    /// when the calendar supplied one (else nil → the caller geocodes the text). Requesting access when
+    /// already decided does not re-prompt.
+    func upcomingTimedEventsWithLocation(withinHours hours: Int = 3) async -> [LocatedEvent] {
+        guard (try? await store.requestFullAccessToEvents()) == true else { return [] }
+        let now = Date()
+        guard let end = Calendar.current.date(byAdding: .hour, value: hours, to: now) else { return [] }
+        let predicate = store.predicateForEvents(withStart: now, end: end, calendars: nil)
+        return store.events(matching: predicate)
+            .filter { !$0.isAllDay && $0.startDate >= now }
+            .compactMap { e -> LocatedEvent? in
+                guard let loc = e.location?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !loc.isEmpty else { return nil }
+                let base = e.eventIdentifier ?? (e.title ?? "event")
+                return LocatedEvent(id: "\(base)@\(Int(e.startDate.timeIntervalSince1970))",
+                                    title: e.title ?? "Untitled", start: e.startDate,
+                                    location: loc, coordinate: e.structuredLocation?.geoLocation)
+            }
+            .sorted { $0.start < $1.start }
     }
 
     // MARK: - Read Reminders

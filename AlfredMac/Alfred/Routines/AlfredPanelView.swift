@@ -31,6 +31,10 @@ struct AlfredPanelView: View {
     /// selected provider's account so Alfred owns the item (no access prompt on later reads).
     @State private var providerKeyInput = ""
     @State private var providerKeyJustSaved = false
+    /// Google Maps API key entry for transit departure reminders (write-only; saved under account
+    /// "googlemaps"). Only needed when travel mode = transit.
+    @State private var mapsKeyInput = ""
+    @State private var mapsKeyJustSaved = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -255,8 +259,73 @@ struct AlfredPanelView: View {
 
             Divider()
 
+            departureRemindersGroup
+
+            Divider()
+
             voiceLearningGroup
         }
+    }
+
+    private var departureRemindersGroup: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle(isOn: $appState.departureRemindersEnabled) {
+                settingLabel("Departure reminders",
+                             "A heads-up when it's time to leave for a calendar event that has a location, based on travel time. Needs Location + Calendar access.")
+            }
+            .toggleStyle(.switch)
+
+            if appState.departureRemindersEnabled {
+                VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Travel mode").font(.system(size: 11, weight: .semibold))
+                        Picker("", selection: $appState.departureTravelMode) {
+                            Text("Walking").tag("walking")
+                            Text("Driving").tag("driving")
+                            Text("Transit").tag("transit")
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                    }
+                    if appState.departureTravelMode == "transit" {
+                        mapsKeyField
+                    }
+                }
+            }
+        }
+    }
+
+    private var mapsKeyField: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Google Maps API key").font(.system(size: 11, weight: .semibold))
+            SecureField("needed for transit times", text: $mapsKeyInput)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, design: .monospaced))
+                .onChange(of: mapsKeyInput) { _, _ in mapsKeyJustSaved = false }
+            HStack(spacing: 8) {
+                Button("Save key") { saveMapsKey() }
+                    .controlSize(.small)
+                    .disabled(mapsKeyInput.trimmingCharacters(in: .whitespaces).isEmpty)
+                if mapsKeyJustSaved {
+                    Label("Saved", systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 11)).foregroundStyle(.green).labelStyle(.titleAndIcon)
+                }
+                if let url = URL(string: "https://console.cloud.google.com/google/maps-apis/credentials") {
+                    Link("Get key ↗", destination: url).font(.system(size: 11))
+                }
+            }
+            Text("Apple can't do transit times. Enable the Routes API in Google Cloud; usage stays free but a card is required to create the key.")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func saveMapsKey() {
+        let key = mapsKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+        _ = KeychainHelper.save(service: "com.alfred.app", account: "googlemaps", value: key)
+        mapsKeyInput = ""
+        mapsKeyJustSaved = true
     }
 
     private var imessageBotGroup: some View {

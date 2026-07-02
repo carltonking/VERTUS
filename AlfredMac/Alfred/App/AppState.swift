@@ -90,6 +90,25 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(inboundWatcherEnabled, forKey: "inboundWatcherEnabled") }
     }
 
+    /// Opt-in: notify when it's time to leave for an upcoming calendar event that has a location, based
+    /// on travel time. Off by default. Needs Location + Calendar. See `DepartureWatcher`.
+    @Published var departureRemindersEnabled: Bool {
+        didSet { UserDefaults.standard.set(departureRemindersEnabled, forKey: "departureRemindersEnabled") }
+    }
+    /// Travel mode for the estimate: "walking" or "driving" (free, Apple MKDirections) or "transit"
+    /// (Google Routes API — needs a Google Maps key in Keychain, account "googlemaps").
+    @Published var departureTravelMode: String {
+        didSet { UserDefaults.standard.set(departureTravelMode, forKey: "departureTravelMode") }
+    }
+    /// Arrive this many minutes before the event starts (folded into "leave by").
+    @Published var departureArriveEarlyMinutes: Int {
+        didSet { UserDefaults.standard.set(departureArriveEarlyMinutes, forKey: "departureArriveEarlyMinutes") }
+    }
+    /// Nudge this many minutes before "leave by" — the heads-up to start wrapping up.
+    @Published var departurePackupLeadMinutes: Int {
+        didSet { UserDefaults.standard.set(departurePackupLeadMinutes, forKey: "departurePackupLeadMinutes") }
+    }
+
     /// User-facing disclosure for the voice-learning opt-in — surface this wherever the toggle is
     /// shown (there is no Settings UI yet; keep it in sync with the toggle's copy).
     static let voiceLearningDisclosure =
@@ -219,6 +238,10 @@ final class AppState: ObservableObject {
         UserDefaults.standard.removeObject(forKey: "screenMonitoringEnabled")
         screenMonitoringEnabled = false
         inboundWatcherEnabled = UserDefaults.standard.bool(forKey: "inboundWatcherEnabled")
+        departureRemindersEnabled = UserDefaults.standard.bool(forKey: "departureRemindersEnabled")
+        departureTravelMode = UserDefaults.standard.string(forKey: "departureTravelMode") ?? "walking"
+        departureArriveEarlyMinutes = UserDefaults.standard.object(forKey: "departureArriveEarlyMinutes") as? Int ?? 10
+        departurePackupLeadMinutes = UserDefaults.standard.object(forKey: "departurePackupLeadMinutes") as? Int ?? 30
         voiceLearningFromMessagesEnabled = UserDefaults.standard.bool(forKey: "voiceLearningFromMessagesEnabled")
         imessageBotEnabled = UserDefaults.standard.bool(forKey: "imessageBotEnabled")
         imessageBotTrigger = UserDefaults.standard.string(forKey: "imessageBotTrigger") ?? "alfred"

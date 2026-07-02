@@ -134,6 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let mailCompose = MailComposeCapability()
     private let screenMonitoring = ScreenMonitoringManager()
     private var inboundWatcher: InboundWatcher?
+    private var departureWatcher: DepartureWatcher?
     private var alfredBot: AlfredBotWatcher?
     private var telegramBot: TelegramBotService?
     private let focusSession = FocusSessionManager()
@@ -664,6 +665,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .store(in: &cancellables)
             if appState.inboundWatcherEnabled { watcher.start() }
         }
+
+        // Departure ("time to leave") reminders (opt-in). Same Task/sleep-loop pattern as InboundWatcher,
+        // so it stays outside the SafetyAuditEngine-scanned set.
+        let departure = DepartureWatcher(appState: appState)
+        departureWatcher = departure
+        appState.$departureRemindersEnabled
+            .receive(on: DispatchQueue.main)
+            .sink { [weak departure] enabled in
+                guard let departure else { return }
+                if enabled { departure.start() } else { departure.stop() }
+            }
+            .store(in: &cancellables)
+        if appState.departureRemindersEnabled { departure.start() }
 
         // Voice learning from sent iMessages (opt-in). Detached + watermarked; a no-op (one-time
         // hint) without Full Disk Access. Runs once at launch if enabled, and again when toggled on.

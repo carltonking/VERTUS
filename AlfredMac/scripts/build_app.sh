@@ -155,6 +155,8 @@ ${APP_ICON_PLIST}
   <string>Alfred reads and creates reminders when you ask.</string>
   <key>NSRemindersFullAccessUsageDescription</key>
   <string>Alfred reads and creates reminders when you ask.</string>
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>Alfred uses your location to estimate travel time to calendar events and remind you when to leave.</string>
   <key>CFBundleURLTypes</key>
   <array>
     <dict>
