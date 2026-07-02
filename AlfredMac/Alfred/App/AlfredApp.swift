@@ -705,7 +705,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if appState.imessageBotEnabled { bot.start() }
 
             // Telegram bot (opt-in). Long-poll loop, also outside the SafetyAuditEngine-scanned set.
-            let telegram = TelegramBotService(core: core, appState: appState)
+            let telegram = TelegramBotService(core: core, appState: appState, router: llmRouter)
             telegramBot = telegram
             appState.$telegramBotEnabled
                 .receive(on: DispatchQueue.main)

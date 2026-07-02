@@ -1,10 +1,12 @@
 import CoreGraphics
 import Foundation
+import ImageIO
 import Vision
 
-/// Reads text out of the screen's PIXELS with Apple's Vision framework (free, on-device). Complements
+/// Reads text out of PIXELS with Apple's Vision framework (free, on-device). Complements
 /// `ScreenTextCapability` (Accessibility text): OCR catches event details that live inside images —
-/// flyers, Instagram posts, screenshots — which the accessibility tree can't see.
+/// flyers, Instagram posts, screenshots — which the accessibility tree can't see. Works on the live
+/// screen and on arbitrary image data (e.g. a photo sent to the Telegram bot).
 struct ScreenOCRCapability {
     private let screen = ScreenCapability()
 
@@ -13,6 +15,14 @@ struct ScreenOCRCapability {
     func recognizeScreenText() async -> String? {
         guard let cgImage = try? await screen.captureCGImage() else { return nil }
         return await Self.recognize(cgImage)
+    }
+
+    /// OCRs arbitrary image bytes (JPEG/PNG/etc.). Returns nil if the data isn't a decodable image or
+    /// no text is found.
+    static func recognizeText(inImageData data: Data) async -> String? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        return await recognize(cgImage)
     }
 
     private static func recognize(_ image: CGImage) async -> String? {

@@ -19,6 +19,7 @@ final class TelegramBotService: ObservableObject {
 
     private let core: AssistantCore
     private let appState: AppState
+    private let router: LLMRouter?   // for photo → calendar-event extraction
     private let messaging = MessagingCapability()
     private let mailCompose = MailComposeCapability()
 
@@ -39,9 +40,10 @@ final class TelegramBotService: ObservableObject {
     private var pending: PendingAction?
     private static var didLogHint = false
 
-    init(core: AssistantCore, appState: AppState) {
+    init(core: AssistantCore, appState: AppState, router: LLMRouter? = nil) {
         self.core = core
         self.appState = appState
+        self.router = router
     }
 
     func start() {
@@ -92,6 +94,10 @@ final class TelegramBotService: ObservableObject {
 
             for (_, text) in Self.ownerMessages(from: updates, ownerChatID: ownerChatID()) {
                 await handle(text: text, token: token)
+            }
+            // Photos → treat as "add this event to my calendar" (OCR the image, extract, create).
+            for (_, fileId, caption) in Self.ownerPhotos(from: updates, ownerChatID: ownerChatID()) {
+                await handlePhoto(fileId: fileId, caption: caption, token: token)
             }
             if isActive { status = "Listening on Telegram." }
         }
@@ -195,6 +201,58 @@ final class TelegramBotService: ObservableObject {
         }
     }
 
+    // MARK: - Photo → calendar event
+
+    /// A photo the owner sends is treated as "add this event to my calendar": download it, OCR the
+    /// image (Vision), extract the event, and create it — the same brain as the Mac bar flow.
+    private func handlePhoto(fileId: String, caption: String?, token: String) async {
+        guard let router else {
+            await sendReply("I can't read photos right now — no AI provider is configured.", token: token)
+            return
+        }
+        await sendReply("📷 Reading that screenshot…", token: token)
+        guard let data = await downloadFile(fileId: fileId, token: token) else {
+            await sendReply("Couldn't download that image — try sending it again.", token: token)
+            return
+        }
+        guard let ocr = await ScreenOCRCapability.recognizeText(inImageData: data), !ocr.isEmpty else {
+            await sendReply("I couldn't read any text in that image.", token: token)
+            return
+        }
+        let query = caption?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? "add this event to my calendar"
+        guard let ev = await CalendarEventCapability.extract(screenText: ocr, query: query, now: Date(), router: router) else {
+            await sendReply("I couldn't find an event in that image. Try a clearer screenshot, or type the details.", token: token)
+            return
+        }
+        do {
+            let result = try await CalendarRemindersCapability().createEvent(
+                title: ev.title, start: ev.start, end: ev.end,
+                location: ev.location, notes: ev.notes, allDay: ev.allDay)
+            await sendReply(result, token: token)
+        } catch {
+            await sendReply("Couldn't add the event: \(error.localizedDescription)", token: token)
+        }
+    }
+
+    /// Resolves a Telegram file_id to its bytes: getFile → file_path → download from the file endpoint.
+    private func downloadFile(fileId: String, token: String) async -> Data? {
+        guard let metaURL = URL(string: "https://api.telegram.org/bot\(token)/getFile?file_id=\(fileId)"),
+              let (meta, mResp) = try? await URLSession.shared.data(from: metaURL),
+              (mResp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        struct FileResp: Decodable {
+            struct Result: Decodable {
+                let filePath: String?
+                enum CodingKeys: String, CodingKey { case filePath = "file_path" }
+            }
+            let result: Result
+        }
+        guard let path = (try? JSONDecoder().decode(FileResp.self, from: meta))?.result.filePath,
+              let fileURL = URL(string: "https://api.telegram.org/file/bot\(token)/\(path)"),
+              let (bytes, fResp) = try? await URLSession.shared.data(from: fileURL),
+              (fResp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        return bytes
+    }
+
     // MARK: - Send (splits long replies)
 
     private func sendReply(_ text: String, token: String) async {
@@ -227,8 +285,13 @@ final class TelegramBotService: ObservableObject {
         let message: Message?
         enum CodingKeys: String, CodingKey { case updateId = "update_id"; case message }
     }
-    struct Message: Decodable { let text: String?; let chat: Chat }
+    struct Message: Decodable { let text: String?; let caption: String?; let photo: [PhotoSize]?; let chat: Chat }
     struct Chat: Decodable { let id: Int64 }
+    struct PhotoSize: Decodable {
+        let fileId: String
+        let fileSize: Int?
+        enum CodingKeys: String, CodingKey { case fileId = "file_id"; case fileSize = "file_size" }
+    }
 
     static func decodeUpdates(_ data: Data) -> [Update]? {
         struct Response: Decodable { let ok: Bool; let result: [Update] }
@@ -242,6 +305,17 @@ final class TelegramBotService: ObservableObject {
             guard let m = u.message, let text = m.text, !text.isEmpty,
                   String(m.chat.id) == ownerChatID else { return nil }
             return (u.updateId, text)
+        }
+    }
+
+    /// Owner-only photo messages → the LARGEST photo's file_id + any caption. Telegram sends `photo`
+    /// as an array of sizes (largest last / biggest file_size).
+    static func ownerPhotos(from updates: [Update], ownerChatID: String) -> [(updateId: Int, fileId: String, caption: String?)] {
+        updates.compactMap { u in
+            guard let m = u.message, let photos = m.photo, !photos.isEmpty,
+                  String(m.chat.id) == ownerChatID else { return nil }
+            let largest = photos.max { ($0.fileSize ?? 0) < ($1.fileSize ?? 0) } ?? photos[photos.count - 1]
+            return (u.updateId, largest.fileId, m.caption)
         }
     }
 
