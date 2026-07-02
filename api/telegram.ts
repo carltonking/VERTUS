@@ -4,7 +4,7 @@
 import { sendMessage, downloadFile, largestPhotoId } from "./_lib/telegram";
 import { geminiText } from "./_lib/gemini";
 import { extractFromText, extractFromImage } from "./_lib/extract";
-import { createEvent } from "./_lib/caldav";
+import { createEvent, diagnose } from "./_lib/caldav";
 
 const HELP = [
   "Commands:",
@@ -29,6 +29,22 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     // One-time, owner-gated webhook self-setup: GET /api/telegram?setup=<OWNER_CHAT_ID>.
     // Lets us arm the Telegram webhook using the token already in this function's env
     // (the token is stored "Sensitive" in Vercel and can't be pulled back out).
+    // Owner-gated CalDAV diagnostic: GET /api/telegram?diag=<OWNER_CHAT_ID>. Reports each iCloud
+    // discovery step + a throwaway test PUT so we can see exactly why a calendar write fails.
+    const d = /[?&]diag=([^&]+)/.exec(req.url || "");
+    if (d) {
+      const owner = process.env.OWNER_CHAT_ID;
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json");
+      if (!owner || decodeURIComponent(d[1]) !== owner) {
+        res.end(JSON.stringify({ ok: false, error: "not authorized" }));
+        return;
+      }
+      const report = await diagnose().catch((e: any) => ({ error: String(e?.message ?? e) }));
+      res.end(JSON.stringify(report, null, 2));
+      return;
+    }
+
     const m = /[?&]setup=([^&]+)/.exec(req.url || "");
     if (m) {
       const token = process.env.CLOUD_BOT_TOKEN;
@@ -45,7 +61,19 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url: PUBLIC_URL, allowed_updates: ["message", "edited_message"], drop_pending_updates: true }),
         });
-        res.end(await tg.text());
+        const hookBody = await tg.text();
+        // Register the command menu so the bot shows its skills (the "/" menu), like the Mac bot.
+        await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            commands: [
+              { command: "calendar", description: "Add an event — attach a photo or type details" },
+              { command: "help", description: "What Alfred can do" },
+            ],
+          }),
+        });
+        res.end(hookBody);
       } catch (e: any) {
         res.end(JSON.stringify({ ok: false, error: String(e?.message ?? e) }));
       }

@@ -176,3 +176,73 @@ function resolve(base: string, href: string): string {
     return href;
   }
 }
+
+// MARK: - Diagnostics (owner-gated; reports each discovery step + a test PUT, never the credentials)
+
+export async function diagnose(): Promise<Record<string, unknown>> {
+  const appleId = process.env.APPLE_ID;
+  const appPassword = process.env.APPLE_APP_PASSWORD;
+  const out: Record<string, unknown> = {
+    hasAppleId: !!appleId,
+    hasAppPassword: !!appPassword,
+    appleIdLooksLikeEmail: !!appleId && /.+@.+\..+/.test(appleId),
+    appPasswordLen: appPassword ? appPassword.length : 0,
+    envCalUrlSet: !!process.env.CALDAV_CALENDAR_URL,
+  };
+  if (!appleId || !appPassword) return out;
+  const auth = "Basic " + Buffer.from(`${appleId}:${appPassword}`).toString("base64");
+  const base = "https://caldav.icloud.com";
+
+  const p = await propfind(`${base}/`, auth, "0",
+    `<A:propfind xmlns:A="DAV:"><A:prop><A:current-user-principal/></A:prop></A:propfind>`);
+  out.step1_principal_ok = !!p;
+  if (!p) { out.hint = "PROPFIND to caldav.icloud.com returned non-207 — usually a wrong Apple ID / app-specific password (401)."; return out; }
+  const principal = propHref(p.body, "current-user-principal");
+  out.principalHref = principal;
+  if (!principal) { out.step1_body = p.body.slice(0, 300); return out; }
+  const principalUrl = resolve(p.finalUrl || `${base}/`, principal);
+  out.principalUrl = principalUrl;
+
+  const h = await propfind(principalUrl, auth, "0",
+    `<A:propfind xmlns:A="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><A:prop><C:calendar-home-set/></A:prop></A:propfind>`);
+  out.step2_home_ok = !!h;
+  if (!h) return out;
+  const home = propHref(h.body, "calendar-home-set");
+  out.homeHref = home;
+  if (!home) { out.step2_body = h.body.slice(0, 300); return out; }
+  const homeUrl = resolve(h.finalUrl || principalUrl, home);
+  out.homeUrl = homeUrl;
+
+  const list = await propfind(homeUrl, auth, "1",
+    `<A:propfind xmlns:A="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><A:prop><A:resourcetype/><A:displayname/><C:supported-calendar-component-set/></A:prop></A:propfind>`);
+  out.step3_list_ok = !!list;
+  if (!list) return out;
+  const calHref = pickCalendar(list.body);
+  out.calHref = calHref;
+  if (!calHref) { out.step3_body = list.body.slice(0, 1500); return out; }
+  const calUrl = resolve(list.finalUrl || homeUrl, calHref);
+  out.calUrl = calUrl;
+
+  // Test PUT of a throwaway event (safe to delete) to see iCloud's actual response.
+  const now = new Date();
+  const tomorrow = new Intl.DateTimeFormat("en-CA", { timeZone: USER_TZ, year: "numeric", month: "2-digit", day: "2-digit" })
+    .format(new Date(now.getTime() + 86400000));
+  const testEv: ExtractedEvent = { title: "Alfred diagnostic (safe to delete)", date: tomorrow, start: "15:00", end: "16:00", allDay: false, location: null, notes: null };
+  const uid = `alfreddiag-${Date.now()}`;
+  const ics = buildICS(testEv, uid);
+  out.ics = ics;
+  const href = calUrl.replace(/\/+$/, "") + `/${uid}.ics`;
+  out.putHref = href;
+  try {
+    const put = await fetch(href, {
+      method: "PUT",
+      headers: { "Content-Type": "text/calendar; charset=utf-8", Authorization: auth },
+      body: ics,
+    });
+    out.putStatus = put.status;
+    out.putBody = (await put.text()).slice(0, 600);
+  } catch (e: any) {
+    out.putError = String(e?.message ?? e);
+  }
+  return out;
+}
