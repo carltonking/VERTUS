@@ -38,6 +38,7 @@ final class TelegramBotService: ObservableObject {
         }
     }
     private var pending: PendingAction?
+    private var didRegisterCommands = false
     private static var didLogHint = false
 
     init(core: AssistantCore, appState: AppState, router: LLMRouter? = nil) {
@@ -79,6 +80,8 @@ final class TelegramBotService: ObservableObject {
                 status = "Set your Telegram chat ID to enable the bot."
                 try? await Task.sleep(nanoseconds: 5_000_000_000); continue
             }
+
+            if !didRegisterCommands { await registerCommands(token: token); didRegisterCommands = true }
 
             let offset = defaults.integer(forKey: offsetKey)
             guard let data = await getUpdates(token: token, offset: offset) else {
@@ -140,7 +143,14 @@ final class TelegramBotService: ObservableObject {
         let cmd = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cmd.isEmpty else { return }
 
-        // Routines → text back the routine list (same data as the menu-bar Routines tab).
+        // Slash commands ("skills"): /calendar, /routines, /help. A photo with a /calendar caption is
+        // handled in handlePhoto.
+        if cmd.hasPrefix("/") {
+            await handleSlashCommand(cmd, token: token)
+            return
+        }
+
+        // Natural-language routines → text back the routine list (same data as the menu-bar tab).
         if cmd.lowercased().contains("routine") {
             await sendReply(await core.routinesText(), token: token)
             return
@@ -207,6 +217,74 @@ final class TelegramBotService: ObservableObject {
         }
     }
 
+    // MARK: - Slash commands ("skills")
+
+    private static let helpText = """
+    Commands:
+    /calendar — add an event. Attach a photo of it, or type details: /calendar dentist tomorrow 3pm
+    /routines — list your routines
+    /help — show this
+    Or just talk to me normally.
+    """
+
+    private func handleSlashCommand(_ cmd: String, token: String) async {
+        let split = cmd.dropFirst().split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+        // Strip a "@botname" suffix Telegram adds to commands in groups.
+        let command = (split.first.map(String.init) ?? "").split(separator: "@").first.map(String.init)?.lowercased() ?? ""
+        let args = split.count > 1 ? String(split[1]).trimmingCharacters(in: .whitespaces) : ""
+
+        switch command {
+        case "calendar", "cal", "event":
+            if args.isEmpty {
+                await sendReply("Attach a photo of an event, or add details — e.g. /calendar dentist tomorrow 3pm.", token: token)
+            } else {
+                await addCalendarEvent(from: args, token: token)
+            }
+        case "routines", "routine":
+            await sendReply(await core.routinesText(), token: token)
+        case "help", "start":
+            await sendReply(Self.helpText, token: token)
+        default:
+            await sendReply("Unknown command “/\(command)”. Try /help.", token: token)
+        }
+    }
+
+    /// Creates a calendar event from typed text (the /calendar path without a photo).
+    private func addCalendarEvent(from text: String, token: String) async {
+        guard let router else {
+            await sendReply("No AI provider is configured.", token: token)
+            return
+        }
+        guard let ev = await CalendarEventCapability.extract(screenText: text, query: "add to calendar", now: Date(), router: router) else {
+            await sendReply("I couldn't find an event in that. Try: /calendar dentist tomorrow 3pm at 5th ave.", token: token)
+            return
+        }
+        do {
+            let result = try await CalendarRemindersCapability().createEvent(
+                title: ev.title, start: ev.start, end: ev.end, location: ev.location, notes: ev.notes, allDay: ev.allDay)
+            await sendReply(result, token: token)
+        } catch {
+            await sendReply("Couldn't add the event: \(error.localizedDescription)", token: token)
+        }
+    }
+
+    /// Registers the slash commands with Telegram so they appear in the "/" menu (idempotent; called
+    /// once per launch).
+    private func registerCommands(token: String) async {
+        let commands: [[String: String]] = [
+            ["command": "calendar", "description": "Add an event (attach a photo or type details)"],
+            ["command": "routines", "description": "List your routines"],
+            ["command": "help", "description": "Show commands"],
+        ]
+        guard let url = URL(string: "https://api.telegram.org/bot\(token)/setMyCommands"),
+              let body = try? JSONSerialization.data(withJSONObject: ["commands": commands]) else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+        _ = try? await URLSession.shared.data(for: req)
+    }
+
     // MARK: - Photo → calendar event
 
     /// A photo the owner sends is treated as "add this event to my calendar": download it, OCR the
@@ -225,7 +303,10 @@ final class TelegramBotService: ObservableObject {
             await sendReply("I couldn't read any text in that image.", token: token)
             return
         }
-        let query = caption?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? "add this event to my calendar"
+        // A "/calendar" caption is just the explicit command — drop it; keep any extra words as context.
+        let cap = caption?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let extra = cap.hasPrefix("/") ? (cap.split(separator: " ", maxSplits: 1).dropFirst().first.map(String.init) ?? "") : cap
+        let query = extra.nonEmpty ?? "add this event to my calendar"
         guard let ev = await CalendarEventCapability.extract(screenText: ocr, query: query, now: Date(), router: router) else {
             await sendReply("I couldn't find an event in that image. Try a clearer screenshot, or type the details.", token: token)
             return
