@@ -22,8 +22,35 @@ const CHAT_SYSTEM =
 
 import type { IncomingMessage, ServerResponse } from "http";
 
+const PUBLIC_URL = "https://alfredassistant.vercel.app/api/telegram";
+
 export default async function handler(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (req.method !== "POST") {
+    // One-time, owner-gated webhook self-setup: GET /api/telegram?setup=<OWNER_CHAT_ID>.
+    // Lets us arm the Telegram webhook using the token already in this function's env
+    // (the token is stored "Sensitive" in Vercel and can't be pulled back out).
+    const m = /[?&]setup=([^&]+)/.exec(req.url || "");
+    if (m) {
+      const token = process.env.CLOUD_BOT_TOKEN;
+      const owner = process.env.OWNER_CHAT_ID;
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json");
+      if (!token || !owner || decodeURIComponent(m[1]) !== owner) {
+        res.end(JSON.stringify({ ok: false, error: "setup not authorized" }));
+        return;
+      }
+      try {
+        const tg = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: PUBLIC_URL, allowed_updates: ["message", "edited_message"], drop_pending_updates: true }),
+        });
+        res.end(await tg.text());
+      } catch (e: any) {
+        res.end(JSON.stringify({ ok: false, error: String(e?.message ?? e) }));
+      }
+      return;
+    }
     res.statusCode = 200;
     res.end("Alfred Lite is running.");
     return;
