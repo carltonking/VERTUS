@@ -3,6 +3,7 @@
 // var (CALDAV_CALENDAR_URL). Times use TZID + a bundled VTIMEZONE so iCloud places them correctly.
 
 import { ExtractedEvent, USER_TZ } from "./extract";
+import { parseToken } from "./keys";
 
 /** America/New_York VTIMEZONE (RFC-correct, so iCloud honors local times + DST). v1 targets this TZ. */
 const NY_VTIMEZONE = [
@@ -66,12 +67,45 @@ function buildICS(ev: ExtractedEvent, uid: string): string {
   } else {
     const start = ev.start || "09:00";
     const end = ev.end || addHour(start);
-    lines.push(`DTSTART;TZID=${USER_TZ}:${local(ev.date, start)}`, `DTEND;TZID=${USER_TZ}:${local(ev.date, end)}`);
+    const endDate = end <= start ? nextDay(ev.date) : ev.date; // advance a day for overnight / 23:xx→00:xx wrap
+    lines.push(`DTSTART;TZID=${USER_TZ}:${local(ev.date, start)}`, `DTEND;TZID=${USER_TZ}:${local(endDate, end)}`);
   }
   if (ev.location) lines.push(`LOCATION:${esc(ev.location)}`);
   if (ev.notes) lines.push(`DESCRIPTION:${esc(ev.notes)}`);
+  if (ev.url) lines.push(`URL:${ev.url}`); // URI value — not TEXT-escaped
+  if (ev.categories?.length) lines.push(`CATEGORIES:${ev.categories.map(esc).join(",")}`);
+  for (const a of ev.alarms ?? []) {
+    lines.push(
+      "BEGIN:VALARM",
+      "ACTION:DISPLAY",
+      `DESCRIPTION:${esc(ev.title)}`,
+      `TRIGGER${a.related ? `;RELATED=${a.related}` : ""}:${a.offset}`,
+      "END:VALARM",
+    );
+  }
   lines.push("END:VEVENT", "END:VCALENDAR");
-  return lines.join("\r\n");
+  return lines.map(fold).join("\r\n");
+}
+
+/** RFC5545 line folding at 75 octets (continuations start with a space), on code-point boundaries so
+ * multibyte chars (emoji in SUMMARY) are never split. Readers rejoin CRLF+space. */
+function fold(line: string): string {
+  const chunks: string[] = [];
+  let cur = "";
+  let curBytes = 0;
+  for (const ch of line) {
+    const b = Buffer.byteLength(ch, "utf8");
+    const limit = chunks.length === 0 ? 75 : 74; // continuations lose one octet to the leading space
+    if (curBytes + b > limit) {
+      chunks.push(cur);
+      cur = "";
+      curBytes = 0;
+    }
+    cur += ch;
+    curBytes += b;
+  }
+  chunks.push(cur);
+  return chunks.map((s, i) => (i === 0 ? s : " " + s)).join("\r\n");
 }
 
 function confirmText(ev: ExtractedEvent): string {
@@ -196,6 +230,127 @@ function resolve(base: string, href: string): string {
   }
 }
 
+// MARK: - Batch create / read / delete (syllabus)
+
+function authHeader(): string | null {
+  const appleId = process.env.APPLE_ID;
+  const appPassword = process.env.APPLE_APP_PASSWORD;
+  if (!appleId || !appPassword) return null;
+  return "Basic " + Buffer.from(`${appleId}:${appPassword}`).toString("base64");
+}
+
+async function pool<T>(items: T[], size: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let i = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(size, items.length)) }, async () => {
+    while (i < items.length) {
+      const idx = i++;
+      await fn(items[idx]);
+    }
+  });
+  await Promise.all(workers);
+}
+
+export interface BatchResult { created: number; failed: number; failures: string[] }
+
+/** Batch-create events, resolving the calendar + auth ONCE. Deterministic ev.uid → re-PUT overwrites
+ * (idempotent re-upload). Cloud-only for now; cross-platform search-before-create lands with the Mac. */
+export async function createEvents(events: ExtractedEvent[]): Promise<BatchResult> {
+  const auth = authHeader();
+  if (!auth) return { created: 0, failed: events.length, failures: ["Apple ID / app password not set"] };
+  const calUrl = await resolveCalendarUrl(auth);
+  if (!calUrl) return { created: 0, failed: events.length, failures: ["couldn't find your iCloud calendar"] };
+  const base = calUrl.replace(/\/+$/, "");
+  let created = 0;
+  let failed = 0;
+  const failures: string[] = [];
+  await pool(events, 4, async (ev) => {
+    const uid = ev.uid ?? `alfredlite-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    const res = await fetch(`${base}/${uid}.ics`, {
+      method: "PUT",
+      headers: { "Content-Type": "text/calendar; charset=utf-8", Authorization: auth },
+      body: buildICS(ev, uid),
+    }).catch(() => null);
+    if (res && [200, 201, 204].includes(res.status)) created++;
+    else {
+      failed++;
+      failures.push(`${ev.title} (HTTP ${res?.status ?? "net"})`);
+    }
+  });
+  return { created, failed, failures };
+}
+
+export interface SchoolRef { href: string; token: Record<string, string> }
+
+/** calendar-query REPORT for Alfred-tagged events in a wide window; returns hrefs + parsed tokens. */
+async function listSchool(auth: string, calUrl: string, daysBack = 400, daysFwd = 400): Promise<SchoolRef[]> {
+  const now = new Date();
+  const start = utcStamp(new Date(now.getTime() - daysBack * 86400000));
+  const end = utcStamp(new Date(now.getTime() + daysFwd * 86400000));
+  const body =
+    `<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">` +
+    `<D:prop><D:getetag/><C:calendar-data/></D:prop>` +
+    `<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">` +
+    `<C:time-range start="${start}" end="${end}"/>` +
+    `</C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`;
+  const res = await fetch(calUrl, {
+    method: "REPORT",
+    headers: { Authorization: auth, Depth: "1", "Content-Type": "application/xml; charset=utf-8" },
+    body,
+  }).catch(() => null);
+  if (!res || (res.status !== 207 && res.status !== 200)) return [];
+  return parseSchoolRefs(await res.text());
+}
+
+function parseSchoolRefs(xml: string): SchoolRef[] {
+  const blocks = xml.split(/<[^>]*\bresponse\b[^>]*>/i).slice(1);
+  const refs: SchoolRef[] = [];
+  for (const b of blocks) {
+    const href = (/<[^>]*\bhref\b[^>]*>([^<]+)<\/[^>]*\bhref\b[^>]*>/i.exec(b) || [])[1]?.trim();
+    if (!href) continue;
+    const cdata = (/<[^>]*calendar-data[^>]*>([\s\S]*?)<\/[^>]*calendar-data[^>]*>/i.exec(b) || [])[1];
+    if (!cdata) continue;
+    const ics = unfoldICS(xmlUnescape(cdata));
+    const desc = icsProp(ics, "DESCRIPTION"); // token has no escapable chars, so raw value is fine
+    const tok = desc ? parseToken(desc) : null;
+    if (tok) refs.push({ href, token: tok });
+  }
+  return refs;
+}
+
+/** Delete all Alfred-tagged events whose token matches `pred`. Returns count, or null on setup error. */
+export async function deleteSchool(pred: (tok: Record<string, string>) => boolean): Promise<number | null> {
+  const auth = authHeader();
+  if (!auth) return null;
+  const calUrl = await resolveCalendarUrl(auth);
+  if (!calUrl) return null;
+  const refs = (await listSchool(auth, calUrl)).filter((r) => pred(r.token));
+  let deleted = 0;
+  await pool(refs, 4, async (r) => {
+    const url = resolve(calUrl, r.href);
+    const res = await fetch(url, { method: "DELETE", headers: { Authorization: auth } }).catch(() => null);
+    if (res && [200, 202, 204, 404].includes(res.status)) deleted++;
+  });
+  return deleted;
+}
+
+function xmlUnescape(s: string): string {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&amp;/g, "&");
+}
+function unfoldICS(ics: string): string {
+  return ics.replace(/\r?\n[ \t]/g, "");
+}
+function icsProp(ics: string, name: string): string | null {
+  // Capture up to the line terminator directly — avoids ".*$" failing against CRLF (. stops at \r).
+  const m = new RegExp(`^${name}(?:;[^:\\r\\n]*)?:([^\\r\\n]*)`, "im").exec(ics);
+  return m ? m[1].trim() : null;
+}
+
 // MARK: - Diagnostics (owner-gated; reports each discovery step + a test PUT, never the credentials)
 
 export async function diagnose(doPut = false): Promise<Record<string, unknown>> {
@@ -248,7 +403,18 @@ export async function diagnose(doPut = false): Promise<Record<string, unknown>> 
   const now = new Date();
   const tomorrow = new Intl.DateTimeFormat("en-CA", { timeZone: USER_TZ, year: "numeric", month: "2-digit", day: "2-digit" })
     .format(new Date(now.getTime() + 86400000));
-  const testEv: ExtractedEvent = { title: "Alfred diagnostic (safe to delete)", date: tomorrow, start: "15:00", end: "16:00", allDay: false, location: null, notes: null };
+  const testEv: ExtractedEvent = {
+    title: "🔁 Alfred diagnostic (safe to delete)",
+    date: tomorrow,
+    start: "15:00",
+    end: "16:00",
+    allDay: false,
+    location: null,
+    notes: "Diagnostic\n\n[alfred|v1|k=diagnostic00|c=DIAG|t=other|b=DIAG-x]",
+    url: "alfred://school/DIAG/other/diagnostic00",
+    categories: ["Alfred", "School", "DIAG", "other", "DIAG-x"],
+    alarms: [{ offset: "-PT1H" }],
+  };
   const uid = `alfreddiag-${Date.now()}`;
   const ics = buildICS(testEv, uid);
   out.ics = ics;
