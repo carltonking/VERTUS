@@ -120,6 +120,89 @@ struct CalendarRemindersCapability {
         return "✅ Added “\(title)” to your calendar — \(df.string(from: start))\(locStr)."
     }
 
+    // MARK: - School events (syllabus) — iCloud calendar + alarms, tagged to match the cloud bot
+
+    /// A writable iCloud (CalDAV) event calendar — events MUST live here (not "On My Mac") to sync to
+    /// the iPhone. Prefers one named `name` (the cloud pins "Personal"), then the default, then any.
+    func iCloudEventCalendar(named name: String) throws -> EKCalendar {
+        let cals = store.calendars(for: .event)
+        if let hit = cals.first(where: { $0.title == name && $0.source?.sourceType == .calDAV && $0.allowsContentModifications }) {
+            return hit
+        }
+        if let def = store.defaultCalendarForNewEvents, def.source?.sourceType == .calDAV, def.allowsContentModifications {
+            return def
+        }
+        if let any = cals.first(where: { $0.source?.sourceType == .calDAV && $0.allowsContentModifications }) {
+            return any
+        }
+        throw LLMError.networkError("No iCloud calendar found. Turn on iCloud → Calendars in System Settings so reminders reach your iPhone.")
+    }
+
+    /// Create/update one school event (idempotent: search-before-create by the shared url/key).
+    @discardableResult
+    func upsertSchoolEvent(_ spec: SchoolEventSpec, calendarName: String = "Personal") async throws -> String {
+        guard (try? await store.requestFullAccessToEvents()) == true else {
+            throw LLMError.networkError("Calendar access denied. Grant it in System Settings → Privacy & Security → Calendars.")
+        }
+        let calendar = try iCloudEventCalendar(named: calendarName)
+        guard let start = syllabusDate(spec.date, time: spec.allDay ? nil : spec.start) else {
+            throw LLMError.networkError("Bad date \(spec.date).")
+        }
+        let lo = Calendar.current.date(byAdding: .day, value: -2, to: start) ?? start
+        let hi = Calendar.current.date(byAdding: .day, value: 2, to: start) ?? start
+        let pred = store.predicateForEvents(withStart: lo, end: hi, calendars: [calendar])
+        let existing = store.events(matching: pred).first {
+            $0.url?.absoluteString == spec.url || ($0.notes?.contains("k=\(spec.key)") ?? false)
+        }
+        let event = existing ?? EKEvent(eventStore: store)
+        event.calendar = calendar
+        event.title = spec.displayTitle
+        event.isAllDay = spec.allDay
+        event.startDate = start
+        if spec.allDay {
+            event.endDate = start
+        } else {
+            let end = spec.end.flatMap { syllabusDate(spec.date, time: $0) } ?? start.addingTimeInterval(3600)
+            event.endDate = end > start ? end : start.addingTimeInterval(3600)
+        }
+        if let loc = spec.location, !loc.isEmpty { event.location = loc }
+        event.url = URL(string: spec.url)
+        event.notes = [spec.humanNotes, spec.token].compactMap { $0 }.joined(separator: "\n\n")
+        event.alarms = spec.alarmOffsets.map { EKAlarm(relativeOffset: $0) }
+        try store.save(event, span: .thisEvent, commit: true)
+        return event.eventIdentifier
+    }
+
+    /// Create many school events on one iCloud calendar. Returns (ok, failed).
+    func createSchoolEvents(_ specs: [SchoolEventSpec], calendarName: String = "Personal") async throws -> (ok: Int, failed: Int) {
+        guard (try? await store.requestFullAccessToEvents()) == true else {
+            throw LLMError.networkError("Calendar access denied. Grant it in System Settings → Privacy & Security → Calendars.")
+        }
+        _ = try iCloudEventCalendar(named: calendarName) // validate the calendar up front
+        var ok = 0, failed = 0
+        for spec in specs {
+            do { _ = try await upsertSchoolEvent(spec, calendarName: calendarName); ok += 1 }
+            catch { failed += 1 }
+        }
+        return (ok, failed)
+    }
+
+    /// Delete all school events for a course code (matches the token's c=<CODE> field in notes).
+    @discardableResult
+    func deleteSchoolCourse(code: String, calendarName: String = "Personal") async throws -> Int {
+        guard (try? await store.requestFullAccessToEvents()) == true else { return 0 }
+        let calendar = try iCloudEventCalendar(named: calendarName)
+        let now = Date()
+        let lo = Calendar.current.date(byAdding: .day, value: -400, to: now) ?? now
+        let hi = Calendar.current.date(byAdding: .day, value: 400, to: now) ?? now
+        let pred = store.predicateForEvents(withStart: lo, end: hi, calendars: [calendar])
+        let norm = SyllabusKeys.normCode(code)
+        let matches = store.events(matching: pred).filter { $0.notes?.contains("c=\(norm)|") ?? false }
+        var n = 0
+        for e in matches where (try? store.remove(e, span: .thisEvent, commit: true)) != nil { n += 1 }
+        return n
+    }
+
     // MARK: - Read Reminders
 
     func readReminders(limit: Int = 10) async throws -> String {

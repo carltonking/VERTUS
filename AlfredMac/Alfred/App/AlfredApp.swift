@@ -1499,6 +1499,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             store: store,
             screenTextMonitor: screenTextMonitor,
             meetingManager: meetingManager,
+            router: llmRouter,
             ownerName: appState.ownerName,
             onRunNow: { [weak self] routine in self?.routineScheduler?.runNow(routine) },
             onQuit: { [weak self] in self?.quitFromMenu() },

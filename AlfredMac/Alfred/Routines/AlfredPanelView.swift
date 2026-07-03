@@ -7,13 +7,14 @@ struct AlfredPanelView: View {
     let store: MemoryStore
     var screenTextMonitor: ScreenTextMonitor?
     var meetingManager: MeetingCaptureManager?
+    var router: LLMRouter?
     var ownerName: String = ""
     var onRunNow: (RoutineRecord) -> Void
     var onQuit: () -> Void
     var onScreenTextToggle: (Bool) -> Void = { _ in }
     @ObservedObject var appState: AppState
 
-    enum Tab: String, CaseIterable { case routines = "Routines", reminders = "Reminders", profile = "Profile", settings = "Settings" }
+    enum Tab: String, CaseIterable { case routines = "Routines", school = "School", reminders = "Reminders", profile = "Profile", settings = "Settings" }
 
     @State private var tab: Tab = .routines
     @State private var routines: [RoutineRecord] = []
@@ -86,6 +87,13 @@ struct AlfredPanelView: View {
     private var content: some View {
         switch tab {
         case .routines: routinesContent
+        case .school:
+            if let router {
+                CoursesTabView(router: router)
+            } else {
+                Text("Set up your AI provider in Settings first.")
+                    .font(.system(size: 12)).foregroundStyle(.secondary).padding()
+            }
         case .reminders: RemindersTabView()
         case .profile: HermesDashboardView(store: store, screenTextMonitor: screenTextMonitor,
                                             meetingManager: meetingManager, ownerName: ownerName,
