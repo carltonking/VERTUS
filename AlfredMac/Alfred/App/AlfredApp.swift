@@ -143,6 +143,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hideOnLeaveTimer: Timer?
     private var shownByHover = false
     private(set) var llmRouter: LLMRouter?
+    /// Long-lived so the syllabus review survives the menu-bar popover closing while the file panel is open.
+    private var syllabusService: SyllabusImportService?
     private(set) var memoryStore: MemoryStore?
     private var assistantCore: AssistantCore?
     private(set) var learningService: BehavioralLearningService?
@@ -1495,11 +1497,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         guard let store = memoryStore else { return }
+        if syllabusService == nil, let r = llmRouter { syllabusService = SyllabusImportService(router: r) }
         let panel = AlfredPanelView(
             store: store,
             screenTextMonitor: screenTextMonitor,
             meetingManager: meetingManager,
-            router: llmRouter,
+            syllabusService: syllabusService,
             ownerName: appState.ownerName,
             onRunNow: { [weak self] routine in self?.routineScheduler?.runNow(routine) },
             onQuit: { [weak self] in self?.quitFromMenu() },

@@ -187,6 +187,27 @@ struct CalendarRemindersCapability {
         return (ok, failed)
     }
 
+    /// The courses currently on the calendar, derived from tagged events (the calendar is the store).
+    func listSchoolCourses(calendarName: String = "Personal") async throws -> [CourseSummary] {
+        guard (try? await store.requestFullAccessToEvents()) == true else { return [] }
+        let calendar = try iCloudEventCalendar(named: calendarName)
+        let now = Date()
+        let lo = Calendar.current.date(byAdding: .day, value: -400, to: now) ?? now
+        let hi = Calendar.current.date(byAdding: .day, value: 400, to: now) ?? now
+        let pred = store.predicateForEvents(withStart: lo, end: hi, calendars: [calendar])
+        var counts: [String: Int] = [:]
+        var display: [String: String] = [:]
+        for e in store.events(matching: pred) {
+            guard let notes = e.notes, let tok = SyllabusKeys.parseToken(notes), let c = tok["c"] else { continue }
+            counts[c, default: 0] += (tok["t"] == "study" ? 0 : 1) // ensure the key exists; count deadlines only
+            if display[c] == nil, let title = e.title,
+               let r = title.range(of: "\\[([^\\]]+)\\]", options: .regularExpression) {
+                display[c] = String(title[r].dropFirst().dropLast())
+            }
+        }
+        return counts.keys.sorted().map { CourseSummary(code: $0, display: display[$0] ?? $0, count: counts[$0] ?? 0) }
+    }
+
     /// Delete all school events for a course code (matches the token's c=<CODE> field in notes).
     @discardableResult
     func deleteSchoolCourse(code: String, calendarName: String = "Personal") async throws -> Int {

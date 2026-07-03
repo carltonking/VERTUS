@@ -7,14 +7,25 @@ struct AlfredPanelView: View {
     let store: MemoryStore
     var screenTextMonitor: ScreenTextMonitor?
     var meetingManager: MeetingCaptureManager?
-    var router: LLMRouter?
+    var syllabusService: SyllabusImportService?
     var ownerName: String = ""
     var onRunNow: (RoutineRecord) -> Void
     var onQuit: () -> Void
     var onScreenTextToggle: (Bool) -> Void = { _ in }
     @ObservedObject var appState: AppState
 
-    enum Tab: String, CaseIterable { case routines = "Routines", school = "School", reminders = "Reminders", profile = "Profile", settings = "Settings" }
+    enum Tab: String, CaseIterable {
+        case routines = "Routines", school = "School", reminders = "Reminders", profile = "Profile", settings = "Settings"
+        var icon: String {
+            switch self {
+            case .routines: return "clock"
+            case .school: return "graduationcap"
+            case .reminders: return "line.3.horizontal"
+            case .profile: return "person.crop.circle"
+            case .settings: return "gearshape"
+            }
+        }
+    }
 
     @State private var tab: Tab = .routines
     @State private var routines: [RoutineRecord] = []
@@ -40,11 +51,21 @@ struct AlfredPanelView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            Picker("", selection: $tab) {
-                ForEach(Tab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+            HStack(spacing: 4) {
+                ForEach(Tab.allCases, id: \.self) { t in
+                    Button { tab = t } label: {
+                        Image(systemName: t.icon)
+                            .font(.system(size: 15, weight: .medium))
+                            .frame(maxWidth: .infinity, minHeight: 26)
+                            .foregroundStyle(tab == t ? Color.accentColor : Color.secondary)
+                            .background(tab == t ? Color.accentColor.opacity(0.15) : Color.clear)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(t.rawValue)
+                }
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
             .padding(.horizontal, 12)
             .padding(.bottom, 8)
             Divider()
@@ -54,6 +75,7 @@ struct AlfredPanelView: View {
         }
         .frame(width: 340, height: 460)
         .onAppear(perform: reload)
+        .onAppear { if let s = syllabusService, s.phase != .list { tab = .school } } // resume an in-progress import
         .onChange(of: tab) { _, _ in reload() }
         .onReceive(NotificationCenter.default.publisher(for: .alfredRoutineRunDidFinish)) { note in
             // A run (manual, scheduled, or API) finished — refresh rows + the open dropdown live.
@@ -88,8 +110,8 @@ struct AlfredPanelView: View {
         switch tab {
         case .routines: routinesContent
         case .school:
-            if let router {
-                CoursesTabView(router: router)
+            if let syllabusService {
+                CoursesTabView(service: syllabusService)
             } else {
                 Text("Set up your AI provider in Settings first.")
                     .font(.system(size: 12)).foregroundStyle(.secondary).padding()

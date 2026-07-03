@@ -1,88 +1,114 @@
 import Foundation
+import AppKit
 import PDFKit
 
-/// Drives the Courses tab: pick a syllabus file → extract text → LLM → review list → create iCloud
-/// events (+ study blocks). Uses the same tagging as the cloud bot so the two never duplicate.
+/// Drives the School tab: manage courses (list from the calendar), add a course by importing a
+/// syllabus (file → text → LLM → review → create iCloud events + study blocks), and delete a course
+/// at semester's end. Owned by the AppDelegate (not the view) so state survives the popover closing
+/// while the file panel is open. Uses the same tagging as the cloud bot, so the two never duplicate.
 @MainActor
 final class SyllabusImportService: ObservableObject {
-    enum Phase: Equatable {
-        case idle, reading, review, creating
-        case done(String)
-        case error(String)
-    }
+    enum Phase: Equatable { case list, form, reading, review, creating }
 
-    @Published var phase: Phase = .idle
+    @Published var phase: Phase = .list
+    @Published var courses: [CourseSummary] = []
     @Published var items: [SyllabusItem] = []
-    @Published var course: String = ""
+    @Published var course: String = ""      // course-code input; becomes the resolved code after extract
     @Published var termYear: Int?
+    @Published var banner: String?          // transient success/error line
+    @Published var busy = false
 
     private let router: LLMRouter
     private let calendar = CalendarRemindersCapability()
 
     init(router: LLMRouter) { self.router = router }
 
-    /// Step 1 — read a picked file, extract, and populate the review list.
-    func load(url: URL, courseHint: String) async {
+    // MARK: - Course list
+
+    func loadCourses() async {
+        busy = true
+        courses = (try? await calendar.listSchoolCourses()) ?? []
+        busy = false
+    }
+
+    func startAdd() {
+        items = []; course = ""; termYear = nil; banner = nil; phase = .form
+    }
+
+    func cancel() { banner = nil; phase = .list }
+
+    func delete(_ summary: CourseSummary) async {
+        busy = true
+        do {
+            let n = try await calendar.deleteSchoolCourse(code: summary.code)
+            banner = "Removed \(summary.display) — \(n) item\(n == 1 ? "" : "s")."
+        } catch {
+            banner = "Couldn't remove \(summary.display)."
+        }
+        await loadCourses()
+        busy = false
+    }
+
+    // MARK: - Import a syllabus
+
+    /// Opens a native file panel (works from the menu-bar popover, unlike SwiftUI .fileImporter).
+    func chooseAndLoad() async {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.pdf, .image, .plainText]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.prompt = "Read syllabus"
+        panel.message = "Choose a syllabus PDF or photo"
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        await load(url: url)
+    }
+
+    private func load(url: URL) async {
         phase = .reading
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
 
         guard let text = await Self.text(from: url), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            phase = .error("That file had no readable text. If it's a scanned PDF, try a clear photo instead.")
-            return
+            banner = "That file had no readable text. Try a PDF or a clear photo."; phase = .form; return
         }
-        let hint = courseHint.trimmingCharacters(in: .whitespaces)
+        let hint = course.trimmingCharacters(in: .whitespaces)
         guard let extract = await SyllabusExtractor.extract(text: text, courseHint: hint.isEmpty ? nil : hint, now: Date(), router: router) else {
-            phase = .error("Couldn't reach the AI or parse the syllabus. Try again in a moment.")
-            return
+            banner = "Couldn't reach the AI or read the syllabus. Try again."; phase = .form; return
         }
         guard !extract.items.isEmpty else {
-            phase = .error("No dated items found. Make sure the syllabus lists explicit assignment/exam dates.")
-            return
+            banner = "No dated items found. Make sure the syllabus lists explicit dates."; phase = .form; return
         }
         items = extract.items.sorted { $0.date < $1.date }
-        course = hint.isEmpty ? (extract.code ?? extract.course ?? "Course") : hint
+        if hint.isEmpty { course = extract.code ?? extract.course ?? "Course" }
         termYear = extract.termYear
+        banner = nil
         phase = .review
     }
 
-    /// Step 2 — create the checked items (+ study blocks) on the iCloud calendar.
     func commit() async {
         let chosen = items.filter { $0.include }
-        guard !chosen.isEmpty else { phase = .error("Nothing selected."); return }
+        guard !chosen.isEmpty else { banner = "Nothing selected."; return }
         phase = .creating
         let code = course.trimmingCharacters(in: .whitespaces).isEmpty ? "Course" : course.trimmingCharacters(in: .whitespaces)
         let batch = SyllabusKeys.batchId(code, termYear)
 
         var specs = chosen.map { SyllabusEvents.deadlineSpec($0, code: code, batch: batch) }
-        let studySpecs = chosen
-            .filter { $0.type == .exam || $0.type == .final || $0.type == .quiz }
+        let study = chosen.filter { $0.type == .exam || $0.type == .final || $0.type == .quiz }
             .flatMap { StudyPlanner.sessions(for: $0, code: code, batch: batch, now: Date()) }
-        specs += studySpecs
+        specs += study
 
         do {
             let r = try await calendar.createSchoolEvents(specs, calendarName: "Personal")
-            let study = studySpecs.isEmpty ? "" : ", incl. \(studySpecs.count) study blocks"
-            let failed = r.failed > 0 ? " (\(r.failed) failed)" : ""
-            phase = .done("Added \(r.ok) items to your Personal calendar\(study)\(failed).")
+            let s = study.isEmpty ? "" : " + \(study.count) study blocks"
+            let f = r.failed > 0 ? " (\(r.failed) failed)" : ""
+            banner = "✅ Added \(code): \(r.ok) items\(s)\(f)."
         } catch {
-            if case let LLMError.networkError(m) = error { phase = .error(m) }
-            else { phase = .error("Couldn't add to your calendar. \(error.localizedDescription)") }
+            if case let LLMError.networkError(m) = error { banner = "⚠️ \(m)" }
+            else { banner = "⚠️ Couldn't add to your calendar." }
         }
-    }
-
-    func reset() {
-        items = []; course = ""; termYear = nil; phase = .idle
-    }
-
-    /// Delete everything for a course code (mirrors the cloud's /school delete).
-    func deleteCourse(_ code: String) async {
-        do {
-            let n = try await calendar.deleteSchoolCourse(code: code)
-            phase = .done(n > 0 ? "Removed \(n) \(code) items." : "No \(code) items found.")
-        } catch {
-            phase = .error("Couldn't remove those items.")
-        }
+        await loadCourses()
+        phase = .list
     }
 
     // MARK: - File → text
@@ -92,8 +118,8 @@ final class SyllabusImportService: ObservableObject {
         if ext == "pdf" {
             guard let doc = PDFDocument(url: url) else { return nil }
             var s = ""
-            for i in 0..<min(doc.pageCount, 50) where doc.page(at: i)?.string != nil {
-                s += (doc.page(at: i)?.string ?? "") + "\n"
+            for i in 0..<min(doc.pageCount, 50) {
+                if let page = doc.page(at: i)?.string { s += page + "\n" }
             }
             return s
         }

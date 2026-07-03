@@ -40,6 +40,14 @@ struct SyllabusItem: Identifiable, Equatable {
     var include: Bool = true   // review checkbox
 }
 
+/// A course currently present on the calendar (derived from tagged events — the calendar is the store).
+struct CourseSummary: Identifiable, Equatable {
+    var id: String { code }
+    let code: String     // normalized (token c=)
+    let display: String  // pretty label from the event title's [CODE], else the code
+    let count: Int       // number of deadline items (excludes study blocks)
+}
+
 /// A concrete event to create on the calendar (deadline or generated study block).
 struct SchoolEventSpec {
     let key: String
@@ -117,6 +125,19 @@ enum SyllabusKeys {
         let tp = topics.map(tokenVal).filter { !$0.isEmpty }
         if !tp.isEmpty { parts.append("tp=\(tp.joined(separator: "~"))") }
         return "[alfred|v1|\(parts.joined(separator: "|"))]"
+    }
+
+    /// Parse the `[alfred|v1|...]` token out of a notes/description string.
+    static func parseToken(_ text: String) -> [String: String]? {
+        guard let r = text.range(of: "\\[alfred\\|v1\\|[^\\]]*\\]", options: .regularExpression) else { return nil }
+        let inner = text[r].dropFirst("[alfred|v1|".count).dropLast()
+        var out: [String: String] = [:]
+        for kv in inner.split(separator: "|") {
+            if let eq = kv.firstIndex(of: "=") {
+                out[String(kv[..<eq])] = String(kv[kv.index(after: eq)...])
+            }
+        }
+        return out
     }
 }
 
