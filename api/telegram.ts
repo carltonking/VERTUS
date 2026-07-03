@@ -4,7 +4,7 @@
 import { sendMessage, downloadFile, largestPhotoId } from "./_lib/telegram";
 import { geminiText } from "./_lib/gemini";
 import { extractFromText, extractFromImage, extractSyllabus, SyllabusItem, SyllabusItemType, ExtractedEvent, AlarmSpec, USER_TZ } from "./_lib/extract";
-import { createEvent, createEvents, deleteSchool, diagnose } from "./_lib/caldav";
+import { createEvent, createEvents, deleteSchool, diagnose, listSchoolDiag } from "./_lib/caldav";
 import { planStudySessions } from "./_lib/study";
 import { itemKey, batchId, normCode, schoolURL, schoolToken, schoolCategories } from "./_lib/keys";
 
@@ -71,6 +71,21 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
       }
       const parsed = await extractSyllabus(sample, null, new Date()).catch((e: any) => ({ error: String(e?.message ?? e) }));
       res.end(JSON.stringify(parsed, null, 2));
+      return;
+    }
+
+    // Owner-gated read diagnostic: GET /api/telegram?readdiag=<OWNER> → currently-tagged Alfred events.
+    const rd = /[?&]readdiag=([^&]+)/.exec(req.url || "");
+    if (rd) {
+      const owner = process.env.OWNER_CHAT_ID;
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json");
+      if (!owner || decodeURIComponent(rd[1]) !== owner) {
+        res.end(JSON.stringify({ ok: false, error: "not authorized" }));
+        return;
+      }
+      const list = await listSchoolDiag().catch((e: any) => ({ error: String(e?.message ?? e) }));
+      res.end(JSON.stringify(list, null, 2));
       return;
     }
 

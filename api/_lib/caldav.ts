@@ -333,6 +333,16 @@ export async function deleteSchool(pred: (tok: Record<string, string>) => boolea
   return deleted;
 }
 
+/** Owner-gated read diagnostic: list currently-tagged Alfred events (href + token). */
+export async function listSchoolDiag(): Promise<{ count: number; items: SchoolRef[] } | null> {
+  const auth = authHeader();
+  if (!auth) return null;
+  const calUrl = await resolveCalendarUrl(auth);
+  if (!calUrl) return null;
+  const refs = await listSchool(auth, calUrl);
+  return { count: refs.length, items: refs.slice(0, 50) };
+}
+
 function xmlUnescape(s: string): string {
   return s
     .replace(/&lt;/g, "<")
