@@ -2,7 +2,7 @@
 // from a photo or text, independent of the Mac. Owner-only. Telegram POSTs each update here.
 
 import { sendMessage, downloadFile, largestPhotoId } from "./_lib/telegram";
-import { geminiText } from "./_lib/gemini";
+import { answerChat, macOnlyReply } from "./_lib/chat";
 import { extractFromText, extractFromImage, extractSyllabus, SyllabusItem, SyllabusItemType, ExtractedEvent, AlarmSpec, USER_TZ } from "./_lib/extract";
 import { createEvent, createEvents, deleteSchool, diagnose, listSchoolDiag } from "./_lib/caldav";
 import { planStudySessions } from "./_lib/study";
@@ -34,13 +34,6 @@ const ROUTINE_HELP = [
 ].join("\n");
 
 const MAX_ITEMS = Number(process.env.SYLLABUS_MAX_ITEMS || 60);
-
-const CHAT_SYSTEM =
-  "You are Alfred, Carlton's personal assistant, reachable on his phone. Be concise and direct — lead " +
-  "with the answer, cut filler and preamble. Real conversation: contractions, natural language, no forced " +
-  "enthusiasm, one question at a time. Be unbiased and intellectually honest — when Carlton states a " +
-  "debatable opinion or plan, push back with the counterargument instead of just agreeing. Always write " +
-  "times in 24-hour format (14:30, not 2:30 PM).";
 
 import type { IncomingMessage, ServerResponse } from "http";
 
@@ -237,8 +230,9 @@ async function handleUpdate(update: any, token: string, owner: string): Promise<
   if (isCalendarAdd(text)) return addFromText(text, token, chatId);
   if (isEmailCheck(text)) return emailTriage(token, chatId);
 
-  const reply = (await geminiText(CHAT_SYSTEM, text)) ?? "Sorry — I couldn't reach the AI just now. Try again in a moment.";
-  await sendMessage(token, chatId, reply);
+  // Genuinely Mac-only asks get an honest decline; everything else is answered with calendar/web context.
+  const macOnly = macOnlyReply(text);
+  await sendMessage(token, chatId, macOnly ?? (await answerChat(text)));
 }
 
 async function handleCommand(cmd: string, token: string, chatId: string): Promise<void> {

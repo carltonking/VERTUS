@@ -431,6 +431,81 @@ function tzOffsetMs(date: Date, tz: string): number {
   return asTz - date.getTime();
 }
 
+// MARK: - General upcoming events (for the chat assistant's "what's on my calendar" answers)
+
+export interface CalendarEvent {
+  uid: string;
+  title: string;
+  start: Date;
+  allDay: boolean;
+  location?: string;
+}
+
+/** ALL events (timed + all-day) starting within the next `withinHours`, soonest first. Unlike
+ *  listUpcomingLocatedEvents (departure), this keeps events with no LOCATION and includes all-day. */
+export async function listUpcomingEvents(withinHours = 72): Promise<CalendarEvent[]> {
+  const auth = authHeader();
+  if (!auth) return [];
+  const calUrl = await resolveCalendarUrl(auth);
+  if (!calUrl) return [];
+  const now = new Date();
+  const start = utcStamp(now);
+  const end = utcStamp(new Date(now.getTime() + withinHours * 3600_000));
+  const body =
+    `<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">` +
+    `<D:prop><D:getetag/><C:calendar-data><C:expand start="${start}" end="${end}"/></C:calendar-data></D:prop>` +
+    `<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">` +
+    `<C:time-range start="${start}" end="${end}"/>` +
+    `</C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`;
+  const res = await fetch(calUrl, {
+    method: "REPORT",
+    headers: { Authorization: auth, Depth: "1", "Content-Type": "application/xml; charset=utf-8" },
+    body,
+  }).catch(() => null);
+  if (!res || (res.status !== 207 && res.status !== 200)) return [];
+  return parseAllEvents(await res.text(), now.getTime(), now.getTime() + withinHours * 3600_000);
+}
+
+/** Exported for unit testing. Parses a REPORT multistatus into events (timed + all-day). */
+export function parseAllEvents(xml: string, fromMs: number, toMs: number): CalendarEvent[] {
+  const blocks = xml.split(/<[^>]*\bresponse\b[^>]*>/i).slice(1);
+  const out: CalendarEvent[] = [];
+  for (const b of blocks) {
+    const cdata = (/<[^>]*calendar-data[^>]*>([\s\S]*?)<\/[^>]*calendar-data[^>]*>/i.exec(b) || [])[1];
+    if (!cdata) continue;
+    const ics = unfoldICS(xmlUnescape(cdata));
+    if (/^RRULE:/im.test(ics)) continue; // un-expanded recurring master — no reliable instant
+    const info = icsStartInfo(ics);
+    if (!info) continue;
+    const ms = info.start.getTime();
+    if (ms < fromMs - 86_400_000 || ms > toMs) continue; // −1d so today's all-day (local midnight) counts
+    out.push({
+      uid: icsProp(ics, "UID") || String(ms),
+      title: icsProp(ics, "SUMMARY") || "(untitled)",
+      start: info.start,
+      allDay: info.allDay,
+      location: icsProp(ics, "LOCATION") || undefined,
+    });
+  }
+  return out.sort((a, b) => a.start.getTime() - b.start.getTime());
+}
+
+/** DTSTART → absolute instant + all-day flag. All-day (VALUE=DATE / 8-digit) anchors at local midnight. */
+function icsStartInfo(ics: string): { start: Date; allDay: boolean } | null {
+  const m = /^DTSTART([^:\r\n]*):([^\r\n]+)/im.exec(ics);
+  if (!m) return null;
+  const params = m[1] || "";
+  const value = m[2].trim();
+  const dOnly = /^(\d{4})(\d{2})(\d{2})$/.exec(value);
+  if (dOnly) return { start: zonedWallTimeToUTC(+dOnly[1], +dOnly[2], +dOnly[3], 0, 0, 0, USER_TZ), allDay: true };
+  const dt = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z)?$/.exec(value);
+  if (!dt) return null;
+  const [, y, mo, d, h, mi, s, z] = dt;
+  if (z) return { start: new Date(Date.UTC(+y, +mo - 1, +d, +h, +mi, +s)), allDay: false };
+  const tz = (/TZID=([^;:]+)/i.exec(params) || [])[1] || USER_TZ;
+  return { start: zonedWallTimeToUTC(+y, +mo, +d, +h, +mi, +s, tz), allDay: false };
+}
+
 function xmlUnescape(s: string): string {
   return s
     .replace(/&lt;/g, "<")
