@@ -278,9 +278,19 @@ function strOrNull(v: unknown): string | null {
 function pad(n: number): string {
   return String(n).padStart(2, "0");
 }
+// The dateReference loop builds ~10 formatters per extract; these two shapes never vary
+// per request, so cache them at module scope. Both are bound to USER_TZ.
+const weekdayFmt = new Intl.DateTimeFormat("en-US", { timeZone: USER_TZ, weekday: "long" });
+const isoFmt = new Intl.DateTimeFormat("en-CA", { timeZone: USER_TZ, year: "numeric", month: "2-digit", day: "2-digit" });
+
 function fmt(d: Date, tz: string, opts: Intl.DateTimeFormatOptions): string {
+  // Fast path for the only call shape used across the app; falls back for any other args.
+  if (tz === USER_TZ && opts.weekday === "long" && Object.keys(opts).length === 1) {
+    return weekdayFmt.format(d);
+  }
   return new Intl.DateTimeFormat("en-US", { timeZone: tz, ...opts }).format(d);
 }
 function isoDate(d: Date, tz: string): string {
+  if (tz === USER_TZ) return isoFmt.format(d);
   return new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
 }

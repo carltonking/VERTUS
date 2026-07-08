@@ -343,6 +343,94 @@ export async function listSchoolDiag(): Promise<{ count: number; items: SchoolRe
   return { count: refs.length, items: refs.slice(0, 50) };
 }
 
+// MARK: - Upcoming located events (for the "time to leave" departure watcher)
+
+export interface CalEvent {
+  uid: string;
+  title: string;
+  location: string; // non-empty; events without a LOCATION are dropped
+  start: Date;      // absolute start instant
+}
+
+/** Timed events with a LOCATION starting within the next `withinHours`, soonest first. Recurring events
+ *  are expanded server-side (calendar-query <C:expand>) so each returned instance has a concrete start. */
+export async function listUpcomingLocatedEvents(withinHours = 3): Promise<CalEvent[]> {
+  const auth = authHeader();
+  if (!auth) return [];
+  const calUrl = await resolveCalendarUrl(auth);
+  if (!calUrl) return [];
+
+  const now = new Date();
+  const start = utcStamp(now);
+  const end = utcStamp(new Date(now.getTime() + withinHours * 3600_000));
+  const body =
+    `<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">` +
+    `<D:prop><D:getetag/><C:calendar-data><C:expand start="${start}" end="${end}"/></C:calendar-data></D:prop>` +
+    `<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">` +
+    `<C:time-range start="${start}" end="${end}"/>` +
+    `</C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`;
+  const res = await fetch(calUrl, {
+    method: "REPORT",
+    headers: { Authorization: auth, Depth: "1", "Content-Type": "application/xml; charset=utf-8" },
+    body,
+  }).catch(() => null);
+  if (!res || (res.status !== 207 && res.status !== 200)) return [];
+
+  return parseLocatedEvents(await res.text(), now.getTime(), now.getTime() + withinHours * 3600_000);
+}
+
+function parseLocatedEvents(xml: string, fromMs: number, toMs: number): CalEvent[] {
+  const blocks = xml.split(/<[^>]*\bresponse\b[^>]*>/i).slice(1);
+  const out: CalEvent[] = [];
+  for (const b of blocks) {
+    const cdata = (/<[^>]*calendar-data[^>]*>([\s\S]*?)<\/[^>]*calendar-data[^>]*>/i.exec(b) || [])[1];
+    if (!cdata) continue;
+    const ics = unfoldICS(xmlUnescape(cdata));
+    if (/^RRULE:/im.test(ics)) continue;   // an un-expanded recurring master — no reliable instant, skip
+    const location = icsProp(ics, "LOCATION");
+    if (!location) continue;               // departure nudges need somewhere to go
+    const started = icsStart(ics);
+    if (!started) continue;                // all-day / unparseable → skip (mirrors the Mac's timed-only)
+    const ms = started.getTime();
+    if (ms < fromMs || ms > toMs) continue;
+    out.push({ uid: icsProp(ics, "UID") || String(ms), title: icsProp(ics, "SUMMARY") || "your next event", location, start: started });
+  }
+  return out.sort((a, b) => a.start.getTime() - b.start.getTime());
+}
+
+/** Parse a VEVENT's DTSTART to an absolute instant. Handles `...Z` (UTC), `TZID=...` (zoned), and bare
+ *  floating times (assumed USER_TZ). Returns null for all-day (VALUE=DATE, an 8-digit value). */
+function icsStart(ics: string): Date | null {
+  const m = /^DTSTART([^:\r\n]*):([^\r\n]+)/im.exec(ics);
+  if (!m) return null;
+  const params = m[1] || "";
+  const value = m[2].trim();
+  if (/^\d{8}$/.test(value)) return null; // all-day
+  const dt = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z)?$/.exec(value);
+  if (!dt) return null;
+  const [, y, mo, d, h, mi, s, z] = dt;
+  if (z) return new Date(Date.UTC(+y, +mo - 1, +d, +h, +mi, +s));
+  const tz = (/TZID=([^;:]+)/i.exec(params) || [])[1] || USER_TZ;
+  return zonedWallTimeToUTC(+y, +mo, +d, +h, +mi, +s, tz);
+}
+
+/** Convert a wall-clock time in IANA `tz` to an absolute Date (DST-correct via the zone's offset). */
+function zonedWallTimeToUTC(y: number, mo: number, d: number, h: number, mi: number, s: number, tz: string): Date {
+  const asIfUTC = Date.UTC(y, mo - 1, d, h, mi, s);
+  return new Date(asIfUTC - tzOffsetMs(new Date(asIfUTC), tz));
+}
+
+/** Milliseconds `tz` is ahead of UTC at `date` (e.g. America/New_York in July → -14400000). */
+function tzOffsetMs(date: Date, tz: string): number {
+  const p = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  }).formatToParts(date).reduce<Record<string, string>>((a, x) => ((a[x.type] = x.value), a), {});
+  const h = p.hour === "24" ? 0 : Number(p.hour);
+  const asTz = Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day), h, Number(p.minute), Number(p.second));
+  return asTz - date.getTime();
+}
+
 function xmlUnescape(s: string): string {
   return s
     .replace(/&lt;/g, "<")

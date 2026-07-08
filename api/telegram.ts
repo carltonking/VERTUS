@@ -7,14 +7,30 @@ import { extractFromText, extractFromImage, extractSyllabus, SyllabusItem, Sylla
 import { createEvent, createEvents, deleteSchool, diagnose, listSchoolDiag } from "./_lib/caldav";
 import { planStudySessions } from "./_lib/study";
 import { itemKey, batchId, normCode, schoolURL, schoolToken, schoolCategories } from "./_lib/keys";
+import { setLocation } from "./_lib/location";
+import { getRoutines, addRoutine, removeRoutine, setRoutineEnabled, parseWhen } from "./_lib/routines";
+import { handleEmail, emailTriage, isEmailCheck } from "./_lib/emailflow";
 
 const HELP = [
   "Commands:",
   "/calendar — add one event (photo or text): /calendar dentist tomorrow 15:00",
   "/syllabus — add a whole course. Attach the syllabus PDF/photo, caption /syllabus CS 101",
   "/school delete <code> — remove a course's items",
+  "/routine — scheduled prompts that run even when your Mac is off (/routine help)",
+  "/email — read & reply to your mail, Mac off (/email help)",
   "/help — show this",
+  "Share Live Location and I'll text you when it's time to leave for your next event.",
   "Or just talk to me.",
+].join("\n");
+
+const ROUTINE_HELP = [
+  "Cloud routines — scheduled prompts that run even when your Mac is off:",
+  "/routine list — show them",
+  "/routine add <when> | <what>",
+  "   e.g. /routine add weekdays 06:30 | a 3-line markets + AI brief for today",
+  "/routine del <number> — remove one",
+  "/routine on|off <number> — enable / pause",
+  "When: daily 07:00 · weekdays 08:30 · weekends 09:00 · every 30 min · every 2 hours · or raw cron (0 7 * * *).",
 ].join("\n");
 
 const MAX_ITEMS = Number(process.env.SYLLABUS_MAX_ITEMS || 60);
@@ -103,7 +119,8 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
         const tg = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: PUBLIC_URL, allowed_updates: ["message"], drop_pending_updates: true }),
+          // edited_message is required so Telegram delivers Live Location updates (they arrive as edits).
+          body: JSON.stringify({ url: PUBLIC_URL, allowed_updates: ["message", "edited_message"], drop_pending_updates: true }),
         });
         const hookBody = await tg.text();
         // Register the command menu so the bot shows its skills (the "/" menu), like the Mac bot.
@@ -115,6 +132,8 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
               { command: "calendar", description: "Add an event — attach a photo or type details" },
               { command: "syllabus", description: "Add a course — attach the syllabus PDF/photo (caption the course)" },
               { command: "school", description: "Manage courses — e.g. /school delete CS 101" },
+              { command: "routine", description: "Scheduled prompts that run even when your Mac is off" },
+              { command: "email", description: "Triage and reply to your mail — iCloud + Gmail" },
               { command: "help", description: "What Alfred can do" },
             ],
           }),
@@ -171,6 +190,22 @@ function readJson(req: IncomingMessage): Promise<any> {
 }
 
 async function handleUpdate(update: any, token: string, owner: string): Promise<void> {
+  // Location (live or one-off) arrives as a fresh `message`, and live-location updates as an
+  // `edited_message`. Record the newest fix so the departure watcher knows where you are with the Mac
+  // off — this is the only place we honor edited_message (the rest of the bot ignores edits on purpose).
+  const locMsg = update?.message ?? update?.edited_message;
+  const loc = locMsg?.location;
+  if (loc && typeof loc.latitude === "number" && typeof loc.longitude === "number"
+      && String(locMsg.chat?.id ?? "") === String(owner)) {
+    await setLocation(loc.latitude, loc.longitude);
+    if (update?.message) {
+      // Acknowledge only the initial share (a `message`), not each silent live update (`edited_message`).
+      await sendMessage(token, String(locMsg.chat.id),
+        "📍 Got it — I'll watch your calendar and text you when it's time to leave. Keep Live Location on and this stays fresh; stop sharing whenever you like.");
+    }
+    return;
+  }
+
   const msg = update?.message; // ignore edited_message: the single-event path uses random UIDs and would duplicate
   if (!msg) return;
   if (String(msg.chat?.id ?? "") !== String(owner)) return; // owner only
@@ -200,6 +235,7 @@ async function handleUpdate(update: any, token: string, owner: string): Promise<
 
   if (text.startsWith("/")) return handleCommand(text, token, chatId);
   if (isCalendarAdd(text)) return addFromText(text, token, chatId);
+  if (isEmailCheck(text)) return emailTriage(token, chatId);
 
   const reply = (await geminiText(CHAT_SYSTEM, text)) ?? "Sorry — I couldn't reach the AI just now. Try again in a moment.";
   await sendMessage(token, chatId, reply);
@@ -222,12 +258,69 @@ async function handleCommand(cmd: string, token: string, chatId: string): Promis
     case "class":
     case "course":
       return handleSchool(args, token, chatId);
+    case "routine":
+    case "routines":
+      return handleRoutine(args, token, chatId);
+    case "email":
+    case "inbox":
+    case "mail":
+      return handleEmail(args, token, chatId);
     case "help":
     case "start":
       return sendMessage(token, chatId, HELP);
     default:
       return sendMessage(token, chatId, `Unknown command “/${word}”. Try /help.`);
   }
+}
+
+async function handleRoutine(args: string, token: string, chatId: string): Promise<void> {
+  const parts = args.split(/\s+/);
+  const sub = (parts[0] || "").toLowerCase();
+  const remainder = args.slice(parts[0]?.length ?? 0).trim();
+  const ref = parts.slice(1).join(" ").trim();
+
+  if (!sub || sub === "list" || sub === "ls") {
+    const list = await getRoutines();
+    if (!list.length) {
+      return sendMessage(token, chatId, "No cloud routines yet. Add one:\n/routine add daily 07:00 | summarize the top AI and markets news");
+    }
+    const lines = list.map((r, i) =>
+      `${i + 1}. ${r.enabled ? "🟢" : "⚪️"} ${r.title}\n   ${r.cron} (${r.tz})${r.web ? " · 🌐 news" : ""}`);
+    return sendMessage(token, chatId, `Cloud routines (run even with your Mac off):\n\n${lines.join("\n")}\n\n/routine help for commands.`);
+  }
+
+  if (sub === "add" || sub === "new") {
+    const pipe = remainder.indexOf("|");
+    if (pipe < 0) {
+      return sendMessage(token, chatId, "Format: /routine add <when> | <what>\ne.g. /routine add daily 07:00 | summarize the top AI and markets news");
+    }
+    const whenStr = remainder.slice(0, pipe).trim();
+    const prompt = remainder.slice(pipe + 1).trim();
+    const cron = parseWhen(whenStr);
+    if (!cron) {
+      return sendMessage(token, chatId, `I couldn't read the schedule “${whenStr}”. Try: daily 07:00 · weekdays 08:30 · every 30 min · or raw cron like 0 7 * * *.`);
+    }
+    if (!prompt) return sendMessage(token, chatId, "Add what to do after the | — e.g. | a 3-line brief of today's AI news.");
+    const web = /\b(news|headlines?|markets?|stocks?|latest|today'?s)\b/i.test(prompt);
+    const title = prompt.length > 48 ? prompt.slice(0, 46).trimEnd() + "…" : prompt;
+    const r = await addRoutine({ title, cron, tz: USER_TZ, prompt, web, enabled: true });
+    return sendMessage(token, chatId, `✅ Added “${r.title}”\n   ${r.cron} (${r.tz})${web ? " · 🌐 news" : ""}\nI'll run it on schedule and text you the result. /routine list to see all.`);
+  }
+
+  if (sub === "del" || sub === "delete" || sub === "rm" || sub === "remove") {
+    if (!ref) return sendMessage(token, chatId, "Which one? /routine del <number> (see /routine list).");
+    const removed = await removeRoutine(ref);
+    return sendMessage(token, chatId, removed ? `🗑️ Removed “${removed.title}”.` : `No routine ${ref}. /routine list to see them.`);
+  }
+
+  if (sub === "on" || sub === "enable" || sub === "off" || sub === "disable") {
+    const enable = sub === "on" || sub === "enable";
+    if (!ref) return sendMessage(token, chatId, `Which one? /routine ${enable ? "on" : "off"} <number> (see /routine list).`);
+    const updated = await setRoutineEnabled(ref, enable);
+    return sendMessage(token, chatId, updated ? `${enable ? "🟢 Enabled" : "⚪️ Paused"} “${updated.title}”.` : `No routine ${ref}.`);
+  }
+
+  return sendMessage(token, chatId, ROUTINE_HELP);
 }
 
 async function addFromText(text: string, token: string, chatId: string): Promise<void> {
@@ -238,8 +331,12 @@ async function addFromText(text: string, token: string, chatId: string): Promise
 }
 
 async function handlePhoto(fileId: string, caption: string | undefined, token: string, chatId: string): Promise<void> {
-  await sendMessage(token, chatId, "📷 Reading that…");
-  const bytes = await downloadFile(token, fileId);
+  // Fire the ack concurrently with the download (sendMessage swallows its own errors and returns
+  // void, so it can't reject the Promise.all) — removes one Telegram round-trip from the path.
+  const [bytes] = await Promise.all([
+    downloadFile(token, fileId),
+    sendMessage(token, chatId, "📷 Reading that…"),
+  ]);
   if (!bytes) return sendMessage(token, chatId, "Couldn't download that image — try sending it again.");
   const base64 = Buffer.from(bytes).toString("base64");
   const cleanCaption = caption && !caption.startsWith("/") ? caption : undefined;
@@ -318,8 +415,11 @@ function toEvent(item: SyllabusItem, code: string, batch: string): ExtractedEven
 }
 
 async function handleSyllabus(fileId: string, mime: string, caption: string | undefined, token: string, chatId: string): Promise<void> {
-  await sendMessage(token, chatId, "📚 Reading your syllabus… this can take ~20s.");
-  const bytes = await downloadFile(token, fileId);
+  // Ack and download run concurrently (see handlePhoto) — one fewer Telegram round-trip.
+  const [bytes] = await Promise.all([
+    downloadFile(token, fileId),
+    sendMessage(token, chatId, "📚 Reading your syllabus… this can take ~20s."),
+  ]);
   if (!bytes) return sendMessage(token, chatId, "Couldn't download that file — try sending it again.");
   const base64 = Buffer.from(bytes).toString("base64");
   const courseHint = courseFromCaption(caption);

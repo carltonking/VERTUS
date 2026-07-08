@@ -5,6 +5,11 @@
   "description": "Alfred Lite — always-on cloud Telegram bot (Vercel serverless): chat + add calendar events on the go, independent of the Mac.",
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/nodemailer": "^8.0.1",
     "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "imapflow": "^1.4.6",
+    "nodemailer": "^9.0.3"
   }
 }
