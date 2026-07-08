@@ -18,10 +18,23 @@ export function geminiVision(
   return generate(system, [{ text: prompt }, { inlineData: { mimeType, data: imageBase64 } }], temperature);
 }
 
-async function generate(system: string, parts: unknown[], temperature: number): Promise<string | null> {
+/** Watch a YouTube video and answer a question about it. Gemini ingests the URL natively (visual +
+ *  audio) — no download/transcription. Needs a video-capable model (flash-lite may not qualify), so this
+ *  uses GEMINI_VIDEO_MODEL (default gemini-2.5-flash) rather than the lite chat model. */
+export function geminiYouTube(
+  system: string,
+  prompt: string,
+  youtubeUrl: string,
+  temperature = 0.4
+): Promise<string | null> {
+  const model = process.env.GEMINI_VIDEO_MODEL || "gemini-2.5-flash";
+  return generate(system, [{ text: prompt }, { fileData: { fileUri: youtubeUrl } }], temperature, model);
+}
+
+async function generate(system: string, parts: unknown[], temperature: number, model: string = MODEL): Promise<string | null> {
   const key = process.env.GEMINI_API_KEY;
   if (!key) return null;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${key}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
   try {
     const res = await fetch(url, {
       method: "POST",

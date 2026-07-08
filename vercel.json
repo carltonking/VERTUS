@@ -1,7 +1,7 @@
 {
   "outputDirectory": "website",
   "functions": {
-    "api/telegram.ts": { "maxDuration": 60 },
+    "api/telegram.ts": { "maxDuration": 300 },
     "api/cron-briefing.ts": { "maxDuration": 60 },
     "api/cron-departure.ts": { "maxDuration": 60 },
     "api/cron-routines.ts": { "maxDuration": 60 }

@@ -3,6 +3,8 @@
 
 import { sendMessage, downloadFile, largestPhotoId } from "./_lib/telegram";
 import { answerChat, macOnlyReply } from "./_lib/chat";
+import { handleWatch, hasYouTubeUrl, activeVideo, watchFollowUp } from "./_lib/watch";
+import { kvConfigured, kvSetNX } from "./_lib/kv";
 import { extractFromText, extractFromImage, extractSyllabus, SyllabusItem, SyllabusItemType, ExtractedEvent, AlarmSpec, USER_TZ } from "./_lib/extract";
 import { createEvent, createEvents, deleteSchool, diagnose, listSchoolDiag } from "./_lib/caldav";
 import { planStudySessions } from "./_lib/study";
@@ -18,6 +20,7 @@ const HELP = [
   "/school delete <code> — remove a course's items",
   "/routine — scheduled prompts that run even when your Mac is off (/routine help)",
   "/email — read & reply to your mail, Mac off (/email help)",
+  "/watch — send a YouTube link, then ask me about the video",
   "/help — show this",
   "Share Live Location and I'll text you when it's time to leave for your next event.",
   "Or just talk to me.",
@@ -127,6 +130,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
               { command: "school", description: "Manage courses — e.g. /school delete CS 101" },
               { command: "routine", description: "Scheduled prompts that run even when your Mac is off" },
               { command: "email", description: "Triage and reply to your mail — iCloud + Gmail" },
+              { command: "watch", description: "Watch a YouTube video and answer questions about it" },
               { command: "help", description: "What Alfred can do" },
             ],
           }),
@@ -152,6 +156,14 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   try {
     update = await readJson(req);
   } catch {
+    res.statusCode = 200;
+    res.end("ok");
+    return;
+  }
+  // De-dupe: a slow handler (e.g. watching a long video) can outrun Telegram's ~60s webhook window and
+  // make it retry the same update_id. If we've already started this one, ignore the retry so it can't
+  // double-answer. Only when the store is configured — otherwise process normally.
+  if (kvConfigured() && update?.update_id != null && !(await kvSetNX(`tg:update:${update.update_id}`, "1", 600))) {
     res.statusCode = 200;
     res.end("ok");
     return;
@@ -227,12 +239,16 @@ async function handleUpdate(update: any, token: string, owner: string): Promise<
   if (!text) return;
 
   if (text.startsWith("/")) return handleCommand(text, token, chatId);
+  if (hasYouTubeUrl(text)) return handleWatch(text, token, chatId); // a YouTube link → watch & discuss it
   if (isCalendarAdd(text)) return addFromText(text, token, chatId);
   if (isEmailCheck(text)) return emailTriage(token, chatId);
 
-  // Genuinely Mac-only asks get an honest decline; everything else is answered with calendar/web context.
+  // Genuinely Mac-only asks get an honest decline.
   const macOnly = macOnlyReply(text);
-  await sendMessage(token, chatId, macOnly ?? (await answerChat(text)));
+  if (macOnly) return sendMessage(token, chatId, macOnly);
+  // In an active video session, plain messages are follow-up questions about that video.
+  if (await activeVideo(chatId)) return watchFollowUp(text, token, chatId);
+  await sendMessage(token, chatId, await answerChat(text));
 }
 
 async function handleCommand(cmd: string, token: string, chatId: string): Promise<void> {
@@ -259,6 +275,9 @@ async function handleCommand(cmd: string, token: string, chatId: string): Promis
     case "inbox":
     case "mail":
       return handleEmail(args, token, chatId);
+    case "watch":
+    case "video":
+      return handleWatch(args, token, chatId);
     case "help":
     case "start":
       return sendMessage(token, chatId, HELP);

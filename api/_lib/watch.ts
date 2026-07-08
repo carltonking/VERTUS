@@ -1,0 +1,106 @@
+// Watch a YouTube video and answer questions about it — Gemini ingests the URL natively (visual +
+// audio), so there's no downloading/transcription and it works with the Mac off. Sending a link (or
+// /watch <url>) starts a short-lived "video session" stored per chat in Upstash, so plain follow-up
+// questions are answered about that same video until it's stopped or expires.
+
+import { sendMessage, sendChatAction } from "./telegram";
+import { geminiYouTube } from "./gemini";
+import { kvGet, kvSet, kvDel } from "./kv";
+
+const activeKey = (chatId: string) => `watch:active:${chatId}`;
+const SESSION_TTL_S = 30 * 60; // a video session lasts 30 min of inactivity
+
+const WATCH_SYSTEM =
+  "You are Alfred, watching a YouTube video for Carlton and answering his questions about it. Be concise " +
+  "and specific, grounded in what actually happens in the video; give rough timestamps when useful. If " +
+  "the video doesn't cover what he asks, say so instead of guessing. Plain text, 24-hour times.";
+
+const WATCH_HELP = [
+  "Watch a video & ask about it (works with your Mac off):",
+  "Send a YouTube link — or /watch <link> — optionally with a question, e.g.",
+  "  /watch https://youtu.be/abc123 what's the main argument?",
+  "Then just ask follow-up questions. /watch stop when you're done.",
+].join("\n");
+
+const YT_PATTERNS = [
+  /youtu\.be\/([A-Za-z0-9_-]{6,})/i,
+  /[?&]v=([A-Za-z0-9_-]{6,})/i,
+  /\/shorts\/([A-Za-z0-9_-]{6,})/i,
+  /\/embed\/([A-Za-z0-9_-]{6,})/i,
+  /youtube\.com\/live\/([A-Za-z0-9_-]{6,})/i,
+];
+
+export function youtubeIdFrom(text: string): string | null {
+  for (const p of YT_PATTERNS) {
+    const m = p.exec(text);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+export function youtubeUrlFrom(text: string): string | null {
+  const id = youtubeIdFrom(text);
+  return id ? `https://www.youtube.com/watch?v=${id}` : null;
+}
+
+/** True when the message clearly contains a YouTube link (so we should treat it as "watch this"). */
+export function hasYouTubeUrl(text: string): boolean {
+  return /youtube\.com|youtu\.be/i.test(text) && youtubeIdFrom(text) !== null;
+}
+
+async function setActive(chatId: string, url: string): Promise<void> {
+  await kvSet(activeKey(chatId), JSON.stringify({ url, at: Date.now() }), SESSION_TTL_S);
+}
+
+/** The active video URL for this chat, or null. */
+export async function activeVideo(chatId: string): Promise<string | null> {
+  const raw = await kvGet(activeKey(chatId));
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw);
+    return typeof v?.url === "string" ? v.url : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Answer `question` about `url`, refreshing the session. Shows a typing status while Gemini watches. */
+async function answerAbout(url: string, question: string, token: string, chatId: string): Promise<void> {
+  await sendChatAction(token, chatId);
+  const answer = await geminiYouTube(WATCH_SYSTEM, question, url);
+  await setActive(chatId, url); // keep the session warm on each interaction
+  if (!answer) {
+    return sendMessage(token, chatId, "I couldn't get through that video — it may be private, age-restricted, too long, or unavailable. Try another link.");
+  }
+  await sendMessage(token, chatId, answer);
+}
+
+/** Entry for `/watch …` and for a bare YouTube link. Handles start, ask-about-active, and stop. */
+export async function handleWatch(args: string, token: string, chatId: string): Promise<void> {
+  const trimmed = args.trim();
+  if (/^(stop|off|done|clear|end)\b/i.test(trimmed)) {
+    await kvDel(activeKey(chatId));
+    return sendMessage(token, chatId, "Stopped watching. Send a new link anytime.");
+  }
+
+  const url = youtubeUrlFrom(trimmed);
+  if (url) {
+    const question = trimmed.replace(/\S*(youtube\.com|youtu\.be)\S*/gi, "").trim();
+    await sendMessage(token, chatId, "🎬 Watching that video… (can take up to a minute)");
+    await answerAbout(url, question || "Give a concise summary: what is this video about and its key points?", token, chatId);
+    await sendMessage(token, chatId, "Ask me anything about it — /watch stop when you're done.");
+    return;
+  }
+
+  // No URL in the message → treat as a question about the active video, else show help.
+  const active = await activeVideo(chatId);
+  if (active) return answerAbout(active, trimmed || "Summarize the key points.", token, chatId);
+  return sendMessage(token, chatId, WATCH_HELP);
+}
+
+/** A plain follow-up message while a video session is active. */
+export async function watchFollowUp(text: string, token: string, chatId: string): Promise<void> {
+  const active = await activeVideo(chatId);
+  if (!active) return; // caller checked, but guard anyway
+  return answerAbout(active, text, token, chatId);
+}

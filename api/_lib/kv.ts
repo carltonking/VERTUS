@@ -46,3 +46,10 @@ export async function kvSet(key: string, value: string, ttlSeconds?: number): Pr
 export async function kvDel(key: string): Promise<void> {
   await command(["DEL", key]);
 }
+
+/** Atomic set-if-absent with TTL. Returns true if THIS call set the key (i.e. it was new). Used to
+ *  process each webhook update exactly once. Returns false if the store isn't configured. */
+export async function kvSetNX(key: string, value: string, ttlSeconds: number): Promise<boolean> {
+  const r = await command(["SET", key, value, "NX", "EX", Math.ceil(ttlSeconds)]);
+  return r === "OK";
+}

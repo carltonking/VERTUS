@@ -13,6 +13,15 @@ export async function sendMessage(token: string, chatId: string | number, text: 
   }
 }
 
+/** Shows a transient "typing…" status in the chat (e.g. while Gemini watches a video). Best-effort. */
+export async function sendChatAction(token: string, chatId: string | number, action = "typing"): Promise<void> {
+  await fetch(`${API(token)}/sendChatAction`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, action }),
+  }).catch(() => {});
+}
+
 /** Resolves a Telegram file_id to its bytes (getFile → file_path → download). */
 export async function downloadFile(token: string, fileId: string): Promise<Uint8Array | null> {
   try {
