@@ -12,6 +12,7 @@ import { itemKey, batchId, normCode, schoolURL, schoolToken, schoolCategories } 
 import { setLocation } from "./_lib/location";
 import { getRoutines, addRoutine, removeRoutine, setRoutineEnabled, parseWhen } from "./_lib/routines";
 import { handleEmail, emailTriage, isEmailCheck } from "./_lib/emailflow";
+import { chainStatus } from "./_lib/llm";
 
 const HELP = [
   "Commands:",
@@ -21,6 +22,7 @@ const HELP = [
   "/routine — scheduled prompts that run even when your Mac is off (/routine help)",
   "/email — read & reply to your mail, Mac off (/email help)",
   "/watch — send a YouTube link, then ask me about the video",
+  "/models — which AI backends are up, and which one I'm using",
   "/help — show this",
   "Share Live Location and I'll text you when it's time to leave for your next event.",
   "Or just talk to me.",
@@ -278,6 +280,9 @@ async function handleCommand(cmd: string, token: string, chatId: string): Promis
     case "watch":
     case "video":
       return handleWatch(args, token, chatId);
+    case "models":
+    case "llm":
+      return sendMessage(token, chatId, await chainStatus());
     case "help":
     case "start":
       return sendMessage(token, chatId, HELP);

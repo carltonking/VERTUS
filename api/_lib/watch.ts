@@ -1,10 +1,11 @@
-// Watch a YouTube video and answer questions about it — Gemini ingests the URL natively (visual +
-// audio), so there's no downloading/transcription and it works with the Mac off. Sending a link (or
+// Watch a YouTube video and answer questions about it — the video-capable model in the chain (Gemini
+// today) ingests the URL natively (visual + audio), so there's no downloading/transcription and it
+// works with the Mac off. Sending a link (or
 // /watch <url>) starts a short-lived "video session" stored per chat in Upstash, so plain follow-up
 // questions are answered about that same video until it's stopped or expires.
 
 import { sendMessage, sendChatAction } from "./telegram";
-import { geminiYouTube } from "./gemini";
+import { llmVideo } from "./llm";
 import { kvGet, kvSet, kvDel } from "./kv";
 
 const activeKey = (chatId: string) => `watch:active:${chatId}`;
@@ -64,10 +65,10 @@ export async function activeVideo(chatId: string): Promise<string | null> {
   }
 }
 
-/** Answer `question` about `url`, refreshing the session. Shows a typing status while Gemini watches. */
+/** Answer `question` about `url`, refreshing the session. Shows a typing status while it watches. */
 async function answerAbout(url: string, question: string, token: string, chatId: string): Promise<void> {
   await sendChatAction(token, chatId);
-  const answer = await geminiYouTube(WATCH_SYSTEM, question, url);
+  const answer = await llmVideo(WATCH_SYSTEM, question, url);
   await setActive(chatId, url); // keep the session warm on each interaction
   if (!answer) {
     return sendMessage(token, chatId, "I couldn't get through that video — it may be private, age-restricted, too long, or unavailable. Try another link.");

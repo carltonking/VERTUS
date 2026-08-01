@@ -1,5 +1,5 @@
 // Daily morning briefing — a Vercel Cron job that runs SERVER-SIDE (independent of the Mac): it
-// pulls current headlines, has Gemini write a concise briefing, and pushes it to the owner's Telegram.
+// pulls current headlines, has the model chain write a concise briefing, and pushes it to the owner's Telegram.
 // This is the "runs even when the Mac is off/asleep" delivery path for a time-based routine.
 //
 // Scheduling (see vercel.json): the cron fires at 10:00 AND 11:00 UTC. Vercel crons are UTC-only, but
@@ -8,7 +8,7 @@
 
 import type { IncomingMessage, ServerResponse } from "http";
 import { sendMessage } from "./_lib/telegram";
-import { geminiText } from "./_lib/gemini";
+import { llmText } from "./_lib/llm";
 
 const TZ = "America/New_York";
 const SEND_HOUR = 6; // 06:00 local
@@ -98,7 +98,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     ? `Today is ${etDate(now)}. Write the briefing from these current headlines:\n\n${news}`
     : `Today is ${etDate(now)}. Note briefly that headlines couldn't be fetched this morning.`;
 
-  const body = (await geminiText(system, user, 0.4)) ?? "Couldn't generate the briefing this morning.";
+  const body = (await llmText(system, user, 0.4)) ?? "Couldn't generate the briefing this morning.";
   await sendMessage(token, owner, `Morning Briefing — ${etDate(now)}\n\n${body}`);
   return json(res, 200, { ok: true, sent: true });
 }

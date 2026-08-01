@@ -3,7 +3,7 @@
 // Alfred's "draft, then confirm" product rule). Per-chat list + pending draft live in Upstash.
 
 import { sendMessage } from "./telegram";
-import { geminiText } from "./gemini";
+import { llmText } from "./llm";
 import { mailConfigured, fetchAllRecent, sendMail } from "./mail";
 import { kvGet, kvSet, kvDel } from "./kv";
 
@@ -85,7 +85,7 @@ export async function emailTriage(token: string, chatId: string): Promise<void> 
   const forModel = list
     .map((m) => `[${m.n}] (${m.account}) ${m.from} — ${m.subject}${m.snippet ? `\n    ${m.snippet}` : ""}`)
     .join("\n");
-  const triage = await geminiText(TRIAGE_SYSTEM, `Today is ${new Date().toISOString().slice(0, 10)}.\n\n${forModel}`, 0.4);
+  const triage = await llmText(TRIAGE_SYSTEM, `Today is ${new Date().toISOString().slice(0, 10)}.\n\n${forModel}`, 0.4);
   const footer = "\n\nReply: /email reply <n> | your message · full: /email <n>";
   await sendMessage(token, chatId, (triage || `Recent mail:\n\n${forModel}`) + footer);
 }
@@ -127,7 +127,7 @@ async function emailDraftReply(rest: string, token: string, chatId: string): Pro
   const user =
     `Reply to this email.\nFrom: ${msg.from} <${msg.fromAddress}>\nSubject: ${msg.subject}\n` +
     `Excerpt: ${msg.snippet || "(none)"}\n\nCarlton's instruction: ${instruction || "write an appropriate reply"}`;
-  const body = ((await geminiText(system, user, 0.5)) || "").trim();
+  const body = ((await llmText(system, user, 0.5)) || "").trim();
   if (!body) return sendMessage(token, chatId, "Couldn't draft that just now — try again.");
 
   const subject = /^re:/i.test(msg.subject) ? msg.subject : `Re: ${msg.subject}`;

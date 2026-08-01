@@ -2,7 +2,7 @@
 // yearMentioned flag, and DETERMINISTIC year snapping (past no-year date → next future occurrence).
 // Timezone-aware because the cloud server runs in UTC but the user's events are local.
 
-import { geminiText, geminiVision } from "./gemini";
+import { llmText, llmVision } from "./llm";
 
 export const USER_TZ = process.env.USER_TZ || "America/New_York";
 
@@ -52,7 +52,7 @@ export interface SyllabusExtract {
   items: SyllabusItem[];
 }
 
-/** Extract every dated item from a syllabus (PDF/image via Gemini vision, or plain text). */
+/** Extract every dated item from a syllabus (PDF/image via the vision chain, or plain text). */
 export async function extractSyllabus(
   input: string,
   mime: string | null,
@@ -61,8 +61,8 @@ export async function extractSyllabus(
 ): Promise<SyllabusExtract | null> {
   const sys = syllabusPrompt(now, courseHint);
   const raw = mime
-    ? await geminiVision(sys, SYLLABUS_USER_PROMPT, input, mime, 0.2)
-    : await geminiText(sys, `SYLLABUS:\n"""\n${input.slice(0, 20000)}\n"""\n\nExtract every dated item.`, 0.2);
+    ? await llmVision(sys, SYLLABUS_USER_PROMPT, input, mime, 0.2)
+    : await llmText(sys, `SYLLABUS:\n"""\n${input.slice(0, 20000)}\n"""\n\nExtract every dated item.`, 0.2);
   return raw ? parseSyllabus(raw, now, courseHint) : null;
 }
 
@@ -183,13 +183,13 @@ function intOrNull(v: unknown): number | null {
 }
 
 export async function extractFromText(text: string, now: Date): Promise<ExtractedEvent | null> {
-  const raw = await geminiText(systemPrompt(now), `SOURCE:\n"""\n${text.slice(0, 6000)}\n"""\n\nExtract the event.`, 0.2);
+  const raw = await llmText(systemPrompt(now), `SOURCE:\n"""\n${text.slice(0, 6000)}\n"""\n\nExtract the event.`, 0.2);
   return raw ? parse(raw, now) : null;
 }
 
 export async function extractFromImage(base64: string, mime: string, now: Date, caption?: string): Promise<ExtractedEvent | null> {
   const prompt = `Extract the single calendar event shown in this image.${caption ? ` Extra context: ${caption}` : ""}`;
-  const raw = await geminiVision(systemPrompt(now), prompt, base64, mime, 0.2);
+  const raw = await llmVision(systemPrompt(now), prompt, base64, mime, 0.2);
   return raw ? parse(raw, now) : null;
 }
 

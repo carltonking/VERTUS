@@ -13,7 +13,7 @@ export async function sendMessage(token: string, chatId: string | number, text: 
   }
 }
 
-/** Shows a transient "typing…" status in the chat (e.g. while Gemini watches a video). Best-effort. */
+/** Shows a transient "typing…" status in the chat (e.g. while the model watches a video). Best-effort. */
 export async function sendChatAction(token: string, chatId: string | number, action = "typing"): Promise<void> {
   await fetch(`${API(token)}/sendChatAction`, {
     method: "POST",

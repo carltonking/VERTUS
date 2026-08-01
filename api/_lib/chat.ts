@@ -4,7 +4,7 @@
 // /email triage route. Requests that genuinely need the Mac (iMessage, local files, Obsidian, screen,
 // app control) get a deterministic, honest decline instead of a hallucinated answer.
 
-import { geminiText } from "./gemini";
+import { llmText } from "./llm";
 import { listUpcomingEvents, CalendarEvent } from "./caldav";
 import { searchHeadlines } from "./news";
 import { USER_TZ } from "./extract";
@@ -77,6 +77,6 @@ export async function answerChat(text: string): Promise<string> {
   }
 
   const user = context ? `${text}\n${context}` : text;
-  const reply = await geminiText(CHAT_SYSTEM, user, 0.5);
+  const reply = await llmText(CHAT_SYSTEM, user, 0.5);
   return reply ?? "Sorry — I couldn't reach the AI just now. Try again in a moment.";
 }

@@ -8,7 +8,7 @@
 
 import type { IncomingMessage, ServerResponse } from "http";
 import { sendMessage } from "./_lib/telegram";
-import { geminiText } from "./_lib/gemini";
+import { llmText } from "./_lib/llm";
 import { getRoutines, CloudRoutine } from "./_lib/routines";
 import { dueSince } from "./_lib/cron";
 import { searchHeadlines } from "./_lib/news";
@@ -38,7 +38,7 @@ async function runRoutine(r: CloudRoutine, now: Date): Promise<string> {
     "directly — no greeting, no preamble, no sign-off, plain text (no markdown headers). Be concise and " +
     "useful. 24-hour times. If you can't do something without his Mac (reading his files, iMessage, or " +
     `screen), say so briefly. Today is ${friendlyDate(r.tz, now)}.`;
-  const out = await geminiText(system, r.prompt + context, 0.5);
+  const out = await llmText(system, r.prompt + context, 0.5);
   return (out ?? "").trim() || "(no response)";
 }
 
