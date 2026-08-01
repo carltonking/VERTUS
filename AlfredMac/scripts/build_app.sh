@@ -101,6 +101,16 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 cp "$BINARY_PATH" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
+# alfred-mcp: the MCP shim Hermes spawns to reach Alfred's macOS tools. It must
+# ship inside the bundle so it inherits the same signature, and so HermesSession
+# can locate it relative to the main executable.
+if [[ -f "$BIN_DIR/alfred-mcp" ]]; then
+  cp "$BIN_DIR/alfred-mcp" "$APP_BUNDLE/Contents/MacOS/alfred-mcp"
+  chmod +x "$APP_BUNDLE/Contents/MacOS/alfred-mcp"
+else
+  echo "  ! alfred-mcp not found in $BIN_DIR — Hermes will have no macOS tools"
+fi
+
 if [[ -d "$BIN_DIR/Sparkle.framework" ]]; then
   cp -R "$BIN_DIR/Sparkle.framework" "$APP_BUNDLE/Contents/Frameworks/"
 fi

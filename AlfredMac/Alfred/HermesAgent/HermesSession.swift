@@ -195,10 +195,14 @@ actor HermesSession {
             "clientInfo": ["name": "alfred", "version": Self.appVersion],
         ])
 
-        // 2. session/new
+        // 2. session/new, injecting Alfred's macOS tools for this session only.
+        //
+        // Per-session registration rather than `hermes mcp add`: it leaves
+        // ~/.hermes untouched, keeps the bar self-contained, and means a Hermes
+        // run started from anywhere else doesn't inherit control of this Mac.
         let session = try await request("session/new", [
             "cwd": workingDirectory,
-            "mcpServers": [],  // Phase 2 injects Alfred's macOS tools here.
+            "mcpServers": Self.alfredMCPServer.map { [$0] } ?? [],
         ])
         guard let sid = session["sessionId"] as? String else {
             throw HermesError.protocolError("session/new returned no sessionId")
@@ -208,6 +212,22 @@ actor HermesSession {
 
     private static var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+    }
+
+    /// The `McpServerStdio` entry describing Alfred's own tool server, or nil if
+    /// the shim isn't in the bundle (e.g. running the bare SwiftPM binary rather
+    /// than the assembled .app).
+    private static var alfredMCPServer: [String: Any]? {
+        guard let shim = Bundle.main.url(forAuxiliaryExecutable: "alfred-mcp")?.path
+                ?? Bundle.main.executableURL?
+                    .deletingLastPathComponent()
+                    .appendingPathComponent("alfred-mcp").path,
+              FileManager.default.isExecutableFile(atPath: shim)
+        else {
+            NSLog("[hermes] alfred-mcp not found in bundle — macOS tools unavailable this session")
+            return nil
+        }
+        return ["name": "alfred", "command": shim, "args": [], "env": []]
     }
 
     /// Terminate the agent. Safe to call repeatedly.

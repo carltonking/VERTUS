@@ -442,10 +442,26 @@ final class ComputerControlCapability {
         }
     }
 
+    /// Fast-path refusal for obviously dangerous scripts.
+    ///
+    /// This is a blocklist, so it is necessarily incomplete — it cannot be made
+    /// sufficient, and must not be treated as the safety control. `rm -rf` used
+    /// to pass it cleanly because none of the English words matched. The actual
+    /// control is the human confirmation in AlfredToolServer.confirmControl;
+    /// this only avoids bothering the user with scripts that are never OK.
     private func containsDestructiveRequest(_ text: String) -> Bool {
-        ["delete", "remove", "erase", "trash", "wipe", "format", "purchase", "buy now", "send money", "transfer money"].contains {
-            text.contains($0)
-        }
+        let englishTerms = [
+            "delete", "remove", "erase", "trash", "wipe", "format",
+            "purchase", "buy now", "send money", "transfer money",
+        ]
+        // Shell and system destruction the English list never covered.
+        let shellTerms = [
+            "rm -rf", "rm -f", "sudo ", "mkfs", "dd if=", "> /dev/",
+            "shutdown", "reboot", "killall", "diskutil erase", "csrutil",
+            "chmod -r 777", "chown -r", ":(){", "curl | sh", "curl|sh",
+            "wget | sh", "| bash", "defaults delete", "launchctl unload",
+        ]
+        return (englishTerms + shellTerms).contains { text.contains($0) }
     }
 
     private static func keyCode(for key: String) -> CGKeyCode? {

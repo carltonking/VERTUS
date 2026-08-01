@@ -22,6 +22,13 @@ let package = Package(
                 .process("Resources"),
             ]
         ),
+        // The MCP shim Hermes spawns. Deliberately dependency-free and
+        // privilege-free: it only relays bytes to the running Alfred.app, which
+        // holds the TCC grants. See AlfredMCP/main.swift.
+        .executableTarget(
+            name: "alfred-mcp",
+            path: "AlfredMCP"
+        ),
         .testTarget(
             name: "AlfredTests",
             dependencies: ["Alfred"],

@@ -251,6 +251,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupBarWindow()
         setupStatusItem()
 
+        // Expose Alfred's macOS capabilities to Hermes over MCP. Started before
+        // the heavy graph build because `alfred-mcp` retries its connect for only
+        // ~5s, and Hermes may spawn it as soon as the first query lands.
+        AlfredToolServer.shared.start()
+
         // Defer the heavier startup (DB open, service graph, observe/start wiring) one runloop turn
         // so it never blocks first paint. Stays on the main actor — ordering/thread affinity intact.
         Task { @MainActor [weak self] in
