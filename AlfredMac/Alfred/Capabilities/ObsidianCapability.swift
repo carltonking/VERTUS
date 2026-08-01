@@ -105,16 +105,21 @@ struct ObsidianCapability {
 
     /// Strips command-phrase noise as whole words/phrases so a term like "findings" isn't gutted
     /// by the noise word "find". Uses `\b` anchors rather than blind substring replacement.
+    // The noise phrases are constant; compile their word-boundary regexes once (in array order,
+    // so the sequential replacement below is byte-identical to the per-call version).
+    private static let noiseRegexes: [NSRegularExpression] = [
+        "search obsidian for", "search my obsidian", "search obsidian",
+        "in my obsidian vault", "my obsidian vault", "obsidian vault",
+        "in obsidian", "on obsidian", "from obsidian", "my obsidian", "obsidian",
+        "in my notes", "my notes", "my vault", "notes about", "note about",
+        "look up", "show me", "find", "search",
+    ].compactMap {
+        try? NSRegularExpression(pattern: "\\b" + NSRegularExpression.escapedPattern(for: $0) + "\\b")
+    }
+
     private func cleanedSearchTerm(from query: String) -> String {
         var t = query.lowercased()
-        let noise = ["search obsidian for", "search my obsidian", "search obsidian",
-                     "in my obsidian vault", "my obsidian vault", "obsidian vault",
-                     "in obsidian", "on obsidian", "from obsidian", "my obsidian", "obsidian",
-                     "in my notes", "my notes", "my vault", "notes about", "note about",
-                     "look up", "show me", "find", "search"]
-        for phrase in noise {
-            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: phrase) + "\\b"
-            guard let re = try? NSRegularExpression(pattern: pattern) else { continue }
+        for re in Self.noiseRegexes {
             t = re.stringByReplacingMatches(in: t, range: NSRange(t.startIndex..., in: t), withTemplate: " ")
         }
         return t.trimmingCharacters(in: CharacterSet(charactersIn: " ?.!,"))

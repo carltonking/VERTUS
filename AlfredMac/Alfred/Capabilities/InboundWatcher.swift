@@ -19,18 +19,25 @@ final class InboundWatcher: ObservableObject {
 
     private let router: LLMRouter
     private let emailReader = EmailReadService()
-    private let interval: TimeInterval
-    private let maxNotifyPerCycle = 5
+    /// Fast tick — texts are a cheap indexed chat.db ROWID query, so we poll them often for ~10s
+    /// latency. Email is checked every `emailEvery` ticks (a headless SQLite read, still cheap) so
+    /// it lands within ~60s without an LLM triage call on every fast tick.
+    private let textInterval: TimeInterval
+    private let emailEvery: Int
+    private let maxNotifyPerChannel = 5
+    private let maxTriagePerChannel = 12
     private var monitorTask: Task<Void, Never>?
 
     private let defaults = UserDefaults.standard
     private let kLastTextRowID = "inbound.lastTextRowID"
     private let kSeenEmail = "inbound.seenEmailKeys"
     private let kBaselined = "inbound.baselined"
+    private let kEmailReaderV2 = "inbound.emailReaderV2"
 
-    init(router: LLMRouter, interval: TimeInterval = 150) {
+    init(router: LLMRouter, textInterval: TimeInterval = 10, emailEvery: Int = 6) {
         self.router = router
-        self.interval = interval
+        self.textInterval = textInterval
+        self.emailEvery = max(1, emailEvery)
     }
 
     func start() {
@@ -50,15 +57,38 @@ final class InboundWatcher: ObservableObject {
     // MARK: - Loop
 
     private func runLoop() async {
+        migrateEmailReaderIfNeeded()
         // Baseline once so we never notify about the backlog that existed before the user opted in.
         if !defaults.bool(forKey: kBaselined) {
             await baseline()
             defaults.set(true, forKey: kBaselined)
         }
+        var tick = 0
         while !Task.isCancelled {
-            await checkOnce()
-            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            lastCheckAt = Date()
+            // Run both channels concurrently so an email read never gates text detection (and vice
+            // versa). They touch disjoint UserDefaults keys, so concurrent execution is safe.
+            async let texts: Void = checkTexts()
+            async let email: Void = runEmailTick(tick)
+            _ = await (texts, email)
+            status = "Last checked \(Self.time(Date()))."
+            tick &+= 1
+            try? await Task.sleep(nanoseconds: UInt64(textInterval * 1_000_000_000))
         }
+    }
+
+    /// The email reader switched from Mail AppleScript (localized date string) to the Envelope Index
+    /// (Unix-epoch date). The dedup key embeds the date, so old seen-keys no longer match — reset the
+    /// baseline once so we re-seed cleanly instead of re-notifying the entire unread backlog.
+    private func migrateEmailReaderIfNeeded() {
+        guard !defaults.bool(forKey: kEmailReaderV2) else { return }
+        defaults.removeObject(forKey: kBaselined)
+        defaults.removeObject(forKey: kSeenEmail)
+        defaults.set(true, forKey: kEmailReaderV2)
+    }
+
+    private func runEmailTick(_ tick: Int) async {
+        if tick % emailEvery == 0 { await checkEmail() }
     }
 
     private func baseline() async {
@@ -72,19 +102,15 @@ final class InboundWatcher: ObservableObject {
         }
     }
 
-    private func checkOnce() async {
-        lastCheckAt = Date()
-        var notified = 0
-        var triaged = 0
-        let maxTriage = 12   // bound LLM cost per cycle (separate from the notify cap)
-
-        // --- Texts (stable ROWID cursor) ---
-        // Advance the cursor ONLY past messages we actually handled, so a burst larger than the
-        // per-cycle budget isn't silently skipped — the remainder is picked up next cycle.
+    // --- Texts (stable ROWID cursor) ---
+    // Advance the cursor ONLY past messages we actually handled, so a burst larger than the
+    // per-cycle budget isn't silently skipped — the remainder is picked up next cycle.
+    private func checkTexts() async {
+        var notified = 0, triaged = 0
         let lastRow = Int64(defaults.integer(forKey: kLastTextRowID))
         var lastHandledRow = lastRow
         for msg in MessagesReadCapability.recentReceived(afterRowID: lastRow, limit: 10) {
-            if notified >= maxNotifyPerCycle || triaged >= maxTriage { break }
+            if notified >= maxNotifyPerChannel || triaged >= maxTriagePerChannel { break }
             lastHandledRow = msg.rowid
             guard !msg.text.isEmpty, msg.text != "[attachment]" else { continue }
             triaged += 1
@@ -96,38 +122,37 @@ final class InboundWatcher: ObservableObject {
             }
         }
         if lastHandledRow > lastRow { defaults.set(Int(lastHandledRow), forKey: kLastTextRowID) }
+    }
 
-        // --- Email (no stable id → dedup on sender|subject|date) ---
-        if let unread = try? await emailReader.fetchRecentUnread(limit: 30, includeBody: true) {
-            let seen = Set(defaults.stringArray(forKey: kSeenEmail) ?? [])
-            var handled: [String] = []   // only keys we decided on this cycle get marked seen
-            for mail in unread {
-                let key = Self.emailKey(mail)
-                if seen.contains(key) { continue }
-                // Out of budget → leave UNSEEN so it's retried next cycle (never dropped).
-                if notified >= maxNotifyPerCycle || triaged >= maxTriage { continue }
-                let senderRaw = mail.metadata["sender"] ?? mail.subtitle
-                let subject = mail.metadata["subject"] ?? mail.title
-                let body = mail.metadata["body"] ?? ""
-                handled.append(key)
-                // Cheap prefilter: skip obvious automated senders without spending an LLM call.
-                if Self.isAutomated(senderRaw) { continue }
-                triaged += 1
-                if let t = await triage(channel: .email, sender: Self.displayName(senderRaw),
-                                        subject: subject, preview: subject), t.needsReply {
-                    await postNotification(channel: "email", sender: Self.displayName(senderRaw),
-                                           handle: Self.extractEmail(senderRaw), subject: subject,
-                                           preview: body.isEmpty ? subject : body, summary: t.summary,
-                                           id: "inbound.email.\(UInt(bitPattern: key.hashValue))")
-                    notified += 1
-                }
+    // --- Email (no stable id → dedup on sender|subject|date) ---
+    private func checkEmail() async {
+        guard let unread = try? await emailReader.fetchRecentUnread(limit: 30) else { return }
+        var notified = 0, triaged = 0
+        let seen = Set(defaults.stringArray(forKey: kSeenEmail) ?? [])
+        var handled: [String] = []   // only keys we decided on this cycle get marked seen
+        for mail in unread {
+            let key = Self.emailKey(mail)
+            if seen.contains(key) { continue }
+            // Out of budget → leave UNSEEN so it's retried next cycle (never dropped).
+            if notified >= maxNotifyPerChannel || triaged >= maxTriagePerChannel { continue }
+            let senderRaw = mail.metadata["sender"] ?? mail.subtitle
+            let subject = mail.metadata["subject"] ?? mail.title
+            handled.append(key)
+            // Cheap prefilter: skip obvious automated senders without spending an LLM call.
+            if Self.isAutomated(senderRaw) { continue }
+            triaged += 1
+            if let t = await triage(channel: .email, sender: Self.displayName(senderRaw),
+                                    subject: subject, preview: subject), t.needsReply {
+                await postNotification(channel: "email", sender: Self.displayName(senderRaw),
+                                       handle: Self.extractEmail(senderRaw), subject: subject,
+                                       preview: subject, summary: t.summary,
+                                       id: "inbound.email.\(UInt(bitPattern: key.hashValue))")
+                notified += 1
             }
-            // Persist newest-last and capped; un-handled keys stay out so they aren't lost.
-            let prior = (defaults.stringArray(forKey: kSeenEmail) ?? []).filter { !handled.contains($0) }
-            defaults.set(Array((prior + handled).suffix(1000)), forKey: kSeenEmail)
         }
-
-        status = "Last checked \(Self.time(Date()))."
+        // Persist newest-last and capped; un-handled keys stay out so they aren't lost.
+        let prior = (defaults.stringArray(forKey: kSeenEmail) ?? []).filter { !handled.contains($0) }
+        defaults.set(Array((prior + handled).suffix(1000)), forKey: kSeenEmail)
     }
 
     // MARK: - Triage
@@ -137,9 +162,13 @@ final class InboundWatcher: ObservableObject {
     private func triage(channel: InboundChannel, sender: String, subject: String?, preview: String) async -> Triage? {
         let kind = channel == .email ? "email" : "text message"
         let system = """
-        You triage an incoming \(kind) for a busy person. Decide whether it needs a PERSONAL reply \
-        from them. Automated mail, newsletters, receipts, promotions, system notifications, no-reply \
-        senders, and spam do NOT need a reply. Respond with ONE line of JSON only, no prose: \
+        You are a STRICT gatekeeper deciding whether to interrupt a busy person about an incoming \
+        \(kind). Say YES only when it genuinely warrants their attention now: a direct question or \
+        request that needs a timely personal reply, or time-sensitive / important information with \
+        real personal or work consequence. Say NO for everything else — FYIs that need no action, \
+        casual chit-chat, acknowledgements ("ok", "thanks", "got it", "sounds good"), newsletters, \
+        promotions, receipts, marketing, order/shipping/social notifications, automated or no-reply \
+        senders, and spam. When in doubt, say NO. Respond with ONE line of JSON only, no prose: \
         {"needsReply": true|false, "summary": "<8 words max, what it is about>"}
         """
         var user = "From: \(sender)\n"

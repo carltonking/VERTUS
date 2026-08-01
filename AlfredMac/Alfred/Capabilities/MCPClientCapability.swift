@@ -13,6 +13,12 @@ struct MCPConfig: Decodable {
 struct MCPClientCapability {
     private let configURL: URL
 
+    // tools/list for a given server is stable within a session, so cache it (across the freshly-made
+    // struct instances) instead of re-spawning the npx subprocess for every discovery. callTool is
+    // NOT cached (it has side effects). This is the safe part of the persistent-process upgrade noted
+    // below; the full long-lived-process rewrite needs runtime-verified lifecycle handling.
+    private static let toolsListCache = ToolsListCache()
+
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
         configURL = home.appending(path: ".alfred/mcp_servers.json")
@@ -24,11 +30,13 @@ struct MCPClientCapability {
     }
 
     func listTools(server: String) async throws -> String {
+        if let cached = Self.toolsListCache.get(server) { return cached }
         guard let config = loadConfig(), let serverConfig = config.mcpServers[server] else {
             throw LLMError.networkError("MCP server \"\(server)\" not found in config.")
         }
         let request = MCPRequest(id: 2, method: "tools/list", params: [:])
         let response = try await send(request: request, config: serverConfig)
+        Self.toolsListCache.set(server, response)
         return response
     }
 
@@ -108,6 +116,14 @@ struct MCPClientCapability {
             }
         }
     }
+}
+
+/// Thread-safe session cache for `tools/list` responses, keyed by server name.
+private final class ToolsListCache {
+    private let lock = NSLock()
+    private var store: [String: String] = [:]
+    func get(_ key: String) -> String? { lock.lock(); defer { lock.unlock() }; return store[key] }
+    func set(_ key: String, _ value: String) { lock.lock(); store[key] = value; lock.unlock() }
 }
 
 /// Owns the single-resume / cleanup bookkeeping for one MCP call so the read handlers,

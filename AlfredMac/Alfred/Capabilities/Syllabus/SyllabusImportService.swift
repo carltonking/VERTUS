@@ -113,15 +113,19 @@ final class SyllabusImportService: ObservableObject {
 
     // MARK: - File → text
 
-    static func text(from url: URL) async -> String? {
+    nonisolated static func text(from url: URL) async -> String? {
         let ext = url.pathExtension.lowercased()
         if ext == "pdf" {
-            guard let doc = PDFDocument(url: url) else { return nil }
-            var s = ""
-            for i in 0..<min(doc.pageCount, 50) {
-                if let page = doc.page(at: i)?.string { s += page + "\n" }
-            }
-            return s
+            // PDFDocument construction + per-page .string extraction is synchronous and CPU-bound;
+            // run it off the main actor so importing a syllabus doesn't freeze the menu-bar popover.
+            return await Task.detached {
+                guard let doc = PDFDocument(url: url) else { return nil }
+                var s = ""
+                for i in 0..<min(doc.pageCount, 50) {
+                    if let page = doc.page(at: i)?.string { s += page + "\n" }
+                }
+                return s
+            }.value
         }
         if ["png", "jpg", "jpeg", "heic", "heif", "tiff", "gif", "bmp"].contains(ext), let data = try? Data(contentsOf: url) {
             return await ScreenOCRCapability.recognizeText(inImageData: data)

@@ -77,67 +77,81 @@ final class EmailReadService: ReadOnlyIntegrationProtocol {
         }
     }
 
-    /// All recent unread inbox messages (no query filter) — backs "summarize my emails".
-    /// Unlike `performSearch`, this launches Mail via `tell` if it isn't running, so it works
-    /// from a headless routine. Throws on AppleScript/permission failure so the caller can react.
+    /// All recent unread inbox messages (no query filter) — backs "summarize my emails" and the
+    /// inbound watcher.
+    ///
+    /// Reads Mail's local **Envelope Index** SQLite database directly (read-only) instead of scripting
+    /// Mail.app. A `tell application "Mail"` AUTO-LAUNCHES Mail; this never does — Alfred reads mail
+    /// headlessly whether or not Mail is open. Requires Full Disk Access, which Alfred already relies
+    /// on (it reads the Messages `chat.db` the same way). `includeBody` is accepted for source
+    /// compatibility but ignored: the Envelope Index carries no message body, and triage/notifications
+    /// key off the subject anyway. Never throws for the common cases (DB missing / unreadable → []).
     func fetchRecentUnread(limit: Int = 20, includeBody: Bool = false) async throws -> [IntegrationSearchResult] {
-        // Robust script: filter only by read status (the compound `where (date … and …)` whose-clause
-        // is buggy/slow and the old version also carried a stray backslash that mangled it). `limit`
-        // doubles as the AppleScript cap (callers pass a large value to baseline the whole backlog).
-        // When includeBody, each message's content is fetched, truncated, and stripped of
-        // tabs/newlines so the tab/linefeed-delimited parse stays deterministic — wrapped in its own
-        // `try` so a body-fetch failure degrades to an empty body, never breaking the whole fetch.
-        let bodyClause = includeBody ? """
-                    set bodyText to ""
-                    try
-                        set rawBody to content of msg
-                        if (count of rawBody) > 600 then set rawBody to text 1 thru 600 of rawBody
-                        set AppleScript's text item delimiters to {return, linefeed, tab}
-                        set bodyParts to text items of rawBody
-                        set AppleScript's text item delimiters to " "
-                        set bodyText to bodyParts as text
-                        set AppleScript's text item delimiters to ""
-                    end try
-        """ : "                    set bodyText to \"\""
-        let scriptSource = """
-        tell application "Mail"
-            set out to ""
-            set unreadMsgs to (messages of inbox whose read status is false)
-            set n to (count of unreadMsgs)
-            if n > \(limit) then set n to \(limit)
-            repeat with i from 1 to n
-                try
-                    set msg to item i of unreadMsgs
-        \(bodyClause)
-                    set out to out & (subject of msg) & tab & (sender of msg) & tab & ((date received of msg) as string) & tab & bodyText & linefeed
-                end try
-            end repeat
-            return out
-        end tell
+        guard let db = Self.envelopeIndexPath() else { return [] }
+        // addresses.comment = display name, addresses.address = email. date_received is Unix epoch
+        // seconds (no 2001 offset in V10+). Restrict to INBOX so Sent/Junk/Trash/All-Mail are excluded.
+        let sql = """
+        SELECT s.subject, a.comment, a.address, m.date_received
+        FROM messages m
+        JOIN mailboxes mb ON m.mailbox = mb.ROWID
+        LEFT JOIN subjects s ON m.subject = s.ROWID
+        LEFT JOIN addresses a ON m.sender = a.ROWID
+        WHERE m.read = 0 AND m.deleted = 0 AND UPPER(mb.url) LIKE '%INBOX%'
+        ORDER BY m.date_received DESC
+        LIMIT \(max(1, limit));
         """
-        var errorDict: NSDictionary?
-        guard let script = NSAppleScript(source: scriptSource) else {
-            throw IntegrationError.underlying(NSError(domain: "com.alfred.email", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Failed to compile AppleScript"]))
-        }
-        let output = script.executeAndReturnError(&errorDict)
-        if let error = errorDict {
-            throw IntegrationError.underlying(NSError(domain: "com.alfred.email", code: -2,
-                userInfo: error as? [String: Any]))
-        }
-        let lines = output.stringValue?.split(separator: "\n").map(String.init) ?? []
-        return lines.prefix(limit).map { line in
-            let parts = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
-            let subject = parts.count > 0 && !parts[0].isEmpty ? parts[0] : "(no subject)"
-            let sender = parts.count > 1 ? parts[1] : "Unknown"
-            let dateStr = parts.count > 2 ? parts[2] : ""
-            let body = parts.count > 3 ? parts[3] : ""
-            var metadata = ["subject": subject, "sender": sender, "date": dateStr]
-            if !body.isEmpty { metadata["body"] = body }
+        let rows = Self.runSqlite(dbPath: db, sql: sql)
+        return rows.compactMap { f in
+            guard f.count >= 4 else { return nil }
+            let subject = f[0].isEmpty ? "(no subject)" : f[0]
+            let name = f[1], address = f[2], date = f[3]
+            let sender = name.isEmpty ? address : "\(name) <\(address)>"
             return IntegrationSearchResult(
                 title: subject, subtitle: sender, source: "Email", icon: "envelope",
-                metadata: metadata
-            )
+                metadata: ["subject": subject, "sender": sender, "date": date])
         }
+    }
+
+    /// Locates the Mail Envelope Index, picking the highest `V<n>` container (V9/V10/V11 vary by
+    /// macOS release). Returns nil if Mail data isn't present.
+    private static func envelopeIndexPath() -> String? {
+        let base = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Mail")
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: base) else { return nil }
+        let versions = entries
+            .filter { $0.hasPrefix("V") && Int($0.dropFirst()) != nil }
+            .sorted { (Int($0.dropFirst()) ?? 0) > (Int($1.dropFirst()) ?? 0) }
+        for v in versions {
+            let path = "\(base)/\(v)/MailData/Envelope Index"
+            if fm.fileExists(atPath: path) { return path }
+        }
+        return nil
+    }
+
+    /// Runs a read-only query against the Envelope Index out-of-process via `/usr/bin/sqlite3` (no
+    /// SQLite C linking needed). Fields are split on US (0x1F) and rows on RS (0x1E) so a subject that
+    /// contains a newline can't corrupt the row split. `immutable=1` guarantees we never take a lock
+    /// or hit SQLITE_BUSY while Mail is actively writing. Returns [] on any failure.
+    private static func runSqlite(dbPath: String, sql: String) -> [[String]] {
+        let fs = "\u{1F}", rs = "\u{1E}"
+        let uri = "file:" + dbPath.replacingOccurrences(of: " ", with: "%20") + "?immutable=1"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        proc.arguments = ["-readonly", "-separator", fs, "-newline", rs, uri, sql]
+        let stdout = Pipe()
+        proc.standardOutput = stdout
+        proc.standardError = FileHandle.nullDevice   // discard (undrained stderr pipe could deadlock)
+        do { try proc.run() } catch { return [] }
+        // Watchdog: a wedged sqlite3 can't hang the caller; closing the pipe unblocks the read.
+        let watchdog = DispatchWorkItem { proc.terminate() }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 15, execute: watchdog)
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        watchdog.cancel()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0,
+              let text = String(data: data, encoding: .utf8), !text.isEmpty else { return [] }
+        return text.components(separatedBy: rs)
+            .filter { !$0.isEmpty }
+            .map { $0.components(separatedBy: fs) }
     }
 }

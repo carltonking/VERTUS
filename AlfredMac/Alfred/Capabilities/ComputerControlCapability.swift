@@ -42,6 +42,42 @@ final class ComputerControlCapability {
         case typeText(String)
         case wait(TimeInterval)
 
+        /// The on-screen point this action targets, in global CG (top-left origin) coordinates —
+        /// the same space `postMouse`/`CGWarpMouseCursorPosition` use. Nil for actions with no
+        /// location (keys, typing, wait). The visual cursor overlay glides here before the action fires.
+        var targetPoint: CGPoint? {
+            switch self {
+            case .moveMouse(let x, let y), .click(let x, let y), .doubleClick(let x, let y):
+                return CGPoint(x: x, y: y)
+            case .clickElement(_, let frame, _):
+                return CGPoint(x: frame.midX, y: frame.midY)
+            case .pressKey, .hotkey, .typeText, .wait:
+                return nil
+            }
+        }
+
+        /// A natural-language sentence for narrating the step in the Alfred bar.
+        var narration: String {
+            switch self {
+            case .moveMouse:
+                return "Moving to the spot…"
+            case .click:
+                return "Clicking…"
+            case .doubleClick:
+                return "Double-clicking…"
+            case .clickElement(_, _, let label):
+                return "Clicking \(label)…"
+            case .pressKey(let key):
+                return "Pressing \(key)…"
+            case .hotkey(let keys):
+                return "Pressing \(keys.joined(separator: "+"))…"
+            case .typeText:
+                return "Typing…"
+            case .wait:
+                return "Waiting a moment…"
+            }
+        }
+
         var summary: String {
             switch self {
             case .moveMouse(let x, let y):
@@ -196,7 +232,13 @@ final class ComputerControlCapability {
         return .clickElement(index: element.index, frame: element.frame, label: element.label)
     }
 
-    func execute(_ plan: Plan, onStep: ((String) -> Void)? = nil) async throws -> String {
+    /// - Parameters:
+    ///   - onStep: called with each action's summary as it starts (bar status text).
+    ///   - onActionStart: awaited *before* the action fires — the visual cursor overlay uses this to
+    ///     glide to `action.targetPoint` so it arrives on target just as the click/keypress happens.
+    func execute(_ plan: Plan,
+                 onStep: ((String) -> Void)? = nil,
+                 onActionStart: ((Action) async -> Void)? = nil) async throws -> String {
         guard hasAccessibilityPermission else {
             throw ControlError.accessibilityMissing
         }
@@ -207,6 +249,8 @@ final class ComputerControlCapability {
         for action in plan.actions {
             if isCancelled { throw ControlError.cancelled }
             onStep?(action.summary)
+            await onActionStart?(action)
+            if isCancelled { throw ControlError.cancelled }
             try await execute(action)
             completed.append(action.summary)
         }

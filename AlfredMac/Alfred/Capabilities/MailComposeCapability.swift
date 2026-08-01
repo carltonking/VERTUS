@@ -141,14 +141,18 @@ struct MailComposeCapability {
             guard Self.confirmSend(to: display, subject: subj, body: bodyText) else { return "Email cancelled." }
         }
 
+        // When actually sending, the message is invisible and Mail is never activated — it sends in
+        // the background without a window or focus steal. When only drafting, the message IS visible
+        // and Mail is brought forward so the user can review and hit send.
+        let visible = doSend ? "false" : "true"
+        let tail = doSend ? "send newMessage" : "activate"
         let script = """
         tell application "Mail"
-            set newMessage to make new outgoing message with properties {subject:"\(Self.esc(subj))", content:"\(Self.escBody(bodyText))", visible:true}
+            set newMessage to make new outgoing message with properties {subject:"\(Self.esc(subj))", content:"\(Self.escBody(bodyText))", visible:\(visible)}
             tell newMessage
                 make new to recipient at end of to recipients with properties {address:"\(Self.esc(email))"}
             end tell
-            \(doSend ? "send newMessage" : "")
-            activate
+            \(tail)
         end tell
         """
         var err: NSDictionary?

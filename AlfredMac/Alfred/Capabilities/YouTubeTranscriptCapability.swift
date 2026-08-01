@@ -114,24 +114,32 @@ struct YouTubeTranscriptCapability {
     }
 
     private func decodeHTMLEntities(_ text: String) -> String {
-        guard let data = text.data(using: .utf8),
-              let decoded = try? NSAttributedString(
-                data: data,
-                options: [
-                    .documentType: NSAttributedString.DocumentType.html,
-                    .characterEncoding: String.Encoding.utf8.rawValue,
-                ],
-                documentAttributes: nil
-              ).string
-        else {
-            return text
-                .replacingOccurrences(of: "&amp;", with: "&")
-                .replacingOccurrences(of: "&quot;", with: "\"")
-                .replacingOccurrences(of: "&#39;", with: "'")
-                .replacingOccurrences(of: "&lt;", with: "<")
-                .replacingOccurrences(of: "&gt;", with: ">")
+        // YouTube timedtext uses only the basic named entities plus numeric escapes, so decode them
+        // directly instead of spinning up an NSAttributedString HTML (WebKit) importer per caption
+        // line — that was multi-second and main-thread-affined over hundreds of segments. (Non-ASCII
+        // arrives as numeric &#NNN;, so arbitrary named entities like &eacute; don't appear.)
+        var result = text
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+
+        // Numeric entities: &#NNN; (decimal) and &#xNN; (hex).
+        if result.contains("&#"), let regex = try? NSRegularExpression(pattern: #"&#(x?)([0-9a-fA-F]+);"#) {
+            let matches = regex.matches(in: result, range: NSRange(result.startIndex..., in: result)).reversed()
+            for match in matches {
+                guard let fullRange = Range(match.range(at: 0), in: result),
+                      let flagRange = Range(match.range(at: 1), in: result),
+                      let numRange = Range(match.range(at: 2), in: result)
+                else { continue }
+                let isHex = !result[flagRange].isEmpty
+                guard let code = Int(result[numRange], radix: isHex ? 16 : 10),
+                      let scalar = UnicodeScalar(code) else { continue }
+                result.replaceSubrange(fullRange, with: String(Character(scalar)))
+            }
         }
 
-        return decoded
+        // Decode &amp; LAST so an entity like "&amp;lt;" resolves to "&lt;" rather than "<".
+        return result.replacingOccurrences(of: "&amp;", with: "&")
     }
 }

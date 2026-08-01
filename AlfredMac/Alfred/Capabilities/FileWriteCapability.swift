@@ -210,9 +210,17 @@ struct FileWriteCapability {
         return typeHints.first { lowered.contains($0.0) }?.1 ?? "txt"
     }
 
+    // These patterns are constant — compile once instead of per file-write request.
+    private static let filenamePattern = try? NSRegularExpression(pattern: #"(?i)(?:^|\s|["'])([^\s"'\n]+?\.(?:txt|md|markdown|json|csv|log|swift|html|css|js|ts|tsx|jsx|py|sh|yaml|yml|pdf|docx|pptx))(?=\s|$|["'])"#)
+    private static let topicPatterns: [NSRegularExpression] = [
+        #"(?i)\b(?:about|for|on)\s+(.+?)(?:\s+(?:as|to|named|called)\b|$)"#,
+        #"(?i)\b(?:note|file|document)\s+(.+?)(?:\s+(?:as|to|named|called)\b|$)"#,
+    ].compactMap { try? NSRegularExpression(pattern: $0) }
+    private static let topicNoiseRegex = try? NSRegularExpression(pattern: #"(?i)\b(?:markdown|text|file|document|note|readme|txt|md|json|csv|log|swift|html|css|javascript|typescript|python|shell|yaml|yml|pdf|docx|word|pptx|powerpoint|slides|slide|deck|presentation)\b"#)
+    private static let filenameCollapseRegex = try? NSRegularExpression(pattern: #"[\s-]+"#)
+
     private func sanitizedSuggestedFilename(from query: String) -> String? {
-        let pattern = #"(?i)(?:^|\s|["'])([^\s"'\n]+?\.(?:txt|md|markdown|json|csv|log|swift|html|css|js|ts|tsx|jsx|py|sh|yaml|yml|pdf|docx|pptx))(?=\s|$|["'])"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        guard let regex = Self.filenamePattern else { return nil }
         let range = NSRange(query.startIndex..<query.endIndex, in: query)
         guard let match = regex.firstMatch(in: query, range: range),
               let nameRange = Range(match.range(at: 1), in: query)
@@ -241,21 +249,17 @@ struct FileWriteCapability {
     }
 
     private func topicFromPrompt(_ query: String) -> String? {
-        let patterns = [
-            #"(?i)\b(?:about|for|on)\s+(.+?)(?:\s+(?:as|to|named|called)\b|$)"#,
-            #"(?i)\b(?:note|file|document)\s+(.+?)(?:\s+(?:as|to|named|called)\b|$)"#,
-        ]
-
-        for pattern in patterns {
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+        for regex in Self.topicPatterns {
             let range = NSRange(query.startIndex..<query.endIndex, in: query)
             guard let match = regex.firstMatch(in: query, range: range),
                   let topicRange = Range(match.range(at: 1), in: query)
             else { continue }
 
-            let topic = String(query[topicRange])
-                .replacingOccurrences(of: #"(?i)\b(?:markdown|text|file|document|note|readme|txt|md|json|csv|log|swift|html|css|javascript|typescript|python|shell|yaml|yml|pdf|docx|word|pptx|powerpoint|slides|slide|deck|presentation)\b"#, with: "", options: .regularExpression)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let topicRaw = String(query[topicRange])
+            let stripped = Self.topicNoiseRegex.map {
+                $0.stringByReplacingMatches(in: topicRaw, range: NSRange(topicRaw.startIndex..., in: topicRaw), withTemplate: "")
+            } ?? topicRaw
+            let topic = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
             if !topic.isEmpty {
                 return topic
             }
@@ -270,9 +274,11 @@ struct FileWriteCapability {
         let scalars = lastComponent.unicodeScalars.map { scalar in
             allowed.contains(scalar) ? Character(scalar) : "-"
         }
-        let cleaned = String(scalars)
-            .replacingOccurrences(of: #"[\s-]+"#, with: "-", options: .regularExpression)
-            .trimmingCharacters(in: CharacterSet(charactersIn: ".-_ "))
+        let scalarsStr = String(scalars)
+        let collapsed = Self.filenameCollapseRegex.map {
+            $0.stringByReplacingMatches(in: scalarsStr, range: NSRange(scalarsStr.startIndex..., in: scalarsStr), withTemplate: "-")
+        } ?? scalarsStr
+        let cleaned = collapsed.trimmingCharacters(in: CharacterSet(charactersIn: ".-_ "))
 
         return cleaned.isEmpty ? "alfred-output" : String(cleaned.prefix(80))
     }

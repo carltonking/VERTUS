@@ -56,10 +56,18 @@ final class ActionSelectionEngine {
         let lowered = query.lowercased()
         var explanation: [String] = []
 
+        // Compute the DB-backed inputs ONCE up front instead of re-fetching them inside scoreAction
+        // for every action type. Previously getTopHabits / getDailyRewardSummary /
+        // generateResponseStyleProfile each ran once PER action type (~9x); the last also mutates
+        // currentProfile + calls logSignals, so that side effect now fires once. Scores are identical.
+        let topHabits = habits?.getTopHabits(limit: 10) ?? []
+        let rewardSummary = context.rewardContext.isEmpty ? nil : rewards?.getDailyRewardSummary()
+        let styleProfile = adaptation?.generateResponseStyleProfile()
+
         // 1. Compute scores for all action types
         var candidates: [ActionCandidate] = []
         for actionType in allActionTypes {
-            let candidate = scoreAction(actionType: actionType, query: query, lowered: lowered, context: context, explanation: &explanation)
+            let candidate = scoreAction(actionType: actionType, query: query, lowered: lowered, context: context, topHabits: topHabits, rewardSummary: rewardSummary, styleProfile: styleProfile, explanation: &explanation)
             candidates.append(candidate)
         }
 
@@ -86,12 +94,15 @@ final class ActionSelectionEngine {
         query: String,
         lowered: String,
         context: UnifiedContext,
+        topHabits: [Habit],
+        rewardSummary: DailyRewardSummary?,
+        styleProfile: ResponseStyleProfile?,
         explanation: inout [String]
     ) -> ActionCandidate {
         let base = computeBaseScore(actionType: actionType, lowered: lowered, context: context)
-        let habitMod = computeHabitModifier(actionType: actionType)
-        let rewardMod = computeRewardModifier(actionType: actionType, context: context)
-        let adaptationMod = computeAdaptationModifier(actionType: actionType)
+        let habitMod = computeHabitModifier(actionType: actionType, topHabits: topHabits)
+        let rewardMod = computeRewardModifier(actionType: actionType, rewardSummary: rewardSummary)
+        let adaptationMod = computeAdaptationModifier(actionType: actionType, styleProfile: styleProfile)
         let adjustedScore = max(0, min(1.0, base + habitMod + rewardMod + adaptationMod))
 
         var reasoning: [String] = []
@@ -189,10 +200,9 @@ final class ActionSelectionEngine {
 
     // MARK: - Modifiers
 
-    private func computeHabitModifier(actionType: String) -> Double {
-        guard let habits = habits else { return 0.0 }
-        let habitList = habits.getTopHabits(limit: 10)
-        let productivityCount = habitList.filter { $0.type == .productivity_pattern }.count
+    private func computeHabitModifier(actionType: String, topHabits: [Habit]) -> Double {
+        // topHabits is [] when habits is nil, so productivityCount stays 0 (same as the old guard).
+        let productivityCount = topHabits.filter { $0.type == .productivity_pattern }.count
 
         guard productivityCount > 0 else { return 0.0 }
 
@@ -206,11 +216,9 @@ final class ActionSelectionEngine {
         }
     }
 
-    private func computeRewardModifier(actionType: String, context: UnifiedContext) -> Double {
-        guard !context.rewardContext.isEmpty else { return 0.0 }
-
-        let summary = rewards?.getDailyRewardSummary()
-        guard let s = summary, s.totalSignals > 0 else { return 0.0 }
+    private func computeRewardModifier(actionType: String, rewardSummary: DailyRewardSummary?) -> Double {
+        // rewardSummary is nil when context.rewardContext was empty (gate preserved by the caller).
+        guard let s = rewardSummary, s.totalSignals > 0 else { return 0.0 }
 
         switch actionType {
         case "respond_text":
@@ -222,9 +230,9 @@ final class ActionSelectionEngine {
         }
     }
 
-    private func computeAdaptationModifier(actionType: String) -> Double {
-        guard let adaptation = adaptation else { return 0.0 }
-        let profile = adaptation.generateResponseStyleProfile()
+    private func computeAdaptationModifier(actionType: String, styleProfile: ResponseStyleProfile?) -> Double {
+        // styleProfile is nil when adaptation is nil (same as the old guard).
+        guard let profile = styleProfile else { return 0.0 }
 
         switch actionType {
         case "respond_text":

@@ -74,18 +74,24 @@ final class AlfredBotWatcher: ObservableObject {
     // MARK: - Loop
 
     private func runLoop() async {
+        var emptyPolls = 0
         while !Task.isCancelled {
-            await checkOnce()
-            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            let didWork = await checkOnce()
+            emptyPolls = didWork ? 0 : min(emptyPolls + 1, 2)
+            // Idle backoff: after consecutive empty polls, poll less often (3s → up to 9s) to cut
+            // steady-state chat.db reads; resets to 3s the moment a poll finds new messages.
+            let sleep = interval * Double(1 + emptyPolls)
+            try? await Task.sleep(nanoseconds: UInt64(sleep * 1_000_000_000))
         }
     }
 
-    private func checkOnce() async {
+    @discardableResult
+    private func checkOnce() async -> Bool {
         let ownerHandle = appState.imessageBotOwnerHandle.trimmingCharacters(in: .whitespaces)
         guard !ownerHandle.isEmpty else {
             Self.logHintOnce()
             status = "Set your iMessage address to use the bot."
-            return
+            return false
         }
 
         // Baseline once so pre-opt-in "alfred …" messages in history aren't run.
@@ -97,7 +103,7 @@ final class AlfredBotWatcher: ObservableObject {
 
         let cursor = Int64(defaults.integer(forKey: cursorKey))
         let messages = MessagesReadCapability.recentSelfChatMessages(ownerHandle: ownerHandle, afterRowID: cursor, limit: 20)
-        guard !messages.isEmpty else { return }
+        guard !messages.isEmpty else { return false }
 
         var newCursor = cursor
         let trig = trigger()
@@ -112,6 +118,7 @@ final class AlfredBotWatcher: ObservableObject {
         }
         defaults.set(Int(newCursor), forKey: cursorKey)   // advance the cursor past this batch
         status = "Last checked \(Self.time(Date()))."
+        return true
     }
 
     // MARK: - Command handling

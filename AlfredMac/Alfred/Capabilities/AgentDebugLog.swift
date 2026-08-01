@@ -10,9 +10,11 @@ enum AgentDebugLog {
         return dir.appending(path: "computer-control.log")
     }()
 
+    private static let iso8601 = ISO8601DateFormatter()
+
     static func log(_ message: String) {
         // No argless Date() in this codebase's tooling-sensitive paths, but here in app code it's fine.
-        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        let line = "[\(Self.iso8601.string(from: Date()))] \(message)\n"
         guard let data = line.data(using: .utf8) else { return }
         if let handle = try? FileHandle(forWritingTo: fileURL) {
             defer { try? handle.close() }

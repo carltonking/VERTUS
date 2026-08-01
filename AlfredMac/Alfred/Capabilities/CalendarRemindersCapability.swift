@@ -75,7 +75,18 @@ struct CalendarRemindersCapability {
     /// when the calendar supplied one (else nil → the caller geocodes the text). Requesting access when
     /// already decided does not re-prompt.
     func upcomingTimedEventsWithLocation(withinHours hours: Int = 3) async -> [LocatedEvent] {
-        guard (try? await store.requestFullAccessToEvents()) == true else { return [] }
+        // Only request access when undetermined; when already authorized skip the request (a no-op
+        // re-prompt-wise, but still an async round-trip on every 180s DepartureWatcher cycle).
+        let granted: Bool
+        switch EKEventStore.authorizationStatus(for: .event) {
+        case .fullAccess, .authorized:
+            granted = true
+        case .notDetermined:
+            granted = (try? await store.requestFullAccessToEvents()) == true
+        default:
+            granted = false
+        }
+        guard granted else { return [] }
         let now = Date()
         guard let end = Calendar.current.date(byAdding: .hour, value: hours, to: now) else { return [] }
         let predicate = store.predicateForEvents(withStart: now, end: end, calendars: nil)
@@ -386,17 +397,19 @@ struct CalendarRemindersCapability {
 
     // MARK: - Helpers
 
+    // Cached instead of allocating per event/reminder inside the read-loop .map calls.
+    private static let monthDayFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "MMM d"; return f
+    }()
+    private static let hourMinuteFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
+    }()
+
     private func formatDateTime(_ date: Date) -> String {
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "MMM d"
-        let timeFormatter = DateFormatter()
-        timeFormatter.dateFormat = "HH:mm"
-        return "\(dateFormatter.string(from: date)) at \(timeFormatter.string(from: date))"
+        return "\(Self.monthDayFormatter.string(from: date)) at \(Self.hourMinuteFormatter.string(from: date))"
     }
 
     private func formatTime(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm"
-        return formatter.string(from: date)
+        return Self.hourMinuteFormatter.string(from: date)
     }
 }

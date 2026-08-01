@@ -40,6 +40,45 @@ actor ScreenCapability {
         return data.base64EncodedString()
     }
 
+    /// A screenshot plus its pixel dimensions — the guidance ("point at my screen") feature needs the
+    /// size so it can map the model's screenshot-space coordinates back to on-screen points.
+    struct Screenshot: Sendable {
+        let base64: String
+        let mediaType: String
+        let width: Int
+        let height: Int
+    }
+
+    func captureForVision() async throws -> Screenshot {
+        let full = try await captureCGImage()
+        // Downscale to a max 1280px long edge (Clicky does the same): a smaller image uploads and
+        // infers much faster, and vision models tend to ground coordinates at least as well on it.
+        // The returned width/height are the DOWNSCALED pixel size, which the caller scales back to
+        // display points — so accuracy is unaffected.
+        let image = Self.downscaled(full, maxLongEdge: 1280) ?? full
+        let data = try jpegData(from: image)
+        return Screenshot(base64: data.base64EncodedString(),
+                          mediaType: "image/jpeg",
+                          width: image.width,
+                          height: image.height)
+    }
+
+    private static func downscaled(_ image: CGImage, maxLongEdge: Int) -> CGImage? {
+        let longEdge = max(image.width, image.height)
+        guard longEdge > maxLongEdge else { return image }
+        let scale = Double(maxLongEdge) / Double(longEdge)
+        let w = Int((Double(image.width) * scale).rounded())
+        let h = Int((Double(image.height) * scale).rounded())
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            return image
+        }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()
+    }
+
     // MARK: - Private
 
     private func fetchShareableContent() async throws -> SCShareableContent {

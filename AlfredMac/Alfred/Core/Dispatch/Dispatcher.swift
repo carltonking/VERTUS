@@ -120,7 +120,10 @@ struct Dispatcher {
         if any(["send email", "send message", "send a message", "email to", "reply to", "forward ", "send the email"]) {
             return .sendMessage
         }
-        if any(["run command", "execute command", "terminal ", "bash ", "shell ", "run script", "run: "]) {
+        // NOTE: match specific terminal *intent* ("in terminal", "terminal command"), NOT the bare
+        // word "terminal" — it collides with common phrases like "Bloomberg Terminal" and the
+        // finance term "terminal value", which are read-only, not shell commands.
+        if any(["run command", "execute command", "in terminal", "terminal command", "bash ", "shell ", "run script", "run: "]) {
             return .systemCommand
         }
         if any(["open ", "launch ", "start app"]) {
@@ -146,7 +149,11 @@ struct Dispatcher {
 
     private func isDestructive(_ query: String) -> Bool {
         let q = query.lowercased()
-        return ["delete", "remove ", "erase", "trash ", "wipe", "rm -rf", "drop table", "format "].contains { q.contains($0) }
+        // Match specific destructive intent. Avoid bare "format " — it collides with the ubiquitous
+        // "data format", "the format of…", "format the output"; the disk-wiping sense is "format
+        // drive/disk" or "reformat".
+        return ["delete", "remove ", "erase", "trash ", "wipe", "rm -rf", "drop table",
+                "format drive", "format disk", "reformat"].contains { q.contains($0) }
     }
 
     static func commandClass(for actionType: ActionType, sensitive: Bool, destructive: Bool) -> CommandClass {

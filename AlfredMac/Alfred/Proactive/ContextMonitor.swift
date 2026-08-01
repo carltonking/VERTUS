@@ -89,7 +89,8 @@ final class ContextMonitor: ObservableObject {
     }
 
     private func frontmostWindowTitle(for app: NSRunningApplication) -> String? {
-        guard AXIsProcessTrusted(), let pid = app.processIdentifier as pid_t? else {
+        // refresh() already gates this call on accessibilityGranted (AXIsProcessTrusted()); no re-check.
+        guard let pid = app.processIdentifier as pid_t? else {
             return nil
         }
 

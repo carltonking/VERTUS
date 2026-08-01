@@ -41,7 +41,10 @@ final class FileSearchService: ReadOnlyIntegrationProtocol {
             guard let enumerator = FileManager.default.enumerator(
                 at: directory,
                 includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
-                options: [.skipsHiddenFiles]
+                // Treat .app/.xcodeproj/.rtfd/.key/.pages bundles as opaque — they can each hold
+                // thousands of files. Behavior change: files INSIDE packages become unfindable, which
+                // is the right trade for a user-document search.
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]
             ) else { continue }
 
             for case let fileURL as URL in enumerator {

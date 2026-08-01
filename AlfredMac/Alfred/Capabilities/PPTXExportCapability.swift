@@ -53,8 +53,9 @@ struct PPTXExportCapability {
                 currentBullets = []
             } else if line.hasPrefix("- ") || line.hasPrefix("* ") {
                 currentBullets.append(String(line.dropFirst(2)))
-            } else if line.range(of: #"^\d+\.\s+"#, options: .regularExpression) != nil {
-                let bullet = line.replacingOccurrences(of: #"^\d+\.\s+"#, with: "", options: .regularExpression)
+            } else if let re = Self.orderedListPrefix,
+                      re.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil {
+                let bullet = re.stringByReplacingMatches(in: line, range: NSRange(line.startIndex..., in: line), withTemplate: "")
                 currentBullets.append(bullet)
             } else if currentTitle == nil {
                 currentTitle = fallbackTitle ?? "Presentation"
@@ -87,12 +88,17 @@ struct PPTXExportCapability {
         return [titleSlide] + contentSlides
     }
 
+    // Slide-parsing patterns are constant — compile once instead of per line/heading.
+    private static let orderedListPrefix = try? NSRegularExpression(pattern: #"^\d+\.\s+"#)
+    private static let headingPrefix = try? NSRegularExpression(pattern: #"^#{1,3}\s+"#)
+
     private func isHeading(_ line: String) -> Bool {
         line.hasPrefix("# ") || line.hasPrefix("## ") || line.hasPrefix("### ")
     }
 
     private func cleanHeading(_ line: String) -> String {
-        line.replacingOccurrences(of: #"^#{1,3}\s+"#, with: "", options: .regularExpression)
+        guard let re = Self.headingPrefix else { return line }
+        return re.stringByReplacingMatches(in: line, range: NSRange(line.startIndex..., in: line), withTemplate: "")
     }
 
     private func slideXML(_ slide: Slide, slideNumber: Int) -> String {

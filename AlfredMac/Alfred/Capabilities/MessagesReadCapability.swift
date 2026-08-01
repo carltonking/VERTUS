@@ -273,8 +273,9 @@ struct MessagesReadCapability {
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int64(stmt, 1, afterRowID)
 
-        let index = contactIndex()
-        var out: [Received] = []
+        // Collect rows first, then build contactIndex() (a full CNContactStore scan) only when there
+        // is something to name — the 150s watcher usually polls to an empty result.
+        var raw: [(rowid: Int64, handle: String, body: String)] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             let rowid = sqlite3_column_int64(stmt, 0)
             var body = ""
@@ -287,11 +288,17 @@ struct MessagesReadCapability {
             }
             if body.isEmpty { body = "[attachment]" }
             let handle = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "Unknown"
-            out.append(Received(rowid: rowid, handle: handle,
-                                name: nameForHandle(handle, index: index),
-                                text: body.replacingOccurrences(of: "\n", with: " ")))
+            raw.append((rowid: rowid, handle: handle, body: body))
         }
-        return out
+
+        guard !raw.isEmpty else { return [] }
+
+        let index = contactIndex()
+        return raw.map { r in
+            Received(rowid: r.rowid, handle: r.handle,
+                     name: nameForHandle(r.handle, index: index),
+                     text: r.body.replacingOccurrences(of: "\n", with: " "))
+        }
     }
 
     private static func nameForHandle(_ handle: String, index: [String: String]) -> String {
@@ -372,7 +379,11 @@ struct MessagesReadCapability {
 
     private static func firstIndex(of pattern: [UInt8], in bytes: [UInt8]) -> Int? {
         guard !pattern.isEmpty, bytes.count >= pattern.count else { return nil }
-        for i in 0...(bytes.count - pattern.count) where Array(bytes[i..<i + pattern.count]) == pattern {
+        // In-place byte compare — no per-position Array slice allocation.
+        outer: for i in 0...(bytes.count - pattern.count) {
+            for j in 0..<pattern.count where bytes[i + j] != pattern[j] {
+                continue outer
+            }
             return i
         }
         return nil

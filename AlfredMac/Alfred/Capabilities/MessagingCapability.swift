@@ -151,9 +151,10 @@ struct MessagingCapability {
     /// Raw send (no confirmation UI). The interactive path goes through `confirmAndSend`; the iMessage
     /// bot reuses this directly after its own text-confirmation round-trip.
     func send(message: String, toHandle handle: String) -> Bool {
+        // No `activate` — Messages sends in the background (launching headless if needed) without
+        // stealing focus or opening a window, so sending never interrupts what's on screen.
         let script = """
         tell application "Messages"
-            activate
             set targetService to 1st service whose service type = iMessage
             set targetBuddy to buddy "\(Self.escape(handle))" of targetService
             send "\(Self.escape(message))" to targetBuddy

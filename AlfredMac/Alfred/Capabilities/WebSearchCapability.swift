@@ -5,23 +5,134 @@ struct WebSearchCapability {
 
     init() {
         let config = URLSessionConfiguration.default
-        // Web/search is awaited before the first token streams, so this timeout is a direct
-        // floor on time-to-first-token for any query that triggers a search. 15s was the worst
-        // TTFT cliff; 4s bounds it while still completing the overwhelming majority of searches.
-        config.timeoutIntervalForRequest = 4
+        // Ceiling only — each request passes its OWN timeout (see `search(query:timeout:)`): short
+        // for interactive queries (bounds time-to-first-token), longer for background routines,
+        // which can afford to wait for a slow search instead of failing with no live data.
+        config.timeoutIntervalForRequest = 25
         session = URLSession(configuration: config)
     }
 
     // MARK: - Search
 
-    func search(query: String) async throws -> String {
-        if let braveKey = KeychainHelper.load(service: "com.alfred.app", account: "brave"),
-           !braveKey.isEmpty {
-            if let result = try? await braveSearch(query: query, apiKey: braveKey) {
+    /// Priority: Tavily (free, no credit card) → Brave (needs a paid/carded key) → keyless
+    /// DuckDuckGo (free, best-effort). `timeout` is per request — pass a longer value for routines.
+    func search(query: String, timeout: TimeInterval = 8) async throws -> String {
+        if let tavilyKey = KeychainHelper.load(service: "com.alfred.app", account: "tavily"),
+           !tavilyKey.isEmpty {
+            if let result = try? await tavilySearch(query: query, apiKey: tavilyKey, timeout: timeout) {
                 return result
             }
         }
-        return try await duckDuckGoSearch(query: query)
+        if let braveKey = KeychainHelper.load(service: "com.alfred.app", account: "brave"),
+           !braveKey.isEmpty {
+            if let result = try? await braveSearch(query: query, apiKey: braveKey, timeout: timeout) {
+                return result
+            }
+        }
+        // Keyless & reliable: Google News RSS (recent, sourced articles — great for a briefing),
+        // then DuckDuckGo as a general fallback.
+        if let news = try? await googleNewsSearch(query: query, timeout: timeout),
+           !news.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return news
+        }
+        return try await duckDuckGoSearch(query: query, timeout: timeout)
+    }
+
+    // MARK: - Google News RSS (keyless, free, reliable — not scraper-blocked like DDG)
+
+    private func googleNewsSearch(query: String, timeout: TimeInterval) async throws -> String {
+        var components = URLComponents(string: "https://news.google.com/rss/search")!
+        components.queryItems = [
+            URLQueryItem(name: "q", value: query),
+            URLQueryItem(name: "hl", value: "en-US"),
+            URLQueryItem(name: "gl", value: "US"),
+            URLQueryItem(name: "ceid", value: "US:en"),
+        ]
+        guard let url = components.url else { throw LLMError.networkError("Bad news URL") }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
+
+        let (data, response) = try await session.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            throw LLMError.networkError("Google News HTTP \(http.statusCode)")
+        }
+        let xml = String(data: data, encoding: .utf8) ?? ""
+        let items = parseRSSItems(xml).prefix(6)
+        if items.isEmpty { throw LLMError.networkError("No news results") }
+        return items.enumerated().map { i, it in
+            var line = "[\(i + 1)] \(it.title)"
+            if !it.source.isEmpty { line += " — \(it.source)" }
+            if !it.date.isEmpty { line += " (\(it.date))" }
+            if !it.link.isEmpty { line += "\n\(it.link)" }
+            return line
+        }.joined(separator: "\n\n")
+    }
+
+    private struct RSSItem { let title: String; let link: String; let source: String; let date: String }
+
+    private func parseRSSItems(_ xml: String) -> [RSSItem] {
+        var items: [RSSItem] = []
+        var rest = Substring(xml)
+        while let start = rest.range(of: "<item>"),
+              let end = rest.range(of: "</item>", range: start.upperBound..<rest.endIndex) {
+            let block = String(rest[start.upperBound..<end.lowerBound])
+            rest = rest[end.upperBound...]
+            let title = decodeXML(extractTag("title", block))
+            let link = extractTag("link", block)
+            let date = String(extractTag("pubDate", block).prefix(16))
+            var source = ""
+            if let s = block.range(of: "<source"),
+               let gt = block.range(of: ">", range: s.upperBound..<block.endIndex),
+               let e = block.range(of: "</source>", range: gt.upperBound..<block.endIndex) {
+                source = decodeXML(String(block[gt.upperBound..<e.lowerBound]))
+            }
+            if !title.isEmpty { items.append(RSSItem(title: title, link: link, source: source, date: date)) }
+        }
+        return items
+    }
+
+    private func extractTag(_ tag: String, _ block: String) -> String {
+        guard let open = block.range(of: "<\(tag)>") ?? block.range(of: "<\(tag) "),
+              let gt = block.range(of: ">", range: open.lowerBound..<block.endIndex),
+              let close = block.range(of: "</\(tag)>", range: gt.upperBound..<block.endIndex)
+        else { return "" }
+        return String(block[gt.upperBound..<close.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func decodeXML(_ s: String) -> String {
+        s.replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&apos;", with: "'")
+    }
+
+    // MARK: - Tavily Search (free tier, no credit card)
+
+    private func tavilySearch(query: String, apiKey: String, timeout: TimeInterval) async throws -> String {
+        var request = URLRequest(url: URL(string: "https://api.tavily.com/search")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = timeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = ["api_key": apiKey, "query": query, "max_results": 5, "search_depth": "basic"]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            throw LLMError.networkError("Tavily API error")
+        }
+        struct TavilyResponse: Decodable {
+            struct Result: Decodable { let title: String?; let url: String?; let content: String? }
+            let results: [Result]?
+        }
+        let decoded = try JSONDecoder().decode(TavilyResponse.self, from: data)
+        let results = decoded.results?.prefix(4) ?? []
+        if results.isEmpty { throw LLMError.networkError("No results") }
+        return results.enumerated().map { i, r in
+            "[\(i + 1)] \(r.title ?? "")\n\(r.content ?? "")\n\(r.url ?? "")"
+        }.joined(separator: "\n\n")
     }
 
     // MARK: - Page fetch
@@ -39,7 +150,7 @@ struct WebSearchCapability {
 
     // MARK: - Brave Search
 
-    private func braveSearch(query: String, apiKey: String) async throws -> String {
+    private func braveSearch(query: String, apiKey: String, timeout: TimeInterval) async throws -> String {
         var components = URLComponents(string: "https://api.search.brave.com/res/v1/web/search")!
         components.queryItems = [
             URLQueryItem(name: "q", value: query),
@@ -48,6 +159,7 @@ struct WebSearchCapability {
         guard let url = components.url else { throw LLMError.networkError("Bad Brave URL") }
 
         var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
         request.setValue(apiKey, forHTTPHeaderField: "X-Subscription-Token")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
@@ -79,26 +191,30 @@ struct WebSearchCapability {
 
     // MARK: - DuckDuckGo fallback
 
-    private func duckDuckGoSearch(query: String) async throws -> String {
+    private func duckDuckGoSearch(query: String, timeout: TimeInterval) async throws -> String {
         var components = URLComponents(string: "https://html.duckduckgo.com/html/")!
         components.queryItems = [URLQueryItem(name: "q", value: query)]
         guard let url = components.url else { throw LLMError.networkError("Bad DDG URL") }
 
         var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
         request.setValue("text/html", forHTTPHeaderField: "Accept")
 
-        let (data, _) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            throw LLMError.networkError("DuckDuckGo HTTP \(http.statusCode)")
+        }
         let html = String(data: data, encoding: .utf8) ?? ""
 
-        // Extract result snippets between result__snippet spans
+        // Only DDG's real result markers count as a hit. If they're absent, DDG served a
+        // challenge / rate-limit / anomaly page — THROW so the caller treats it as a failed search
+        // (webSearchFailed → "answer from general knowledge") instead of feeding the raw error page
+        // to the model as if it were results. Dumping that page was the "DuckDuckGo 50x / JSON
+        // dump" garbage. A clean failure beats confident nonsense.
         let snippets = extractDDGSnippets(from: html)
-        if snippets.isEmpty {
-            return stripHTML(html).components(separatedBy: .newlines)
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { $0.count > 40 }
-                .prefix(5)
-                .joined(separator: "\n")
+        guard !snippets.isEmpty else {
+            throw LLMError.networkError("DuckDuckGo returned no parseable results (likely rate-limited or blocked)")
         }
         return snippets.prefix(3).joined(separator: "\n\n")
     }
@@ -167,6 +283,7 @@ struct WebSearchCapability {
         }
         // Strip remaining tags
         var result = ""
+        result.reserveCapacity(text.count)
         var inTag = false
         for char in text {
             if char == "<" { inTag = true; continue }
