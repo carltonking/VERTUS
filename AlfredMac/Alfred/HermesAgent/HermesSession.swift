@@ -217,6 +217,18 @@ actor HermesSession {
     /// The `McpServerStdio` entry describing Alfred's own tool server, or nil if
     /// the shim isn't in the bundle (e.g. running the bare SwiftPM binary rather
     /// than the assembled .app).
+    ///
+    /// ⚠️ Registration silently no-ops unless the optional `mcp` SDK is present in
+    /// Hermes' venv. Without it, `tools.mcp_tool` logs "mcp package not installed"
+    /// at DEBUG (invisible at default INFO) while the adapter still reports
+    /// "refreshed tool surface after ACP MCP registration" — which reads like
+    /// success. The symptom is the model ignoring these tools and improvising.
+    ///
+    ///     ~/.hermes/hermes-agent/venv/bin/python -m pip install "mcp==1.26.0"
+    ///
+    /// Re-check after any `hermes update`; it is not a core dependency, so it can
+    /// vanish and take Alfred's macOS tools with it. Verify without spending model
+    /// quota using scratchpad/mcp_register_probe.py.
     private static var alfredMCPServer: [String: Any]? {
         guard let shim = Bundle.main.url(forAuxiliaryExecutable: "alfred-mcp")?.path
                 ?? Bundle.main.executableURL?
