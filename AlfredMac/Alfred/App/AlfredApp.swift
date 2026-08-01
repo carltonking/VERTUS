@@ -150,6 +150,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var syllabusService: SyllabusImportService?
     private(set) var memoryStore: MemoryStore?
     private var assistantCore: AssistantCore?
+    /// The agent loop. Owns one long-lived `hermes acp` subprocess; see HermesSession.
+    let hermes = HermesSession()
+    /// The turn currently streaming into the bar, so a new query supersedes it.
+    private var hermesTask: Task<Void, Never>?
     private(set) var learningService: BehavioralLearningService?
     private(set) var projectAwareness: ProjectAwarenessService?
     private var adaptiveEngine: AdaptiveSuggestionEngine?
@@ -1810,6 +1814,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             barState.focusToken += 1
             return
         }
+        // Interrupt any turn still running, so dismissing the bar also stops the
+        // agent rather than leaving it working (and billing) unseen.
+        if barState.isProcessing {
+            hermesTask?.cancel()
+            Task { await hermes.cancel() }
+            barState.isProcessing = false
+        }
         // Escape handler: fully dismiss (hotkey-only model — same as pressing the shortcut).
         hideBar()
     }
@@ -2080,6 +2091,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func handleQuery(_ text: String) {
         // Active inbound-reply session (from a notification tap) — each turn drafts/refines/sends.
+        // This is the notification feature's own state machine, not agent routing, so it stays
+        // ahead of Hermes.
         if pendingInboundReply != nil { handleInboundReplyTurn(text); return }
 
         barState.responseText = ""
@@ -2101,144 +2114,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // M6 smart dispatcher: strip polite/filler wrappers ("can you", "please", "alfred,") so
-        // every capability understands intent regardless of phrasing. `cmd` drives detection and
-        // execution; the raw `text` is kept only for the audit log and the literal two-turn message.
-        let cmd = QueryNormalizer.normalize(text)
+        let normalizedQuery = QueryNormalizer.normalize(text)
+            .lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // "Add this to my calendar" — read the event off the current screen (Accessibility text),
-        // extract the details with the LLM, and create it. The bar is a non-activating panel, so the
-        // app the user was looking at stays frontmost and captureFrontmost() reads THAT, not Alfred.
-        if CalendarEventCapability.detect(in: cmd) {
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                defer {
-                    self.barState.isProcessing = false
-                    self.barState.presenceState = .expanded
-                }
-                guard let router = self.llmRouter else {
-                    self.barState.responseText = "No AI provider is configured."
-                    return
-                }
-                self.barState.responseText = "Reading your screen…"
-                // Accessibility text (real text) + Vision OCR (text inside images/flyers) so events that
-                // live in a graphic — Instagram posts, screenshots — are readable too.
-                let axText = ScreenTextCapability().captureFrontmost()?.text ?? ""
-                let ocrText = await ScreenOCRCapability().recognizeScreenText() ?? ""
-                let screen = [axText, ocrText].filter { !$0.isEmpty }.joined(separator: "\n---\n")
-                guard !screen.isEmpty else {
-                    self.barState.responseText = "I couldn't read your screen — grant Accessibility + Screen Recording in System Settings → Privacy & Security, or just tell me the event details."
-                    return
-                }
-                guard let ev = await CalendarEventCapability.extract(
-                    screenText: screen, query: text, now: Date(), router: router) else {
-                    self.barState.responseText = "I couldn't find an event on screen. Tell me the title, date and time and I'll add it."
-                    return
-                }
-                do {
-                    let result = try await CalendarRemindersCapability().createEvent(
-                        title: ev.title, start: ev.start, end: ev.end,
-                        location: ev.location, notes: ev.notes, allDay: ev.allDay)
-                    self.barState.responseText = result
-                    self.auditBarAction(prompt: "add calendar event from screen: \(ev.title)",
-                                        result: result, commandClass: "write")
-                } catch {
-                    self.barState.responseText = "Couldn't add the event: \(error.localizedDescription)"
-                }
-            }
-            return
-        }
+        // MARK: Local UI commands
+        //
+        // These act on Alfred itself rather than on the world, so they are answered
+        // here instead of spending an agent turn. Everything else goes to Hermes.
 
-        // Email via Mail.app — default opens a reviewable draft; "send" + a body auto-sends (gated).
-        if let intent = MailComposeCapability.detect(in: cmd) {
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                defer {
-                    self.barState.isProcessing = false
-                    self.barState.presenceState = .expanded
-                }
-                guard let r = await self.mailCompose.resolveEmail(for: intent.recipient) else {
-                    self.barState.responseText = MessagingCapability.contactsAccessDenied()
-                        ? "Alfred doesn't have Contacts access. Grant it in System Settings → Privacy & Security → Contacts, or use a full email address."
-                        : "Couldn't find an email for \"\(intent.recipient)\" — try a full email address."
-                    return
-                }
-                // Freeform instruction (no verbatim "saying ...") → draft it in the user's voice.
-                var body = intent.body
-                var drafted = false
-                var draftFailed = false
-                if body == nil, let instruction = intent.instruction, let drafter = self.draftingService() {
-                    self.barState.responseText = "Drafting an email to \(r.display)…"
-                    if let generated = await drafter.draftBody(
-                        channel: .email, recipientName: intent.recipient,
-                        recipientDisplay: r.display, instruction: instruction) {
-                        body = generated
-                        drafted = true
-                    } else {
-                        draftFailed = true
-                    }
-                }
-                // An AI-written body always opens as a reviewable draft — never auto-send.
-                let send = intent.send && !drafted
-                self.barState.responseText = self.mailCompose.compose(
-                    to: r.email, display: r.display, subject: intent.subject, body: body, send: send)
-                if drafted, let b = body {
-                    self.barState.responseText += "\n\n— Drafted in your voice —\n\(b)"
-                } else if draftFailed {
-                    self.barState.responseText += "\n\n(I couldn't draft that automatically — opened a blank draft. Type your message, or dictate it with \"saying …\".)"
-                }
-                self.auditBarAction(prompt: cmd, result: self.barState.responseText, commandClass: "high-risk write")
-            }
-            return
-        }
-
-        // "text <name> [saying <msg>]" — send an iMessage to a named contact.
-        if let intent = MessagingCapability.detect(in: cmd) {
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                // Always stop "thinking", whatever path we take.
-                defer {
-                    self.barState.isProcessing = false
-                    self.barState.presenceState = .expanded
-                }
-                guard let recipient = await self.messaging.resolveRecipient(for: intent.name) else {
-                    self.barState.responseText = MessagingCapability.contactsAccessDenied()
-                        ? "Alfred doesn't have Contacts access. Grant it in System Settings → Privacy & Security → Contacts, then try again."
-                        : "Couldn't find \"\(intent.name)\" in Contacts — try a phone number or email."
-                    return
-                }
-                if let message = intent.message {
-                    self.barState.responseText = self.messaging.confirmAndSend(message: message, to: recipient)
-                    self.auditBarAction(prompt: cmd, result: self.barState.responseText, commandClass: "high-risk write")
-                } else if let instruction = intent.instruction, let drafter = self.draftingService() {
-                    // Freeform ask → draft it in the user's voice, then confirm before sending.
-                    self.barState.responseText = "Drafting a message to \(recipient.display)…"
-                    if let generated = await drafter.draftBody(
-                        channel: .text, recipientName: intent.name,
-                        recipientDisplay: recipient.display, instruction: instruction) {
-                        self.barState.responseText = self.messaging.confirmAndSend(message: generated, to: recipient)
-                        self.auditBarAction(prompt: cmd, result: self.barState.responseText, commandClass: "high-risk write")
-                    } else {
-                        self.pendingTextRecipient = recipient
-                        self.barState.responseText = "What would you like to send to \(recipient.display)?"
-                    }
-                } else {
-                    self.pendingTextRecipient = recipient
-                    self.barState.responseText = "What would you like to send to \(recipient.display)?"
-                }
-            }
-            return
-        }
-
-        // Real conversation reset. Typing "clear" previously fell through to the LLM, which only
-        // *said* "starting fresh" while the stale history stayed in the DB and kept polluting later
-        // replies (e.g. a bare "yes" resolving against an old, unrelated topic). Actually wipe it.
-        let normalizedQuery = cmd.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        // Real conversation reset. Wipes local history *and* restarts the Hermes
+        // session — Hermes keeps context server-side, so clearing only the local DB
+        // would leave a stale thread that keeps colouring later replies.
         if ["clear", "new chat", "new conversation", "reset", "start over", "start fresh",
             "forget this", "clear chat", "clear conversation"].contains(normalizedQuery) {
             try? memoryStore?.clearHistory()
             // Also drop any armed GitHub write so it can't survive a reset and fire on a later "yes".
             Task { await GitHubWriteGate.shared.clear() }
+            hermesTask?.cancel()
+            Task { await hermes.restart() }
             barState.responseText = "Cleared — starting fresh. What can I do for you?"
             barState.isProcessing = false
             barState.presenceState = .expanded
@@ -2265,298 +2158,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Writing-style personalization (M8): record the user's message on-device to build their
-        // style profile — independent of the broad learning gate. This is a local SQLite write; it
-        // never egresses. The derived style summary is injected into prompts via ContextCompiler.
+        // style profile. Local SQLite write; it never egresses. This is what Phase 3 reads to
+        // generate SOUL.md, so it stays even though Hermes now owns conversational memory.
         if FeatureScope.personalizationEnabled {
             writingStyleStore?.recordWritingSample(text: text, source: .chat)
         }
 
-        // Blueprint v1 quarantine: behavioral-learning ingestion is off in v1 scope.
-        if FeatureScope.learningEnabled {
-        learningService?.recordQueryAccepted(text, context: lastContextForLearning)
-        if let engine = adaptiveEngine {
-            let cat = engine.category(for: ProactiveSuggestion(id: "", title: text, prompt: "", icon: ""))
-            engine.recordAccepted(category: cat)
-        }
-        projectAwareness?.ingestQuery(text, context: lastContextForLearning)
-        memoryStore?.relationshipStore.processText(text, source: .chat)
+        runHermesTurn(text)
+    }
 
-        // Feed query into relationship memory (preferences, workflows)
-        let lowered = text.lowercased()
-        if lowered.contains("prefer") || lowered.contains("like when") || lowered.contains("always") {
-            relationshipMemoryService?.forceSave(text, category: .preferences, source: "query",
-                                                  reasonSaved: "User stated a preference")
-        }
-        if lowered.contains("goal") || lowered.contains("aim to") || lowered.contains("want to") ||
-           lowered.contains("trying to") || lowered.contains("plan to") {
-            relationshipMemoryService?.forceSave(text, category: .goals, source: "query",
-                                                  reasonSaved: "User stated a goal")
-        }
-        if lowered.contains("always have to") || lowered.contains("keep") || lowered.contains("recurring") {
-            relationshipMemoryService?.considerMention(text, category: .recurringProblems, source: "query")
-        }
-        if lowered.contains("learning") || lowered.contains("getting better at") || lowered.contains("skill") {
-            relationshipMemoryService?.considerMention(text, category: .skills, source: "query")
-        }
-        if lowered.contains("process") || lowered.contains("workflow") || lowered.contains("step") {
-            relationshipMemoryService?.considerMention(text, category: .workflows, source: "query")
-        }
-        }
+    /// Stream one Hermes turn into the bar.
+    ///
+    /// This replaces the former ~480-line keyword-dispatch chain
+    /// (`CalendarEventCapability.detect(in:)`, `MailComposeCapability.detect(in:)`,
+    /// `QueryIntent` substring tables, …). Alfred no longer decides what a request
+    /// *means*; Hermes does, with real tool calling. Adding a capability is now a
+    /// matter of exposing a tool, not extending an if-chain.
+    private func runHermesTurn(_ text: String) {
+        let runId = memoryStore?.startRun(source: "bar", prompt: text)
 
-        let selectedFiles = selectedFileContext.snapshot()
+        hermesTask?.cancel()
+        hermesTask = Task { @MainActor [weak self] in
+            guard let self else { return }
 
-        // Read-only inspector: list the clickable elements of the app the user was just in (not
-        // Alfred's own bar). Pure observation, so it's available even while the gated click
-        // feature is off; it also primes the Semantic Object Map for an "click element N" action.
-        // Require an explicit "clickable" intent. The old loose `list && element` clause fired on
-        // unrelated queries ("list the elements of good design") and triggered an unbounded
-        // synchronous Accessibility tree walk on the main thread, stalling the bar.
-        let lowercasedText = text.lowercased()
-        if lowercasedText.contains("clickable")
-            || lowercasedText.contains("what can i click") {
-            let targetBundleId = contextMonitor?.context?.bundleIdentifier
-            let map = computerControl.semanticObjectMapText(targetBundleId: targetBundleId)
-            barState.responseText = map.isEmpty
-                ? (computerControl.hasAccessibilityPermission
-                    ? "No clickable elements found in the front window."
-                    : "Enable Accessibility (System Settings ▸ Privacy & Security ▸ Accessibility) so I can read on-screen elements.")
-                : "Clickable elements:\n\(map)"
-            barState.isProcessing = false
-            barState.presenceState = .expanded
-            return
-        }
+            var streamed = ""          // assistant text only, excludes tool placeholders
+            var showingToolStatus = false
+            var failure: String?
 
-        // Natural-language "control my mac …" routes to the computer-control agent BEFORE the
-        // workflow planner — otherwise its multi-step "and"/"then" detection swallows the request
-        // and fails with "No supported computer-control actions". Provider-agnostic via LLMRouter.
-        if let task = ComputerControlIntent.task(in: text) {
-            guard appState.computerControlEnabled else {
-                barState.responseText = "Computer control is off. Turn it on in Alfred’s Settings tab (menu-bar Alfred icon ▸ Settings), then try again."
-                barState.isProcessing = false
-                barState.presenceState = .expanded
-                return
-            }
-            Task { await CapabilityEventLogger.shared.record("computer control", "requested", detail: "nl-plan") }
-            planAndRunComputerControl(task: task, originalQuery: text)
-            return
-        }
-
-        do {
-            let planner = WorkflowPlanner(computerControl: computerControl)
-            if let workflowPlan = try planner.makePlan(
-                from: cmd,
-                selectedFiles: selectedFiles,
-                shellExecutionEnabled: appState.shellExecutionEnabled
-            ) {
-                Task { await CapabilityEventLogger.shared.record("workflow", "requested") }
-                handleWorkflow(plan: workflowPlan, selectedFiles: selectedFiles)
-                return
-            }
-        } catch {
-            Task { await CapabilityEventLogger.shared.record("workflow", "refused", detail: error.localizedDescription) }
-            barState.responseText = "Workflow not run: \(error.localizedDescription)"
-            barState.isProcessing = false
-            return
-        }
-
-        do {
-            // Explicit literal action script ("click 100 200", "hotkey cmd t"). The natural-language
-            // "control my mac …" path is handled above, before the workflow planner.
-            if appState.computerControlEnabled,
-               let computerPlan = try computerControl.makePlan(from: text) {
-                Task { await CapabilityEventLogger.shared.record("computer control", "requested") }
-                handleComputerControl(plan: computerPlan, originalQuery: text)
-                return
-            }
-        } catch {
-            Task { await CapabilityEventLogger.shared.record("computer control", "refused") }
-            barState.responseText = "Computer control not run: \(error.localizedDescription)"
-            barState.isProcessing = false
-            return
-        }
-
-        // File operations (organize/move/rename/delete) — interactive, explicit selection via
-        // NSOpenPanel, confirmed, security-scoped. Never trusts paths typed into the prompt.
-        if let op = FileOperationCapability.detect(in: cmd) {
-            Task { await CapabilityEventLogger.shared.record("file operation", "requested") }
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                let result = await self.fileOperation.handle(op, query: cmd)
-                self.barState.responseText = result
-                self.auditBarAction(prompt: cmd, result: result, commandClass: "file write")
-                self.barState.isProcessing = false
-                self.barState.presenceState = .expanded
-            }
-            return
-        }
-
-        // Blueprint v1 §4 two-stage brain: the dispatcher proposes (command class + route);
-        // policy disposes (confirm high-risk). §8: audit every command.
-        let decision = Dispatcher().decide(
-            query: cmd,
-            providerIsCloud: llmRouter?.isActiveProviderCloud ?? false
-        )
-        // Redact secrets (e.g. "set github token …") before they reach the audit row.
-        let auditPrompt = Redactor().redact(text).text
-        let runId = memoryStore?.startRun(source: "bar", prompt: auditPrompt)
-        // Analyze once — QueryIntent.analyze is pure and was previously recomputed 4x on this path.
-        let intent = QueryIntent.analyze(decision.query)
-        let alreadyConfirmsElsewhere =
-            intent.shellCommand != nil
-            || intent.appControlQuery != nil
-        if decision.confirmRequired && !alreadyConfirmsElsewhere {
-            guard confirmHighRisk(decision) else {
-                barState.responseText = "Cancelled — \(decision.commandClass.rawValue) needs confirmation."
-                barState.isProcessing = false
-                if let runId {
-                    memoryStore?.completeRun(
-                        id: runId, status: "blocked",
-                        routeReason: decision.routeReason,
-                        commandClass: decision.commandClass.rawValue,
-                        errorText: "User declined confirmation"
-                    )
-                }
-                return
-            }
-        }
-
-        let ownerName = appState.ownerName
-        let screenContextEnabled = appState.screenContextEnabled
-        let shellExecutionEnabled = appState.shellExecutionEnabled
-        let memoryExtractionEnabled = appState.memoryExtractionEnabled
-        let conversationHistoryEnabled = appState.conversationHistoryEnabled
-        let memoryRetentionDays = appState.memoryRetentionDays
-        let core = assistantCore
-        let router = llmRouter
-        let memory = memoryStore
-
-        // App control (open/launch/activate/hide/quit) is a low-risk write — run it without a
-        // confirmation prompt (Blueprint §7: only high-risk writes — delete/send/shell — confirm).
-        if intent.appControlQuery != nil {
-            Task { await CapabilityEventLogger.shared.record("app control", "requested") }
-        }
-
-        if let command = intent.shellCommand {
-            // Only destructive shell (rm/drop/format…) prompts; routine commands run automatically
-            // (decision.confirmRequired is destructive-only per the Dispatcher).
-            if decision.confirmRequired {
-                guard confirmShellCommand(command) else {
-                    barState.responseText = "Shell command cancelled."
-                    barState.isProcessing = false
-                    Task { await CapabilityEventLogger.shared.record("shell", "cancelled by user") }
-                    return
-                }
-                Task { await CapabilityEventLogger.shared.record("shell", "confirmed") }
-            } else {
-                Task { await CapabilityEventLogger.shared.record("shell", "auto-run") }
-            }
-        }
-
-        Task {
-            defer {
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.barState.isProcessing = false
-                    if self.barState.presenceState == .thinking || self.barState.presenceState == .responding {
-                        self.barState.presenceState = .expanded
+            for await event in await self.hermes.prompt(text) {
+                switch event {
+                case .text(let chunk):
+                    if self.barState.presenceState == .thinking {
+                        self.barState.presenceState = .responding
                     }
+                    // First real token clears any tool placeholder still on screen.
+                    if showingToolStatus {
+                        self.barState.responseText = ""
+                        showingToolStatus = false
+                    }
+                    streamed += chunk
+                    self.barState.responseText += chunk
+
+                case .thought:
+                    break  // reasoning stays hidden in v1
+
+                case .toolStarted(_, let title, _):
+                    // Only show progress while there is no answer yet — a tool firing
+                    // mid-sentence must not clobber text the user is already reading.
+                    if streamed.isEmpty {
+                        showingToolStatus = true
+                        self.barState.responseText = "\(title)…"
+                    }
+
+                case .toolProgress:
+                    // Deliberately silent. A failed step is usually retried and
+                    // recovered from, and when it isn't, Hermes reports the real
+                    // reason as assistant text (rate limits, auth, provider
+                    // errors). Surfacing a generic "that step failed" here only
+                    // buried the actual message.
+                    break
+
+                case .usage:
+                    break  // context meter lands with the dashboard (Phase 5)
+
+                case .finished:
+                    break
+
+                case .failed(let message):
+                    failure = message
                 }
             }
 
-            do {
-                if let core {
-                    _ = try await core.process(
-                        query: decision.query,
-                        ownerName: ownerName,
-                        screenContextEnabled: screenContextEnabled,
-                        shellExecutionEnabled: shellExecutionEnabled,
-                        memoryExtractionEnabled: memoryExtractionEnabled,
-                        selectedFiles: selectedFiles,
-                        conversationHistoryEnabled: conversationHistoryEnabled,
-                        memoryRetentionDays: memoryRetentionDays
-                    ) { [weak self] token in
-                        Task { @MainActor [weak self] in
-                            guard let self else { return }
-                            if self.barState.presenceState == .thinking {
-                                self.barState.presenceState = .responding
-                            }
-                            self.barState.responseText += token
-                        }
-                    }
-                } else if let router {
-                    // Fallback when MemoryStore failed to init
-                    let now = ISO8601DateFormatter().string(from: Date())
-                    _ = try await router.streamWithTools(
-                        messages: [.user(text)],
-                        system: AssistantPersona.systemIntro(ownerName: ownerName, currentDate: now),
-                        tools: [LLMTool.openApplication.payload],
-                        executeToolCall: { @Sendable name, args in
-                            await AppControlCapability.executeToolCall(toolName: name, argumentsJSON: args)
-                        }
-                    ) { [weak self] token in
-                        Task { @MainActor [weak self] in
-                            guard let self else { return }
-                            if self.barState.presenceState == .thinking {
-                                self.barState.presenceState = .responding
-                            }
-                            self.barState.responseText += token
-                        }
-                    }
-                } else {
-                    await MainActor.run { [weak self] in
-                        self?.barState.responseText = "Alfred is not ready. Check your API key in Settings."
-                    }
-                }
+            if let failure {
+                self.barState.responseText = failure
+            } else if self.barState.responseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                // The model can return an empty completion; never leave the bar looking dead.
+                self.barState.responseText = "I'm sorry, but I don't have an answer for that."
+            }
 
-                // Blueprint v1 §8: finalize the audit row + render the §3 routing line.
-                if core != nil || router != nil {
-                    let snapshot: (model: String, egress: String, full: String)? = await MainActor.run { [weak self] () -> (model: String, egress: String, full: String)? in
-                        guard let self else { return nil }
-                        let model = router?.activeProvider.id ?? ""
-                        let egress = router?.lastEgressSummary ?? ""
-                        // The model can return an empty completion (e.g. ambiguous input like
-                        // "6!?"). Show an explicit message so the bar never looks dead.
-                        if self.barState.responseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            self.barState.responseText = "I'm sorry, but I don't have an answer for that."
-                        }
-                        // Transparency (model / route / redaction) is recorded in the runs
-                        // audit row below; it is intentionally NOT shown in the bar.
-                        return (model, egress, self.barState.responseText)
-                    }
-                    if let snapshot, let runId {
-                        memory?.completeRun(
-                            id: runId, status: "success",
-                            modelUsed: snapshot.model,
-                            routeReason: decision.routeReason,
-                            commandClass: decision.commandClass.rawValue,
-                            outputFull: snapshot.full,
-                            outputSummary: String(snapshot.full.prefix(200)),
-                            dataSentToCloud: snapshot.egress
-                        )
-                    }
-                }
-            } catch {
-                if let runId {
-                    let blocked = (error as? LLMRouter.EgressError) != nil
-                    memory?.completeRun(
-                        id: runId, status: blocked ? "blocked" : "failed",
-                        modelUsed: router?.activeProvider.id,
-                        routeReason: decision.routeReason,
-                        commandClass: decision.commandClass.rawValue,
-                        errorText: error.localizedDescription,
-                        dataSentToCloud: router?.lastEgressSummary ?? ""
-                    )
-                }
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    let router = self.llmRouter
-                    let providerId = router?.activeProvider.id ?? ""
-                    if providerId == "local", self.isLocalConnectionError(error) {
-                        self.barState.responseText = "Alfred's local model isn't ready yet.\n\nThe server is starting up in the background (it loads the model on first request and can take 10–30s). Try again in a moment.\n\nIf it never connects, run:\npython3 'Fine tuned model for alfred/local_alfred_server.py'"
-                    } else {
-                        self.barState.responseText = "Error: \(error.localizedDescription)"
-                    }
-                }
+            self.barState.isProcessing = false
+            self.barState.presenceState = .expanded
+
+            if let runId {
+                self.memoryStore?.completeRun(
+                    id: runId,
+                    status: failure == nil ? "success" : "failed",
+                    modelUsed: "hermes",
+                    routeReason: "hermes-acp",
+                    commandClass: "agent",
+                    outputFull: self.barState.responseText,
+                    outputSummary: String(self.barState.responseText.prefix(200)),
+                    errorText: failure
+                )
             }
         }
     }
