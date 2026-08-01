@@ -57,9 +57,56 @@ enum PersonaExporter {
         return [
             write(soulDocument(snapshot: snapshot, styleContext: style),
                   to: hermesHome.appendingPathComponent("SOUL.md")),
-            write(userDocument(snapshot: snapshot, styleContext: style),
-                  to: hermesHome.appendingPathComponent("USER.md")),
+            // USER.md lives under memories/, NOT at the HERMES_HOME root —
+            // tools/memory_tool.py get_memory_dir() is get_hermes_home()/"memories".
+            // A copy at the root is silently ignored: it loads zero entries and the
+            // model falls back to guessing from the filesystem.
+            mergeUserProfile(userEntry(snapshot: snapshot, styleContext: style),
+                             at: hermesHome
+                                .appendingPathComponent("memories")
+                                .appendingPathComponent("USER.md")),
         ]
+    }
+
+    /// Entries in MEMORY.md / USER.md are separated by this, per
+    /// `tools/memory_tool.ENTRY_DELIMITER`.
+    private static let entryDelimiter = "\n§\n"
+
+    /// Replace Alfred's entry in USER.md while preserving every other entry.
+    ///
+    /// Hermes curates this file itself — its memory tool appends what it learns
+    /// about the owner across sessions, which is the whole point of the
+    /// `user_char_limit` budget. Rewriting the file wholesale on each launch would
+    /// delete that. So only the entry carrying our marker is replaced; anything
+    /// Hermes wrote is kept, in order.
+    private static func mergeUserProfile(_ entry: String, at url: URL) -> Outcome {
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: url.deletingLastPathComponent(),
+                                   withIntermediateDirectories: true)
+
+            var entries: [String] = []
+            if let raw = try? String(contentsOf: url, encoding: .utf8), !raw.trimmed.isEmpty {
+                entries = raw.components(separatedBy: entryDelimiter)
+                    .map { $0.trimmed }
+                    .filter { !$0.isEmpty }
+            }
+
+            if let index = entries.firstIndex(where: { $0.contains(marker) }) {
+                if entries[index] == entry { return .unchanged(url) }
+                entries[index] = entry
+            } else {
+                // Ours goes first: the owner's own configuration is authoritative
+                // over anything inferred later in the session.
+                entries.insert(entry, at: 0)
+            }
+
+            try (entries.joined(separator: entryDelimiter) + "\n")
+                .write(to: url, atomically: true, encoding: .utf8)
+            return .written(url)
+        } catch {
+            return .failed(url, error)
+        }
     }
 
     /// Describe how the owner writes using **only aggregate statistics**.
@@ -167,8 +214,11 @@ enum PersonaExporter {
     // MARK: - USER.md
 
     /// Facts about the owner, from their own configuration only.
-    private static func userDocument(snapshot: OwnerConfigSnapshot?, styleContext: String?) -> String {
-        var parts: [String] = [marker, ""]
+    ///
+    /// Returned as a single memory *entry*, not a whole file — see
+    /// `mergeUserProfile`.
+    private static func userEntry(snapshot: OwnerConfigSnapshot?, styleContext: String?) -> String {
+        var parts: [String] = [marker]
 
         let ownerBlock = snapshot.map { PersonaTemplate.ownerBlock($0) } ?? ""
         if ownerBlock.trimmed.isEmpty {
@@ -185,7 +235,8 @@ enum PersonaExporter {
             parts.append(ownerBlock)
         }
 
-        return parts.joined(separator: "\n") + "\n"
+        // No trailing newline: entries are joined by the delimiter and trimmed on read.
+        return parts.joined(separator: "\n")
     }
 
     // MARK: - Writing
