@@ -1413,28 +1413,71 @@ actor AssistantCore {
         }
     }
 
+    /// Extracts durable facts **about the user** from what the user said.
+    ///
+    /// The previous version prompted "given this conversation, extract facts worth remembering" and
+    /// fed it BOTH turns without ever saying whose facts to record. The model dutifully recorded
+    /// Alfred's own self-descriptions — "Alfred is not capable of directly viewing the user's
+    /// screen", "Alfred cannot directly interact with the user's file system" — which were then
+    /// retrieved into RELEVANT MEMORIES on every subsequent turn. That is a self-reinforcing
+    /// degradation loop: the assistant hedges, the hedge is stored as fact, the fact is injected,
+    /// the assistant hedges harder. It taught itself it could not do things it can do.
+    ///
+    /// Two defences now: the prompt names the user as the only valid subject and marks the
+    /// assistant reply as context-only, and `isSelfReferential` hard-rejects anything that still
+    /// comes back describing the assistant. The filter is deliberately narrow — it matches the
+    /// assistant in SUBJECT position followed by a copula/modal, so a genuinely useful fact like
+    /// "the user is building Alfred, a macOS assistant" survives while "Alfred is a cloud service"
+    /// does not.
     private func extractAndSaveFacts(query: String, response: String) async {
         let extractionPrompt = """
-            Given this conversation, extract 0–3 specific facts worth remembering long-term \
-            (preferences, names, recurring tasks, decisions). \
-            Return one fact per line. If nothing notable, return NONE.
+            Extract 0–3 durable facts ABOUT THE USER from their message below — their preferences, \
+            people and projects, commitments, decisions, habits, or circumstances.
 
-            User: \(query.prefix(400))
-            Alfred: \(response.prefix(400))
+            Rules:
+            - Record facts about the USER only. Never record anything about the assistant, its \
+            identity, or what it can or cannot do.
+            - Take facts from the USER MESSAGE. The assistant reply is context for understanding \
+            it, never a source of facts.
+            - Skip anything transient (greetings, one-off questions, small talk).
+            - Write each fact as a standalone statement that will still make sense months from now.
+            - One fact per line, no numbering. If there is nothing durable, return exactly NONE.
+
+            USER MESSAGE:
+            \(query.prefix(600))
+
+            ASSISTANT REPLY (context only — not a source of facts):
+            \(response.prefix(300))
             """
 
         guard let raw = try? await router.complete(
             prompt: extractionPrompt,
-            system: "Extract memorable facts. Be terse. One fact per line or NONE."
+            system: "You extract durable facts about a person from their own words. "
+                  + "Never state facts about the assistant. Be terse. One fact per line, or NONE."
         ) else { return }
 
         let lines = raw.components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty && $0.uppercased() != "NONE" && $0.count > 10 }
+            // The NONE check used to be an exact match, so an elaborated refusal like
+            // "NONE (no other notable facts)" was stored verbatim as a remembered fact.
+            .filter { !$0.isEmpty && !$0.uppercased().hasPrefix("NONE") && $0.count > 10 }
+            .filter { !Self.isSelfReferential($0) }
 
         for fact in lines.prefix(3) {
             try? memory.save(content: fact, tags: ["auto", "extracted"])
         }
+    }
+
+    /// True when a candidate fact describes the assistant rather than the user.
+    ///
+    /// Matches the assistant in subject position followed by a copula or modal, optionally negated:
+    /// "Alfred is…", "the assistant cannot…", "Alfred's purpose is…". Does NOT match the assistant
+    /// as an object ("the user is building Alfred"), which is a legitimate fact worth keeping.
+    static func isSelfReferential(_ fact: String) -> Bool {
+        let pattern = #"^\W*(alfred|the assistant|this assistant|the ai|the chatbot|the model|i)\b(’s|'s)?\s+"#
+            + #"(is|is not|isn'?t|are|was|were|can|cannot|can'?t|could|does|does not|doesn'?t|do|"#
+            + #"has|has not|hasn'?t|have|will|would|should|must|acts?|serves?|provides?|lacks?)\b"#
+        return fact.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
     }
 
     /// Detects when the user is telling Alfred HOW to respond (format/length/detail/tone) and saves
