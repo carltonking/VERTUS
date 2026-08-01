@@ -117,6 +117,23 @@ extension LLMProvider {
     func prewarmConnection() {}
 }
 
+/// Adopted by providers that can run a native tool-calling turn.
+///
+/// `LLMRouter.streamWithTools` used to downcast to the concrete `OpenAICompatibleProvider`, which
+/// meant any other provider — including OpenAI-wire-compatible ones like `OpenRouterProvider` —
+/// silently degraded to plain streaming with no tools and no diagnostic. Conforming to this
+/// protocol is now the single thing that decides whether a provider gets tools, so a new provider
+/// opts in explicitly instead of losing the capability by omission.
+protocol ToolCallingProvider: LLMProvider {
+    func streamWithTools(
+        messages: [LLMMessage],
+        system: String,
+        tools: [[String: Any]]?,
+        executeToolCall: ((String, String) async -> String)?,
+        onToken: @escaping @Sendable (String) -> Void
+    ) async throws -> String
+}
+
 extension LLMProvider {
     var supportsVision: Bool {
         let lower = model.lowercased()
@@ -127,7 +144,12 @@ extension LLMProvider {
             || lower.contains("gpt-4")
             || lower.contains("llama-3.2-11b") || lower.contains("llama-3.2-90b")
             || lower.contains("llava") || lower.contains("pixtral")
+            // Local Ollama vision tags (offline/free guidance): qwen2.5vl, qwen3-vl, llama3.2-vision,
+            // minicpm-v, moondream, and the older qwen*-vl names.
             || lower.contains("qwen-vl") || lower.contains("qwen2-vl")
+            || lower.contains("qwen2.5vl") || lower.contains("qwen2.5-vl")
+            || lower.contains("qwen3-vl") || lower.contains("qwen3vl")
+            || lower.contains("minicpm-v") || lower.contains("moondream")
     }
 }
 

@@ -21,6 +21,15 @@ final class OpenRouterProvider: LLMProvider, ObservableObject {
         KeychainHelper.load(service: "com.alfred.app", account: "openrouter") ?? ""
     }
 
+    /// Warm the TLS/keep-alive connection to OpenRouter so the first real request reuses it instead
+    /// of paying the ~100-400ms handshake inline. Fire-and-forget; the response is discarded.
+    func prewarmConnection() {
+        var request = URLRequest(url: baseURL)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 4
+        Task.detached { _ = try? await URLSession.shared.data(for: request) }
+    }
+
     // MARK: - LLMProvider
 
     func complete(messages: [LLMMessage], system: String) async throws -> String {
@@ -53,6 +62,9 @@ final class OpenRouterProvider: LLMProvider, ObservableObject {
 
         var accumulated = ""
 
+        // Reuse a single decoder across all streamed chunks instead of allocating one per line.
+        let decoder = JSONDecoder()
+
         for try await line in byteStream.lines {
             guard line.hasPrefix("data: ") else { continue }
             let payload = String(line.dropFirst(6))
@@ -68,7 +80,7 @@ final class OpenRouterProvider: LLMProvider, ObservableObject {
                 let choices: [Choice]
             }
 
-            if let event = try? JSONDecoder().decode(Delta.self, from: data),
+            if let event = try? decoder.decode(Delta.self, from: data),
                let text = event.choices.first?.delta.content {
                 accumulated += text
                 onToken(text)
@@ -91,6 +103,9 @@ final class OpenRouterProvider: LLMProvider, ObservableObject {
             "model": selectedModel,
             "stream": stream,
             "messages": allMessages,
+            // Bound runaway output (latency + cost); ~8k tokens is far above normal replies and
+            // OpenRouter clamps to the model's limit. A single longer reply would be truncated.
+            "max_tokens": 8192,
         ]
     }
 

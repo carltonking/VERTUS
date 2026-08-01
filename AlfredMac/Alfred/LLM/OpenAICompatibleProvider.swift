@@ -1,6 +1,6 @@
 import Foundation
 
-final class OpenAICompatibleProvider: LLMProvider {
+final class OpenAICompatibleProvider: LLMProvider, ToolCallingProvider {
     let id: String
     let displayName: String
     private let endpoint: URL
@@ -106,6 +106,14 @@ final class OpenAICompatibleProvider: LLMProvider {
         var toolCallAccumulators: [Int: (id: String, name: String, args: String)] = [:]
         var finishReason: String?
 
+        // The JSON keys are snake_case (tool_calls, finish_reason) but the structs are camelCase.
+        // Without this strategy those keys silently decode to nil — which dropped EVERY streamed
+        // tool call (the model's open-app calls vanished → blank replies). `content` has no
+        // underscore so it always worked, masking the bug for plain answers.
+        // Built once and reused across all streamed chunks instead of per-line.
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+
         for try await line in byteStream.lines {
             guard line.hasPrefix("data: ") else { continue }
             let payload = String(line.dropFirst(6))
@@ -135,12 +143,6 @@ final class OpenAICompatibleProvider: LLMProvider {
                 let arguments: String?
             }
 
-            // The JSON keys are snake_case (tool_calls, finish_reason) but the structs are camelCase.
-            // Without this strategy those keys silently decode to nil — which dropped EVERY streamed
-            // tool call (the model's open-app calls vanished → blank replies). `content` has no
-            // underscore so it always worked, masking the bug for plain answers.
-            let decoder = JSONDecoder()
-            decoder.keyDecodingStrategy = .convertFromSnakeCase
             guard let event = try? decoder.decode(Event.self, from: data),
                   let choice = event.choices.first else { continue }
 
@@ -221,6 +223,10 @@ final class OpenAICompatibleProvider: LLMProvider {
             "model": model,
             "stream": stream,
             "messages": allMessages,
+            // Generous output ceiling so a runaway model can't stream unbounded tokens (latency+cost).
+            // ~8k tokens is far above normal replies; OpenAI-compatible providers clamp if the model
+            // supports fewer. A single reply longer than this would be truncated.
+            "max_tokens": 8192,
         ]
 
         if let tools {

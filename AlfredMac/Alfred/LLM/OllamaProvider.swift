@@ -10,6 +10,16 @@ final class OllamaProvider: LLMProvider, ObservableObject {
     @Published var availableModels: [String] = []
     var selectedModel: String
 
+    /// KV-cache context size. Ollama otherwise loads a model at its FULL trained context
+    /// (llama3.1:8b = 131072 tokens ≈ 22 GB RAM for a 5 GB model). Capping this is the difference
+    /// between ~6 GB and ~22 GB. Raise only if you truly need very long local contexts.
+    var contextLength: Int = 8192
+
+    /// How long Ollama keeps the model resident after a request. nil = Ollama's default (5 min).
+    /// Background callers (e.g. the learning pipeline) set a short value like "30s" so a big model
+    /// doesn't sit in RAM between infrequent ticks. Accepts Ollama duration strings, or "0" to unload.
+    var keepAlive: String? = nil
+
     var model: String {
         get { selectedModel }
         set { selectedModel = newValue }
@@ -82,9 +92,12 @@ final class OllamaProvider: LLMProvider, ObservableObject {
             let done: Bool
         }
 
+        // Reuse a single decoder across all streamed chunks instead of allocating one per line.
+        let decoder = JSONDecoder()
+
         for try await line in byteStream.lines {
             guard !line.isEmpty, let data = line.data(using: .utf8) else { continue }
-            guard let chunk = try? JSONDecoder().decode(Chunk.self, from: data),
+            guard let chunk = try? decoder.decode(Chunk.self, from: data),
                   let text = chunk.message?.content, !text.isEmpty
             else { continue }
             accumulated += text
@@ -98,17 +111,33 @@ final class OllamaProvider: LLMProvider, ObservableObject {
     // MARK: - Private
 
     private func buildBody(messages: [LLMMessage], system: String, stream: Bool) -> [String: Any] {
-        var ollamaMessages: [[String: String]] = []
+        var ollamaMessages: [[String: Any]] = []
         if !system.isEmpty {
             ollamaMessages.append(["role": "system", "content": system])
         }
-        ollamaMessages += messages.map { ["role": $0.role, "content": $0.content] }
+        for message in messages {
+            var entry: [String: Any] = ["role": message.role, "content": message.content]
+            // Ollama's /api/chat takes images as a per-message array of RAW base64 (no "data:" prefix).
+            // Without this the screenshot for guidance ("point at my screen") is silently dropped and a
+            // vision model gets a text-only prompt.
+            if let image = message.imageBase64, !image.isEmpty {
+                entry["images"] = [image]
+            }
+            ollamaMessages.append(entry)
+        }
 
-        return [
+        var body: [String: Any] = [
             "model": selectedModel,
             "stream": stream,
             "messages": ollamaMessages,
+            // Cap the KV cache so Ollama doesn't allocate the model's full 131072-token context
+            // (~22 GB for llama3.1:8b). This is the single biggest RAM lever.
+            // num_predict bounds output length so a runaway model can't generate unbounded tokens;
+            // 8192 is far above normal replies (a single longer reply would be truncated).
+            "options": ["num_ctx": contextLength, "num_predict": 8192],
         ]
+        if let keepAlive { body["keep_alive"] = keepAlive }
+        return body
     }
 
     private func validate(response: URLResponse, data: Data?) throws {
