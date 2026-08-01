@@ -46,8 +46,27 @@ enum ProfileDigest {
         try? FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
     }
 
-    static func readUser() -> String { (try? String(contentsOf: userURL, encoding: .utf8)) ?? "" }
-    static func readMemory() -> String { (try? String(contentsOf: memoryURL, encoding: .utf8)) ?? "" }
+    // buildSystem() reads USER.md + MEMORY.md on every LLM query. Cache their contents and refresh
+    // the cache from write() (the single mutation point, via regenerate()) so a just-regenerated
+    // profile is visible immediately. Lock-guarded because readers can run under concurrent tasks.
+    private static let cacheLock = NSLock()
+    private static var cachedUser: String?
+    private static var cachedMemory: String?
+
+    static func readUser() -> String {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        if let cachedUser { return cachedUser }
+        let value = (try? String(contentsOf: userURL, encoding: .utf8)) ?? ""
+        cachedUser = value
+        return value
+    }
+    static func readMemory() -> String {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        if let cachedMemory { return cachedMemory }
+        let value = (try? String(contentsOf: memoryURL, encoding: .utf8)) ?? ""
+        cachedMemory = value
+        return value
+    }
 
     /// Bounded private-profile block for the system prompt. When no real profile exists yet, this
     /// injects an explicit anti-fabrication GUARD (not nothing) so the model can't invent personal
@@ -165,5 +184,10 @@ enum ProfileDigest {
         ensureDir()
         try? user.write(to: userURL, atomically: true, encoding: .utf8)
         try? memory.write(to: memoryURL, atomically: true, encoding: .utf8)
+        // The files now contain exactly these strings — refresh the cache so readers see them.
+        cacheLock.lock()
+        cachedUser = user
+        cachedMemory = memory
+        cacheLock.unlock()
     }
 }

@@ -104,7 +104,9 @@ final class WritingStyleStore {
         var closingSet: [String: Int] = [:]
         var phraseCounts: [String: Int] = [:]
         var punctCounts: [String: Int] = [:]
+        var totalParagraphs = 0.0
 
+        // Single pass over the corpus: fold the paragraph count in here instead of a second full loop.
         for s in samples {
             let result = analyzer.analyze(s.text)
             if let g = result.greeting { greetingSet[g, default: 0] += 1 }
@@ -115,22 +117,15 @@ final class WritingStyleStore {
             for (k, v) in result.punctuationPatterns {
                 punctCounts[k, default: 0] += v
             }
+            totalParagraphs += Double(analyzer.splitParagraphs(s.text).count)
         }
 
         let topGreetings = greetingSet.sorted { $0.value > $1.value }.prefix(3).map(\.key)
         let topClosings = closingSet.sorted { $0.value > $1.value }.prefix(3).map(\.key)
         let topPhrases = phraseCounts.sorted { $0.value > $1.value }.prefix(5).map(\.key)
 
-        let paraLen: Double = {
-            var total = 0.0
-            var count = 0
-            for s in samples {
-                let paras = analyzer.splitParagraphs(s.text)
-                total += Double(paras.count)
-                count += 1
-            }
-            return count > 0 ? total / Double(count) : 1.0
-        }()
+        // samples is guaranteed non-empty above, so this matches the old count>0 division exactly.
+        let paraLen = totalParagraphs / Double(samples.count)
 
         let now = Date().timeIntervalSince1970
 

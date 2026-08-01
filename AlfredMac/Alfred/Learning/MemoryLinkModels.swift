@@ -73,12 +73,18 @@ extension MemoryLink: Codable {
         strength = try container.decode(Double.self, forKey: .strength)
         userConfirmed = try container.decode(Bool.self, forKey: .userConfirmed)
         userRejected = try container.decode(Bool.self, forKey: .userRejected)
-        let dateFormatter = ISO8601DateFormatter()
-        dateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let dateFormatter = Self.iso8601
         createdAt = try dateFormatter.date(from: container.decode(String.self, forKey: .createdAt)) ?? Date()
         lastVerifiedAt = try dateFormatter.date(from: container.decode(String.self, forKey: .lastVerifiedAt)) ?? Date()
         lastReferencedAt = try container.decodeIfPresent(String.self, forKey: .lastReferencedAt).flatMap { dateFormatter.date(from: $0) }
     }
+
+    // One shared formatter instead of allocating per link on every save/load of the links array.
+    private static let iso8601: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
@@ -89,8 +95,7 @@ extension MemoryLink: Codable {
         try container.encode(strength, forKey: .strength)
         try container.encode(userConfirmed, forKey: .userConfirmed)
         try container.encode(userRejected, forKey: .userRejected)
-        let dateFormatter = ISO8601DateFormatter()
-        dateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let dateFormatter = Self.iso8601
         try container.encode(dateFormatter.string(from: createdAt), forKey: .createdAt)
         try container.encode(dateFormatter.string(from: lastVerifiedAt), forKey: .lastVerifiedAt)
         try container.encodeIfPresent(lastReferencedAt.map { dateFormatter.string(from: $0) }, forKey: .lastReferencedAt)

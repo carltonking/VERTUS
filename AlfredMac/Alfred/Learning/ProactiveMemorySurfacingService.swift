@@ -181,9 +181,15 @@ final class ProactiveMemorySurfacingService {
             }
         }
 
+        // Compute the shared scans once — Rules 2/3/6 each re-ran getReflections() (a full filter+sort)
+        // and Rules 3/10 re-ran memoriesMentioningTool with the same lowercased app name.
+        let loweredApp = appName?.lowercased()
+        let allReflections = memoryReflections?.getReflections() ?? []
+        let toolMemoriesForApp = loweredApp.map { relationshipMemory.memoriesMentioningTool($0) } ?? []
+
         // Rule 2 - Time-Based Pattern (from reflections)
-        if let reflections = memoryReflections {
-            let timeReflections = reflections.getReflections().filter { $0.type == .timeAssociation && $0.confidence > 0.6 }
+        if memoryReflections != nil {
+            let timeReflections = allReflections.filter { $0.type == .timeAssociation && $0.confidence > 0.6 }
             for reflection in timeReflections {
                 let key = "insight:\(String(reflection.content.prefix(40)))"
                 guard !recentIds.contains(key) && !blocklist.contains(reflection.id.uuidString) else { continue }
@@ -199,9 +205,9 @@ final class ProactiveMemorySurfacingService {
         }
 
         // Rule 3 - Tool Preference
-        if let app = appName?.lowercased() {
-            let toolMemories = relationshipMemory.memoriesMentioningTool(app)
-            let toolReflections = memoryReflections?.getReflections().filter { $0.type == .toolPreference && $0.confidence > 0.5 } ?? []
+        if let app = loweredApp {
+            let toolMemories = toolMemoriesForApp
+            let toolReflections = allReflections.filter { $0.type == .toolPreference && $0.confidence > 0.5 }
 
             let fromMemories = toolMemories.first.map { m -> MemorySuggestion? in
                 let key = "tip:Working in \(app)"
@@ -266,9 +272,9 @@ final class ProactiveMemorySurfacingService {
         }
 
         // Rule 6 - Workflow Suggestion
-        if let reflections = memoryReflections {
-            let workflowReflections = reflections.getReflections().filter { $0.type == .toolPreference && $0.confidence > 0.6 }
-            if let app = appName?.lowercased(), let match = workflowReflections.first(where: { $0.content.lowercased().contains(app) }) {
+        if memoryReflections != nil {
+            let workflowReflections = allReflections.filter { $0.type == .toolPreference && $0.confidence > 0.6 }
+            if let app = loweredApp, let match = workflowReflections.first(where: { $0.content.lowercased().contains(app) }) {
                 let key = "action:Run your workflow?"
                 guard !recentIds.contains(key) && !blocklist.contains(match.id.uuidString) else { return results }
                 results.append(MemorySuggestion.make(
@@ -325,8 +331,8 @@ final class ProactiveMemorySurfacingService {
         }
 
         // Rule 10 - Linked Context
-        if let linkService = memoryLinkService, let appName = appName?.lowercased() {
-            let recentMemories = relationshipMemory.memoriesMentioningTool(appName)
+        if let linkService = memoryLinkService, let appName = loweredApp {
+            let recentMemories = toolMemoriesForApp
             for mem in recentMemories.prefix(2) {
                 let linkedIds = linkService.linkedMemoryIds(for: mem.id, minStrength: 0.3)
                 for lid in linkedIds {
@@ -352,17 +358,19 @@ final class ProactiveMemorySurfacingService {
 
     private func rankSuggestions(_ suggestions: [MemorySuggestion]) -> [MemorySuggestion] {
         let now = Date()
+        // Look up createdAt by id once instead of a linear firstIndex scan per comparison.
+        let createdAtById = Dictionary(self.suggestions.map { ($0.id, $0.createdAt) }, uniquingKeysWith: { a, _ in a })
         return suggestions.sorted { a, b in
             let recencyA: Double = {
-                if let idx = self.suggestions.firstIndex(where: { $0.id == a.id }) {
-                    let elapsed = now.timeIntervalSince(self.suggestions[idx].createdAt)
+                if let createdAt = createdAtById[a.id] {
+                    let elapsed = now.timeIntervalSince(createdAt)
                     return 1.0 - min(0.5, elapsed / 86400)
                 }
                 return 1.0
             }()
             let recencyB: Double = {
-                if let idx = self.suggestions.firstIndex(where: { $0.id == b.id }) {
-                    let elapsed = now.timeIntervalSince(self.suggestions[idx].createdAt)
+                if let createdAt = createdAtById[b.id] {
+                    let elapsed = now.timeIntervalSince(createdAt)
                     return 1.0 - min(0.5, elapsed / 86400)
                 }
                 return 1.0

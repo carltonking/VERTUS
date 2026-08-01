@@ -448,8 +448,9 @@ final class RelationshipMemoryService {
     }
 
     private func promote(_ content: String, category: MemoryCategory, source: String) {
+        let normalizedTarget = normalizeContent(content)
         let existing = memories.filter { !$0.isArchived && $0.category == category }
-        let similar = existing.filter { normalizeContent($0.content) == normalizeContent(content) }
+        let similar = existing.filter { normalizeContent($0.content) == normalizedTarget }
 
         if let match = similar.first, let idx = memories.firstIndex(where: { $0.id == match.id }) {
             updateExisting(at: idx)
@@ -469,8 +470,16 @@ final class RelationshipMemoryService {
 
     // MARK: - Decay Algorithm
 
+    private var lastDecayRun: Date?
+
     private func decayIfNeeded() {
         let now = Date()
+        // Decay math is a function of whole-day granularity, so sub-minute repeats are identical.
+        // This is called several times to build one prompt and ~6x per 60s surfacing tick — throttle
+        // to at most once per 45s. Always runs on the first call (lastDecayRun starts nil).
+        if let last = lastDecayRun, now.timeIntervalSince(last) < 45 { return }
+        lastDecayRun = now
+
         var changed = false
 
         for i in memories.indices {

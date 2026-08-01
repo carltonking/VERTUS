@@ -9,16 +9,27 @@ struct VisionOCRCapability {
     /// CPU-bound). Returns "" on failure or empty result.
     func recognizeText(in jpegData: Data, maxChars: Int = 6000) async -> String {
         await Task.detached(priority: .utility) {
-            let request = VNRecognizeTextRequest()
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = true
-
-            let handler = VNImageRequestHandler(data: jpegData, options: [:])
-            guard (try? handler.perform([request])) != nil else { return "" }
-
-            let lines = (request.results ?? [])
-                .compactMap { $0.topCandidates(1).first?.string }
-            return String(lines.joined(separator: "\n").prefix(maxChars))
+            Self.run(handler: VNImageRequestHandler(data: jpegData, options: [:]), maxChars: maxChars)
         }.value
+    }
+
+    /// Recognize text directly from a CGImage — avoids a JPEG encode+decode round-trip when the
+    /// caller already holds the frame (e.g. ScreenCapability.captureCGImage()). Same config/cap.
+    func recognizeText(in cgImage: CGImage, maxChars: Int = 6000) async -> String {
+        await Task.detached(priority: .utility) {
+            Self.run(handler: VNImageRequestHandler(cgImage: cgImage, options: [:]), maxChars: maxChars)
+        }.value
+    }
+
+    private static func run(handler: VNImageRequestHandler, maxChars: Int) -> String {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+
+        guard (try? handler.perform([request])) != nil else { return "" }
+
+        let lines = (request.results ?? [])
+            .compactMap { $0.topCandidates(1).first?.string }
+        return String(lines.joined(separator: "\n").prefix(maxChars))
     }
 }

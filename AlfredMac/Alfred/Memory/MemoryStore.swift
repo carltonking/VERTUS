@@ -58,7 +58,7 @@ struct RunRecord: Codable, FetchableRecord, MutablePersistableRecord {
 
 /// Blueprint v1 §5 routine: a scheduled natural-language prompt run headless through the
 /// same engine as AlfredBar. Cron-scheduled; only `unattended-safe` routines run headless.
-struct RoutineRecord: Codable, FetchableRecord, MutablePersistableRecord {
+struct RoutineRecord: Codable, FetchableRecord, MutablePersistableRecord, Identifiable {
     static let databaseTableName = "routines"
 
     var id: Int64?
@@ -887,6 +887,17 @@ final class MemoryStore {
         logger.notice("Semantic memory unavailable — run `ollama pull nomic-embed-text` to enable semantic memory.")
     }
 
+    /// Whether hybrid semantic search is currently working, for surfaces that report capability
+    /// status. Previously the fall back to keyword-only search was visible ONLY as a one-shot
+    /// os_log line, so a permanently degraded search looked identical to a healthy one.
+    /// `nil` means no embedding has been attempted yet this session.
+    static var semanticSearchStatus: (available: Bool, retryAt: Date?)? {
+        hintLock.lock(); defer { hintLock.unlock() }
+        guard didLogOllamaHint || embedCircuitOpenUntil != nil else { return nil }
+        if let until = embedCircuitOpenUntil, until > Date() { return (false, until) }
+        return (true, nil)
+    }
+
     /// Serializes a vector to a little-endian Float BLOB for the `embedding` column.
     static func embeddingData(_ vector: [Float]) -> Data {
         vector.withUnsafeBufferPointer { Data(buffer: $0) }
@@ -1146,6 +1157,30 @@ final class MemoryStore {
                     arguments: [maxRows]
                 )
             }
+        }
+    }
+
+    /// Runaway guard for the `memories` table — deliberately NOT an age-based retention policy.
+    ///
+    /// Extracted facts are the durable part of what Alfred knows about its owner, so expiring them
+    /// on a clock would quietly undo the whole point. Instead this only enforces a very high row
+    /// ceiling, evicting least-recently-*accessed* rows first, so a runaway extraction bug can't
+    /// grow the table without bound while genuinely-used facts survive indefinitely.
+    /// Deleting memories on purpose remains `clearMemories()`.
+    func pruneMemories(maxRows: Int = 50_000) throws {
+        guard maxRows > 0 else { return }
+        try db.write { db in
+            try db.execute(
+                sql: """
+                DELETE FROM memories
+                WHERE id NOT IN (
+                    SELECT id FROM memories
+                    ORDER BY accessed_at DESC, id DESC
+                    LIMIT ?
+                )
+                """,
+                arguments: [maxRows]
+            )
         }
     }
 

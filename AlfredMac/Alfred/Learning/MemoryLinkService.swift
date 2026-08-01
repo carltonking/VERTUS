@@ -187,6 +187,11 @@ final class MemoryLinkService {
 
             let userConfirmedIds = Set(self.links.filter { $0.userConfirmed }.flatMap { [$0.fromId, $0.toId] })
 
+            // Precompute keyword sets and lowercased content once per memory (O(n)) so the O(n^2)
+            // pair loop below reuses them instead of re-tokenizing/lowercasing both sides per pair.
+            let keywordSets = memories.map { self.extractKeywords(from: $0.content) }
+            let loweredContents = memories.map { $0.content.lowercased() }
+
             for i in 0..<memories.count {
                 guard CFAbsoluteTimeGetCurrent() - start < self.maxBuildDuration else { break }
                 let memA = memories[i]
@@ -204,7 +209,7 @@ final class MemoryLinkService {
                     }
 
                     if !skipExisting(.keywordOverlap) {
-                        let kwStrength = self.keywordOverlapStrength(memA, memB)
+                        let kwStrength = self.keywordOverlapStrength(keywordSets[i], keywordSets[j])
                         if kwStrength >= self.jaccardThreshold {
                             newLinks.append(MemoryLink.make(from: pair.from, to: pair.to, type: .keywordOverlap, strength: kwStrength))
                         }
@@ -225,14 +230,14 @@ final class MemoryLinkService {
                     }
 
                     if !skipExisting(.contradictory) {
-                        let conStrength = self.contradictionStrength(memA, memB)
+                        let conStrength = self.contradictionStrength(loweredContents[i], loweredContents[j], keywordSets[i], keywordSets[j])
                         if conStrength > 0 {
                             newLinks.append(MemoryLink.make(from: pair.from, to: pair.to, type: .contradictory, strength: conStrength))
                         }
                     }
 
                     if !skipExisting(.causeEffect) {
-                        let ceStrength = self.causeEffectStrength(memA, memB)
+                        let ceStrength = self.causeEffectStrength(memA, memB, loweredContents[i], loweredContents[j], keywordSets[i], keywordSets[j])
                         if ceStrength > 0 {
                             newLinks.append(MemoryLink.make(from: pair.from, to: pair.to, type: .causeEffect, strength: ceStrength))
                         }
@@ -270,9 +275,7 @@ final class MemoryLinkService {
 
     // MARK: - Detection Algorithms
 
-    private func keywordOverlapStrength(_ a: RelationshipMemory, _ b: RelationshipMemory) -> Double {
-        let kwA = extractKeywords(from: a.content)
-        let kwB = extractKeywords(from: b.content)
+    private func keywordOverlapStrength(_ kwA: Set<String>, _ kwB: Set<String>) -> Double {
         guard !kwA.isEmpty && !kwB.isEmpty else { return 0 }
         let intersection = kwA.intersection(kwB)
         let union = kwA.union(kwB)
@@ -298,10 +301,7 @@ final class MemoryLinkService {
         return fromWeights[b.category] ?? 0
     }
 
-    private func contradictionStrength(_ a: RelationshipMemory, _ b: RelationshipMemory) -> Double {
-        let loweredA = a.content.lowercased()
-        let loweredB = b.content.lowercased()
-
+    private func contradictionStrength(_ loweredA: String, _ loweredB: String, _ kwA: Set<String>, _ kwB: Set<String>) -> Double {
         let aHasPos = positiveWords.contains { loweredA.contains($0) }
         let aHasNeg = negativeWords.contains { loweredA.contains($0) }
         let bHasPos = positiveWords.contains { loweredB.contains($0) }
@@ -310,25 +310,18 @@ final class MemoryLinkService {
         let oppositeSentiment = (aHasPos && bHasNeg) || (aHasNeg && bHasPos)
         guard oppositeSentiment else { return 0 }
 
-        let kwA = extractKeywords(from: a.content)
-        let kwB = extractKeywords(from: b.content)
         let shared = kwA.intersection(kwB)
         guard !shared.isEmpty else { return 0 }
 
         return min(0.85, 0.5 + Double(shared.count) * 0.1)
     }
 
-    private func causeEffectStrength(_ a: RelationshipMemory, _ b: RelationshipMemory) -> Double {
-        let loweredA = a.content.lowercased()
-        let loweredB = b.content.lowercased()
-
+    private func causeEffectStrength(_ a: RelationshipMemory, _ b: RelationshipMemory, _ loweredA: String, _ loweredB: String, _ kwA: Set<String>, _ kwB: Set<String>) -> Double {
         let aIsCause = causeEffectMarkers.contains { loweredA.contains($0) }
         let bIsEffect = causeEffectMarkers.contains { loweredB.contains($0) }
 
         guard aIsCause || bIsEffect else { return 0 }
 
-        let kwA = extractKeywords(from: a.content)
-        let kwB = extractKeywords(from: b.content)
         let shared = kwA.intersection(kwB)
         guard !shared.isEmpty else { return 0 }
 

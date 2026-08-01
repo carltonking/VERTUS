@@ -65,6 +65,9 @@ final class ResponseAdaptationEngine {
 
     private(set) var currentProfile: ResponseStyleProfile = .neutral
 
+    private typealias RewardMetrics = (verbosityBias: Double, structureBias: Double, adaptationDrift: Double, dominantAdjustments: [String])
+    private typealias LoopMetrics = (acceptanceRate: Double, rejectionRate: Double, editRate: Double)
+
     struct SignalLog {
         var verbositySignals: [String] = []
         var toneSignals: [String] = []
@@ -107,11 +110,18 @@ final class ResponseAdaptationEngine {
     // MARK: - Profile computation
 
     private func computeProfile(_ log: inout SignalLog) -> ResponseStyleProfile {
-        let verbosity = determineVerbosity(&log)
-        let tone = determineTone(&log)
-        let structure = determineStructure(&log)
-        let depth = determineDepth(&log)
-        let formatting = determineFormatting(&log)
+        // Compute the shared inputs once — previously re-fetched inside multiple determineX helpers
+        // (reward metrics 4x, learning-loop metrics 3x, writing profile 3x). No state mutates between
+        // reads within one computeProfile, so reuse is behavior-identical.
+        let rewardMetrics = computeRewardMetrics()
+        let loopMetrics = computeLearningLoopMetrics()
+        let writingProfile = writingStyle?.getWritingProfile()
+
+        let verbosity = determineVerbosity(&log, rewardMetrics: rewardMetrics, writingProfile: writingProfile)
+        let tone = determineTone(&log, loopMetrics: loopMetrics, rewardMetrics: rewardMetrics, writingProfile: writingProfile)
+        let structure = determineStructure(&log, rewardMetrics: rewardMetrics)
+        let depth = determineDepth(&log, loopMetrics: loopMetrics)
+        let formatting = determineFormatting(&log, loopMetrics: loopMetrics, rewardMetrics: rewardMetrics, writingProfile: writingProfile)
 
         return ResponseStyleProfile(
             verbosity: verbosity,
@@ -146,10 +156,7 @@ final class ResponseAdaptationEngine {
 
     // MARK: - Verbosity
 
-    private func determineVerbosity(_ log: inout SignalLog) -> Double {
-        let rewardMetrics = computeRewardMetrics()
-        let writingProfile = writingStyle?.getWritingProfile()
-
+    private func determineVerbosity(_ log: inout SignalLog, rewardMetrics: RewardMetrics, writingProfile: WritingProfile?) -> Double {
         var base: Double = 0.5
         if let profile = writingProfile, profile.totalSamples >= 3 {
             switch profile.avgSentenceLength {
@@ -187,11 +194,7 @@ final class ResponseAdaptationEngine {
 
     // MARK: - Tone
 
-    private func determineTone(_ log: inout SignalLog) -> ResponseStyleProfile.ResponseTone {
-        let writingProfile = writingStyle?.getWritingProfile()
-        let metrics = computeLearningLoopMetrics()
-        let rewardMetrics = computeRewardMetrics()
-
+    private func determineTone(_ log: inout SignalLog, loopMetrics metrics: LoopMetrics, rewardMetrics: RewardMetrics, writingProfile: WritingProfile?) -> ResponseStyleProfile.ResponseTone {
         let baseFormality = writingProfile?.formalityScore ?? 0.5
 
         let hasToneAdjustment = rewardMetrics.dominantAdjustments.contains { $0.contains("tone") }
@@ -214,8 +217,7 @@ final class ResponseAdaptationEngine {
 
     // MARK: - Structure
 
-    private func determineStructure(_ log: inout SignalLog) -> Double {
-        let rewardMetrics = computeRewardMetrics()
+    private func determineStructure(_ log: inout SignalLog, rewardMetrics: RewardMetrics) -> Double {
         let habitList = habits.getTopHabits(limit: 10)
         let productivityHabits = habitList.filter { $0.type == .productivity_pattern }
 
@@ -246,9 +248,7 @@ final class ResponseAdaptationEngine {
 
     // MARK: - Explanation depth
 
-    private func determineDepth(_ log: inout SignalLog) -> Double {
-        let metrics = computeLearningLoopMetrics()
-
+    private func determineDepth(_ log: inout SignalLog, loopMetrics metrics: LoopMetrics) -> Double {
         var base: Double = 0.6
         if metrics.acceptanceRate > 0.8 {
             base -= 0.1
@@ -266,11 +266,7 @@ final class ResponseAdaptationEngine {
 
     // MARK: - Formatting
 
-    private func determineFormatting(_ log: inout SignalLog) -> ResponseStyleProfile.ResponseFormatting {
-        let writingProfile = writingStyle?.getWritingProfile()
-        let metrics = computeLearningLoopMetrics()
-        let rewardMetrics = computeRewardMetrics()
-
+    private func determineFormatting(_ log: inout SignalLog, loopMetrics metrics: LoopMetrics, rewardMetrics: RewardMetrics, writingProfile: WritingProfile?) -> ResponseStyleProfile.ResponseFormatting {
         guard let profile = writingProfile, profile.totalSamples >= 3 else {
             log.formattingSignals.append("insufficient writing data → standard")
             return .standard

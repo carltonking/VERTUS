@@ -168,6 +168,9 @@ final class PersonalContextService {
         return compressed.prefix(5).map { "• \($0)" }.joined(separator: "\n")
     }
 
+    // Compiled once; compressQueries collapses whitespace on every recent query per build.
+    private static let whitespaceRegex = try! NSRegularExpression(pattern: "\\s+")
+
     private func compressQueries(_ queries: [String]) -> [String] {
         let stopWords = Set([
             "the", "a", "an", "in", "on", "at", "to", "for", "of", "with",
@@ -181,9 +184,11 @@ final class PersonalContextService {
         var compressed: [String] = []
 
         for query in queries {
-            let trimmed = query
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            let stripped = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = Self.whitespaceRegex.stringByReplacingMatches(
+                in: stripped,
+                range: NSRange(stripped.startIndex..., in: stripped),
+                withTemplate: " ")
 
             if trimmed.count < 10 { continue }
 

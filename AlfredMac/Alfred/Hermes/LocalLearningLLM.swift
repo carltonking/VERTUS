@@ -32,6 +32,8 @@ actor LocalLearningLLM {
     /// output is empty. Never throws — learning enrichment must never break the capture path.
     func run(system: String, prompt: String, model: String? = nil) async -> String? {
         let provider = OllamaProvider(model: model ?? defaultModel)
+        provider.contextLength = 4096   // enrichment prompts are short — no need for a big KV cache
+        provider.keepAlive = "30s"       // unload shortly after each background tick — don't sit at GBs of RAM
         guard let out = try? await provider.complete(prompt: prompt, system: system) else { return nil }
         let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed

@@ -27,8 +27,15 @@ final class HabitStore {
         let detected = detector.detect(from: events)
         logger.info("Detected \(detected.count) habit(s) from \(events.count) events")
 
+        // Prefetch existing habits once (by lowercased name) so saveOrUpdate avoids an unindexed
+        // LOWER(name) full scan per detected habit. Detector output names are unique within a pass.
+        let existingByName: [String: HabitRecord] = {
+            let all = (try? db.read { db in try HabitRecord.fetchAll(db) }) ?? []
+            return Dictionary(all.map { ($0.name.lowercased(), $0) }, uniquingKeysWith: { a, _ in a })
+        }()
+
         for habit in detected where habit.confidence >= 0.3 {
-            saveOrUpdate(habit)
+            saveOrUpdate(habit, existing: existingByName[habit.name.lowercased()])
         }
 
         pruneLowConfidence()
@@ -62,7 +69,31 @@ final class HabitStore {
     }
 
     func getTopHabits(limit: Int = 10) -> [Habit] {
-        Array(getHabits().prefix(limit))
+        do {
+            // Order + limit in SQL (idx_habit_confidence backs this) so SQLite stops early instead
+            // of materializing and mapping the entire habit_records table.
+            let records = try db.read { db in
+                try HabitRecord
+                    .order(Column("confidence").desc)
+                    .limit(limit)
+                    .fetchAll(db)
+            }
+            return records.map { record in
+                Habit(
+                    id: record.id,
+                    name: record.name,
+                    type: HabitType(rawValue: record.habitType) ?? .custom,
+                    confidence: record.confidence,
+                    firstObserved: Date(timeIntervalSince1970: record.firstObserved),
+                    lastObserved: Date(timeIntervalSince1970: record.lastObserved),
+                    occurrenceCount: record.occurrenceCount,
+                    metadata: record.metadata
+                )
+            }
+        } catch {
+            logger.error("Failed to get top habits: \(error.localizedDescription)")
+            return []
+        }
     }
 
     func updateHabit(id: Int64, name: String? = nil, confidence: Double? = nil) {
@@ -130,12 +161,9 @@ final class HabitStore {
 
     // MARK: - Private
 
-    private func saveOrUpdate(_ detected: DetectedHabit) {
+    private func saveOrUpdate(_ detected: DetectedHabit, existing: HabitRecord?) {
         do {
-            let lowered = detected.name.lowercased()
-            if let existing = try db.read({ db in
-                try HabitRecord.filter(sql: "LOWER(name) = ?", arguments: [lowered]).fetchOne(db)
-            }) {
+            if let existing {
                 let newConfidence = min(existing.confidence + 0.08, 1.0)
                 let now = Date().timeIntervalSince1970
                 try db.write { db in

@@ -124,8 +124,10 @@ final class ScreenTextMonitor: ObservableObject {
     private func ocrFallback(appName: String, bundleId: String) {
         Task { [weak self] in
             guard let self,
-                  let jpeg = try? await self.screen.captureScreen() else { return }
-            let text = await self.ocr.recognizeText(in: jpeg)
+                  let cgImage = try? await self.screen.captureCGImage() else { return }
+            // OCR the captured CGImage directly instead of JPEG-encoding it then re-decoding it just
+            // to hand Vision an image (lossless, and one fewer full-frame round-trip).
+            let text = await self.ocr.recognizeText(in: cgImage)
             guard !text.isEmpty else { return }
             self.insertIfNew(appName: appName, bundleId: bundleId, windowTitle: "", text: text)
         }

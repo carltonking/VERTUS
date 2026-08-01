@@ -41,6 +41,7 @@ struct MemoryDashboardView: View {
     @State private var workflows: [Workflow] = []
     @State private var selectedTab = 0
     @State private var searchText = ""
+    @State private var searchDebounce: DispatchWorkItem?
     @State private var categoryFilter: MemoryCategory? = nil
     @State private var importanceFilter: ImportanceFilter = .all
     @State private var showArchived = false
@@ -228,7 +229,12 @@ struct MemoryDashboardView: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 13))
                 .onChange(of: searchText) {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { loadData() }
+                    // Real debounce: cancel the prior pending reload so a burst of keystrokes triggers
+                    // a single loadData() 0.3s after the last one, not one per keystroke.
+                    searchDebounce?.cancel()
+                    let work = DispatchWorkItem { loadData() }
+                    searchDebounce = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
                 }
 
             Spacer()
@@ -304,9 +310,11 @@ struct MemoryDashboardView: View {
     }
 
     private var memoriesList: some View {
-        ScrollView {
+        // Compute the filtered+sorted list once per render instead of twice (ForEach + isEmpty).
+        let sorted = sortedMemories
+        return ScrollView {
             LazyVStack(spacing: 2) {
-                ForEach(sortedMemories) { memory in
+                ForEach(sorted) { memory in
                     MemoryRow(
                         memory: memory,
                         isSelected: selectedMemoryIDs.contains(memory.id),
@@ -321,7 +329,7 @@ struct MemoryDashboardView: View {
                     )
                 }
 
-                if sortedMemories.isEmpty {
+                if sorted.isEmpty {
                     VStack(spacing: 8) {
                         Image(systemName: "tray")
                             .font(.largeTitle)
@@ -617,9 +625,11 @@ struct MemoryDashboardView: View {
     }
 
     private var reflectionsList: some View {
-        ScrollView {
+        // Compute the filtered list once per render instead of twice (ForEach + isEmpty).
+        let reflections = filteredReflections
+        return ScrollView {
             LazyVStack(spacing: 2) {
-                ForEach(filteredReflections) { reflection in
+                ForEach(reflections) { reflection in
                     ReflectionRow(
                         reflection: reflection,
                         isSelected: selectedReflection?.id == reflection.id,
@@ -644,7 +654,7 @@ struct MemoryDashboardView: View {
                     )
                 }
 
-                if filteredReflections.isEmpty {
+                if reflections.isEmpty {
                     VStack(spacing: 8) {
                         Image(systemName: "lightbulb")
                             .font(.largeTitle)

@@ -123,7 +123,13 @@ final class ProjectAwarenessService {
             }
         }
 
-        if let cur = currentProject() {
+        // Same result as currentProject() but reuses `active` instead of recomputing activeProjects().
+        if let cur = active.max(by: { a, b in
+            if abs(a.confidence - b.confidence) > 0.2 {
+                return a.confidence < b.confidence
+            }
+            return a.lastSeen < b.lastSeen
+        }) {
             let apps = cur.relatedApps.prefix(3).joined(separator: ", ")
             let appContext = apps.isEmpty ? "" : " — active in \(apps)"
             lines.append("")
@@ -146,28 +152,29 @@ final class ProjectAwarenessService {
 
     // MARK: - Detection from queries
 
+    // Compiled once (mirrors the existing properNounPattern/titlePathPatterns statics) instead of
+    // recompiling all 11 NSRegularExpressions on every query.
+    private static let queryPatterns: [(regex: NSRegularExpression, nameGroup: Int)] = [
+        (try! NSRegularExpression(pattern: "(?:work(?:ing)?\\s+(?:on|in)\\s+)([A-Z][A-Za-z0-9]*)"), 1),
+        (try! NSRegularExpression(pattern: "(?:implement(?:ing)?\\s+)([A-Z][A-Za-z0-9]*)"), 1),
+        (try! NSRegularExpression(pattern: "(?:build(?:ing)?\\s+)([A-Z][A-Za-z0-9]*)"), 1),
+        (try! NSRegularExpression(pattern: "(?:debug(?:ging)?\\s+)([A-Z][A-Za-z0-9]*)"), 1),
+        (try! NSRegularExpression(pattern: "(?:fix(?:ing)?(?:\\s+in)?\\s+)([A-Z][A-Za-z0-9]*)"), 1),
+        (try! NSRegularExpression(pattern: "(?:feature\\s+(?:for|in)\\s+)([A-Z][A-Za-z0-9]*)"), 1),
+        (try! NSRegularExpression(pattern: "(?:update(?:ing)?\\s+)([A-Z][A-Za-z0-9]*)"), 1),
+        (try! NSRegularExpression(pattern: "(?:refactor(?:ing)?\\s+)([A-Z][A-Za-z0-9]*)"), 1),
+        (try! NSRegularExpression(pattern: "(?:issue\\s+(?:in|with)\\s+)([A-Z][A-Za-z0-9]*)"), 1),
+        (try! NSRegularExpression(pattern: "(?:bug\\s+(?:in|with)\\s+)([A-Z][A-Za-z0-9]*)"), 1),
+        (try! NSRegularExpression(pattern: "(?:code\\s+(?:for|in)\\s+)([A-Z][A-Za-z0-9]*)"), 1),
+    ]
+
     private func detectCandidatesFromQuery(_ query: String, context: AppContext?) -> [Candidate] {
         var candidates: [Candidate] = []
         let now = Date()
 
         // Pattern-based extraction
-        let patterns: [(regex: String, nameGroup: Int)] = [
-            ("(?:work(?:ing)?\\s+(?:on|in)\\s+)([A-Z][A-Za-z0-9]*)", 1),
-            ("(?:implement(?:ing)?\\s+)([A-Z][A-Za-z0-9]*)", 1),
-            ("(?:build(?:ing)?\\s+)([A-Z][A-Za-z0-9]*)", 1),
-            ("(?:debug(?:ging)?\\s+)([A-Z][A-Za-z0-9]*)", 1),
-            ("(?:fix(?:ing)?(?:\\s+in)?\\s+)([A-Z][A-Za-z0-9]*)", 1),
-            ("(?:feature\\s+(?:for|in)\\s+)([A-Z][A-Za-z0-9]*)", 1),
-            ("(?:update(?:ing)?\\s+)([A-Z][A-Za-z0-9]*)", 1),
-            ("(?:refactor(?:ing)?\\s+)([A-Z][A-Za-z0-9]*)", 1),
-            ("(?:issue\\s+(?:in|with)\\s+)([A-Z][A-Za-z0-9]*)", 1),
-            ("(?:bug\\s+(?:in|with)\\s+)([A-Z][A-Za-z0-9]*)", 1),
-            ("(?:code\\s+(?:for|in)\\s+)([A-Z][A-Za-z0-9]*)", 1),
-        ]
-
-        for pattern in patterns {
-            if let match = try? NSRegularExpression(pattern: pattern.regex, options: [])
-                .firstMatch(in: query, options: [], range: NSRange(query.startIndex..., in: query)) {
+        for pattern in Self.queryPatterns {
+            if let match = pattern.regex.firstMatch(in: query, options: [], range: NSRange(query.startIndex..., in: query)) {
                 let nameRange = match.range(at: pattern.nameGroup)
                 if let range = Range(nameRange, in: query) {
                     let name = String(query[range])
@@ -312,10 +319,10 @@ final class ProjectAwarenessService {
             projects.append(project)
         }
 
-        // Persist on important updates
-        if projects.count <= 20 || projects.first(where: { $0.normalizedName == normalized }) != nil {
-            try? store.save(projects)
-        }
+        // A project with this normalizedName always exists here (we just added or updated it above),
+        // so the old count/contains guard was always true. Persist unconditionally, off the main
+        // thread — addActivity fires from the main-thread context sink on every app/window/URL change.
+        store.saveAsync(projects)
     }
 
     private func mergeCandidates(_ candidates: [Candidate], into existing: inout [Project]) {

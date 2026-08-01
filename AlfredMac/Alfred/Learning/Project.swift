@@ -28,6 +28,9 @@ struct Project: Codable, Equatable, Identifiable {
 
 final class ProjectStore {
     private let fileURL: URL
+    // Single serial writer: both save() and saveAsync() route through this queue so a synchronous
+    // write can never race a background one (they'd otherwise clobber the same file).
+    private let writeQueue = DispatchQueue(label: "com.alfred.projectstore.write")
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -44,9 +47,22 @@ final class ProjectStore {
     }
 
     func save(_ projects: [Project]) throws {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(projects)
-        try data.write(to: fileURL, options: .atomic)
+        try writeQueue.sync {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(projects)
+            try data.write(to: fileURL, options: .atomic)
+        }
+    }
+
+    /// Snapshot + encode + atomic write on the serial queue, off the caller's (main) thread.
+    /// Serial submission order is preserved, so the last enqueued snapshot wins.
+    func saveAsync(_ projects: [Project]) {
+        writeQueue.async { [fileURL] in
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            guard let data = try? encoder.encode(projects) else { return }
+            try? data.write(to: fileURL, options: .atomic)
+        }
     }
 }

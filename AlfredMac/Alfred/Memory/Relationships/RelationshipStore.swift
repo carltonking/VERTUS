@@ -65,10 +65,9 @@ final class RelationshipStore {
 
     func getPerson(id: Int64) -> Person? {
         do {
-            let records = try db.read { db in
-                try PersonRecord.filter(Column("id") == id).fetchAll(db)
-            }
-            guard let record = records.first else { return nil }
+            guard let record = try db.read({ db in
+                try PersonRecord.fetchOne(db, key: id)
+            }) else { return nil }
 
             let rel = try bestRelationship(for: id)
             return Person(
@@ -97,9 +96,9 @@ final class RelationshipStore {
                     .limit(limit)
                     .fetchAll(db)
             }
-            return try records.map { record in
-                let rel = try bestRelationship(for: record.id!)
-                return Person(
+            let relByPerson = bestRelationships(for: records.compactMap { $0.id })
+            return records.map { record in
+                Person(
                     id: record.id,
                     name: record.name,
                     aliases: record.aliasList,
@@ -107,7 +106,7 @@ final class RelationshipStore {
                     lastSeen: Date(timeIntervalSince1970: record.lastSeen),
                     interactionCount: record.interactionCount,
                     notes: record.notes,
-                    primaryRelationship: rel
+                    primaryRelationship: record.id.flatMap { relByPerson[$0] }
                 )
             }
         } catch {
@@ -124,9 +123,9 @@ final class RelationshipStore {
                     .limit(limit)
                     .fetchAll(db)
             }
-            return try records.map { record in
-                let rel = try bestRelationship(for: record.id!)
-                return Person(
+            let relByPerson = bestRelationships(for: records.compactMap { $0.id })
+            return records.map { record in
+                Person(
                     id: record.id,
                     name: record.name,
                     aliases: record.aliasList,
@@ -134,7 +133,7 @@ final class RelationshipStore {
                     lastSeen: Date(timeIntervalSince1970: record.lastSeen),
                     interactionCount: record.interactionCount,
                     notes: record.notes,
-                    primaryRelationship: rel
+                    primaryRelationship: record.id.flatMap { relByPerson[$0] }
                 )
             }
         } catch {
@@ -250,13 +249,21 @@ final class RelationshipStore {
 
         guard !recent.isEmpty else { return summary }
 
+        // Resolve all recent-interaction names in one query instead of one read per interaction.
+        let personIds = Array(Set(recent.map { $0.personId }))
+        let namesById: [Int64: String] = (try? db.read { db in
+            try PersonRecord.filter(personIds.contains(Column("id"))).fetchAll(db)
+        })?.reduce(into: [:]) { dict, record in
+            if let rid = record.id { dict[rid] = record.name }
+        } ?? [:]
+
         var lines: [String] = []
         lines.append(summary)
         lines.append("")
         lines.append("Recent interactions:")
 
         for interaction in recent {
-            let name = personName(for: interaction.personId) ?? "Someone"
+            let name = namesById[interaction.personId] ?? "Someone"
             let daysAgo = Calendar.current.dateComponents([.day], from: interaction.timestamp, to: Date()).day ?? 0
             let timeLabel = daysAgo == 0 ? "today" : "\(daysAgo) day\(daysAgo == 1 ? "" : "s") ago"
             let summaryLabel = interaction.summary.prefix(100)
@@ -324,6 +331,32 @@ final class RelationshipStore {
         )
     }
 
+    /// Batched bestRelationship(for:) for many people in ONE query: the highest-confidence
+    /// relationship per personId. Equivalent to calling bestRelationship on each id (~N reads → 1).
+    private func bestRelationships(for personIds: [Int64]) -> [Int64: Relationship] {
+        guard !personIds.isEmpty else { return [:] }
+        let records = (try? db.read { db in
+            try RelationshipRecord
+                .filter(personIds.contains(Column("personId")))
+                .order(Column("confidence").desc)
+                .fetchAll(db)
+        }) ?? []
+        // Records come back confidence-desc, so the FIRST seen per personId is the max-confidence
+        // one — identical to fetchOne(order: confidence.desc) per person.
+        var best: [Int64: Relationship] = [:]
+        for record in records where best[record.personId] == nil {
+            best[record.personId] = Relationship(
+                id: record.id,
+                personId: record.personId,
+                type: RelationshipType(rawValue: record.relationshipType) ?? .unknown,
+                confidence: record.confidence,
+                lastUpdated: Date(timeIntervalSince1970: record.lastUpdated),
+                isManualOverride: record.isManualOverride
+            )
+        }
+        return best
+    }
+
     private func recentInteractions(limit: Int = 10) -> [Interaction] {
         do {
             let records = try db.read { db in
@@ -347,9 +380,9 @@ final class RelationshipStore {
     }
 
     private func personName(for personId: Int64) -> String? {
-        let records = try? db.read { db in
-            try PersonRecord.filter(Column("id") == personId).fetchAll(db)
-        }
-        return records?.first?.name
+        guard let record = try? db.read({ db in
+            try PersonRecord.fetchOne(db, key: personId)
+        }) else { return nil }
+        return record.name
     }
 }

@@ -355,8 +355,9 @@ final class MemoryReflectionService {
                 let ids = unique.map { $0.id }
                 var linkCount = 0
                 for i in 0..<ids.count {
+                    // Depends only on i — fetch once per i and use an O(1) Set membership test.
+                    let linked = Set(linkService.linkedMemoryIds(for: ids[i], minStrength: 0.2))
                     for j in (i + 1)..<ids.count {
-                        let linked = linkService.linkedMemoryIds(for: ids[i], minStrength: 0.2)
                         if linked.contains(ids[j]) {
                             linkCount += 1
                         }
@@ -396,10 +397,11 @@ final class MemoryReflectionService {
 
             guard !positive.isEmpty && !negative.isEmpty else { continue }
 
+            // Tokenize each negative memory once instead of re-extracting per positive.
+            let negWithKeywords = negative.map { ($0, extractKeywords(from: $0.content)) }
             for pos in positive {
                 let posKeywords = extractKeywords(from: pos.content)
-                for neg in negative {
-                    let negKeywords = extractKeywords(from: neg.content)
+                for (neg, negKeywords) in negWithKeywords {
                     let shared = posKeywords.intersection(negKeywords)
                     guard !shared.isEmpty else { continue }
 

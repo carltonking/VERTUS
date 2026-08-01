@@ -145,9 +145,13 @@ struct HermesDashboardView: View {
 
     private func reloadMeetings() { meetings = store.recentMeetings(limit: 10) }
 
+    // Cached instead of allocating per row in ForEach(screenResults).
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "MMM d, h:mm a"; return f
+    }()
+
     private static func time(_ epoch: Double) -> String {
-        let f = DateFormatter(); f.dateFormat = "MMM d, h:mm a"
-        return f.string(from: Date(timeIntervalSince1970: epoch))
+        Self.timeFormatter.string(from: Date(timeIntervalSince1970: epoch))
     }
 }
 
