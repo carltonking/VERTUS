@@ -153,10 +153,10 @@ struct BarView: View {
         onSubmit(text)
     }
 
-    private static var logoImage: NSImage? {
+    private static let logoImage: NSImage? = {
         guard let url = Bundle.main.url(forResource: "alfred-small-logo", withExtension: "png") else {
             return nil
         }
         return NSImage(contentsOf: url)
-    }
+    }()
 }

@@ -14,7 +14,26 @@ struct OnboardingView: View {
         _currentStep = State(initialValue: initialStep)
     }
 
-    private let totalSteps = 5
+    // MARK: Owner Configuration (OCS) intake — step 5, present only when the feature is enabled.
+    //
+    // With `ownerConfigEnabled` off, `totalSteps` stays 5 and every existing step keeps its index,
+    // so the current onboarding is byte-identical. With it on, one extra step collects the minimum
+    // the assistant needs to speak for someone: name, pronouns, sign-off, zone, and how cautious to
+    // be. Registers, folders, Adobe/Rhino, classifications, and cloud sync are deliberately NOT here.
+    @State private var ownerPreferredName = ""
+    @State private var ownerPronounSubject = OwnerConfig.Identity.Pronouns.neutral.subject
+    @State private var ownerPronounObject = OwnerConfig.Identity.Pronouns.neutral.object
+    @State private var ownerPronounPossessive = OwnerConfig.Identity.Pronouns.neutral.possessive
+    @State private var ownerSignOffName = ""
+    @State private var ownerRoleTitle = ""
+    @State private var ownerOrganization = ""
+    @State private var ownerTimeZone = OwnerConfigDefaults.provisionalTimeZone
+    @State private var ownerUses24HourTime = true
+    @State private var ownerApprovalPreset: OwnerConfigDefaults.ApprovalPreset = .balanced
+    @State private var ownerSaveError: String?
+
+    private var ownerConfigStepIndex: Int { 5 }
+    private var totalSteps: Int { appState.ownerConfigEnabled ? 6 : 5 }
     private let bg = Color(red: 0.11, green: 0.11, blue: 0.12)
 
     enum ConnectionState {
@@ -70,7 +89,158 @@ struct OnboardingView: View {
         case 2: stepChooseAI
         case 3: stepAPIKey
         case 4: stepPermissions
+        case 5 where appState.ownerConfigEnabled: stepOwnerProfile
         default: EmptyView()
+        }
+    }
+
+    // MARK: - Step 5: Owner profile (Owner Configuration only)
+
+    private var stepOwnerProfile: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            stepHeader(title: "A little about you")
+            Text("Alfred writes and schedules on your behalf, so it needs these before it can draft anything. Everything else can wait until Settings.")
+                .font(.system(size: 12)).foregroundStyle(.white.opacity(0.6))
+                .fixedSize(horizontal: false, vertical: true)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    ownerField("What should Alfred call you?", text: $ownerPreferredName,
+                               placeholder: "preferred name")
+                    ownerField("Name to sign outgoing messages with", text: $ownerSignOffName,
+                               placeholder: "sign-off name")
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Your pronouns").font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.85))
+                        HStack(spacing: 8) {
+                            TextField("they", text: $ownerPronounSubject).textFieldStyle(.roundedBorder)
+                            TextField("them", text: $ownerPronounObject).textFieldStyle(.roundedBorder)
+                            TextField("their", text: $ownerPronounPossessive).textFieldStyle(.roundedBorder)
+                        }
+                        Text("Used whenever Alfred refers to you. Defaults to they/them until you change it.")
+                            .font(.system(size: 10)).foregroundStyle(.white.opacity(0.5))
+                    }
+
+                    ownerField("Role or title (optional)", text: $ownerRoleTitle, placeholder: "role")
+                    ownerField("Organization (optional)", text: $ownerOrganization, placeholder: "organization")
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Time zone").font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.85))
+                        Picker("", selection: $ownerTimeZone) {
+                            ForEach(Self.commonTimeZones, id: \.self) { Text($0).tag($0) }
+                        }
+                        .labelsHidden().pickerStyle(.menu)
+                        Text("Every time Alfred writes — calendar entries included — uses this. Confirm it even if it already looks right.")
+                            .font(.system(size: 10)).foregroundStyle(.white.opacity(0.5))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Toggle("Use 24-hour times (14:30)", isOn: $ownerUses24HourTime)
+                        .font(.system(size: 12)).toggleStyle(.switch)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("How cautious should Alfred be?")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.85))
+                        Picker("", selection: $ownerApprovalPreset) {
+                            ForEach(OwnerConfigDefaults.ApprovalPreset.allCases, id: \.self) {
+                                Text($0.label).tag($0)
+                            }
+                        }
+                        .labelsHidden().pickerStyle(.menu)
+                        Text(ownerApprovalPreset.detail)
+                            .font(.system(size: 10)).foregroundStyle(.white.opacity(0.5))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text("Sending, deleting, computer control, and shell commands always ask — you can loosen the rest later, never below that floor.")
+                            .font(.system(size: 10)).foregroundStyle(.white.opacity(0.4))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if let ownerSaveError {
+                        Text(ownerSaveError).font(.system(size: 11)).foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.trailing, 4)
+            }
+            .frame(maxHeight: 320)
+        }
+        .frame(maxWidth: 460, alignment: .leading)
+        .onAppear(perform: seedOwnerFieldsFromExistingConfig)
+    }
+
+    private func ownerField(_ label: String, text: Binding<String>, placeholder: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label).font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.85))
+            TextField(placeholder, text: text).textFieldStyle(.roundedBorder)
+        }
+    }
+
+    /// A short, sane list plus the machine's own zone. Not exhaustive — Settings can offer the full
+    /// IANA database later; onboarding only needs to get the common case right.
+    private static var commonTimeZones: [String] {
+        var zones = ["America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles",
+                     "Europe/London", "Europe/Berlin", "Europe/Paris", "Asia/Tokyo",
+                     "Australia/Sydney", "UTC"]
+        let current = TimeZone.current.identifier
+        if !zones.contains(current) { zones.insert(current, at: 0) }
+        return zones
+    }
+
+    /// Pre-fill from an existing configuration (or the legacy name) so re-running onboarding doesn't
+    /// present empty fields over values the owner already set.
+    private func seedOwnerFieldsFromExistingConfig() {
+        guard appState.ownerConfigEnabled else { return }
+        if let snapshot = OwnerConfigStore.shared.currentSnapshot() {
+            let id = snapshot.config.identity
+            if ownerPreferredName.isEmpty { ownerPreferredName = id.preferredName ?? id.fullName ?? "" }
+            if ownerSignOffName.isEmpty { ownerSignOffName = id.signOffName ?? "" }
+            if ownerRoleTitle.isEmpty { ownerRoleTitle = id.roleTitle ?? "" }
+            if ownerOrganization.isEmpty { ownerOrganization = id.organization ?? "" }
+            ownerPronounSubject = id.pronouns.subject
+            ownerPronounObject = id.pronouns.object
+            ownerPronounPossessive = id.pronouns.possessive
+            ownerTimeZone = id.timeZone
+            ownerUses24HourTime = id.timeFormat == .h24
+        } else if ownerPreferredName.isEmpty {
+            ownerPreferredName = appState.ownerName
+        }
+        if ownerSignOffName.isEmpty { ownerSignOffName = ownerPreferredName }
+    }
+
+    /// Write the intake into the canonical configuration. Returns false (and surfaces the reason)
+    /// when validation rejects it, so onboarding cannot complete with an unusable owner profile.
+    private func saveOwnerConfig() -> Bool {
+        guard appState.ownerConfigEnabled else { return true }
+        let store = OwnerConfigStore.shared
+        var config = store.currentSnapshot()?.config ?? OwnerConfigDefaults.blank
+
+        let preferred = ownerPreferredName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fullName = appState.ownerName.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.identity.fullName = fullName.isEmpty ? preferred : fullName
+        config.identity.preferredName = preferred
+        config.identity.signOffName = ownerSignOffName.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.identity.pronouns = .init(
+            subject: ownerPronounSubject.trimmingCharacters(in: .whitespacesAndNewlines),
+            object: ownerPronounObject.trimmingCharacters(in: .whitespacesAndNewlines),
+            possessive: ownerPronounPossessive.trimmingCharacters(in: .whitespacesAndNewlines))
+        config.identity.roleTitle = ownerRoleTitle.isEmptyAfterTrim ? nil : ownerRoleTitle
+        config.identity.organization = ownerOrganization.isEmptyAfterTrim ? nil : ownerOrganization
+        config.identity.timeZone = ownerTimeZone
+        config.identity.timeZoneConfirmed = true          // the owner just chose it
+        config.identity.timeFormat = ownerUses24HourTime ? .h24 : .h12
+        config.approvals.policies = ownerApprovalPreset.policies
+
+        do {
+            try store.save(config, updatedBy: .onboarding)
+            ownerSaveError = nil
+            return true
+        } catch {
+            ownerSaveError = error.localizedDescription
+            return false
         }
     }
 
@@ -420,6 +590,13 @@ struct OnboardingView: View {
             if case .success = connectionState { return true }
             // Allow advancing with a non-empty key even without testing
             return !apiKeyInput.trimmingCharacters(in: .whitespaces).isEmpty
+        case 5 where appState.ownerConfigEnabled:
+            // The three fields the assistant cannot speak for someone without.
+            return !ownerPreferredName.isEmptyAfterTrim
+                && !ownerSignOffName.isEmptyAfterTrim
+                && !ownerPronounSubject.isEmptyAfterTrim
+                && !ownerPronounObject.isEmptyAfterTrim
+                && !ownerPronounPossessive.isEmptyAfterTrim
         default: return true
         }
     }
@@ -438,6 +615,9 @@ struct OnboardingView: View {
     }
 
     private func finish() {
+        // With Owner Configuration on, a rejected profile blocks completion — finishing onboarding
+        // with an unusable owner profile would leave drafting silently disabled with no explanation.
+        guard saveOwnerConfig() else { return }
         appState.isOnboardingComplete = true
         UserDefaults.standard.set(true, forKey: "isOnboardingComplete")
         dismiss()
@@ -491,12 +671,12 @@ private struct AlfredWelcomeLogo: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private static var logoImage: NSImage? {
+    private static let logoImage: NSImage? = {
         guard let url = Bundle.main.url(forResource: "alfred-big-logo", withExtension: "png") else {
             return nil
         }
         return NSImage(contentsOf: url)
-    }
+    }()
 }
 
 private struct AlfredTriangleMark: Shape {

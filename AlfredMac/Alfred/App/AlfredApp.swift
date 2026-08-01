@@ -117,6 +117,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let selectedFileContext = SelectedFileContext()
     private let bookmarkStore = SecurityScopedBookmarkStore()
     private let computerControl = ComputerControlCapability()
+    /// The Clicky-style visual cursor that narrates on-screen actions. Emerges from the menu-bar
+    /// icon, glides to each target, and retreats when Alfred is done.
+    private lazy var cursorOverlay = CursorOverlayController()
     private let fileOperation = FileOperationCapability()
     private let messaging = MessagingCapability()
     private var pendingTextRecipient: MessagingCapability.Recipient?
@@ -135,10 +138,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let screenMonitoring = ScreenMonitoringManager()
     private var inboundWatcher: InboundWatcher?
     private var departureWatcher: DepartureWatcher?
-    private var alfredBot: AlfredBotWatcher?
     private var telegramBot: TelegramBotService?
     private let focusSession = FocusSessionManager()
     private var escapeMonitor: Any?
+    private var localEscapeMonitor: Any?
     private var notchHoverMonitor: Any?
     private var hideOnLeaveTimer: Timer?
     private var shownByHover = false
@@ -202,11 +205,105 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Launch
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Single-instance guard. Two auto-start paths (the launchd agent and a macOS login item) can
+        // both fire at login, painting two menu-bar icons. If another copy with our bundle id is
+        // already running, bail before we set up anything. Keep the OLDEST instance (launchDate, pid
+        // tie-break) so a simultaneous double-launch collapses to exactly one survivor.
+        // NOTE: use exit(0), NOT NSApp.terminate — terminate runs applicationWillTerminate →
+        // unloadLaunchAgent(), which would `launchctl unload` and SIGTERM the surviving agent instance.
+        let me = NSRunningApplication.current
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.alfred.app"
+        let survivor = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).min { a, b in
+            let da = a.launchDate ?? .distantFuture, db = b.launchDate ?? .distantFuture
+            if da != db { return da < db }
+            return a.processIdentifier < b.processIdentifier
+        }
+        if let survivor, survivor.processIdentifier != me.processIdentifier {
+            NSLog("[Alfred] Duplicate instance already running as pid \(survivor.processIdentifier); exiting this copy.")
+            exit(0)
+        }
+
         AppDelegate.shared = self
         NSApp.setActivationPolicy(.accessory)
 
         ensureAppDirectories()
         NotificationManager.shared.setup()
+
+        let router = LLMRouter(appState: appState)
+        llmRouter = router
+
+        GlobalHotkeyManager.shared.registerHotkey(
+            keyCode: 8,
+            modifiers: UInt32(768),
+            identifier: 3,
+            action: { [weak self] in
+                self?.showChatWindow()
+            }
+        )
+
+        // Paint the bar + menu-bar icon FIRST so they appear a runloop tick sooner, before the DB
+        // open + ~20-service graph build. handleQuery optional-chains core/router/memoryStore, so a
+        // query landing in the sub-tick deferral gap degrades safely.
+        setupBarWindow()
+        setupStatusItem()
+
+        // Defer the heavier startup (DB open, service graph, observe/start wiring) one runloop turn
+        // so it never blocks first paint. Stays on the main actor — ordering/thread affinity intact.
+        Task { @MainActor [weak self] in
+            self?.completeStartup()
+        }
+    }
+
+    /// Owner Configuration (OCS). Non-nil only when `AppState.ownerConfigEnabled` is on, so with the
+    /// flag off nothing downstream sees it and the legacy `ownerName` path is untouched.
+    private(set) var ownerConfigStore: OwnerConfigStore?
+
+    /// Prepares the owner configuration when the feature flag is on: seeds it once from the legacy
+    /// `ownerName`, then hands the store to `AssistantCore` for persona rendering.
+    ///
+    /// Idempotent — `migrateFromLegacyIfNeeded` returns immediately when a configuration exists, so
+    /// this can run on every launch without touching the owner's edits.
+    @MainActor
+    private func prepareOwnerConfigIfEnabled() {
+        guard appState.ownerConfigEnabled else {
+            ownerConfigStore = nil
+            return
+        }
+        let store = OwnerConfigStore.shared
+        let outcome = store.migrateFromLegacyIfNeeded(
+            legacyOwnerName: UserDefaults.standard.string(forKey: "ownerName"))
+        ownerConfigStore = store
+
+        switch outcome {
+        case let .alreadyExists(revision):
+            logger.info("Owner configuration loaded at revision \(revision, privacy: .public)")
+        case let .seeded(revision):
+            logger.info("Owner configuration seeded from the legacy owner name at revision \(revision, privacy: .public)")
+        case .skippedNoLegacyName:
+            // Fresh install: onboarding collects the identity fields.
+            logger.info("Owner configuration not seeded — no legacy owner name to carry across.")
+        case let .refusedCanonicalCorrupt(recoverableRevision):
+            // The file is left exactly as found. Recovery is an explicit action, never automatic.
+            logger.error("Owner configuration file is unreadable; migration refused. Recoverable revision: \(recoverableRevision.map(String.init) ?? "none", privacy: .public)")
+            barState.contextStatus = recoverableRevision.map {
+                "Your owner configuration file can't be read. It's been left untouched — revision \($0) can be restored from Settings."
+            } ?? "Your owner configuration file can't be read. It's been left untouched; no earlier revision is available."
+        case let .failed(message):
+            logger.error("Owner configuration could not be seeded: \(message, privacy: .public)")
+            barState.contextStatus = "Owner configuration couldn't be created: \(message)"
+        }
+
+        if let validation = store.currentSnapshot()?.validation, !validation.isValid {
+            barState.contextStatus = "Owner configuration needs attention: "
+                + validation.errors.prefix(2).map(\.path).joined(separator: ", ")
+        }
+    }
+
+    @MainActor
+    private func completeStartup() {
+        guard let router = llmRouter else { return }
+
+        prepareOwnerConfigIfEnabled()
 
         do {
             memoryStore = try MemoryStore()
@@ -229,18 +326,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.addButton(withTitle: "OK")
             alert.runModal()
         }
-
-        let router = LLMRouter(appState: appState)
-        llmRouter = router
-
-        GlobalHotkeyManager.shared.registerHotkey(
-            keyCode: 8,
-            modifiers: UInt32(768),
-            identifier: 3,
-            action: { [weak self] in
-                self?.showChatWindow()
-            }
-        )
 
         if let store = memoryStore {
             let projectService = ProjectAwarenessService(memory: store)
@@ -340,7 +425,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 rewardEngine: learningOn ? store.rewardEngine : nil,
                 contextCompiler: (learningOn || personalizationOn) ? compiler : nil,
                 actionSelectionEngine: actionEngine,
-                taskDashboardService: learningOn ? dashService : nil
+                taskDashboardService: learningOn ? dashService : nil,
+                ownerConfig: ownerConfigStore
             )
             let linkService = MemoryLinkService(relationshipMemory: relationshipMem)
             linkService.initialize()
@@ -365,8 +451,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             subscribeToWorkflowNotifications()
         }
 
-        setupBarWindow()
-        setupStatusItem()
         setupComputerControlCancelMonitor()
         resolveRememberedFileAccess()
         observeBarSizing()
@@ -379,6 +463,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         startHermesCapture()
         startLearningProfileTimer()
+        sweepRetentionOnLaunch()
 
         if appState.isOnboardingComplete {
             startHotkeyListener()
@@ -460,41 +545,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func resolveRememberedFileAccess() {
-        var statuses: [String] = []
-        var rememberedFileURLs: [URL] = []
-        var rememberedFolderURL: URL?
+        // The bookmark resolution (Keychain decode + URL(resolvingBookmarkData:) filesystem verify)
+        // can stall on a missing/slow/network volume, so run it off the main thread and hop back only
+        // to apply the resulting UI state. resolve() does NOT start security-scoped access (that's
+        // SecurityScopedResourceAccess), so there's no scoped-access lifetime to preserve here.
+        let store = bookmarkStore
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var statuses: [String] = []
+            var rememberedFileURLs: [URL] = []
+            var rememberedFolderURL: URL?
 
-        do {
-            if let fileResolution = try bookmarkStore.resolveFiles() {
-                if fileResolution.isStale {
-                    statuses.append("Remembered file access is stale. Choose the file again, then remember access.")
-                } else if !fileResolution.urls.isEmpty {
-                    rememberedFileURLs = fileResolution.urls
-                    statuses.append(fileResolution.urls.count == 1
-                        ? "Remembered file access loaded: \(fileResolution.urls[0].lastPathComponent)"
-                        : "Remembered access loaded for \(fileResolution.urls.count) files.")
+            do {
+                if let fileResolution = try store.resolveFiles() {
+                    if fileResolution.isStale {
+                        statuses.append("Remembered file access is stale. Choose the file again, then remember access.")
+                    } else if !fileResolution.urls.isEmpty {
+                        rememberedFileURLs = fileResolution.urls
+                        statuses.append(fileResolution.urls.count == 1
+                            ? "Remembered file access loaded: \(fileResolution.urls[0].lastPathComponent)"
+                            : "Remembered access loaded for \(fileResolution.urls.count) files.")
+                    }
                 }
+            } catch {
+                statuses.append("Could not load remembered file access. Choose the file again.")
             }
-        } catch {
-            statuses.append("Could not load remembered file access. Choose the file again.")
-        }
 
-        do {
-            if let folderResolution = try bookmarkStore.resolveFolder() {
-                if folderResolution.isStale {
-                    statuses.append("Remembered folder access is stale. Choose the folder again, then remember access.")
-                } else if let folderURL = folderResolution.urls.first {
-                    rememberedFolderURL = folderURL
-                    statuses.append("Remembered folder access loaded: \(folderURL.lastPathComponent)")
+            do {
+                if let folderResolution = try store.resolveFolder() {
+                    if folderResolution.isStale {
+                        statuses.append("Remembered folder access is stale. Choose the folder again, then remember access.")
+                    } else if let folderURL = folderResolution.urls.first {
+                        rememberedFolderURL = folderURL
+                        statuses.append("Remembered folder access loaded: \(folderURL.lastPathComponent)")
+                    }
                 }
+            } catch {
+                statuses.append("Could not load remembered folder access. Choose the folder again.")
             }
-        } catch {
-            statuses.append("Could not load remembered folder access. Choose the folder again.")
-        }
 
-        if !statuses.isEmpty {
-            selectedFileContext.restoreRemembered(fileURLs: rememberedFileURLs, folderURL: rememberedFolderURL)
-            barState.contextStatus = statuses.joined(separator: " ")
+            guard !statuses.isEmpty else { return }
+            let fileURLs = rememberedFileURLs
+            let folderURL = rememberedFolderURL
+            let status = statuses.joined(separator: " ")
+            Task { @MainActor in
+                guard let self else { return }
+                self.selectedFileContext.restoreRemembered(fileURLs: fileURLs, folderURL: folderURL)
+                self.barState.contextStatus = status
+            }
         }
     }
 
@@ -548,7 +645,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         guard let router = llmRouter else { return }
-        let viewModel = ChatViewModel(llmRouter: router)
+        // Share the bar's prompt builder so the Chat window gets persona, owner name, learned
+        // profile, style preferences, and retrieved memories. It previously passed `system: ""`,
+        // making it the only surface with no personalization at all.
+        let core = assistantCore
+        let name = appState.ownerName
+        let viewModel = ChatViewModel(llmRouter: router) { query in
+            guard let core else { return "" }
+            return await core.conversationalSystem(ownerName: name, query: query)
+        }
         chatViewModel = viewModel
 
         let window = NSWindow(
@@ -571,6 +676,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setupComputerControlCancelMonitor() {
+        // Global monitor: Esc pressed while ANOTHER app is focused (e.g. during computer control).
         escapeMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.keyCode == 53 else { return }
             Task { @MainActor in
@@ -580,6 +686,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if self?.barWindow?.isVisible == true {
                     self?.handlePresenceCollapse()
                 }
+            }
+        }
+        // Local monitor: Esc pressed while the Alfred bar itself is focused. The focused SwiftUI
+        // TextField swallows Escape before `.onKeyPress(.escape)` (and thus handlePresenceCollapse)
+        // can see it, so intercept it here and consume the event. Local monitors run on the main
+        // thread during event dispatch, so we're already on the main actor.
+        localEscapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == 53, let self else { return event }
+            return MainActor.assumeIsolated {
+                guard self.barWindow?.isVisible == true else { return event }
+                self.computerControl.cancel()
+                self.handlePresenceCollapse()
+                return nil   // consume — don't let the field editor also act on Esc
             }
         }
     }
@@ -692,21 +811,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
-        // iMessage bot (opt-in). Task/sleep loop like InboundWatcher — not a SafetyAuditEngine class,
-        // so the startup audit stays green. No-op without a configured handle / permissions.
-        if let core = assistantCore {
-            let bot = AlfredBotWatcher(core: core, appState: appState)
-            alfredBot = bot
-            appState.$imessageBotEnabled
-                .receive(on: DispatchQueue.main)
-                .sink { [weak bot] enabled in
-                    guard let bot else { return }
-                    if enabled { bot.start() } else { bot.stop() }
-                }
-                .store(in: &cancellables)
-            if appState.imessageBotEnabled { bot.start() }
-
-            // Telegram bot (opt-in). Long-poll loop, also outside the SafetyAuditEngine-scanned set.
+        // Telegram bot. INBOUND (long-poll getUpdates) now lives in the cloud webhook ("Alfred Lite",
+        // api/telegram.ts) so it answers even when this Mac is off. A single bot can't both run a
+        // webhook and long-poll the same token — the Mac polling would 409 the cloud webhook — so the
+        // Mac no longer polls by default. OUTBOUND is unaffected: TelegramNotifier (routine output,
+        // departure nudges) only needs `telegramBotEnabled` and posts via sendMessage, which works from
+        // anywhere. To fall back to Mac-side inbound polling (e.g. if you stop using the cloud bot), set
+        // UserDefaults `telegramInboundPollingEnabled` = true and relaunch.
+        // (The iMessage bot was removed from the app; AlfredBotWatcher's static helpers are still
+        // reused by TelegramBotService.)
+        let macInboundPolling = UserDefaults.standard.bool(forKey: "telegramInboundPollingEnabled")
+        if let core = assistantCore, macInboundPolling {
             let telegram = TelegramBotService(core: core, appState: appState, router: llmRouter)
             telegramBot = telegram
             appState.$telegramBotEnabled
@@ -949,6 +1064,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task.detached {
             await ProfileDigest.regenerate(ownerName: owner, signals: signals,
                                            screenTextCount: screenCount, meetingCount: meetingCount)
+        }
+    }
+
+    // MARK: - Retention
+
+    /// One-shot retention sweep at launch, off the main actor.
+    ///
+    /// `screen_text_log` is written by `ScreenTextMonitor` independently of chat activity and its
+    /// prune had **no call site anywhere in the app**, so captured on-screen text accumulated
+    /// forever. Conversation history is already pruned per-turn in `AssistantCore.postProcess`;
+    /// this covers the two tables nothing was sweeping.
+    private func sweepRetentionOnLaunch() {
+        guard let store = memoryStore else { return }
+        let screenDays = appState.screenTextRetentionDays
+        Task.detached(priority: .utility) {
+            store.pruneScreenText(olderThanDays: screenDays)
+            try? store.pruneMemories()
         }
     }
 
@@ -1668,6 +1800,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handlePresenceCollapse() {
+        // During an inbound-reply session, Esc means "just chat instead" (as the prompt promises):
+        // drop the reply but keep the bar open in normal chat mode rather than dismissing it.
+        if pendingInboundReply != nil {
+            pendingInboundReply = nil
+            barState.responseText = "Okay, dropped that. What can I help with?"
+            barState.isProcessing = false
+            barState.presenceState = .expanded
+            barState.focusToken += 1
+            return
+        }
         // Escape handler: fully dismiss (hotkey-only model — same as pressing the shortcut).
         hideBar()
     }
@@ -1720,10 +1862,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                   subject: subject, preview: preview, lastDraft: nil)
 
         let verb = channel == "email" ? "emailed" : "texted"
-        barState.isProcessing = false
-        barState.responseText = "📩 \(sender) \(verb) you:\n“\(String(preview.prefix(500)))”\n\n"
-            + "What do you want to say back? I'll write it in your voice. (Press Esc to just chat instead.)"
+        let noun = channel == "email" ? "email" : "message"
+        barState.isProcessing = true
+        barState.responseText = "Reading \(sender)'s \(noun)…"
         showBar()   // showBar activates the app and orders the bar front
+
+        // Summarize rather than echo the whole thing — length scales with the message. The full
+        // text is kept on `pendingInboundReply`, so "show the full message" / questions still work.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.barState.isProcessing = false; self.barState.presenceState = .expanded }
+            let summary = await self.summarizeInbound(channel: channel, sender: sender,
+                                                      subject: subject, preview: preview)
+            guard self.pendingInboundReply != nil else { return }   // Esc during summarize → bail
+            self.barState.responseText = "\(sender) \(verb) you. \(summary)\n\n"
+                + "What do you want to say back? I'll write it in your voice. Ask me for more or to "
+                + "show the full \(noun) anytime, or press Esc to just chat."
+        }
+    }
+
+    /// Summarizes an incoming message for the reply prompt. The summary length scales with the
+    /// content — a one-liner for a short text, a few sentences for a long email. No emojis are added.
+    @MainActor
+    private func summarizeInbound(channel: String, sender: String, subject: String?, preview: String) async -> String {
+        let trimmed = preview.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "It came through with no readable content." }
+        guard let router = llmRouter else { return String(trimmed.prefix(280)) }
+        let noun = channel == "email" ? "email" : "message"
+        // Word budget grows with the source length: ~one line for a short text, a few sentences for
+        // a long email. Roughly one summary word per 12 source chars, clamped to a sane band.
+        let budget = min(60, max(12, trimmed.count / 12))
+        let system = """
+        You summarize an incoming \(noun) so a busy person instantly knows what it's about and what, \
+        if anything, is being asked of them. Write plain prose — no greeting, no sign-off, no markdown, \
+        and do NOT add any emojis. Keep it to about \(budget) words or fewer; a short \(noun) gets a \
+        single short sentence, a long one gets a few. Refer to the sender in the third person.
+        """
+        var user = ""
+        if let subject, !subject.isEmpty { user += "Subject: \(subject)\n" }
+        user += "\(noun.capitalized) from \(sender):\n\(String(trimmed.prefix(1000)))"
+        guard let raw = try? await router.complete(prompt: user, system: system) else {
+            return String(trimmed.prefix(280))
+        }
+        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Answers a question the user asks about the incoming message during a reply session, using only
+    /// the message text as context. Keeps them in the session (they can still draft afterward).
+    @MainActor
+    private func answerInboundQuestion(_ ctx: InboundReplyContext, question: String) async -> String {
+        guard let router = llmRouter else { return "I can't look into that right now." }
+        let noun = ctx.channel == "email" ? "email" : "message"
+        let system = """
+        You help someone understand an incoming \(noun) from \(ctx.sender). Answer their question \
+        using ONLY the \(noun) below. Be concise and plain — no markdown, and do NOT add any emojis. \
+        If the answer isn't in the \(noun), say so plainly.
+        """
+        var user = ""
+        if let subject = ctx.subject, !subject.isEmpty { user += "Subject: \(subject)\n" }
+        user += "\(noun.capitalized):\n\(String(ctx.preview.prefix(1000)))\n\nQuestion: \(question)"
+        guard let raw = try? await router.complete(prompt: user, system: system) else {
+            return "I couldn't look into that."
+        }
+        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Runs a routine's drafted write after the owner tapped "Run now" on the confirmation
+    /// notification. Attended (a human tap) → the write is allowed to happen, mirroring running the
+    /// same command from the AlfredBar. Routed here from NotificationManager.didReceive.
+    @MainActor
+    func confirmRoutineFromNotification(_ userInfo: [String: String]) {
+        guard userInfo["kind"] == "routine_confirm",
+              let ridStr = userInfo["routineId"], let rid = Int64(ridStr) else { return }
+        let pendingRunId = userInfo["runId"].flatMap { Int64($0) }
+        routineScheduler?.confirmAndRun(routineId: rid, pendingRunId: pendingRunId)
     }
 
     /// One turn of an active inbound-reply session (armed by `respondToInboundNotification`). Exit
@@ -1745,6 +1957,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             barState.responseText = "Okay, dropped that. What can I help with?"
             barState.isProcessing = false
             barState.presenceState = .expanded
+            return
+        }
+
+        // "Show me the whole thing" → print the stored message verbatim (any emojis in it are the
+        // sender's, not ours). The reply session stays open.
+        let showFullTriggers: Set<String> = [
+            "show full message", "show the full message", "show me the full message", "full message",
+            "the full message", "show message", "show the message", "show me the message",
+            "read it", "read the message", "read the full message", "read the whole message",
+            "read the whole thing", "show the whole thing", "whole message", "read full", "show full",
+            "full email", "show the full email", "show the email", "read the full email", "read the email"]
+        if showFullTriggers.contains(lower) {
+            let noun = ctx.channel == "email" ? "email" : "message"
+            let full = ctx.preview.trimmingCharacters(in: .whitespacesAndNewlines)
+            barState.responseText = (full.isEmpty ? "There's no full \(noun) text to show." :
+                "Full \(noun) from \(ctx.sender):\n\n\(full)")
+                + "\n\nTell me what to say back, or press Esc to just chat."
+            barState.isProcessing = false
+            barState.presenceState = .expanded
+            return
+        }
+
+        // A question or a request for more detail about the message → answer it, don't draft a reply.
+        if Self.looksLikeInboundQuestion(lower) {
+            barState.responseText = "One sec…"
+            barState.isProcessing = true
+            barState.presenceState = .thinking
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.barState.isProcessing = false; self.barState.presenceState = .expanded }
+                let answer = await self.answerInboundQuestion(ctx, question: input)
+                guard self.pendingInboundReply != nil else { return }
+                self.barState.responseText = answer
+                    + "\n\nWant me to draft a reply? Tell me what to say, or press Esc to just chat."
+            }
             return
         }
 
@@ -1799,6 +2046,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let words: Set<String> = ["send", "send it", "send that", "send it now", "yes", "yes send",
                                   "yep", "yeah", "yup", "ok send", "okay send", "go", "do it", "perfect"]
         return words.contains(lower)
+    }
+
+    /// True when the user is asking ABOUT the incoming message (answer it) rather than telling Alfred
+    /// what to write (draft it). Imperative drafting instructions ("make it warmer", "say yes") don't
+    /// start with a question word, so this stays out of their way.
+    private static func looksLikeInboundQuestion(_ lower: String) -> Bool {
+        if lower.hasSuffix("?") { return true }
+        let starters = ["what", "who", "when", "where", "why", "how", "which", "whose", "is it",
+                        "are they", "does", "did", "do they", "tell me more", "more info",
+                        "more information", "more detail", "explain", "summarize", "summarise"]
+        return starters.contains { lower == $0 || lower.hasPrefix($0 + " ") }
     }
 
     /// Sends an approved inbound reply over the originating channel (already confirmed in the bar).
@@ -2141,9 +2399,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Redact secrets (e.g. "set github token …") before they reach the audit row.
         let auditPrompt = Redactor().redact(text).text
         let runId = memoryStore?.startRun(source: "bar", prompt: auditPrompt)
+        // Analyze once — QueryIntent.analyze is pure and was previously recomputed 4x on this path.
+        let intent = QueryIntent.analyze(decision.query)
         let alreadyConfirmsElsewhere =
-            QueryIntent.analyze(decision.query).shellCommand != nil
-            || QueryIntent.analyze(decision.query).appControlQuery != nil
+            intent.shellCommand != nil
+            || intent.appControlQuery != nil
         if decision.confirmRequired && !alreadyConfirmsElsewhere {
             guard confirmHighRisk(decision) else {
                 barState.responseText = "Cancelled — \(decision.commandClass.rawValue) needs confirmation."
@@ -2172,11 +2432,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // App control (open/launch/activate/hide/quit) is a low-risk write — run it without a
         // confirmation prompt (Blueprint §7: only high-risk writes — delete/send/shell — confirm).
-        if QueryIntent.analyze(decision.query).appControlQuery != nil {
+        if intent.appControlQuery != nil {
             Task { await CapabilityEventLogger.shared.record("app control", "requested") }
         }
 
-        if let command = QueryIntent.analyze(decision.query).shellCommand {
+        if let command = intent.shellCommand {
             // Only destructive shell (rm/drop/format…) prompts; routine commands run automatically
             // (decision.confirmRequired is destructive-only per the Dispatcher).
             if decision.confirmRequired {
@@ -2510,6 +2770,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.barState.isProcessing = false; self.barState.presenceState = .expanded }
+            // Bring the Alfred cursor out of the menu-bar icon for the duration of the session.
+            await self.cursorOverlay.wake(from: self.menuBarCursorAnchor())
+            defer { Task { await self.cursorOverlay.sleep() } }
             let planner = LLMComputerControlPlanner()
             var history: [String] = []
             var successes = 0
@@ -2553,9 +2816,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     do {
                         let plan = try self.computerControl.planFromActionScript(script)
                         self.barState.contextStatus = "Step \(step): \(plan.summary)"
-                        _ = try await self.computerControl.execute(plan) { [weak self] desc in
-                            self?.barState.contextStatus = "Step \(step): \(desc)"
-                        }
+                        _ = try await self.computerControl.execute(
+                            plan,
+                            onStep: { [weak self] desc in
+                                self?.barState.contextStatus = "Step \(step): \(desc)"
+                            },
+                            onActionStart: { [weak self] action in
+                                // Narrate the live step in the bar's visible response area.
+                                self?.barState.responseText = action.narration
+                                self?.barState.contextStatus = action.narration
+                                await self?.animateCursor(for: action)
+                            }
+                        )
                         AgentDebugLog.log("step \(step): ran OK — \(plan.summary)")
                         history.append("Step \(step): \(plan.summary) — done")
                         successes += 1
@@ -2600,6 +2872,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return parts.joined(separator: " — ")
     }
 
+    /// The menu-bar icon's center in global AppKit coordinates — where the visual cursor emerges
+    /// from and returns to. Falls back to the top-right of the main screen before the status item
+    /// has a backing window.
+    private func menuBarCursorAnchor() -> CGPoint {
+        if let window = statusItem?.button?.window {
+            let f = window.frame
+            return CGPoint(x: f.midX, y: f.minY)
+        }
+        let screen = NSScreen.main?.frame ?? .zero
+        return CGPoint(x: screen.maxX - 24, y: screen.maxY - 12)
+    }
+
+    /// Drive the visual cursor for one action about to fire: glide to its target, and pulse a click
+    /// ripple for click-type actions. Awaited before the real event so the cursor lands on time.
+    private func animateCursor(for action: ComputerControlCapability.Action) async {
+        guard let point = action.targetPoint else { return }
+        await cursorOverlay.move(toGlobalCG: point)
+        switch action {
+        case .click, .doubleClick, .clickElement:
+            await cursorOverlay.tap()
+        default:
+            break
+        }
+    }
+
+
     private func handleComputerControl(plan: ComputerControlCapability.Plan, originalQuery: String, targetBundleId: String? = nil) {
         guard computerControl.hasAccessibilityPermission else {
             computerControl.requestAccessibilityPermission()
@@ -2615,6 +2913,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.barState.isProcessing = false }
+            await self.cursorOverlay.wake(from: self.menuBarCursorAnchor())
+            defer { Task { await self.cursorOverlay.sleep() } }
             do {
                 // Bring the target app to the front (post-confirm) so clicks and typing land there
                 // rather than on Alfred's bar.
@@ -2623,9 +2923,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     app.activate()
                     try? await Task.sleep(nanoseconds: 250_000_000)
                 }
-                let message = try await self.computerControl.execute(plan) { [weak self] step in
-                    self?.barState.contextStatus = "Computer control: \(step)"
-                }
+                let message = try await self.computerControl.execute(
+                    plan,
+                    onStep: { [weak self] step in
+                        self?.barState.contextStatus = "Computer control: \(step)"
+                    },
+                    onActionStart: { [weak self] action in
+                        // Narrate the live step in the bar's visible response area.
+                        self?.barState.responseText = action.narration
+                        self?.barState.contextStatus = action.narration
+                        await self?.animateCursor(for: action)
+                    }
+                )
                 self.barState.responseText = message
                 self.barState.contextStatus = message
                 await CapabilityEventLogger.shared.record("computer control", "completed")

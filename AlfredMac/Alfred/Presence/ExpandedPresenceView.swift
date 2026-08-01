@@ -250,12 +250,14 @@ struct ExpandedPresenceView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { didCopy = false }
     }
 
+    // Built once and reused; linkified() runs per streamed token as the answer grows.
+    private static let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+
     /// Detects URLs in the response and makes them clickable links (open in the default browser).
     static func linkified(_ text: String) -> AttributedString {
         var result = AttributedString(text)
         let nsText = text as NSString
-        guard nsText.length > 0,
-              let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+        guard nsText.length > 0, let detector = linkDetector
         else { return result }
         let matches = detector.matches(in: text, options: [], range: NSRange(location: 0, length: nsText.length))
         for match in matches {
@@ -296,10 +298,10 @@ struct ExpandedPresenceView: View {
         return "sparkle"
     }
 
-    private static var logoImage: NSImage? {
+    private static let logoImage: NSImage? = {
         guard let url = Bundle.main.url(forResource: "alfred-small-logo", withExtension: "png") else {
             return nil
         }
         return NSImage(contentsOf: url)
-    }
+    }()
 }

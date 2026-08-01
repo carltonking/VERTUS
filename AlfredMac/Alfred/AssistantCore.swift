@@ -21,6 +21,19 @@ actor AssistantCore {
     // default options is thread-safe, and we never mutate its formatOptions here.
     nonisolated(unsafe) private static let iso8601 = ISO8601DateFormatter()
 
+    /// Human-readable date+time in the user's LOCAL timezone, for telling the model "now". We used to
+    /// hand the model an ISO8601 string, but ISO8601DateFormatter defaults to UTC — so Alfred reported
+    /// the wrong day/time (e.g. 01:10 the next morning instead of 21:10 the evening before). This uses
+    /// the machine's real local clock, 24-hour, with weekday and zone so the model can't misread it.
+    private static func localNowString() -> String {
+        let f = DateFormatter()
+        f.calendar = Calendar.current
+        f.locale = Locale.current
+        f.timeZone = TimeZone.current
+        f.dateFormat = "EEEE, MMMM d, yyyy 'at' HH:mm zzz"
+        return f.string(from: Date())
+    }
+
     private let router: LLMRouter
     private let memory: MemoryStore
     private let screen = ScreenCapability()
@@ -56,6 +69,9 @@ actor AssistantCore {
     private let contextCompiler: ContextCompiler?
     private let actionSelectionEngine: ActionSelectionEngine?
     private let taskDashboardService: TaskDashboardService?
+    /// Owner Configuration (OCS). nil = the feature flag is off, so the legacy `AssistantPersona`
+    /// path is used and behaviour is unchanged. AlfredApp injects the store only when enabled.
+    private let ownerConfig: OwnerConfigStore?
 
     init(
         router: LLMRouter,
@@ -72,7 +88,8 @@ actor AssistantCore {
         rewardEngine: RewardEngine? = nil,
         contextCompiler: ContextCompiler? = nil,
         actionSelectionEngine: ActionSelectionEngine? = nil,
-        taskDashboardService: TaskDashboardService? = nil
+        taskDashboardService: TaskDashboardService? = nil,
+        ownerConfig: OwnerConfigStore? = nil
     ) {
         self.router = router
         self.memory = memory
@@ -89,6 +106,53 @@ actor AssistantCore {
         self.contextCompiler = contextCompiler
         self.actionSelectionEngine = actionSelectionEngine
         self.taskDashboardService = taskDashboardService
+        self.ownerConfig = ownerConfig
+    }
+
+    // MARK: - Persona
+
+    /// The opening of every system prompt.
+    ///
+    /// With Owner Configuration active this is `PersonaTemplate.render` — invariant instructions
+    /// followed immediately by the AUTHORED owner block, so configuration sits above every learned
+    /// block appended later in `buildSystem`. Without it, the legacy persona is returned unchanged.
+    private func personaIntro(ownerName: String, currentDate: String) -> String {
+        guard let snapshot = ownerConfig?.currentSnapshot() else {
+            return AssistantPersona.systemIntro(ownerName: ownerName, currentDate: currentDate)
+        }
+        return PersonaTemplate.render(snapshot: snapshot, currentDate: currentDate)
+    }
+
+    /// The system prompt for a plain conversation surface — the Chat window — which carries its own
+    /// transcript and so needs persona and personalization but NOT the per-query capability blocks
+    /// (web/shell/file/action) that `process` assembles.
+    ///
+    /// Exists because the Chat window previously called `LLMRouter.stream(system: "")` directly and
+    /// was therefore the one surface with no persona, no owner name, no profile, and no memory.
+    /// Retrieval is best-effort: a memory-store failure degrades to persona-only rather than
+    /// throwing, so the chat surface never breaks on a personalization fault.
+    func conversationalSystem(ownerName: String, query: String) -> String {
+        let memories = (try? relevantMemories(for: query)) ?? []
+        let personal = personalContextService?.personalContext()
+        let project = projectAwareness?.currentProject()?.displayName
+        let relationship = relationshipMemoryService?.promptInjection(activeProject: project) ?? ""
+        let reflection = memoryReflectionService?.promptInjection(activeProject: project) ?? ""
+        let unified = contextCompiler?.generateUnifiedContext(query: query)
+
+        // `recentHistory` is deliberately empty: the Chat window sends its own full transcript as
+        // `messages`, so injecting MemoryStore history too would double the conversation.
+        return buildSystem(
+            ownerName: ownerName,
+            memories: memories,
+            webResult: nil,
+            shellResult: nil,
+            selectedFileContentIncluded: false,
+            selectedFolderContentIncluded: false,
+            personalContext: personal,
+            relationshipMemory: relationship,
+            reflectionMemory: reflection,
+            unifiedContext: unified
+        )
     }
 
     func processWorkflow(
@@ -302,9 +366,12 @@ actor AssistantCore {
             return quickResponse
         }
 
+        // Lowercase once and reuse across the pre-LLM detectors below and QueryIntent further down.
+        let lowered = query.lowercased()
+
         // Messages read — needs async to request Contacts access (for name resolution) before the
         // synchronous chat.db read. Handled before the LLM.
-        if MessagesReadCapability.detect(query.lowercased()) {
+        if MessagesReadCapability.detect(lowered) {
             await MessagesReadCapability.ensureContactsAccess()
             let result = MessagesReadCapability.recent()
             onToken(result)
@@ -315,7 +382,7 @@ actor AssistantCore {
         // Handled before the LLM so the model can't invent a fake result. Only fires when the user
         // has set Spotify credentials; otherwise QuickCommands already returned the setup message.
         if SpotifyCapability.hasCredentials,
-           SpotifyCapability.detect(query.lowercased()) == .searchUnsupported {
+           SpotifyCapability.detect(lowered) == .searchUnsupported {
             let result = await SpotifyCapability.searchAndPlay(query: query)
             onToken(result)
             return result
@@ -390,7 +457,6 @@ actor AssistantCore {
             return result
         }
 
-        let lowered = query.lowercased()
         let intent = QueryIntent.analyze(query)
         let rememberedAccess = SecurityScopedResourceAccess(urls: selectedFiles.securityScopedURLs)
         defer { rememberedAccess.stop() }
@@ -427,11 +493,17 @@ actor AssistantCore {
             return message
         }
 
+        // Smart routing (opt-in): pick the best model for THIS prompt on-device. nil = keep the
+        // user's selected provider. Kept on the stack and passed explicitly so it never mutates the
+        // shared activeProvider (safe under actor reentrancy + concurrent bar/telegram/routine runs).
+        let llmOverride = router.overrideProvider(for: query)
+        let effectiveProvider = llmOverride ?? router.activeProvider
+
         // 1. Gather context in parallel where independent
         async let memoriesTask = relevantMemories(for: query)
         async let historyTask = conversationHistoryEnabled ? conversationHistory() : ""
-        async let screenContextTask = maybeScreenContext(intent: intent, enabled: screenContextEnabled, supportsVision: router.activeProvider.supportsVision)
-        async let webResultTask  = maybeWebSearch(query: query, intent: intent)
+        async let screenContextTask = maybeScreenContext(intent: intent, enabled: screenContextEnabled, supportsVision: effectiveProvider.supportsVision)
+        async let webResultTask  = maybeWebSearch(query: query, intent: intent, headless: headless)
         async let githubResultTask = maybeGitHub(query: query)
         async let notionResultTask = maybeNotion(query: query)
         async let obsidianResultTask = maybeObsidian(query: query)
@@ -548,11 +620,18 @@ actor AssistantCore {
         ) ?? ""
         let unifiedContext = contextCompiler?.generateUnifiedContext(query: query)
 
-        // 2a. Action selection — auto-execute high-confidence actions before LLM (interactive only)
-        if !headless, let ctx = unifiedContext, let engine = actionSelectionEngine {
-            let selection = engine.selectBestAction(query: query, context: ctx)
+        // 2a. Action selection — computed once and reused by both the auto-execute gate below and the
+        // suggested-actions block, instead of running selectBestAction twice per interactive query.
+        // selectBestAction is deterministic for a fixed (query, context), so the result is identical.
+        let actionSelection: ActionSelectionEngine.SelectionResult? = {
+            guard let ctx = unifiedContext, let engine = actionSelectionEngine else { return nil }
+            return engine.selectBestAction(query: query, context: ctx)
+        }()
+
+        // Auto-execute high-confidence actions before the LLM (interactive only).
+        if !headless, let selection = actionSelection {
             if selection.top.confidenceScore > 0.85 {
-                if let autoResult = try await autoExecuteAction(selection.top, query: query, lowered: lowered) {
+                if let autoResult = try await autoExecuteAction(selection.top, query: query, lowered: lowered, shellCommand: intent.shellCommand) {
                     onToken(autoResult)
                     Task {
                         await self.postProcess(
@@ -571,7 +650,7 @@ actor AssistantCore {
         }
 
         // 2b. Build system prompt with suggested actions
-        let actionSuggestionBlock = buildActionSuggestionBlock(query: query, context: unifiedContext)
+        let actionSuggestionBlock = buildActionSuggestionBlock(selection: actionSelection)
         let system = buildSystem(
             ownerName: ownerName,
             memories: memories,
@@ -645,6 +724,7 @@ actor AssistantCore {
             // (tool call, or the empty-response retry below) — so plain questions now run tool-free
             // and as fast as the headless bot path, while "open X" still gets the tool.
             tools: (headless || suppressTools || intent.appControlQuery == nil) ? nil : [LLMTool.openApplication.payload],
+            provider: llmOverride,
             executeToolCall: { @Sendable name, args in
                 await AppControlCapability.executeToolCall(toolName: name, argumentsJSON: args)
             },
@@ -656,7 +736,7 @@ actor AssistantCore {
         // answer"), retry once as a plain text completion (no tools) so the user always gets a real
         // reply. The recent conversation is in `system`, so the model can still resolve the "yes".
         if fullResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            fullResponse = try await router.stream(messages: messages, system: system, onToken: onToken)
+            fullResponse = try await router.stream(messages: messages, system: system, provider: llmOverride, onToken: onToken)
         }
 
         // 5. Post-processing (fire-and-forget; don't block the return)
@@ -681,7 +761,7 @@ actor AssistantCore {
         contextBlocks: [String],
         ownerName: String
     ) async throws -> String {
-        let now = Self.iso8601.string(from: Date())
+        let now = Self.localNowString()
         let context = contextBlocks.isEmpty ? "No additional context was available." : contextBlocks.joined(separator: "\n\n")
         let content = try await router.complete(
             messages: [.user("""
@@ -696,7 +776,7 @@ actor AssistantCore {
 
                 Return only the requested content. Do not include save confirmations or implementation notes.
                 """)],
-            system: AssistantPersona.systemIntro(ownerName: ownerName, currentDate: now)
+            system: personaIntro(ownerName: ownerName, currentDate: now)
         )
         return stripWrappingCodeFence(from: content)
     }
@@ -739,7 +819,7 @@ actor AssistantCore {
             return "Show the event details on your screen, then ask again."
         }
 
-        let now = Self.iso8601.string(from: Date())
+        let now = Self.localNowString()
 
         let extractionPrompt = """
             Extract event details from any event information visible in the image.
@@ -840,9 +920,56 @@ actor AssistantCore {
         return "\(header)\n\(capture.text)"
     }
 
-    private func maybeWebSearch(query: String, intent: QueryIntent) async throws -> String? {
+    private func maybeWebSearch(query: String, intent: QueryIntent, headless: Bool) async throws -> String? {
         guard intent.wantsWebSearch else { return nil }
-        return try await web.search(query: query)
+        // A search engine returns NOTHING for a long instruction/prompt, so derive concise search
+        // terms first — this was the #1 reason briefings came back empty. Routines get several
+        // targeted queries for real coverage; interactive gets one to stay fast.
+        let queries = await deriveSearchQueries(from: query, count: headless ? 3 : 1)
+        let timeout: TimeInterval = headless ? 12 : 6
+        let web = self.web
+        // Run the searches CONCURRENTLY so N queries cost ~one search's time, not N×.
+        let ordered: [String] = await withTaskGroup(of: (Int, String?).self) { group in
+            for (i, q) in queries.enumerated() {
+                group.addTask {
+                    var r = try? await web.search(query: q, timeout: timeout)
+                    if r == nil { r = try? await web.search(query: q, timeout: timeout) }   // one retry
+                    if let r, !r.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        return (i, "Results for \"\(q)\":\n\(r)")
+                    }
+                    return (i, nil)
+                }
+            }
+            var acc: [(Int, String)] = []
+            for await (i, s) in group { if let s { acc.append((i, s)) } }
+            return acc.sorted { $0.0 < $1.0 }.map(\.1)
+        }
+        return ordered.isEmpty ? nil : ordered.joined(separator: "\n\n")
+    }
+
+    /// Turns a long instruction/prompt into concise web-search queries. Short inputs pass through;
+    /// long ones are condensed by the model (cheap, and the difference between real results and
+    /// nothing — engines return zero for a 180-word query). Returns 1…count queries.
+    private func deriveSearchQueries(from prompt: String, count: Int) async -> [String] {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.count <= 120 { return [trimmed] }
+        let ask = """
+            Output \(count) short web-search \(count == 1 ? "query" : "queries") (max 8 words each, \
+            one per line, no numbering, no quotes) that together surface the most relevant RECENT \
+            information to fulfill this request. Return ONLY the \(count == 1 ? "query" : "queries").
+
+            Request: \(trimmed.prefix(1500))
+            """
+        if let out = try? await router.complete(prompt: ask, system: "You write short, effective web-search queries.") {
+            let qs = out.split(separator: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\"", with: "") }
+                .map { $0.replacingOccurrences(of: #"^\s*\d+[.)]\s*"#, with: "", options: .regularExpression) }
+                .filter { !$0.isEmpty && $0.count < 100 }
+            if !qs.isEmpty { return Array(qs.prefix(count)) }
+        }
+        // Fallback: first sentence, capped to ~12 words.
+        let firstSentence = trimmed.split(whereSeparator: { ".!?\n".contains($0) }).first.map(String.init) ?? trimmed
+        return [firstSentence.split(separator: " ").prefix(12).joined(separator: " ")]
     }
 
     /// Pulls GitHub context (PRs, issues, notifications, profile) when the user mentions GitHub.
@@ -873,7 +1000,8 @@ actor AssistantCore {
 
     /// Fetches unread inbox messages when the user asks about email, so the model can summarize
     /// real mail instead of saying it lacks access. Read-only — runs in interactive + headless
-    /// (routine) paths. Needs Automation permission for Mail (prompted on first use).
+    /// (routine) paths. Reads Mail's local Envelope Index directly (needs Full Disk Access) and never
+    /// launches Mail.app.
     private func maybeEmailSummary(query: String) async -> String? {
         let q = query.lowercased()
         let triggers = ["summarize my email", "summarise my email", "summary of my email",
@@ -951,7 +1079,7 @@ actor AssistantCore {
         lowered: String,
         memoryExtractionEnabled: Bool
     ) async throws -> String {
-        let now = Self.iso8601.string(from: Date())
+        let now = Self.localNowString()
         let content = try await router.complete(
             messages: [.user("""
                 Create the exact file contents requested by the user.
@@ -965,7 +1093,7 @@ actor AssistantCore {
                 Output only the file contents. Do not include explanations, markdown fences, save confirmations, or surrounding commentary.
                 """)],
             system: """
-                \(AssistantPersona.systemIntro(ownerName: ownerName, currentDate: now))
+                \(personaIntro(ownerName: ownerName, currentDate: now))
 
                 You are generating content for a local .\(request.fileExtension) document that Alfred will save through a user-approved macOS save panel. Return only the document body content.
                 """
@@ -1059,10 +1187,12 @@ actor AssistantCore {
         unifiedContext: UnifiedContext? = nil,
         actionSuggestionBlock: String = ""
     ) -> String {
-        let now = Self.iso8601.string(from: Date())
+        let now = Self.localNowString()
 
         var parts: [String] = []
-        parts.append(AssistantPersona.systemIntro(ownerName: ownerName, currentDate: now))
+        // Slot 1 + 2: invariant instructions, then the AUTHORED owner block. Everything appended
+        // below this line is learned or retrieved context and therefore ranks lower (OCS §10).
+        parts.append(personaIntro(ownerName: ownerName, currentDate: now))
 
         // Hermes Tier‑1: inject the bounded local profile (USER.md / MEMORY.md) if present.
         let profileBlock = ProfileDigest.injectedSystemText()
@@ -1072,6 +1202,17 @@ actor AssistantCore {
         // High in the prompt so they're followed by default.
         let styleBlock = stylePrefs.systemPromptBlock(ownerName: ownerName)
         if !styleBlock.isEmpty { parts.append(styleBlock) }
+
+        // Learned writing voice — the point of the "digital clone": Alfred should sound like the user,
+        // not like a generic assistant. Empty until enough samples exist, so it self-activates over time.
+        let voiceBlock = writingStyle?.generateStyleContext() ?? ""
+        if !voiceBlock.isEmpty {
+            parts.append("""
+            HOW \(ownerName.uppercased()) WRITES — mirror this so you sound like them (their length, \
+            formality, and phrasing), not like a peppy assistant:
+            \(voiceBlock)
+            """)
+        }
 
         if let personalContext, !personalContext.isEmpty {
             parts.append("PERSONAL CONTEXT:\n\(personalContext)")
@@ -1137,14 +1278,48 @@ actor AssistantCore {
             These abilities depend on the user's macOS Accessibility permissions.
             """)
 
-        return parts.joined(separator: "\n\n")
+        return Self.assembleUnderBudget(parts)
+    }
+
+    /// Hard ceiling on the assembled system prompt.
+    ///
+    /// ~12k chars ≈ 3k tokens. Every block above is individually bounded but NOTHING bounded their
+    /// sum, so on a well-populated profile the prompt could reach five figures of tokens — enough to
+    /// exceed a free tier's per-minute budget in a single turn (Groq's is 12k TPM) and rate-limit
+    /// every provider in the fallback chain at once. Trimming here is strictly better than a chain
+    /// that has nothing left to fall back to.
+    static let systemPromptBudget = 12_000
+
+    /// Joins the prompt blocks, dropping from the END until the result fits `systemPromptBudget`.
+    ///
+    /// Order is significance order: the persona/invariant block is built first and the capability
+    /// notices last, so trimming the tail sheds retrieved and advisory context before it ever
+    /// touches identity or safety instructions. The first block is never dropped — if it alone
+    /// exceeds the budget it is truncated rather than lost, since an empty persona is worse than a
+    /// clipped one.
+    static func assembleUnderBudget(_ parts: [String], budget: Int? = nil) -> String {
+        let limit = budget ?? systemPromptBudget
+        let sep = "\n\n"
+        var kept: [String] = []
+        var total = 0
+
+        for part in parts where !part.isEmpty {
+            let cost = part.count + (kept.isEmpty ? 0 : sep.count)
+            guard total + cost <= limit else { continue }
+            kept.append(part)
+            total += cost
+        }
+
+        if kept.isEmpty, let first = parts.first(where: { !$0.isEmpty }) {
+            return String(first.prefix(limit))
+        }
+        return kept.joined(separator: sep)
     }
 
     // MARK: - Action selection
 
-    private func buildActionSuggestionBlock(query: String, context: UnifiedContext?) -> String {
-        guard let ctx = context, let engine = actionSelectionEngine else { return "" }
-        let result = engine.selectBestAction(query: query, context: ctx)
+    private func buildActionSuggestionBlock(selection: ActionSelectionEngine.SelectionResult?) -> String {
+        guard let result = selection else { return "" }
 
         var lines: [String] = []
         lines.append("SUGGESTED ACTIONS:")
@@ -1165,7 +1340,7 @@ actor AssistantCore {
         return lines.joined(separator: "\n")
     }
 
-    private func autoExecuteAction(_ candidate: ActionCandidate, query: String, lowered: String) async throws -> String? {
+    private func autoExecuteAction(_ candidate: ActionCandidate, query: String, lowered: String, shellCommand: String?) async throws -> String? {
         switch candidate.actionType {
         case "open_application":
             return try await apps.handle(query: query, lowered: lowered)
@@ -1180,8 +1355,8 @@ actor AssistantCore {
             return formatted
 
         case "system_command":
-            guard let intent = QueryIntent.analyze(query).shellCommand else { return nil }
-            let output = try await shell.run(command: intent)
+            guard let shellCommand else { return nil }
+            let output = try await shell.run(command: shellCommand)
             return output
 
         default:

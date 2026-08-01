@@ -9,6 +9,12 @@
     <array>
         <string>/Applications/Alfred.app/Contents/MacOS/Alfred</string>
     </array>
+    <!-- Attributes this background item to Alfred (not the Terminal that loaded it) in macOS
+         Login Items, so the user only has to allow "Alfred" — not "Terminal". -->
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>com.alfred.app</string>
+    </array>
     <key>RunAtLoad</key>
     <true/>
     <!-- Safe now that the menu-bar status item provides Quit (which unloads this agent in

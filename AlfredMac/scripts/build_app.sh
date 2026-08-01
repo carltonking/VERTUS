@@ -82,8 +82,11 @@ if [[ -f "$APP_ICON_SOURCE" ]]; then
 fi
 
 step "Building Swift package"
-swift build -c release --package-path "$REPO_ROOT" --scratch-path "$SCRATCH_PATH"
+# Capture the bin path first (a graph query), then do the actual compile — avoids re-entering
+# SwiftPM a second time purely to read the path after the build. The real build still runs below and
+# the existence check that follows still validates the produced binary.
 BIN_DIR="$(swift build -c release --package-path "$REPO_ROOT" --scratch-path "$SCRATCH_PATH" --show-bin-path)"
+swift build -c release --package-path "$REPO_ROOT" --scratch-path "$SCRATCH_PATH"
 BINARY_PATH="$BIN_DIR/$APP_NAME"
 
 [[ -f "$BINARY_PATH" ]] || die "Binary not found at $BINARY_PATH"
@@ -204,19 +207,23 @@ if [[ "$INSTALL" == true ]]; then
   rm -rf "$INSTALL_PATH"
   cp -R "$APP_BUNDLE" "$INSTALL_PATH"
   ok "Installed $INSTALL_PATH"
+  # Remove the staging copy so it doesn't linger in ~/…/build and show up in Spotlight as a
+  # duplicate "Alfred (build)". The real, launchable app now lives only in /Applications.
+  rm -rf "$APP_BUNDLE"
+  ok "Removed staging bundle (installed copy is the only Alfred.app)"
 fi
 
 echo
-echo "Alfred app bundle is ready:"
-echo "  $APP_BUNDLE"
 if [[ "$INSTALL" == true ]]; then
-  echo "Installed app:"
+  echo "Installed app (the only Alfred.app):"
   echo "  $INSTALL_PATH"
-fi
-echo
-echo "Launch with:"
-if [[ "$INSTALL" == true ]]; then
+  echo
+  echo "Launch with:"
   echo "  open \"$INSTALL_PATH\""
 else
+  echo "Alfred app bundle is ready:"
+  echo "  $APP_BUNDLE"
+  echo
+  echo "Launch with:"
   echo "  open \"$APP_BUNDLE\""
 fi

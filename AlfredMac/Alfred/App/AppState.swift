@@ -25,7 +25,7 @@ enum PrivacyMode: String, CaseIterable, Codable, Equatable {
 
 final class AppState: ObservableObject {
 
-    private static let defaultProviderModels: [String: String] = [
+    static let defaultProviderModels: [String: String] = [
         "local": "alfred",
         "openrouter": "meta-llama/llama-3.3-70b-instruct:free",
         "ollama": "llama3.1:8b",
@@ -62,8 +62,23 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(isOnboardingComplete, forKey: "isOnboardingComplete") }
     }
 
+    /// Owner Configuration System (OCS) master switch. OFF by default: with it off, `ownerName` below
+    /// stays authoritative and the persona renders from `AssistantPersona.systemIntro` exactly as it
+    /// always has, so enabling the subsystem is a deliberate act and turning it back off is a clean
+    /// revert. Restart-required — the service graph reads it once at launch.
+    @Published var ownerConfigEnabled: Bool {
+        didSet { UserDefaults.standard.set(ownerConfigEnabled, forKey: "ownerConfigEnabled") }
+    }
+
     @Published var proactiveSuggestionsEnabled: Bool {
         didSet { UserDefaults.standard.set(proactiveSuggestionsEnabled, forKey: "proactiveSuggestionsEnabled") }
+    }
+
+    /// Opt-in: analyze each prompt ON-DEVICE and delegate it to the best available model — local
+    /// (Ollama) for private prompts, a configured cloud model (Groq/Gemini/OpenRouter) for research,
+    /// recency, or heavy reasoning. Otherwise the selected provider is used as the default/fallback.
+    @Published var smartRoutingEnabled: Bool {
+        didSet { UserDefaults.standard.set(smartRoutingEnabled, forKey: "smartRoutingEnabled") }
     }
 
     @Published var shellExecutionEnabled: Bool {
@@ -172,6 +187,13 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(memoryRetentionDays, forKey: "memoryRetentionDays") }
     }
 
+    /// Retention for captured on-screen text (`screen_text_log`). Separate from, and shorter than,
+    /// `memoryRetentionDays`: screen text is both the highest-volume and the most sensitive thing
+    /// Alfred stores, and its prune was previously never called at all, so the table grew forever.
+    @Published var screenTextRetentionDays: Int {
+        didSet { UserDefaults.standard.set(screenTextRetentionDays, forKey: "screenTextRetentionDays") }
+    }
+
     @Published var privacyMode: PrivacyMode {
         didSet { UserDefaults.standard.set(privacyMode.rawValue, forKey: "privacyMode") }
     }
@@ -232,7 +254,10 @@ final class AppState: ObservableObject {
         selectedModel = removedProviders.contains(rawProvider) ? "alfred" : savedModel
         ownerName = UserDefaults.standard.string(forKey: "ownerName") ?? ""
         isOnboardingComplete = UserDefaults.standard.bool(forKey: "isOnboardingComplete")
+        // Default false — preserves the existing persona/ownerName behaviour until explicitly enabled.
+        ownerConfigEnabled = UserDefaults.standard.object(forKey: "ownerConfigEnabled") as? Bool ?? false
         proactiveSuggestionsEnabled = UserDefaults.standard.object(forKey: "proactiveSuggestionsEnabled") as? Bool ?? false
+        smartRoutingEnabled = UserDefaults.standard.object(forKey: "smartRoutingEnabled") as? Bool ?? false
         shellExecutionEnabled = UserDefaults.standard.object(forKey: "shellExecutionEnabled") as? Bool ?? false
         screenContextEnabled = UserDefaults.standard.object(forKey: "screenContextEnabled") as? Bool ?? true
         UserDefaults.standard.removeObject(forKey: "screenMonitoringEnabled")
@@ -253,9 +278,13 @@ final class AppState: ObservableObject {
         screenTextCaptureEnabled = UserDefaults.standard.object(forKey: "screenTextCaptureEnabled") as? Bool ?? true
         focusSensitivity = UserDefaults.standard.string(forKey: "focusSensitivity") ?? "medium"
         computerControlEnabled = UserDefaults.standard.object(forKey: "computerControlEnabled") as? Bool ?? false
-        memoryExtractionEnabled = UserDefaults.standard.object(forKey: "memoryExtractionEnabled") as? Bool ?? false
+        // Default ON: `RELEVANT MEMORIES:` retrieval runs on every turn regardless, so with this off
+        // the assistant was searching a permanently empty table and could never remember anything
+        // across sessions. Settings still exposes the toggle and a delete-everything control.
+        memoryExtractionEnabled = UserDefaults.standard.object(forKey: "memoryExtractionEnabled") as? Bool ?? true
         conversationHistoryEnabled = UserDefaults.standard.object(forKey: "conversationHistoryEnabled") as? Bool ?? true
         memoryRetentionDays = UserDefaults.standard.object(forKey: "memoryRetentionDays") as? Int ?? 90
+        screenTextRetentionDays = UserDefaults.standard.object(forKey: "screenTextRetentionDays") as? Int ?? 30
         privacyMode = PrivacyMode(rawValue: UserDefaults.standard.string(forKey: "privacyMode") ?? "") ?? .standard
         cloudDisabled = UserDefaults.standard.object(forKey: "cloudDisabled") as? Bool ?? false
         behavioralLearningEnabled = UserDefaults.standard.object(forKey: "behavioralLearningEnabled") as? Bool ?? false
@@ -264,6 +293,9 @@ final class AppState: ObservableObject {
         backupMaxCount = UserDefaults.standard.object(forKey: "backupMaxBackupCount") as? Int ?? 10
         backupEncryptDefault = UserDefaults.standard.object(forKey: "backupEncryptByDefault") as? Bool ?? false
         backupAutoEnabled = UserDefaults.standard.object(forKey: "autoBackupEnabled") as? Bool ?? true
+        // Rewrite stale keychain ACLs from the current stable-signed binary BEFORE the first read,
+        // so this launch (and every later one) reads API keys without the Mac-password prompt.
+        Keychain.repairAccessControlOnce()
         apiKey = Keychain.load(key: "alfred.apiKey") ?? ""
     }
 }
@@ -306,5 +338,59 @@ enum Keychain {
             kSecAttrService: "com.alfred.app",
         ]
         SecItemDelete(query as CFDictionary)
+    }
+
+    /// One-time repair for the "keychain wants your Mac password on every launch" prompt.
+    ///
+    /// Older Alfred builds were ad-hoc signed, so each stored item's access-control list (ACL) got
+    /// pinned to that build's code-hash. Now that the app is signed with the stable "Alfred Local
+    /// Signing" certificate, the hash differs, so macOS treats every read as an untrusted access and
+    /// prompts. Re-adding each item from THIS stable-signed process rewrites its ACL to trust the
+    /// stable certificate (which is constant across rebuilds), after which reads are silent forever.
+    ///
+    /// Runs once, guarded by a versioned flag. One enumerate pass covers every helper because they
+    /// all store under the same `com.alfred.app` service (Keychain, KeychainHelper, BackupKeychainHelper).
+    /// The migration read itself may raise the "Allow" dialog once per still-stale item; after that,
+    /// no prompts. If the signing cert is ever regenerated, bump the flag suffix to re-run.
+    static func repairAccessControlOnce() {
+        let flag = "keychainACLRepaired.v1"
+        guard !UserDefaults.standard.bool(forKey: flag) else { return }
+        defer { UserDefaults.standard.set(true, forKey: flag) }
+
+        // Enumerate accounts under our service WITHOUT reading data (attribute reads don't hit the ACL).
+        let listQuery: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: "com.alfred.app",
+            kSecReturnAttributes: true,
+            kSecMatchLimit: kSecMatchLimitAll,
+        ]
+        var out: AnyObject?
+        guard SecItemCopyMatching(listQuery as CFDictionary, &out) == errSecSuccess,
+              let items = out as? [[CFString: Any]] else { return }
+
+        for item in items {
+            guard let account = item[kSecAttrAccount] as? String else { continue }
+            // Read the value (may prompt once if this item is still pinned to a stale code-hash)…
+            let readQuery: [CFString: Any] = [
+                kSecClass: kSecClassGenericPassword,
+                kSecAttrService: "com.alfred.app",
+                kSecAttrAccount: account,
+                kSecReturnData: true,
+                kSecMatchLimit: kSecMatchLimitOne,
+            ]
+            var data: AnyObject?
+            guard SecItemCopyMatching(readQuery as CFDictionary, &data) == errSecSuccess,
+                  let value = data as? Data else { continue }
+            // …then delete + re-add so the fresh ACL trusts the current stable-signed binary.
+            let base: [CFString: Any] = [
+                kSecClass: kSecClassGenericPassword,
+                kSecAttrService: "com.alfred.app",
+                kSecAttrAccount: account,
+            ]
+            SecItemDelete(base as CFDictionary)
+            var add = base
+            add[kSecValueData] = value
+            SecItemAdd(add as CFDictionary, nil)
+        }
     }
 }

@@ -30,11 +30,10 @@ struct AlfredPanelView: View {
     @State private var tab: Tab = .routines
     @State private var routines: [RoutineRecord] = []
     @State private var showingAdd = false
+    @State private var editingRoutine: RoutineRecord?
     /// Routine ids with a run in flight (shows a spinner instead of last status).
     @State private var runningIDs: Set<Int64> = []
     /// The routine whose output dropdown is expanded, plus its cached run history.
-    @State private var expandedID: Int64?
-    @State private var routineRuns: [Int64: [RunRecord]] = [:]
     /// Telegram bot token entry (write-only: we never read the secret back into the field, so the
     /// Keychain isn't touched during rendering). Saved via KeychainHelper so Alfred owns the item.
     @State private var telegramTokenInput = ""
@@ -47,6 +46,9 @@ struct AlfredPanelView: View {
     /// "googlemaps"). Only needed when travel mode = transit.
     @State private var mapsKeyInput = ""
     @State private var mapsKeyJustSaved = false
+
+    @State private var braveKeyInput = ""
+    @State private var braveKeyJustSaved = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -78,15 +80,17 @@ struct AlfredPanelView: View {
         .onAppear { if let s = syllabusService, s.phase != .list { tab = .school } } // resume an in-progress import
         .onChange(of: tab) { _, _ in reload() }
         .onReceive(NotificationCenter.default.publisher(for: .alfredRoutineRunDidFinish)) { note in
-            // A run (manual, scheduled, or API) finished — refresh rows + the open dropdown live.
+            // A run (manual, scheduled, or API) finished — clear its spinner and refresh row status.
             if let id = note.object as? Int64 {
                 runningIDs.remove(id)
-                if expandedID == id { routineRuns[id] = store.runsForRoutine(id: id) }
             }
             reload()
         }
         .sheet(isPresented: $showingAdd) {
             AddRoutineSheet(store: store) { reload() }
+        }
+        .sheet(item: $editingRoutine) { routine in
+            AddRoutineSheet(store: store, existing: routine) { reload() }
         }
     }
 
@@ -127,6 +131,10 @@ struct AlfredPanelView: View {
     private var settingsContent: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
+                OwnerConfigStatusView(appState: appState)
+
+                Divider()
+
                 Toggle(isOn: $appState.computerControlEnabled) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Computer control").font(.system(size: 13, weight: .semibold))
@@ -208,10 +216,38 @@ struct AlfredPanelView: View {
             } else {
                 providerKeyField
             }
+
+            fallbackChainNote
+
+            Divider().padding(.vertical, 2)
+
+            Toggle(isOn: $appState.smartRoutingEnabled) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Smart routing (auto-pick best model)").font(.system(size: 12, weight: .semibold))
+                    Text("Analyzes each prompt on-device and delegates it: Ollama (local) for private prompts, a configured cloud model (Groq/Gemini) for research, recency, or heavy reasoning. Otherwise uses the provider above. Set a cloud key so the cloud half works.")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .toggleStyle(.switch)
         }
         .onChange(of: appState.selectedProvider) { _, _ in
             providerKeyInput = ""; providerKeyJustSaved = false
         }
+    }
+
+    /// Shows the automatic fallback order so a silent provider switch never looks like a bug. Save a key
+    /// for more than one provider and Alfred drains them in this order as each free tier runs out.
+    private var fallbackChainNote: some View {
+        let chain = LLMRouter.chainIDs(primary: appState.selectedProvider)
+            .map { id in Self.providerChoices.first { $0.id == id }?.label ?? id }
+            .joined(separator: " → ")
+        return Label(
+            "Auto-fallback: \(chain). If one is rate-limited or its key dies, Alfred retries the next one — no interruption. Add keys for more providers to make the chain longer.",
+            systemImage: "arrow.triangle.branch"
+        )
+        .font(.system(size: 10)).foregroundStyle(.secondary).labelStyle(.titleAndIcon)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var providerKeyField: some View {
@@ -273,10 +309,6 @@ struct AlfredPanelView: View {
                 .foregroundStyle(.secondary)
                 .kerning(0.5)
 
-            imessageBotGroup
-
-            Divider()
-
             telegramBotGroup
 
             Divider()
@@ -294,7 +326,44 @@ struct AlfredPanelView: View {
             Divider()
 
             voiceLearningGroup
+
+            Divider()
+
+            webSearchGroup
         }
+    }
+
+    private var webSearchGroup: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Web search (optional Tavily key)").font(.system(size: 11, weight: .semibold))
+            Text("Alfred searches with keyless DuckDuckGo for free — no key needed. For more reliable results in routines, add a Tavily key: free, 1,000 searches/month, NO credit card. (Brave also works but now needs a paid plan.)")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            SecureField("tavily api key (optional)", text: $braveKeyInput)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, design: .monospaced))
+                .onChange(of: braveKeyInput) { _, _ in braveKeyJustSaved = false }
+            HStack(spacing: 8) {
+                Button("Save key") { saveBraveKey() }
+                    .controlSize(.small)
+                    .disabled(braveKeyInput.trimmingCharacters(in: .whitespaces).isEmpty)
+                if braveKeyJustSaved {
+                    Label("Saved", systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 11)).foregroundStyle(.green).labelStyle(.titleAndIcon)
+                }
+                if let url = URL(string: "https://app.tavily.com") {
+                    Link("Get free key ↗", destination: url).font(.system(size: 11))
+                }
+            }
+        }
+    }
+
+    private func saveBraveKey() {
+        let key = braveKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+        _ = KeychainHelper.save(service: "com.alfred.app", account: "tavily", value: key)
+        braveKeyInput = ""
+        braveKeyJustSaved = true
     }
 
     private var departureRemindersGroup: some View {
@@ -356,23 +425,6 @@ struct AlfredPanelView: View {
         _ = KeychainHelper.save(service: "com.alfred.app", account: "googlemaps", value: key)
         mapsKeyInput = ""
         mapsKeyJustSaved = true
-    }
-
-    private var imessageBotGroup: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Toggle(isOn: $appState.imessageBotEnabled) {
-                settingLabel("iMessage bot",
-                             "Text Alfred from your phone in your own iMessage thread. Needs Full Disk Access + Automation for Messages.")
-            }
-            .toggleStyle(.switch)
-
-            if appState.imessageBotEnabled {
-                VStack(alignment: .leading, spacing: 8) {
-                    labeledField("Trigger word", "alfred", text: $appState.imessageBotTrigger)
-                    labeledField("Your iMessage handle", "+1… or you@icloud.com", text: $appState.imessageBotOwnerHandle)
-                }
-            }
-        }
     }
 
     private var telegramBotGroup: some View {
@@ -487,7 +539,6 @@ struct AlfredPanelView: View {
 
     private func routineRow(_ routine: RoutineRecord) -> some View {
         let isRunning = routine.id.map { runningIDs.contains($0) } ?? false
-        let isExpanded = routine.id != nil && expandedID == routine.id
         return VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(routine.title.isEmpty ? "Untitled" : routine.title)
@@ -504,75 +555,52 @@ struct AlfredPanelView: View {
             HStack(spacing: 8) {
                 Label(triggerLabel(routine), systemImage: triggerIcon(routine.trigger_type))
                     .font(.caption2).foregroundStyle(.secondary)
-                if isRunning {
-                    HStack(spacing: 3) {
-                        ProgressView().controlSize(.mini).scaleEffect(0.6)
-                        Text("running…").font(.caption2).foregroundStyle(.secondary)
-                    }
-                } else if let status = routine.last_status {
-                    Text(status).font(.caption2)
-                        .foregroundStyle(status == "success" ? .green : (status == "failed" ? .red : .orange))
-                }
+                statusView(routine, isRunning: isRunning)
                 Spacer()
                 Button { runNow(routine) } label: { Image(systemName: "play.circle") }
                     .buttonStyle(.plain).help("Run now").disabled(isRunning)
-                Button { toggleExpanded(routine) } label: {
-                    Image(systemName: isExpanded ? "chevron.up.circle" : "chevron.down.circle")
-                }
-                .buttonStyle(.plain).help("Show output")
+                Button { editingRoutine = routine } label: { Image(systemName: "pencil") }
+                    .buttonStyle(.plain).help("Edit")
                 Button { delete(routine) } label: { Image(systemName: "trash") }
                     .buttonStyle(.plain).help("Delete")
             }
-            if isExpanded { routineOutput(routine) }
+            if routine.trigger_type == "api", let id = routine.id {
+                HStack(spacing: 4) {
+                    Image(systemName: "link").font(.caption2)
+                    Text("alfred://run?routine=\(id)")
+                        .font(.caption2.monospaced()).textSelection(.enabled)
+                }
+                .foregroundStyle(.secondary)
+            }
         }
         .padding(8)
         .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
     }
 
-    // MARK: - Per-routine output dropdown
-
+    /// Compact one-line status: running / success / error: <reason>.
     @ViewBuilder
-    private func routineOutput(_ routine: RoutineRecord) -> some View {
-        let history = routine.id.map { routineRuns[$0] ?? [] } ?? []
-        Divider().padding(.vertical, 2)
-        if routine.trigger_type == "api", let id = routine.id {
-            HStack(spacing: 4) {
-                Image(systemName: "link").font(.caption2)
-                Text("alfred://run?routine=\(id)")
-                    .font(.caption2.monospaced()).textSelection(.enabled)
+    private func statusView(_ routine: RoutineRecord, isRunning: Bool) -> some View {
+        if isRunning {
+            HStack(spacing: 3) {
+                ProgressView().controlSize(.mini).scaleEffect(0.6)
+                Text("running").font(.caption2).foregroundStyle(.secondary)
             }
-            .foregroundStyle(.secondary)
-        }
-        if history.isEmpty {
-            Text("No runs yet — press play to run it now.")
-                .font(.caption2).foregroundStyle(.secondary)
         } else {
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(history, id: \.id) { run in
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Text(Self.statusGlyph(run.status))
-                                .font(.caption2).foregroundStyle(Self.statusColor(run.status))
-                            Text(Self.timeString(run.started_at))
-                                .font(.caption2).foregroundStyle(.secondary)
-                        }
-                        Text(runText(run))
-                            .font(.caption2).textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(6)
-                    .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 6))
-                }
+            switch routine.last_status {
+            case "success":
+                Text("success").font(.caption2).foregroundStyle(.green)
+            case "failed":
+                Text("error: \(routine.last_output_summary ?? "unknown")")
+                    .font(.caption2).foregroundStyle(.red)
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+            case "awaiting_confirm":
+                Text("awaiting confirmation").font(.caption2).foregroundStyle(.yellow)
+            case .some(let s):
+                Text(s).font(.caption2).foregroundStyle(.secondary)
+            case .none:
+                EmptyView()
             }
         }
-    }
-
-    private func runText(_ run: RunRecord) -> String {
-        if let out = run.output_full, !out.isEmpty { return out }
-        if let s = run.output_summary, !s.isEmpty { return s }
-        if let e = run.error_text, !e.isEmpty { return e }
-        return "(no output)"
     }
 
     private func triggerIcon(_ trigger: String) -> String {
@@ -591,23 +619,11 @@ struct AlfredPanelView: View {
         }
     }
 
-    private func toggleExpanded(_ routine: RoutineRecord) {
-        guard let id = routine.id else { return }
-        if expandedID == id {
-            expandedID = nil
-        } else {
-            expandedID = id
-            routineRuns[id] = store.runsForRoutine(id: id)
-        }
-    }
-
-    /// Marks the routine as running, opens its output dropdown, then fires it. The completion
-    /// notification (`.alfredRoutineRunDidFinish`) clears the spinner and refreshes the output.
+    /// Marks the routine as running, then fires it. The completion notification
+    /// (`.alfredRoutineRunDidFinish`) clears the spinner and refreshes the row status.
     private func runNow(_ routine: RoutineRecord) {
         guard let id = routine.id else { return }
         runningIDs.insert(id)
-        expandedID = id
-        routineRuns[id] = store.runsForRoutine(id: id)
         onRunNow(routine)
     }
 
@@ -630,56 +646,54 @@ struct AlfredPanelView: View {
         reload()
     }
 
-    private static func statusGlyph(_ s: String) -> String {
-        switch s {
-        case "success": return "✓"
-        case "failed": return "✗"
-        case "blocked": return "⊘"
-        default: return "…"
-        }
-    }
-
-    private static func statusColor(_ s: String) -> Color {
-        switch s {
-        case "success": return .green
-        case "failed": return .red
-        case "blocked": return .orange
-        default: return .secondary
-        }
-    }
-
-    private static let timeFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "MMM d, h:mm a"
-        return f
-    }()
-
-    private static func timeString(_ epoch: Double) -> String {
-        timeFormatter.string(from: Date(timeIntervalSince1970: epoch))
-    }
 }
 
 private struct AddRoutineSheet: View {
     let store: MemoryStore
+    let existing: RoutineRecord?
     var onSave: () -> Void
     @Environment(\.dismiss) private var dismiss
 
-    @State private var title = ""
-    @State private var prompt = ""
-    @State private var cron = "0 9 * * *"
+    @State private var title: String
+    @State private var prompt: String
+    @State private var cron: String
     @State private var cronError: String?
-    @State private var triggerType = "schedule"
+    @State private var triggerType: String
+
+    /// `existing == nil` → create a new routine; otherwise edit it in place (id/created_at/enabled
+    /// and run history are preserved; only the edited fields change).
+    init(store: MemoryStore, existing: RoutineRecord? = nil, onSave: @escaping () -> Void) {
+        self.store = store
+        self.existing = existing
+        self.onSave = onSave
+        _title = State(initialValue: existing?.title ?? "")
+        _prompt = State(initialValue: existing?.prompt_text ?? "")
+        let existingCron = existing?.schedule_cron ?? ""
+        _cron = State(initialValue: existingCron.isEmpty ? "every day at 09:00" : existingCron)
+        _cronError = State(initialValue: nil)
+        _triggerType = State(initialValue: existing?.trigger_type ?? "schedule")
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("New Routine").font(.title3.bold())
+            Text(existing == nil ? "New Routine" : "Edit Routine").font(.title3.bold())
 
             TextField("Title", text: $title)
                 .textFieldStyle(.roundedBorder)
 
-            TextField("Prompt — what Alfred should do", text: $prompt, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(2...4)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Prompt — what Alfred should do")
+                    .font(.caption).foregroundStyle(.secondary)
+                // TextEditor scrolls internally once the prompt outgrows the fixed height, so long
+                // prompts stay fully viewable/editable instead of being clipped.
+                TextEditor(text: $prompt)
+                    .font(.callout)
+                    .frame(height: 150)
+                    .scrollContentBackground(.hidden)
+                    .padding(6)
+                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
+            }
 
             Picker("Trigger", selection: $triggerType) {
                 Text("Schedule").tag("schedule")
@@ -691,13 +705,17 @@ private struct AddRoutineSheet: View {
 
             if triggerType == "schedule" {
                 VStack(alignment: .leading, spacing: 4) {
-                    TextField("Schedule (cron: min hour dom mon dow)", text: $cron)
+                    TextField("When to run — e.g. “every day at 0600”", text: $cron)
                         .textFieldStyle(.roundedBorder)
+                        .onChange(of: cron) { _, _ in cronError = nil }
                     if let cronError {
                         Text(cronError).font(.caption).foregroundStyle(.red)
+                    } else if let preview = schedulePreview {
+                        Text(preview).font(.caption2).foregroundStyle(.green)
                     }
-                    Text("e.g. \"0 9 * * *\" daily 9am · \"*/30 * * * *\" every 30 min · \"0 8 * * 1\" Mondays 8am")
+                    Text("Plain English works: “every day at 0600”, “weekdays at 8am”, “mondays at 9:30pm”, “every 30 minutes”. Cron (“0 6 * * *”) still works too.")
                         .font(.caption2).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             } else if triggerType == "manual" {
                 Text("Runs only when you press play on the routine.")
@@ -707,7 +725,7 @@ private struct AddRoutineSheet: View {
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
-            Text("Only read-only routines run unattended; anything that writes or sends is blocked and notified.")
+            Text("Read-only routines run automatically. Anything that writes or sends is drafted first, then waits for you to tap “Run now” in a notification.")
                 .font(.caption2).foregroundStyle(.secondary)
 
             HStack {
@@ -722,34 +740,69 @@ private struct AddRoutineSheet: View {
         .frame(width: 380)
     }
 
+    /// Live "what this resolves to" for the schedule field: interprets the text as cron or plain
+    /// English and shows the resulting cron + next fire time, so the user gets instant feedback.
+    private var schedulePreview: String? {
+        let trimmed = cron.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        let expr = CronSchedule(trimmed) != nil ? trimmed : NaturalSchedule.cron(from: trimmed)
+        guard let expr, let sched = CronSchedule(expr) else { return nil }
+        var line = "→ \(expr)"
+        if let next = sched.nextDate(after: Date(), in: .current) {
+            line += " · next \(Self.schedulePreviewFormatter.string(from: next))"
+        }
+        return line
+    }
+
+    private static let schedulePreviewFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "EEE MMM d, h:mm a"
+        return f
+    }()
+
     private func save() {
         let tz = TimeZone.current
         var cronToSave = ""
         var next: Double?
         if triggerType == "schedule" {
-            guard let schedule = CronSchedule(cron) else {
-                cronError = "Invalid cron expression."
+            // Accept raw cron OR plain English ("every day at 0600"). Store the resolved cron so the
+            // scheduler stays cron-based — only the input is natural language.
+            let trimmed = cron.trimmingCharacters(in: .whitespaces)
+            let expr = CronSchedule(trimmed) != nil ? trimmed : (NaturalSchedule.cron(from: trimmed) ?? "")
+            guard let schedule = CronSchedule(expr) else {
+                cronError = "Couldn't read that schedule. Try “every day at 0600” or cron “0 6 * * *”."
                 return
             }
-            cronToSave = cron
+            cronToSave = expr
             next = schedule.nextDate(after: Date(), in: tz)?.timeIntervalSince1970
         }
-        let record = RoutineRecord(
-            id: nil,
-            title: title,
-            prompt_text: prompt,
-            schedule_cron: cronToSave,
-            timezone: tz.identifier,
-            enabled: true,
-            policy_class: "unattended-safe",
-            trigger_type: triggerType,
-            last_run_at: nil,
-            next_run_at: next,
-            last_status: nil,
-            last_output_summary: nil,
-            created_at: Date().timeIntervalSince1970
-        )
-        store.addRoutine(record)
+        if var rec = existing {
+            // Edit in place — preserve id, created_at, enabled, and run history.
+            rec.title = title
+            rec.prompt_text = prompt
+            rec.schedule_cron = cronToSave
+            rec.timezone = tz.identifier
+            rec.trigger_type = triggerType
+            rec.next_run_at = next
+            store.updateRoutine(rec)
+        } else {
+            let record = RoutineRecord(
+                id: nil,
+                title: title,
+                prompt_text: prompt,
+                schedule_cron: cronToSave,
+                timezone: tz.identifier,
+                enabled: true,
+                policy_class: "unattended-safe",
+                trigger_type: triggerType,
+                last_run_at: nil,
+                next_run_at: next,
+                last_status: nil,
+                last_output_summary: nil,
+                created_at: Date().timeIntervalSince1970
+            )
+            store.addRoutine(record)
+        }
         onSave()
         dismiss()
     }

@@ -39,6 +39,11 @@ struct CronSchedule: Equatable {
     func matches(_ date: Date, in timeZone: TimeZone) -> Bool {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = timeZone
+        return matches(date, calendar: cal)
+    }
+
+    /// Same test against a preconfigured calendar, so callers in a loop (nextDate) don't rebuild one.
+    private func matches(_ date: Date, calendar cal: Calendar) -> Bool {
         let c = cal.dateComponents([.minute, .hour, .day, .month, .weekday], from: date)
         guard let minute = c.minute, let hour = c.hour, let day = c.day,
               let month = c.month, let weekday = c.weekday else { return false }
@@ -69,7 +74,7 @@ struct CronSchedule: Equatable {
         let limit = 60 * 24 * 366 * 4 + 60 * 24 * 2
         var step = 0
         while step < limit {
-            if matches(candidate, in: timeZone) { return candidate }
+            if matches(candidate, calendar: cal) { return candidate }
             guard let next = cal.date(byAdding: .minute, value: 1, to: candidate) else { return nil }
             candidate = next
             step += 1

@@ -15,10 +15,16 @@ final class ChatViewModel: ObservableObject {
     private let llmRouter: LLMRouter
     private var saveTask: Task<Void, Never>?
     private let saveURL: URL
-    
-    init(llmRouter: LLMRouter) {
+    /// Builds the persona + personalization system prompt for a turn. Injected rather than
+    /// constructed here so the Chat window shares one prompt builder with the bar instead of
+    /// drifting from it. Nil (no `AssistantCore`) degrades to an unpersonalized chat rather than
+    /// failing — which is exactly what this surface did unconditionally before.
+    private let systemPromptProvider: ((String) async -> String)?
+
+    init(llmRouter: LLMRouter, systemPromptProvider: ((String) async -> String)? = nil) {
         self.llmRouter = llmRouter
-        
+        self.systemPromptProvider = systemPromptProvider
+
         let appSupport = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let folder = appSupport
@@ -66,16 +72,17 @@ final class ChatViewModel: ObservableObject {
         conversations[idx].messages.append(assistantMsg)
         
         let messages = conversations[idx].messages.map(\.llmMessage)
-        
+        let system = await systemPromptProvider?(text) ?? ""
+
         isStreaming = true
         defer { isStreaming = false }
-        
+
         do {
-            _ = try await llmRouter.stream(messages: messages, system: "") { [weak self] token in
+            _ = try await llmRouter.stream(messages: messages, system: system) { [weak self] token in
                 Task { @MainActor in
                     guard let self = self else { return }
                     if let cIdx = self.conversations.firstIndex(where: { $0.id == conversationId }),
-                       let mIdx = self.conversations[cIdx].messages.firstIndex(where: { $0.id == assistantId }) {
+                       let mIdx = self.conversations[cIdx].messages.lastIndex(where: { $0.id == assistantId }) {
                         self.conversations[cIdx].messages[mIdx].content += token
                     }
                 }
@@ -107,12 +114,18 @@ final class ChatViewModel: ObservableObject {
         saveTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard let self = self, !Task.isCancelled else { return }
-            do {
-                let data = try JSONEncoder().encode(self.conversations)
-                try data.write(to: self.saveURL)
-            } catch {
-                print("Failed to save conversations: \(error)")
-            }
+            // Snapshot on the main actor (cheap COW), then encode+write off it so the JSON encode of
+            // every thread's messages doesn't run on the main thread. Conversation is Sendable.
+            let snapshot = self.conversations
+            let url = self.saveURL
+            await Task.detached {
+                do {
+                    let data = try JSONEncoder().encode(snapshot)
+                    try data.write(to: url)
+                } catch {
+                    print("Failed to save conversations: \(error)")
+                }
+            }.value
         }
     }
     

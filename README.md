@@ -34,10 +34,42 @@ Alfred works at zero cost with any of these:
 Get keys at:
 - Gemini: [aistudio.google.com](https://aistudio.google.com)
 - Groq: [console.groq.com](https://console.groq.com)
+- Cerebras: [cloud.cerebras.ai](https://cloud.cerebras.ai)
+- Mistral: [console.mistral.ai](https://console.mistral.ai)
 - OpenRouter: [openrouter.ai](https://openrouter.ai)
 - Ollama: [ollama.com](https://ollama.com)
 
 The current provider router exposes Local, Gemini, Groq, OpenRouter, and Ollama.
+
+## Automatic Model Fallback
+
+Free tiers run out. Alfred never stops on one — every LLM call walks an ordered chain and
+returns the first backend that answers. A provider that fails (rate limit, dead key, 5xx,
+timeout) goes on a short cooldown, so the next request skips straight past it instead of
+paying the same failure again. No switch to flip, nothing to notice.
+
+**On the Mac**, the chain is: your selected provider → every other provider you've saved a key
+for (Groq → Gemini → OpenRouter) → local Ollama, which needs no key at all. Save more than one
+key in Settings and the chain gets longer. Calls carrying an image only fall back to
+vision-capable models, so a screenshot is never handed to a text-only model.
+
+**In the cloud** (`api/`), the chain is configured entirely through environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `GEMINI_API_KEY` | Google Gemini — text, vision, and video (the only one that watches YouTube) |
+| `GROQ_API_KEY` | Groq — text + vision |
+| `CEREBRAS_API_KEY` | Cerebras — text |
+| `OPENROUTER_API_KEY` | OpenRouter — text + vision |
+| `MISTRAL_API_KEY` | Mistral — text + vision |
+| `<NAME>_API_KEY_2` … `_5` | Extra keys for the same provider; comma-separated values work too |
+| `LLM_CHAIN` | Reorder or restrict the chain, e.g. `groq,gemini,cerebras` |
+| `<PROVIDER>_MODEL` | Override one provider's text model, e.g. `GROQ_MODEL=llama-3.1-8b-instant` |
+| `LLM_TIMEOUT_MS` | Per-attempt timeout (default 30000) |
+
+Providers with no key are skipped, so adding a key is the only step to extend the chain.
+Cooldowns are shared across serverless invocations through Upstash KV when it's configured.
+Send `/models` to the Telegram bot to see which backends are up and which are cooling.
 
 ## Quick Start
 

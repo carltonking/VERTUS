@@ -22,6 +22,10 @@ fi
 mkdir -p "$HOME/Library/LaunchAgents"
 mkdir -p "$HOME/.alfred/logs"
 
+# The launchd agent is the ONE source of auto-start. Remove any stray macOS "Open at Login" item so
+# Alfred doesn't get launched twice (two menu-bar icons). Harmless if none exists.
+osascript -e 'tell application "System Events" to delete login item "Alfred"' 2>/dev/null || true
+
 # Stamp the log dir token
 sed -e "s|__LOG_DIR__|$HOME/.alfred/logs|g" \
     "$PLIST_SRC" > "$PLIST_DEST"

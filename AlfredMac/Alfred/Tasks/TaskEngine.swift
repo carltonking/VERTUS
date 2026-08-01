@@ -307,11 +307,23 @@ final class TaskEngine {
 
     func getSnapshot() -> TaskSnapshot {
         let tasks = listTasks()
+        // Fetch all runs once (timestamp desc) and group in memory, capping each task at 100, instead
+        // of one getTaskHistory read per task (N+1). Order + per-task cap match getTaskHistory exactly.
         var runsByTask: [Int64: [TaskRun]] = [:]
         for task in tasks {
-            if let id = task.id {
-                runsByTask[id] = getTaskHistory(taskId: id, limit: 100)
+            if let id = task.id { runsByTask[id] = [] }
+        }
+        do {
+            let records = try db.read { db in
+                try TaskRunRecord.order(Column("timestamp").desc).fetchAll(db)
             }
+            for record in records {
+                guard var runs = runsByTask[record.taskId], runs.count < 100 else { continue }
+                runs.append(TaskRun(record: record))
+                runsByTask[record.taskId] = runs
+            }
+        } catch {
+            logger.error("Failed to fetch task runs for snapshot: \(error.localizedDescription)")
         }
         return TaskSnapshot(tasks: tasks, runsByTask: runsByTask, sequence: getCurrentSequence())
     }
@@ -319,7 +331,8 @@ final class TaskEngine {
     // MARK: - Dashboard hooks
 
     var taskCount: Int {
-        listTasks().count
+        // SELECT COUNT(*) — no row materialization/decode (listTasks() has no filter, so same count).
+        (try? db.read { db in try TaskDefinitionRecord.fetchCount(db) }) ?? 0
     }
 
     func tasksDueForSchedule() -> [TaskDefinition] {

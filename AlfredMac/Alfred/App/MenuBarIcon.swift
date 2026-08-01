@@ -6,9 +6,16 @@ import AppKit
 /// step in decomposing that god object: the drawing holds no app state, so it
 /// lives cleanly on its own and can be unit-tested in isolation.
 enum MenuBarIcon {
+    // The PNG bytes are read/decoded from the bundle once; each make() builds a FRESH NSImage from
+    // them so callers can safely mutate their copy (size, lockFocus badge drawing) — caching the
+    // NSImage itself would share an NSImageRep that badge drawing could corrupt.
+    private static let logoData: Data? = {
+        guard let url = Bundle.main.url(forResource: "alfred-small-logo", withExtension: "png") else { return nil }
+        return try? Data(contentsOf: url)
+    }()
+
     static func make() -> NSImage {
-        if let url = Bundle.main.url(forResource: "alfred-small-logo", withExtension: "png"),
-           let sourceImage = NSImage(contentsOf: url) {
+        if let data = logoData, let sourceImage = NSImage(data: data) {
             sourceImage.size = NSSize(width: 18, height: 18)
             sourceImage.isTemplate = false
             sourceImage.accessibilityDescription = "Alfred"

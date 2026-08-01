@@ -11,14 +11,16 @@ import Foundation
 /// permutations (`P(n,k)` / `P(n k)`) and combinations (`C(n,k)` / `C(n k)`).
 enum MathEvaluator {
 
+    // Rebuilt on every keystroke otherwise; the character set is constant.
+    private static let allowedChars = CharacterSet(charactersIn: "0123456789.+-*/^()!, PCpc \t")
+
     static func evaluate(_ input: String) -> String? {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 2 else { return nil }
         // Must contain a digit, only math characters, and at least one operator/function —
         // so bare words or a lone number don't render a result.
         guard trimmed.rangeOfCharacter(from: .decimalDigits) != nil else { return nil }
-        let allowed = CharacterSet(charactersIn: "0123456789.+-*/^()!, PCpc \t")
-        guard trimmed.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
+        guard trimmed.unicodeScalars.allSatisfy({ Self.allowedChars.contains($0) }) else { return nil }
         let lower = trimmed.lowercased()
         let hasOp = trimmed.dropFirst().rangeOfCharacter(from: CharacterSet(charactersIn: "+-*/^!")) != nil
             || lower.contains("p(") || lower.contains("c(")

@@ -11,6 +11,10 @@ struct RemindersTabView: View {
     @State private var status: EKAuthorizationStatus = EKEventStore.authorizationStatus(for: .reminder)
     @State private var loadError: String?
     @State private var showingAdd = false
+    // Cached grouping — recomputed only when `reminders` changes (in load()), not on every body eval
+    // or unrelated @State change (showingAdd/status/loadError).
+    @State private var dayGroups: [DayGroup] = []
+    @State private var undated: [ReminderItem] = []
 
     private let cal = Calendar.current
 
@@ -138,6 +142,7 @@ struct RemindersTabView: View {
             loadError = error.localizedDescription
         }
         status = EKEventStore.authorizationStatus(for: .reminder)
+        recomputeGroups()
     }
 
     private func toggle(_ r: ReminderItem) {
@@ -155,16 +160,16 @@ struct RemindersTabView: View {
 
     private struct DayGroup { let key: Double; let title: String; let items: [ReminderItem] }
 
+    /// Recompute the grouped/undated caches from `reminders`. Called whenever reminders changes.
     /// Due-dated reminders grouped by day, earliest first; items within a day sorted by time.
-    private var dayGroups: [DayGroup] {
+    private func recomputeGroups() {
         let byDay = Dictionary(grouping: reminders.filter { $0.due != nil }) { cal.startOfDay(for: $0.due!) }
-        return byDay.keys.sorted().map { day in
+        dayGroups = byDay.keys.sorted().map { day in
             let items = (byDay[day] ?? []).sorted { ($0.due ?? .distantFuture) < ($1.due ?? .distantFuture) }
             return DayGroup(key: day.timeIntervalSince1970, title: dayTitle(day), items: items)
         }
+        undated = reminders.filter { $0.due == nil }
     }
-
-    private var undated: [ReminderItem] { reminders.filter { $0.due == nil } }
 
     private func dayTitle(_ day: Date) -> String {
         if cal.isDateInToday(day) { return "Today" }
