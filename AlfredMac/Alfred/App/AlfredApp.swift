@@ -22,6 +22,9 @@ final class BarState: ObservableObject {
     /// Bumped each time the bar is presented so the input field re-grabs focus (so you can type
     /// immediately on ⌘⇧J without clicking the field).
     @Published var focusToken: Int = 0
+    /// Set while Hermes is waiting for the user to approve computer control.
+    /// Rendered in the bar; see ControlConfirmationBroker.
+    @Published var pendingConfirmation: PendingControlConfirmation?
 }
 
 // MARK: - Bridge view
@@ -735,6 +738,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
             .store(in: &cancellables)
+
+        // Confirmations change the bar's height too, and are not covered by the
+        // combineLatest above. Without this the bar stays tall after a
+        // confirmation is answered.
+        barState.$pendingConfirmation
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self, let window = self.barWindow else { return }
+                switch self.barState.presenceState {
+                case .hidden, .collapsed, .listening:
+                    break
+                case .expanded, .thinking, .responding:
+                    window.resizeNotch(toHeight: self.expandedBarHeight(
+                        text: self.barState.responseText,
+                        isProcessing: self.barState.isProcessing,
+                        suggestions: self.barState.suggestions
+                    ))
+                }
+            }
+            .store(in: &cancellables)
     }
 
     private func expandedBarHeight(text: String, isProcessing: Bool, suggestions: [ProactiveSuggestion]) -> CGFloat {
@@ -747,7 +770,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             total += ExpandedPresenceView.suggestionRowHeight
         }
 
-        if isProcessing || hasResponse {
+        // A pending confirmation replaces the response area (see the view's body),
+        // and must be sized for or its buttons render off the bottom of the notch
+        // panel — leaving the user unable to answer a prompt that is blocking an
+        // agent turn.
+        if barState.pendingConfirmation != nil {
+            total += 1 // divider
+            total += ExpandedPresenceView.confirmationScrollHeight
+            total += ExpandedPresenceView.confirmationChromeHeight
+        } else if isProcessing || hasResponse {
             total += 1 // divider
             if hasResponse {
                 total += ExpandedPresenceView.responseHeight(for: text)
@@ -1712,6 +1743,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Fully remove the bar from screen (hotkey-only model). The last response is kept so the
     /// conversation resumes where it left off when the bar is brought back with the shortcut.
+    /// Bring the bar up carrying a computer-control confirmation.
+    ///
+    /// Presented in the bar the user is already looking at rather than as a system
+    /// modal — see ControlConfirmationBroker for why the modal approach was
+    /// abandoned.
+    func presentControlConfirmation(_ request: PendingControlConfirmation) {
+        barState.pendingConfirmation = request
+        // Cancel any in-flight streaming state so the confirmation isn't competing
+        // with a spinner for the same space.
+        barState.isProcessing = false
+        showBar()
+    }
+
+    func dismissControlConfirmation() {
+        barState.pendingConfirmation = nil
+    }
+
     private func hideBar() {
         shownByHover = false
         hideOnLeaveTimer?.invalidate()
@@ -1809,6 +1857,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handlePresenceCollapse() {
+        // Esc while a control confirmation is up means "no". Collapsing the bar
+        // without answering would leave the agent suspended until it timed out,
+        // and would make dismissal look like consent.
+        if barState.pendingConfirmation != nil {
+            ControlConfirmationBroker.shared.resolve(false, source: "escape-key")
+            barState.responseText = "Cancelled."
+            barState.presenceState = .expanded
+            return
+        }
         // During an inbound-reply session, Esc means "just chat instead" (as the prompt promises):
         // drop the reply but keep the bar open in normal chat mode rather than dismissing it.
         if pendingInboundReply != nil {

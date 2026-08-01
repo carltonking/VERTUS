@@ -16,6 +16,7 @@ struct ExpandedPresenceView: View {
     @Binding var responseText: String
     @Binding var isProcessing: Bool
     @Binding var suggestions: [ProactiveSuggestion]
+    @Binding var pendingConfirmation: PendingControlConfirmation?
     let activeProject: String?
     let contextLabel: String
     let contextStatus: String
@@ -37,6 +38,10 @@ struct ExpandedPresenceView: View {
     // 5 lines × 20pt line height + 24pt vertical padding.
     static let maxResponseHeight: CGFloat = 124
     static let suggestionRowHeight: CGFloat = 32
+    /// Scrollable action list inside the confirmation.
+    static let confirmationScrollHeight: CGFloat = 96
+    /// Header + buttons + padding around `confirmationScrollHeight`.
+    static let confirmationChromeHeight: CGFloat = 78
 
     static func responseHeight(for text: String) -> CGFloat {
         guard !text.isEmpty else { return 44 }
@@ -61,7 +66,13 @@ struct ExpandedPresenceView: View {
                     .frame(height: Self.suggestionRowHeight)
             }
 
-            if isProcessing || !responseText.isEmpty {
+            // A pending confirmation outranks everything else in the bar — it is
+            // the only state where Alfred is blocked waiting on the user.
+            if let confirmation = pendingConfirmation {
+                Divider()
+                    .overlay(Color.white.opacity(0.08))
+                confirmationArea(confirmation)
+            } else if isProcessing || !responseText.isEmpty {
                 Divider()
                     .overlay(Color.white.opacity(0.08))
 
@@ -181,6 +192,58 @@ struct ExpandedPresenceView: View {
         .padding(.horizontal, 14)
         .animation(.easeInOut(duration: 0.15), value: inputText.isEmpty)
         .animation(.easeInOut(duration: 0.15), value: isProcessing)
+    }
+
+    // MARK: - Computer-control confirmation
+
+    /// Approval prompt for computer control, drawn in the bar rather than as a
+    /// system modal.
+    ///
+    /// Shows the *resolved actions* — what Alfred parsed and will actually run —
+    /// not the model's raw script, so a mismatch between what was asked for and
+    /// what will happen is visible before approving.
+    ///
+    /// "Don't Run" is the default focus and Esc also denies, so the low-effort
+    /// response is the safe one. Nothing here approves on a timeout; the broker
+    /// denies after 90s.
+    private func confirmationArea(_ confirmation: PendingControlConfirmation) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "hand.raised.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.orange)
+                Text("Alfred wants to control your Mac")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.95))
+            }
+
+            ScrollView {
+                Text(confirmation.summary)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.75))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+            .frame(maxHeight: Self.confirmationScrollHeight)
+
+            HStack(spacing: 8) {
+                Button("Don't Run") {
+                    ControlConfirmationBroker.shared.resolve(false, source: "bar-button-dont-run")
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Button("Run") {
+                    ControlConfirmationBroker.shared.resolve(true, source: "bar-button-run")
+                }
+                .keyboardShortcut(.defaultAction)
+                .tint(.orange)
+
+                Spacer()
+            }
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
     }
 
     // MARK: - Loading row

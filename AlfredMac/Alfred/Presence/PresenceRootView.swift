@@ -34,6 +34,7 @@ struct PresenceRootView: View {
                 responseText: $barState.responseText,
                 isProcessing: $barState.isProcessing,
                 suggestions: $barState.suggestions,
+                pendingConfirmation: $barState.pendingConfirmation,
                 activeProject: activeProject,
                 contextLabel: contextLabel,
                 contextStatus: contextStatus,

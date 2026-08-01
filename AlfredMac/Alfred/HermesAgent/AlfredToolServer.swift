@@ -416,7 +416,10 @@ final class AlfredToolServer {
         // the world. Screen reads run unattended; anything that clicks or types
         // stops here. Without this, an LLM with a tool call can drive the Mac
         // unsupervised, and no blocklist is adequate to that.
-        guard confirmControl(plan: plan) else {
+        //
+        // Drawn in the bar, not as an NSAlert — the modal version auto-approved
+        // itself after a few seconds. See ControlConfirmationBroker.
+        guard await ControlConfirmationBroker.shared.confirm(summary: plan.summary) else {
             throw ToolError.denied
         }
 
@@ -424,36 +427,13 @@ final class AlfredToolServer {
         return "\(result)\n\nActions run:\n\(plan.summary)"
     }
 
-    /// Show the resolved plan and ask.
-    ///
-    /// ⚠️ THIS IS NOT A RELIABLE SAFETY CONTROL — do not treat it as one.
-    ///
-    /// Measured behaviour: when driven from a background MCP call, this alert
-    /// displays (confirmed via `System Events`: a window of description "alert"
-    /// exists) but then dismisses itself after 2-4s and `runModal()` returns
-    /// `alertFirstButtonReturn` (1000) with nobody touching the machine. It
-    /// auto-approves. Something in Alfred's own event handling appears to end the
-    /// modal session; the cause is not yet identified.
-    ///
-    /// It is kept because it makes the action visible to the user, and it does
-    /// honour a real click while it is up. But the gate that actually carries the
-    /// safety weight is `AppState.computerControlEnabled` above. Replacing this
-    /// with a confirm affordance drawn in the bar — which Alfred already knows how
-    /// to present, and which does not depend on AppKit modal sessions — is the
-    /// real fix.
-    @MainActor
-    private static func confirmControl(plan: ComputerControlCapability.Plan) -> Bool {
-        let alert = NSAlert()
-        alert.messageText = "Let Alfred control your Mac?"
-        alert.informativeText = """
-            Alfred wants to run these actions:
-
-            \(plan.summary)
-            """
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Run")
-        alert.addButton(withTitle: "Don't Run")
-        NSApp.activate(ignoringOtherApps: true)
-        return alert.runModal() == .alertFirstButtonReturn
-    }
+    // The NSAlert-based confirmation that used to live here was removed, not
+    // fixed: it displayed and then dismissed itself after 2-4s, returning
+    // `alertFirstButtonReturn` with nobody touching the machine — it
+    // auto-approved. Driving an AppKit modal session from a background MCP call,
+    // inside an `.accessory` app with live event monitors, is not something we
+    // control end to end. ControlConfirmationBroker replaces it with a
+    // continuation-based prompt drawn in the bar, which keeps the main thread
+    // free and can only be resolved by an explicit user action or a
+    // deny-by-default timeout.
 }
