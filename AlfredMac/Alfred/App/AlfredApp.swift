@@ -390,6 +390,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             personalContextService = contextService
             let wss = store.writingStyleStore
             writingStyleStore = wss
+
+            // Give Hermes Alfred's persona and the owner's profile. Without this it
+            // runs on the stock Nous Research persona — a generic assistant that
+            // knows nothing about its owner. Idempotent: writes only on change, and
+            // never overwrites a SOUL.md the user has written themselves.
+            exportPersonaToHermes(writingStyle: wss)
             let ts = store.timelineStore
             appActivityMonitor = AppActivityMonitor(store: ts)
             let relStore = store.relationshipStore
@@ -1743,6 +1749,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Fully remove the bar from screen (hotkey-only model). The last response is kept so the
     /// conversation resumes where it left off when the bar is brought back with the shortcut.
+    /// Write SOUL.md / USER.md into `$HERMES_HOME` so Hermes speaks as Alfred.
+    ///
+    /// Owner facts come from the owner's own configuration via
+    /// `PersonaTemplate.ownerBlock` — never from memory or screen captures, since
+    /// these files are sent to the model provider on every turn.
+    @MainActor
+    private func exportPersonaToHermes(writingStyle: WritingStyleStore?) {
+        let snapshot = ownerConfigStore?.currentSnapshot()
+        // The profile, not generateStyleContext() — the exporter derives an
+        // aggregate-only description from it. See PersonaExporter.styleDescription
+        // for why verbatim excerpts must not go into a file that is uploaded on
+        // every turn.
+        let styleProfile = writingStyle?.getWritingProfile()
+
+        for outcome in PersonaExporter.export(snapshot: snapshot, styleProfile: styleProfile) {
+            switch outcome {
+            case let .written(url):
+                logger.info("Hermes persona written: \(url.lastPathComponent, privacy: .public)")
+            case .unchanged:
+                break
+            case let .skippedUserAuthored(url):
+                // Their file, their call — say so rather than silently doing nothing.
+                logger.info("Left \(url.lastPathComponent, privacy: .public) alone — it looks hand-edited.")
+            case let .failed(url, error):
+                logger.error("Could not write \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
     /// Bring the bar up carrying a computer-control confirmation.
     ///
     /// Presented in the bar the user is already looking at rather than as a system
