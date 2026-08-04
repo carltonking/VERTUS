@@ -1,13 +1,13 @@
 import AppKit
 import SwiftUI
 
-/// Full notch-native bar with input, streaming response, and adaptive suggestions.
+/// Full notch-native bar: input, streaming response, and the computer-control
+/// confirmation. Suggestion chips were removed with Alfred's proactive engine —
+/// Hermes does not emit them.
 ///
 /// Layout (350 px wide):
 /// ┌──────────────────────────────┐
 /// │  [logo]  [  Ask anything…  ] │
-/// │  ─────────────────────────── │
-/// │  ● Suggestion ● Suggestion   │
 /// │  ─────────────────────────── │
 /// │  Response text scrolls here  │
 /// │  ...                        │
@@ -15,14 +15,9 @@ import SwiftUI
 struct ExpandedPresenceView: View {
     @Binding var responseText: String
     @Binding var isProcessing: Bool
-    @Binding var suggestions: [ProactiveSuggestion]
     @Binding var pendingConfirmation: PendingControlConfirmation?
-    let activeProject: String?
-    let contextLabel: String
-    let contextStatus: String
     let focusToken: Int
     let onSubmit: (String) -> Void
-    let onSuggestionTap: (ProactiveSuggestion) -> Void
     let onEscape: () -> Void
 
     @State private var inputText: String = ""
@@ -37,7 +32,6 @@ struct ExpandedPresenceView: View {
     // Output window grows with the response but caps at ~5 lines, then scrolls inside.
     // 5 lines × 20pt line height + 24pt vertical padding.
     static let maxResponseHeight: CGFloat = 124
-    static let suggestionRowHeight: CGFloat = 32
     /// Scrollable action list inside the confirmation.
     static let confirmationScrollHeight: CGFloat = 96
     /// Header + buttons + padding around `confirmationScrollHeight`.
@@ -60,11 +54,6 @@ struct ExpandedPresenceView: View {
         VStack(spacing: 0) {
             inputRow
                 .frame(height: Self.inputRowHeight)
-
-            if !suggestions.isEmpty && responseText.isEmpty && !isProcessing {
-                suggestionRow
-                    .frame(height: Self.suggestionRowHeight)
-            }
 
             // A pending confirmation outranks everything else in the bar — it is
             // the only state where Alfred is blocked waiting on the user.
@@ -101,34 +90,6 @@ struct ExpandedPresenceView: View {
         .onKeyPress(.escape) {
             onEscape()
             return .handled
-        }
-    }
-
-    // MARK: - Suggestion row
-
-    private var suggestionRow: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(suggestions.prefix(6), id: \.id) { suggestion in
-                    Button(action: {
-                        onSuggestionTap(suggestion)
-                    }) {
-                        HStack(spacing: 4) {
-                            Image(systemName: chipIcon(for: suggestion))
-                                .font(.system(size: 9))
-                            Text(suggestion.title)
-                                .font(.system(size: 10, weight: .medium))
-                                .lineLimit(1)
-                        }
-                        .foregroundStyle(.white.opacity(0.8))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 12)
         }
     }
 
@@ -352,14 +313,6 @@ struct ExpandedPresenceView: View {
         onSubmit(text)
     }
 
-    private func chipIcon(for suggestion: ProactiveSuggestion) -> String {
-        if !suggestion.icon.isEmpty { return suggestion.icon }
-        if suggestion.title.contains("Continue") { return "arrow.trianglehead.forward" }
-        if suggestion.title.contains("Review") { return "doc.text.magnifyingglass" }
-        if suggestion.title.contains("Debug") { return "ladybug" }
-        if suggestion.title.contains("Write") { return "pencil" }
-        return "sparkle"
-    }
 
     private static let logoImage: NSImage? = {
         guard let url = Bundle.main.url(forResource: "alfred-small-logo", withExtension: "png") else {

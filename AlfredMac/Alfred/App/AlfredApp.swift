@@ -1,62 +1,56 @@
-import SwiftUI
 import AppKit
 import Combine
-import OSLog
-import CoreServices
+import SwiftUI
 
-private let logger = Logger(subsystem: "com.alfred.app", category: "AlfredApp")
-
-// MARK: - Bar observable state
+// Alfred is a client for Hermes Agent, not an assistant.
 //
-// BarState is a dedicated ObservableObject so AppDelegate can mutate
-// responseText on the MainActor and SwiftUI will re-render BarView.
-// Using a separate object avoids conforming AppDelegate to ObservableObject.
+// It contributes exactly two things Hermes has no equivalent for:
+//
+//   1. A Spotlight-style bar at the notch (⌘⇧J), replacing Hermes' terminal TUI
+//      and its localhost web dashboard.
+//   2. Access to macOS — screen reading, the accessibility tree, and mouse and
+//      keyboard control — handed to Hermes as MCP tools (AlfredToolServer).
+//
+// Everything else an assistant needs lives in Hermes, unmodified: the tool loop,
+// the models, memory, persona (SOUL.md / USER.md), skills, cron and messaging.
+// Alfred used to carry its own versions of all of that; they were deleted rather
+// than left to rot beside the real ones.
 
+// MARK: - Bar state
+
+/// The bar's observable state. Deliberately small — Alfred holds no conversation
+/// state of its own; Hermes owns the session.
+@MainActor
 final class BarState: ObservableObject {
     @Published var responseText: String = ""
     @Published var isProcessing: Bool = false
-    @Published var suggestions: [ProactiveSuggestion] = []
-    @Published var contextLabel: String = ""
-    @Published var contextStatus: String = ""
     @Published var presenceState: AssistantPresenceState = .hidden
-    /// Bumped each time the bar is presented so the input field re-grabs focus (so you can type
-    /// immediately on ⌘⇧J without clicking the field).
+    /// Bumped each time the bar is presented so the input field re-grabs focus
+    /// (so you can type immediately on ⌘⇧J without clicking the field).
     @Published var focusToken: Int = 0
     /// Set while Hermes is waiting for the user to approve computer control.
-    /// Rendered in the bar; see ControlConfirmationBroker.
     @Published var pendingConfirmation: PendingControlConfirmation?
 }
 
 // MARK: - Bridge view
-//
-// BarView takes @Binding. This container resolves it from the EnvironmentObject
-// so AppKit (NSHostingView) doesn't need to manufacture a Binding directly.
 
+/// PresenceRootView takes @Binding; this resolves them from the EnvironmentObject
+/// so AppKit's NSHostingView doesn't have to manufacture bindings directly.
 private struct BarContainer: View {
     @EnvironmentObject private var barState: BarState
-    @EnvironmentObject private var appState: AppState
     let onSubmit: (String) -> Void
-    let onSuggestionTap: (ProactiveSuggestion) -> Void
     let onCollapse: () -> Void
 
     var body: some View {
         PresenceRootView(
-            presenceState: $barState.presenceState,
+            presenceState: Binding(
+                get: { barState.presenceState },
+                set: { barState.presenceState = $0 }
+            ),
             barState: barState,
-            activeProject: projectName,
-            contextLabel: barState.contextLabel,
-            contextStatus: barState.contextStatus,
             onSubmit: onSubmit,
-            onSuggestionTap: onSuggestionTap,
-            onExpand: { barState.presenceState = .expanded },
             onCollapse: onCollapse
         )
-    }
-
-    private var projectName: String? {
-        // Derive from suggestions or context label
-        if !barState.contextLabel.isEmpty { return barState.contextLabel }
-        return nil
     }
 }
 
@@ -65,568 +59,70 @@ private struct BarContainer: View {
 @main
 struct AlfredApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @StateObject private var updaterManager = UpdaterManager()
 
     var body: some Scene {
-        Settings {
-            EmptyView()
-        }
-        .commands {
-            CommandGroup(after: .appInfo) {
-                Button("Check for Updates…") {
-                    updaterManager.checkForUpdates()
-                }
-                .disabled(!updaterManager.canCheckForUpdates)
-            }
-        }
+        // No windows: Alfred is menu-bar resident and the bar is an NSPanel the
+        // delegate owns. Settings is required for a valid Scene graph.
+        Settings { EmptyView() }
     }
 }
 
-// MARK: - AppDelegate
+// MARK: - Delegate
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    /// Direct handle to the running delegate. With `@NSApplicationDelegateAdaptor`, SwiftUI installs
-    /// its own object as `NSApp.delegate` and forwards lifecycle calls here — so `NSApp.delegate as?
-    /// AppDelegate` is nil. Anything outside the SwiftUI graph (e.g. the notification-tap handler)
-    /// must reach the delegate through this instead.
+
+    /// Direct handle to the running delegate. With `@NSApplicationDelegateAdaptor`
+    /// SwiftUI installs its own object as `NSApp.delegate` and forwards lifecycle
+    /// calls here, so `NSApp.delegate as? AppDelegate` is nil. Anything outside the
+    /// SwiftUI graph (the MCP tool server, the confirmation broker) reaches the
+    /// delegate through this.
     static weak var shared: AppDelegate?
 
-    let appState = AppState()
     let barState = BarState()
 
-    private var barWindow: BarWindow?
-    private weak var enableScreenMonitoringItem: NSMenuItem?
-    private weak var disableScreenMonitoringItem: NSMenuItem?
-    private weak var startFocusSessionItem: NSMenuItem?
-    private weak var endFocusSessionItem: NSMenuItem?
-    private weak var pauseFocusSessionItem: NSMenuItem?
-    private weak var resumeFocusSessionItem: NSMenuItem?
-    private weak var focusSensitivityItem: NSMenuItem?
-    private var onboardingWindow: NSWindow?
-    private var chatWindow: NSWindow?
-    private var chatHostingController: NSHostingController<ChatWindowView>?
-    private var chatViewModel: ChatViewModel?
-    private var routineScheduler: RoutineScheduler?
-    private var screenTextMonitor: ScreenTextMonitor?
-    private var meetingManager: MeetingCaptureManager?
+    /// The agent. One long-lived `hermes acp` subprocess; see HermesSession.
+    let hermes = HermesSession()
 
+    private var barWindow: BarWindow?
     private var hotkeyListener: HotkeyListener?
     private var statusItem: NSStatusItem?
-    private var statusMenu: NSMenu?
-    private var popover: NSPopover?
-    private var contextMonitor: ContextMonitor?
-    private let fileAccess = FileAccessCapability()
-    private let selectedFileContext = SelectedFileContext()
-    private let bookmarkStore = SecurityScopedBookmarkStore()
-    private let computerControl = ComputerControlCapability()
-    /// The Clicky-style visual cursor that narrates on-screen actions. Emerges from the menu-bar
-    /// icon, glides to each target, and retreats when Alfred is done.
-    private lazy var cursorOverlay = CursorOverlayController()
-    private let fileOperation = FileOperationCapability()
-    private let messaging = MessagingCapability()
-    private var pendingTextRecipient: MessagingCapability.Recipient?
-    /// An in-progress reply started from an inbound "want me to respond?" notification tap. While set,
-    /// each bar submission is a turn in the reply conversation (draft → refine → confirm-to-send).
-    private struct InboundReplyContext {
-        let channel: String       // "text" or "email"
-        let sender: String
-        let handle: String
-        let subject: String?
-        let preview: String
-        var lastDraft: String?    // set once Alfred has drafted; an affirmative next turn sends it
-    }
-    private var pendingInboundReply: InboundReplyContext?
-    private let mailCompose = MailComposeCapability()
-    private let screenMonitoring = ScreenMonitoringManager()
-    private var inboundWatcher: InboundWatcher?
-    private var departureWatcher: DepartureWatcher?
-    private var telegramBot: TelegramBotService?
-    private let focusSession = FocusSessionManager()
     private var escapeMonitor: Any?
-    private var localEscapeMonitor: Any?
-    private var notchHoverMonitor: Any?
-    private var hideOnLeaveTimer: Timer?
-    private var shownByHover = false
-    private(set) var llmRouter: LLMRouter?
-    /// Long-lived so the syllabus review survives the menu-bar popover closing while the file panel is open.
-    private var syllabusService: SyllabusImportService?
-    private(set) var memoryStore: MemoryStore?
-    private var assistantCore: AssistantCore?
-    /// The agent loop. Owns one long-lived `hermes acp` subprocess; see HermesSession.
-    let hermes = HermesSession()
-    /// The turn currently streaming into the bar, so a new query supersedes it.
+    /// The turn currently streaming, so a new query supersedes it.
     private var hermesTask: Task<Void, Never>?
-    private(set) var learningService: BehavioralLearningService?
-    private(set) var projectAwareness: ProjectAwarenessService?
-    private var adaptiveEngine: AdaptiveSuggestionEngine?
-    private var personalContextService: PersonalContextService?
-    private(set) var learningEventLog: LearningEventLog?
-    private(set) var privacyManager: PrivacyManager?
-    private(set) var relationshipMemoryService: RelationshipMemoryService?
-    private(set) var memoryReflectionService: MemoryReflectionService?
-    private(set) var proactiveSurfacingService: ProactiveMemorySurfacingService?
-    private(set) var backupService: MemoryBackupService?
-    private(set) var workflowDetectionService: WorkflowDetectionService?
-    private(set) var writingStyleStore: WritingStyleStore?
-    private(set) var adaptationEngine: ResponseAdaptationEngine?
-    private(set) var appActivityMonitor: AppActivityMonitor?
-    private(set) var workflowSuggestionService: WorkflowSuggestionService?
-    private(set) var workflowExecutor: WorkflowExecutor?
-    private(set) var memoryLinkService: MemoryLinkService?
-    private var lastContextForLearning: AppContext?
-    private var lastShownSuggestions: [ProactiveSuggestion] = []
-    private var learningProfileTimer: Timer?
-    private var cancellables = Set<AnyCancellable>()
 
-    // MARK: - URL scheme (external/API trigger)
-
-    func applicationWillFinishLaunching(_ notification: Notification) {
-        // Register the alfred:// URL scheme so external systems (Shortcuts, a webhook relay,
-        // GitHub Actions via `open`) can fire a routine: alfred://run?routine=<id>.
-        NSAppleEventManager.shared().setEventHandler(
-            self,
-            andSelector: #selector(handleURLEvent(_:withReplyEvent:)),
-            forEventClass: AEEventClass(kInternetEventClass),
-            andEventID: AEEventID(kAEGetURL)
-        )
-    }
-
-    /// Handles `alfred://run?routine=<id>` (and `?name=<title>` as a convenience). Routed through
-    /// RoutineScheduler so the read-only safety gate + audit logging still apply to external runs.
-    @objc private func handleURLEvent(_ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {
-        guard let urlString = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
-              let url = URL(string: urlString),
-              url.scheme == "alfred", url.host == "run",
-              let store = memoryStore else { return }
-        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
-        if let value = items.first(where: { $0.name == "routine" })?.value, let id = Int64(value) {
-            routineScheduler?.runRoutine(byId: id)
-        } else if let name = items.first(where: { $0.name == "name" })?.value,
-                  let match = store.allRoutines().first(where: { $0.title.caseInsensitiveCompare(name) == .orderedSame }),
-                  let id = match.id {
-            routineScheduler?.runRoutine(byId: id)
-        }
-    }
-
-    // MARK: - Launch
+    // MARK: Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Single-instance guard. Two auto-start paths (the launchd agent and a macOS login item) can
-        // both fire at login, painting two menu-bar icons. If another copy with our bundle id is
-        // already running, bail before we set up anything. Keep the OLDEST instance (launchDate, pid
-        // tie-break) so a simultaneous double-launch collapses to exactly one survivor.
-        // NOTE: use exit(0), NOT NSApp.terminate — terminate runs applicationWillTerminate →
-        // unloadLaunchAgent(), which would `launchctl unload` and SIGTERM the surviving agent instance.
-        let me = NSRunningApplication.current
-        let bundleID = Bundle.main.bundleIdentifier ?? "com.alfred.app"
-        let survivor = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).min { a, b in
-            let da = a.launchDate ?? .distantFuture, db = b.launchDate ?? .distantFuture
-            if da != db { return da < db }
-            return a.processIdentifier < b.processIdentifier
-        }
-        if let survivor, survivor.processIdentifier != me.processIdentifier {
-            NSLog("[Alfred] Duplicate instance already running as pid \(survivor.processIdentifier); exiting this copy.")
-            exit(0)
-        }
+        Self.shared = self
 
-        AppDelegate.shared = self
+        // Menu-bar resident: no Dock icon, no window in the app switcher.
         NSApp.setActivationPolicy(.accessory)
 
-        ensureAppDirectories()
-        NotificationManager.shared.setup()
-
-        let router = LLMRouter(appState: appState)
-        llmRouter = router
-
-        GlobalHotkeyManager.shared.registerHotkey(
-            keyCode: 8,
-            modifiers: UInt32(768),
-            identifier: 3,
-            action: { [weak self] in
-                self?.showChatWindow()
-            }
-        )
-
-        // Paint the bar + menu-bar icon FIRST so they appear a runloop tick sooner, before the DB
-        // open + ~20-service graph build. handleQuery optional-chains core/router/memoryStore, so a
-        // query landing in the sub-tick deferral gap degrades safely.
         setupBarWindow()
         setupStatusItem()
+        startHotkeyListener()
+        installEscapeMonitor()
 
-        // Expose Alfred's macOS capabilities to Hermes over MCP. Started before
-        // the heavy graph build because `alfred-mcp` retries its connect for only
-        // ~5s, and Hermes may spawn it as soon as the first query lands.
+        // Hand Hermes the Mac. Started early because the shim it spawns retries
+        // its connection for only a few seconds.
         AlfredToolServer.shared.start()
-
-        // Defer the heavier startup (DB open, service graph, observe/start wiring) one runloop turn
-        // so it never blocks first paint. Stays on the main actor — ordering/thread affinity intact.
-        Task { @MainActor [weak self] in
-            self?.completeStartup()
-        }
     }
-
-    /// Owner Configuration (OCS). Non-nil only when `AppState.ownerConfigEnabled` is on, so with the
-    /// flag off nothing downstream sees it and the legacy `ownerName` path is untouched.
-    private(set) var ownerConfigStore: OwnerConfigStore?
-
-    /// Prepares the owner configuration when the feature flag is on: seeds it once from the legacy
-    /// `ownerName`, then hands the store to `AssistantCore` for persona rendering.
-    ///
-    /// Idempotent — `migrateFromLegacyIfNeeded` returns immediately when a configuration exists, so
-    /// this can run on every launch without touching the owner's edits.
-    @MainActor
-    private func prepareOwnerConfigIfEnabled() {
-        guard appState.ownerConfigEnabled else {
-            ownerConfigStore = nil
-            return
-        }
-        let store = OwnerConfigStore.shared
-        let outcome = store.migrateFromLegacyIfNeeded(
-            legacyOwnerName: UserDefaults.standard.string(forKey: "ownerName"))
-        ownerConfigStore = store
-
-        switch outcome {
-        case let .alreadyExists(revision):
-            logger.info("Owner configuration loaded at revision \(revision, privacy: .public)")
-        case let .seeded(revision):
-            logger.info("Owner configuration seeded from the legacy owner name at revision \(revision, privacy: .public)")
-        case .skippedNoLegacyName:
-            // Fresh install: onboarding collects the identity fields.
-            logger.info("Owner configuration not seeded — no legacy owner name to carry across.")
-        case let .refusedCanonicalCorrupt(recoverableRevision):
-            // The file is left exactly as found. Recovery is an explicit action, never automatic.
-            logger.error("Owner configuration file is unreadable; migration refused. Recoverable revision: \(recoverableRevision.map(String.init) ?? "none", privacy: .public)")
-            barState.contextStatus = recoverableRevision.map {
-                "Your owner configuration file can't be read. It's been left untouched — revision \($0) can be restored from Settings."
-            } ?? "Your owner configuration file can't be read. It's been left untouched; no earlier revision is available."
-        case let .failed(message):
-            logger.error("Owner configuration could not be seeded: \(message, privacy: .public)")
-            barState.contextStatus = "Owner configuration couldn't be created: \(message)"
-        }
-
-        if let validation = store.currentSnapshot()?.validation, !validation.isValid {
-            barState.contextStatus = "Owner configuration needs attention: "
-                + validation.errors.prefix(2).map(\.path).joined(separator: ", ")
-        }
-    }
-
-    @MainActor
-    private func completeStartup() {
-        guard let router = llmRouter else { return }
-
-        prepareOwnerConfigIfEnabled()
-
-        do {
-            memoryStore = try MemoryStore()
-        } catch {
-            // Without the store, Alfred degrades to a bare LLM with no memory, routines, or
-            // capabilities. Surface it loudly instead of failing silently.
-            logger.error("MemoryStore init failed: \(error.localizedDescription)")
-            barState.contextStatus = "Memory store unavailable: \(error.localizedDescription)"
-            let alert = NSAlert()
-            alert.messageText = "Alfred: database problem"
-            alert.informativeText = """
-                Alfred couldn't open its database, so memory, routines, and most features are \
-                disabled (the bar will only do basic chat).
-
-                \(error.localizedDescription)
-
-                To reset: quit Alfred, move ~/.alfred/db aside, then relaunch.
-                """
-            alert.alertStyle = .critical
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
-        }
-
-        if let store = memoryStore {
-            let projectService = ProjectAwarenessService(memory: store)
-            projectAwareness = projectService
-            let adaptive = AdaptiveSuggestionEngine(memory: store)
-            adaptiveEngine = adaptive
-            let bls = BehavioralLearningService(memory: store)
-            learningService = bls
-            let eventLog = LearningEventLog()
-            learningEventLog = eventLog
-            privacyManager = PrivacyManager(mode: appState.privacyMode)
-            let relationshipMem = RelationshipMemoryService()
-            relationshipMemoryService = relationshipMem
-            let reflectionService = MemoryReflectionService(relationshipMemory: relationshipMem)
-            reflectionService.setMinimalMode(appState.privacyMode == .minimal)
-            memoryReflectionService = reflectionService
-            let contextCollector = ContextCollector(memoryStore: store)
-            let wfDetection = WorkflowDetectionService(
-                contextCollector: contextCollector,
-                relationshipMemory: relationshipMem
-            )
-            workflowDetectionService = wfDetection
-
-            let wfSuggestion = WorkflowSuggestionService(
-                detectionService: wfDetection,
-                contextCollector: contextCollector,
-                relationshipMemory: relationshipMem
-            )
-            workflowSuggestionService = wfSuggestion
-
-            let wfExecutor = WorkflowExecutor()
-            workflowExecutor = wfExecutor
-
-            let surfacingService = ProactiveMemorySurfacingService(
-                relationshipMemory: relationshipMem,
-                memoryReflections: reflectionService,
-                contextCollector: contextCollector,
-                workflowSuggestions: wfSuggestion
-            )
-            surfacingService.proactiveEnabled = appState.proactiveSuggestionsEnabled
-            surfacingService.onBadgeUpdate = { [weak self] hasActive in
-                self?.updateProactiveBadge(hasActive: hasActive)
-            }
-            proactiveSurfacingService = surfacingService
-            let contextService = PersonalContextService(
-                memory: store,
-                learningService: bls,
-                projectAwareness: projectService
-            )
-            personalContextService = contextService
-            let wss = store.writingStyleStore
-            writingStyleStore = wss
-
-            // Give Hermes Alfred's persona and the owner's profile. Without this it
-            // runs on the stock Nous Research persona — a generic assistant that
-            // knows nothing about its owner. Idempotent: writes only on change, and
-            // never overwrites a SOUL.md the user has written themselves.
-            exportPersonaToHermes(writingStyle: wss)
-            let ts = store.timelineStore
-            appActivityMonitor = AppActivityMonitor(store: ts)
-            let relStore = store.relationshipStore
-            let habitStore = store.habitStore
-            let loopStore = store.learningLoopStore
-            let adaptEngine = ResponseAdaptationEngine(
-                writingStyle: wss,
-                habits: habitStore,
-                learningLoop: loopStore,
-                rewardEngine: store.rewardEngine
-            )
-            adaptationEngine = adaptEngine
-            // Blueprint v1 quarantine: the broad learning stack is built but NOT injected
-            // unless FeatureScope.learningEnabled is on. Writing-style personalization (M8) is a
-            // narrow exception gated by FeatureScope.personalizationEnabled — the compiler carries
-            // ONLY the writing-style context when learning is off.
-            let learningOn = FeatureScope.learningEnabled
-            let personalizationOn = FeatureScope.personalizationEnabled
-            let compiler = ContextCompiler(
-                writingStyle: (learningOn || personalizationOn) ? wss : nil,
-                habits: learningOn ? habitStore : nil,
-                relationships: learningOn ? relStore : nil,
-                timeline: learningOn ? ts : nil,
-                adaptation: learningOn ? adaptEngine : nil,
-                rewards: learningOn ? store.rewardEngine : nil
-            )
-            let actionEngine = ActionSelectionEngine(
-                habits: learningOn ? habitStore : nil,
-                rewards: learningOn ? store.rewardEngine : nil,
-                adaptation: learningOn ? adaptEngine : nil
-            )
-            let dashService = store.taskDashboardService
-            assistantCore = AssistantCore(
-                router: router,
-                memory: store,
-                projectAwareness: learningOn ? projectService : nil,
-                personalContextService: learningOn ? contextService : nil,
-                relationshipMemoryService: learningOn ? relationshipMem : nil,
-                memoryReflectionService: learningOn ? reflectionService : nil,
-                writingStyle: learningOn ? wss : nil,
-                relationshipStore: learningOn ? relStore : nil,
-                habitStore: learningOn ? habitStore : nil,
-                learningLoopStore: learningOn ? loopStore : nil,
-                adaptationEngine: learningOn ? adaptEngine : nil,
-                rewardEngine: learningOn ? store.rewardEngine : nil,
-                contextCompiler: (learningOn || personalizationOn) ? compiler : nil,
-                actionSelectionEngine: actionEngine,
-                taskDashboardService: learningOn ? dashService : nil,
-                ownerConfig: ownerConfigStore
-            )
-            let linkService = MemoryLinkService(relationshipMemory: relationshipMem)
-            linkService.initialize()
-            memoryLinkService = linkService
-
-            relationshipMem.memoryLinkService = linkService
-            reflectionService.memoryLinkService = linkService
-            surfacingService.memoryLinkService = linkService
-
-            let backupServ = MemoryBackupService(
-                relationshipService: relationshipMem,
-                reflectionService: reflectionService
-            )
-            backupServ.setWorkflowDetectionService(wfDetection)
-            backupServ.setMemoryLinkService(linkService)
-            backupService = backupServ
-            backupServ.autoBackupEnabled = true
-            backupServ.maxBackupCount = appState.backupMaxCount
-            backupServ.encryptByDefault = appState.backupEncryptDefault
-            backupServ.initialize()
-
-            subscribeToWorkflowNotifications()
-        }
-
-        setupComputerControlCancelMonitor()
-        resolveRememberedFileAccess()
-        observeBarSizing()
-        observeScreenMonitoring()
-        observeFocusSession()
-        observeOnboardingCompletion()
-        observePrivacyMode()
-        startContextMonitor()
-        appActivityMonitor?.start()
-
-        startHermesCapture()
-        startLearningProfileTimer()
-        sweepRetentionOnLaunch()
-
-        if appState.isOnboardingComplete {
-            startHotkeyListener()
-            // Bar is hotkey-controlled only — no hover auto-show/hide. It never appears or
-            // disappears on its own; it stays on screen until the user toggles it with ⌘⇧J.
-        } else {
-            showOnboarding()
-        }
-
-        SafetyAuditEngine.shared.assertNoAutonomousExecution()
-
-        // Blueprint v1 §6: start the one sanctioned scheduler AFTER the audit (it lives in a
-        // class the audit does not scan; only read-only routines run unattended).
-        startRoutineScheduler()
-    }
-
-    private func startRoutineScheduler() {
-        // Don't run routines (which can call cloud + post notifications) before onboarding +
-        // permissions are granted. Started from observeOnboardingCompletion otherwise.
-        guard appState.isOnboardingComplete else { return }
-        guard let store = memoryStore, let core = assistantCore, let router = llmRouter else { return }
-        let scheduler = RoutineScheduler(store: store, core: core, appState: appState, router: router)
-        routineScheduler = scheduler
-        scheduler.start()
-    }
-
 
     func applicationWillTerminate(_ notification: Notification) {
-        GlobalHotkeyManager.shared.unregisterAll()
-        routineScheduler?.stop()
-        unloadLaunchAgent()
+        if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
+        AlfredToolServer.shared.stop()
+        Task { await hermes.shutdown() }
     }
 
-    /// Blueprint v1 §6/§11: a graceful Quit unloads the launchd keep-alive agent so the app
-    /// isn't immediately relaunched. A crash (no graceful terminate) leaves the job loaded, so
-    /// KeepAlive relaunches it; the next login reloads the agent via RunAtLoad either way.
-    private func unloadLaunchAgent() {
-        let plistPath = (NSHomeDirectory() as NSString)
-            .appendingPathComponent("Library/LaunchAgents/com.alfred.launcher.plist")
-        guard FileManager.default.fileExists(atPath: plistPath) else { return }
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        task.arguments = ["unload", plistPath]
-        do { try task.run() } catch { return }
-        // Bound the wait so a stalled launchctl can't wedge Quit (we're mid-termination).
-        let deadline = Date().addingTimeInterval(2.0)
-        while task.isRunning && Date() < deadline { usleep(50_000) }
-        if task.isRunning { task.terminate() }
-    }
-
-    private func isLocalConnectionError(_ error: Error) -> Bool {
-        if let urlError = error as? URLError {
-            switch urlError.code {
-            case .cannotConnectToHost, .networkConnectionLost, .notConnectedToInternet, .dnsLookupFailed:
-                return true
-            default:
-                return false
-            }
-        }
-        // LLMError wrapping a URLError
-        if let llmError = error as? LLMError,
-           case .networkError(let msg) = llmError,
-           msg.contains("Could not connect") || msg.contains("Connection refused")
-        {
-            return true
-        }
-        return false
-    }
-
-    // MARK: - Directory setup
-
-    private func ensureAppDirectories() {
-        let dirs = [".alfred/db", ".alfred/wiki", ".alfred/logs", ".alfred/profile"]
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        for dir in dirs {
-            let url = home.appending(path: dir, directoryHint: .isDirectory)
-            try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        }
-    }
-
-    private func resolveRememberedFileAccess() {
-        // The bookmark resolution (Keychain decode + URL(resolvingBookmarkData:) filesystem verify)
-        // can stall on a missing/slow/network volume, so run it off the main thread and hop back only
-        // to apply the resulting UI state. resolve() does NOT start security-scoped access (that's
-        // SecurityScopedResourceAccess), so there's no scoped-access lifetime to preserve here.
-        let store = bookmarkStore
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            var statuses: [String] = []
-            var rememberedFileURLs: [URL] = []
-            var rememberedFolderURL: URL?
-
-            do {
-                if let fileResolution = try store.resolveFiles() {
-                    if fileResolution.isStale {
-                        statuses.append("Remembered file access is stale. Choose the file again, then remember access.")
-                    } else if !fileResolution.urls.isEmpty {
-                        rememberedFileURLs = fileResolution.urls
-                        statuses.append(fileResolution.urls.count == 1
-                            ? "Remembered file access loaded: \(fileResolution.urls[0].lastPathComponent)"
-                            : "Remembered access loaded for \(fileResolution.urls.count) files.")
-                    }
-                }
-            } catch {
-                statuses.append("Could not load remembered file access. Choose the file again.")
-            }
-
-            do {
-                if let folderResolution = try store.resolveFolder() {
-                    if folderResolution.isStale {
-                        statuses.append("Remembered folder access is stale. Choose the folder again, then remember access.")
-                    } else if let folderURL = folderResolution.urls.first {
-                        rememberedFolderURL = folderURL
-                        statuses.append("Remembered folder access loaded: \(folderURL.lastPathComponent)")
-                    }
-                }
-            } catch {
-                statuses.append("Could not load remembered folder access. Choose the folder again.")
-            }
-
-            guard !statuses.isEmpty else { return }
-            let fileURLs = rememberedFileURLs
-            let folderURL = rememberedFolderURL
-            let status = statuses.joined(separator: " ")
-            Task { @MainActor in
-                guard let self else { return }
-                self.selectedFileContext.restoreRemembered(fileURLs: fileURLs, folderURL: folderURL)
-                self.barState.contextStatus = status
-            }
-        }
-    }
-
-    // MARK: - Bar window
+    // MARK: Bar window
 
     private func setupBarWindow() {
         let window = BarWindow()
         let rootView = BarContainer(
             onSubmit: { [weak self] text in self?.handleQuery(text) },
-            onSuggestionTap: { [weak self] suggestion in
-                self?.handleSuggestionTap(suggestion)
-            },
-            onCollapse: { [weak self] in
-                self?.handlePresenceCollapse()
-            }
+            onCollapse: { [weak self] in self?.handleCollapse() }
         )
-        .environmentObject(appState)
         .environmentObject(barState)
 
         let hostingView = NSHostingView(rootView: rootView)
@@ -634,7 +130,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hostingView.layer?.backgroundColor = NSColor.clear.cgColor
         hostingView.layer?.isOpaque = false
 
-        // Wrap in a visual-effect view for the vibrant notch look
+        // Vibrant notch look.
         let effectView = NSVisualEffectView(frame: hostingView.bounds)
         effectView.material = .hudWindow
         effectView.blendingMode = .behindWindow
@@ -653,1055 +149,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         window.contentView = effectView
         barWindow = window
-    }
 
-    private func showChatWindow() {
-        if let window = chatWindow, window.isVisible {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
-        }
-
-        guard let router = llmRouter else { return }
-        // Share the bar's prompt builder so the Chat window gets persona, owner name, learned
-        // profile, style preferences, and retrieved memories. It previously passed `system: ""`,
-        // making it the only surface with no personalization at all.
-        let core = assistantCore
-        let name = appState.ownerName
-        let viewModel = ChatViewModel(llmRouter: router) { query in
-            guard let core else { return "" }
-            return await core.conversationalSystem(ownerName: name, query: query)
-        }
-        chatViewModel = viewModel
-
-        let window = NSWindow(
-            contentRect: NSRect(x: 200, y: 200, width: 900, height: 700),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Alfred Chat"
-        window.minSize = NSSize(width: 700, height: 500)
-        window.isReleasedWhenClosed = false
-
-        let hostingView = NSHostingView(rootView: ChatWindowView(viewModel: viewModel))
-        hostingView.frame = NSRect(x: 0, y: 0, width: 900, height: 700)
-        window.contentView = hostingView
-
-        chatWindow = window
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    private func setupComputerControlCancelMonitor() {
-        // Global monitor: Esc pressed while ANOTHER app is focused (e.g. during computer control).
-        escapeMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard event.keyCode == 53 else { return }
-            Task { @MainActor in
-                self?.computerControl.cancel()
-                self?.barState.contextStatus = "Computer control stop requested with Esc."
-                // Collapse presence bar on Escape if visible
-                if self?.barWindow?.isVisible == true {
-                    self?.handlePresenceCollapse()
-                }
-            }
-        }
-        // Local monitor: Esc pressed while the Alfred bar itself is focused. The focused SwiftUI
-        // TextField swallows Escape before `.onKeyPress(.escape)` (and thus handlePresenceCollapse)
-        // can see it, so intercept it here and consume the event. Local monitors run on the main
-        // thread during event dispatch, so we're already on the main actor.
-        localEscapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard event.keyCode == 53, let self else { return event }
-            return MainActor.assumeIsolated {
-                guard self.barWindow?.isVisible == true else { return event }
-                self.computerControl.cancel()
-                self.handlePresenceCollapse()
-                return nil   // consume — don't let the field editor also act on Esc
-            }
-        }
-    }
-
-    private func observeBarSizing() {
+        // Resize as content changes. Confirmations are included because their
+        // buttons render off the bottom of the panel otherwise, leaving the user
+        // unable to answer a prompt that is blocking an agent turn.
         barState.$responseText
-            .combineLatest(barState.$isProcessing, barState.$suggestions, barState.$presenceState)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] text, isProcessing, suggestions, presenceState in
-                guard let self else { return }
-                guard let window = self.barWindow else { return }
-
-                switch presenceState {
-                case .hidden, .collapsed:
-                    break
-                case .expanded, .thinking, .responding:
-                    let height = self.expandedBarHeight(
-                        text: text,
-                        isProcessing: isProcessing,
-                        suggestions: suggestions
-                    )
-                    window.resizeNotch(toHeight: height)
-                case .listening:
-                    window.resizeNotch(toHeight: 120)
-                }
-            }
-            .store(in: &cancellables)
-
-        // Confirmations change the bar's height too, and are not covered by the
-        // combineLatest above. Without this the bar stays tall after a
-        // confirmation is answered.
-        barState.$pendingConfirmation
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                guard let self, let window = self.barWindow else { return }
-                switch self.barState.presenceState {
-                case .hidden, .collapsed, .listening:
-                    break
-                case .expanded, .thinking, .responding:
-                    window.resizeNotch(toHeight: self.expandedBarHeight(
-                        text: self.barState.responseText,
-                        isProcessing: self.barState.isProcessing,
-                        suggestions: self.barState.suggestions
-                    ))
-                }
-            }
+            .combineLatest(barState.$isProcessing, barState.$pendingConfirmation)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _, _, _ in self?.resizeBar() }
             .store(in: &cancellables)
     }
 
-    private func expandedBarHeight(text: String, isProcessing: Bool, suggestions: [ProactiveSuggestion]) -> CGFloat {
-        var total = ExpandedPresenceView.inputRowHeight + 4 // 4 pt top padding from VStack
+    private var cancellables = Set<AnyCancellable>()
 
-        let hasSuggestions = !suggestions.isEmpty
-        let hasResponse = !text.isEmpty
-
-        if hasSuggestions && !hasResponse && !isProcessing {
-            total += ExpandedPresenceView.suggestionRowHeight
+    private func resizeBar() {
+        guard let window = barWindow else { return }
+        switch barState.presenceState {
+        case .hidden, .collapsed, .listening:
+            break
+        case .expanded, .thinking, .responding:
+            window.resizeNotch(toHeight: barHeight())
         }
+    }
 
-        // A pending confirmation replaces the response area (see the view's body),
-        // and must be sized for or its buttons render off the bottom of the notch
-        // panel — leaving the user unable to answer a prompt that is blocking an
-        // agent turn.
+    private func barHeight() -> CGFloat {
+        var total = ExpandedPresenceView.inputRowHeight + 4  // 4pt VStack top padding
+
         if barState.pendingConfirmation != nil {
-            total += 1 // divider
+            total += 1  // divider
             total += ExpandedPresenceView.confirmationScrollHeight
             total += ExpandedPresenceView.confirmationChromeHeight
-        } else if isProcessing || hasResponse {
-            total += 1 // divider
-            if hasResponse {
-                total += ExpandedPresenceView.responseHeight(for: text)
-            } else {
-                total += ExpandedPresenceView.loadingRowHeight
-            }
+        } else if barState.isProcessing || !barState.responseText.isEmpty {
+            total += 1  // divider
+            total += barState.responseText.isEmpty
+                ? ExpandedPresenceView.loadingRowHeight
+                : ExpandedPresenceView.responseHeight(for: barState.responseText)
         }
-
         return total
     }
 
-    private func observeScreenMonitoring() {
-        screenMonitoring.$status
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] status in
-                guard let self else { return }
-                if self.screenMonitoring.isActive || status.contains("Screen monitoring") {
-                    self.barState.contextStatus = status
-                }
-            }
-            .store(in: &cancellables)
+    // MARK: Presenting
 
-        screenMonitoring.$isActive
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] isActive in
-                self?.updateScreenMonitoringIndicator(isActive: isActive)
-            }
-            .store(in: &cancellables)
-
-        if appState.screenMonitoringEnabled {
-            screenMonitoring.start()
-        }
-
-        // Proactive inbound watcher (opt-in). Lives outside the SafetyAuditEngine-scanned classes
-        // and uses a Task/sleep loop, so it never trips the startup audit.
-        if let router = llmRouter {
-            let watcher = InboundWatcher(router: router)
-            inboundWatcher = watcher
-            appState.$inboundWatcherEnabled
-                .receive(on: DispatchQueue.main)
-                .sink { [weak watcher] enabled in
-                    guard let watcher else { return }
-                    if enabled { watcher.start() } else { watcher.stop() }
-                }
-                .store(in: &cancellables)
-            if appState.inboundWatcherEnabled { watcher.start() }
-        }
-
-        // Departure ("time to leave") reminders (opt-in). Same Task/sleep-loop pattern as InboundWatcher,
-        // so it stays outside the SafetyAuditEngine-scanned set.
-        let departure = DepartureWatcher(appState: appState)
-        departureWatcher = departure
-        appState.$departureRemindersEnabled
-            .receive(on: DispatchQueue.main)
-            .sink { [weak departure] enabled in
-                guard let departure else { return }
-                if enabled { departure.start() } else { departure.stop() }
-            }
-            .store(in: &cancellables)
-        if appState.departureRemindersEnabled { departure.start() }
-
-        // Voice learning from sent iMessages (opt-in). Detached + watermarked; a no-op (one-time
-        // hint) without Full Disk Access. Runs once at launch if enabled, and again when toggled on.
-        startVoiceLearningFromMessagesIfNeeded()
-        appState.$voiceLearningFromMessagesEnabled
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] enabled in
-                guard enabled else { return }
-                self?.startVoiceLearningFromMessagesIfNeeded()
-            }
-            .store(in: &cancellables)
-
-        // Telegram bot. INBOUND (long-poll getUpdates) now lives in the cloud webhook ("Alfred Lite",
-        // api/telegram.ts) so it answers even when this Mac is off. A single bot can't both run a
-        // webhook and long-poll the same token — the Mac polling would 409 the cloud webhook — so the
-        // Mac no longer polls by default. OUTBOUND is unaffected: TelegramNotifier (routine output,
-        // departure nudges) only needs `telegramBotEnabled` and posts via sendMessage, which works from
-        // anywhere. To fall back to Mac-side inbound polling (e.g. if you stop using the cloud bot), set
-        // UserDefaults `telegramInboundPollingEnabled` = true and relaunch.
-        // (The iMessage bot was removed from the app; AlfredBotWatcher's static helpers are still
-        // reused by TelegramBotService.)
-        let macInboundPolling = UserDefaults.standard.bool(forKey: "telegramInboundPollingEnabled")
-        if let core = assistantCore, macInboundPolling {
-            let telegram = TelegramBotService(core: core, appState: appState, router: llmRouter)
-            telegramBot = telegram
-            appState.$telegramBotEnabled
-                .receive(on: DispatchQueue.main)
-                .sink { [weak telegram] enabled in
-                    guard let telegram else { return }
-                    if enabled { telegram.start() } else { telegram.stop() }
-                }
-                .store(in: &cancellables)
-            if appState.telegramBotEnabled { telegram.start() }
-        }
-    }
-
-    /// Imports Carlton's sent iMessages into the writing-style sample pool when the opt-in is on.
-    /// Off the main thread; the watermark makes it idempotent and incremental.
-    private func startVoiceLearningFromMessagesIfNeeded() {
-        guard appState.voiceLearningFromMessagesEnabled, let wss = writingStyleStore else { return }
-        Task.detached(priority: .utility) { [weak wss] in
-            wss?.importSentMessages()      // iMessage (local, synchronous)
-            await wss?.importSentEmails()  // Gmail (network, gated on Google being connected)
-            wss?.importSentAppleMail()     // Apple Mail iCloud + IMAP (osascript, only if Mail running)
-        }
-    }
-
-    private func observeFocusSession() {
-        focusSession.sensitivity = FocusSensitivity(rawValue: appState.focusSensitivity) ?? .medium
-
-        focusSession.$status
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] status in
-                guard let self else { return }
-                if self.focusSession.isActive || status.contains("Focus session") || status.contains("Focus nudge") {
-                    self.barState.contextStatus = status
-                }
-            }
-            .store(in: &cancellables)
-
-        focusSession.$isActive
-            .combineLatest(focusSession.$isPaused)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _, _ in
-                self?.updateScreenMonitoringIndicator(isActive: self?.screenMonitoring.isActive == true)
-            }
-            .store(in: &cancellables)
-    }
-
-    private func observePrivacyMode() {
-        appState.$privacyMode
-            .dropFirst()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] mode in
-                guard let self else { return }
-                self.privacyManager?.setMode(mode)
-                self.memoryReflectionService?.setMinimalMode(mode == .minimal)
-                self.proactiveSurfacingService?.setMinimalMode(mode == .minimal)
-            }
-            .store(in: &cancellables)
-    }
-
-    private func subscribeToWorkflowNotifications() {
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleRunWorkflowNotification(_:)),
-            name: .runWorkflowFromDashboard,
-            object: nil
-        )
-    }
-
-    @objc private func handleRunWorkflowNotification(_ notification: Notification) {
-        guard let wfID = notification.userInfo?["workflowID"] as? String,
-              let uuid = UUID(uuidString: wfID),
-              let wf = workflowDetectionService?.workflow(by: uuid)
-        else { return }
-        workflowDetectionService?.recordUsage(id: uuid)
-        workflowExecutor?.execute(wf)
-        barState.contextStatus = "Running workflow: \(wf.title)"
-    }
-
-    private func updateScreenMonitoringIndicator(isActive: Bool) {
-        let hasProactive = (proactiveSurfacingService?.getAvailableSuggestions().isEmpty == false)
-        let icon = MenuBarIcon.make()
-        if hasProactive {
-            icon.lockFocus()
-            NSColor.systemBlue.setFill()
-            NSBezierPath(ovalIn: NSRect(x: 13, y: 13, width: 5, height: 5)).fill()
-            icon.unlockFocus()
-            icon.accessibilityDescription = "Alfred has proactive suggestions"
-        }
-        if focusSession.isActive {
-            icon.lockFocus()
-            (focusSession.isPaused ? NSColor.systemYellow : NSColor.systemOrange).setFill()
-            NSBezierPath(ovalIn: NSRect(x: 13, y: 13, width: 5, height: 5)).fill()
-            icon.unlockFocus()
-            icon.accessibilityDescription = focusSession.isPaused
-                ? "Alfred, focus session paused"
-                : "Alfred, focus session active"
-        } else if isActive {
-            icon.lockFocus()
-            NSColor.systemGreen.setFill()
-            NSBezierPath(ovalIn: NSRect(x: 13, y: 13, width: 5, height: 5)).fill()
-            icon.unlockFocus()
-            icon.accessibilityDescription = "Alfred, screen monitoring active"
-        }
-        enableScreenMonitoringItem?.state = isActive ? .on : .off
-        disableScreenMonitoringItem?.isEnabled = isActive
-        startFocusSessionItem?.isEnabled = !focusSession.isActive
-        endFocusSessionItem?.isEnabled = focusSession.isActive
-        pauseFocusSessionItem?.isEnabled = focusSession.isActive && !focusSession.isPaused
-        resumeFocusSessionItem?.isEnabled = focusSession.isActive && focusSession.isPaused
-        focusSensitivityItem?.title = "Focus Sensitivity: \(focusSession.sensitivity.displayName)"
-    }
-
-    private func startContextMonitor() {
-        let monitor = ContextMonitor(interval: 1.5)
-        contextMonitor = monitor
-
-        monitor.$suggestions
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] rawSuggestions in
-                guard let self else { return }
-                let context = self.lastContextForLearning
-                let activeProject = self.projectAwareness?.currentProject()?.displayName
-                let rates = self.learningService?.suggestionCategoriesByConfidence() ?? []
-                let recent = [String]()
-                let fallbackContext = AppContext(appName: "", bundleIdentifier: nil, windowTitle: nil, browserURL: nil, browserTitle: nil)
-
-                let oldSugs = self.lastShownSuggestions
-                self.lastShownSuggestions = rawSuggestions
-                let newIds = Set(rawSuggestions.map { $0.id })
-                for sugs in oldSugs where !newIds.contains(sugs.id) {
-                    self.adaptiveEngine?.recordDismissed(category: self.adaptiveEngine?.category(for: sugs) ?? "default")
-                }
-
-                if let engine = self.adaptiveEngine {
-                    let ranked = SuggestionEngine.rankedSuggestions(
-                        for: context ?? fallbackContext,
-                        adaptiveEngine: engine,
-                        profileCategoryRates: rates,
-                        recentActivity: recent,
-                        activeProject: activeProject
-                    )
-                    self.barState.suggestions = ranked.map { $0.suggestion }
-                    self.learningService?.recordSuggestionsShown(ranked.map { $0.suggestion }, context: context)
-                } else {
-                    self.barState.suggestions = rawSuggestions
-                    self.learningService?.recordSuggestionsShown(rawSuggestions, context: context)
-                }
-            }
-            .store(in: &cancellables)
-
-        monitor.$context
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] context in
-                guard let self, let context else {
-                    self?.barState.contextLabel = ""
-                    self?.lastContextForLearning = nil
-                    return
-                }
-                self.lastContextForLearning = context
-                self.projectAwareness?.ingestContext(context)
-                let title = context.browserTitle ?? context.windowTitle
-                if let title, !title.isEmpty {
-                    self.barState.contextLabel = "\(context.appName) - \(title)"
-                } else {
-                    self.barState.contextLabel = context.appName
-                }
-                self.focusSession.observe(context: context)
-            }
-            .store(in: &cancellables)
-
-        monitor.$status
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] status in
-                self?.barState.contextStatus = status
-            }
-            .store(in: &cancellables)
-
-        appState.$proactiveSuggestionsEnabled
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self, weak monitor] enabled in
-                guard let self, let monitor else { return }
-                if enabled {
-                    monitor.start()
-                } else {
-                    monitor.stop()
-                    self.barState.suggestions = []
-                    self.barState.contextLabel = ""
-                    self.barState.contextStatus = "Proactive suggestions are off in Settings."
-                }
-                self.proactiveSurfacingService?.proactiveEnabled = enabled
-            }
-            .store(in: &cancellables)
-
-        if appState.proactiveSuggestionsEnabled {
-            monitor.start()
-        } else {
-            barState.contextStatus = "Proactive suggestions are off in Settings."
-        }
-    }
-
-    // MARK: - Hermes capture (screen text + meetings, local-only)
-
-    private func startHermesCapture() {
-        guard let store = memoryStore else { return }
-        ProfileDigest.ensureDir()
-        // Drive capture off ContextMonitor's app/window/URL change signal (started just before
-        // this), so text is captured when context actually changes rather than on a blind timer.
-        let monitor = ScreenTextMonitor(
-            store: store,
-            contextChanges: contextMonitor?.$context.eraseToAnyPublisher()
-        )
-        screenTextMonitor = monitor
-        meetingManager = MeetingCaptureManager(store: store)
-        if appState.screenTextCaptureEnabled { monitor.start() }
-    }
-
-    /// Rebuilds the bounded USER.md / MEMORY.md profile from recent local signals (screen text +
-    /// meetings), consolidated entirely on-device via Ollama. Runs off the main actor.
-    private func regenerateHermesProfile() {
-        guard let store = memoryStore else { return }
-        let owner = appState.ownerName
-        let recent = store.recentScreenText(limit: 40)
-        let meetings = store.recentMeetings(limit: 3)
-        // Don't build a profile from nothing — prevents the model inventing traits/projects/people.
-        guard ProfileDigest.hasEnoughData(screenTextCount: recent.count, meetingCount: meetings.count) else { return }
-
-        var signals: [String] = []
-        if !recent.isEmpty {
-            let apps = Array(Set(recent.map(\.app_name))).prefix(8)
-            signals.append("Apps used recently: \(apps.joined(separator: ", "))")
-            let titles = recent.compactMap { $0.window_title.isEmpty ? nil : $0.window_title }.prefix(8)
-            if !titles.isEmpty { signals.append("Recent window titles: \(titles.joined(separator: " | "))") }
-            for snippet in recent.prefix(3) { signals.append("Screen excerpt: \(String(snippet.text.prefix(300)))") }
-        }
-        for meeting in meetings where (meeting.summary?.isEmpty == false) {
-            signals.append("Meeting summary: \(meeting.summary!)")
-        }
-        let screenCount = recent.count
-        let meetingCount = meetings.count
-        Task.detached {
-            await ProfileDigest.regenerate(ownerName: owner, signals: signals,
-                                           screenTextCount: screenCount, meetingCount: meetingCount)
-        }
-    }
-
-    // MARK: - Retention
-
-    /// One-shot retention sweep at launch, off the main actor.
-    ///
-    /// `screen_text_log` is written by `ScreenTextMonitor` independently of chat activity and its
-    /// prune had **no call site anywhere in the app**, so captured on-screen text accumulated
-    /// forever. Conversation history is already pruned per-turn in `AssistantCore.postProcess`;
-    /// this covers the two tables nothing was sweeping.
-    private func sweepRetentionOnLaunch() {
-        guard let store = memoryStore else { return }
-        let screenDays = appState.screenTextRetentionDays
-        Task.detached(priority: .utility) {
-            store.pruneScreenText(olderThanDays: screenDays)
-            try? store.pruneMemories()
-        }
-    }
-
-    // MARK: - Learning profile
-
-    private func startLearningProfileTimer() {
-        learningProfileTimer?.invalidate()
-        learningProfileTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.regenerateHermesProfile()
-                guard let learningService else { return }
-                learningService.generateProfileUpdate()
-                self.projectAwareness?.refreshProjects()
-
-                // Feed active projects into relationship memory
-                for project in (self.projectAwareness?.activeProjects() ?? []) {
-                    self.relationshipMemoryService?.considerMention(
-                        project.displayName,
-                        category: .projects,
-                        source: "project-awareness"
-                    )
-                }
-
-                // Feed top learning interests
-                for interest in learningService.topInterests(limit: 5) {
-                    self.relationshipMemoryService?.considerMention(
-                        interest,
-                        category: .longTermInterests,
-                        source: "behavioral-learning"
-                    )
-                }
-
-                // Run memory reflection if cooldown has elapsed
-                if self.memoryReflectionService?.shouldRunReflection() == true {
-                    let count = self.memoryReflectionService?.runReflectionNow() ?? 0
-                    if count > 0 {
-                        self.barState.contextStatus = "Memory reflection generated \(count) insight(s)"
-                    }
-                }
-
-                // Run habit detection from timeline data
-                self.memoryStore?.habitStore.detectHabits()
-
-                // Check for proactive suggestions
-                if self.proactiveSurfacingService?.proactiveEnabled == true {
-                    _ = self.proactiveSurfacingService?.forceCheck()
-                }
-            }
-        }
-    }
-
-    // MARK: - Menu bar icon
-
-    @objc private func showAlfredFromMenu() {
-        contextMonitor?.refresh(forceBrowserRead: true)
+    private func showBar() {
+        NSApp.activate(ignoringOtherApps: true)
+        barWindow?.orderFrontRegardless()
         barState.presenceState = .expanded
-        barWindow?.expand(toHeight: expandedBarHeight(
-            text: barState.responseText,
-            isProcessing: barState.isProcessing,
-            suggestions: barState.suggestions
-        ))
+        barWindow?.expand(toHeight: barHeight())
+        barState.focusToken += 1
     }
 
-    @objc private func showIntroFromMenu() {
-        showOnboarding(initialStep: 0)
+    private func hideBar() {
+        barState.presenceState = .hidden
+        barWindow?.orderOut(nil)
     }
 
-    @objc private func showPermissionsFromMenu() {
-        showOnboarding(initialStep: 4)
-    }
-
-    @objc private func runDiagnosticsFromMenu() {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            await CapabilityEventLogger.shared.record("diagnostics", "requested")
-            let summary = await diagnosticsSummary()
-            showDiagnosticsPanel(summary)
-            barState.contextStatus = "Diagnostics complete. Summary stayed local."
-            await CapabilityEventLogger.shared.record("diagnostics", "completed")
+    private func toggleBar() {
+        switch barState.presenceState {
+        case .hidden, .collapsed:
+            showBar()
+        case .expanded, .thinking, .responding, .listening:
+            hideBar()
         }
-    }
-
-    @objc private func copyDiagnosticsSummaryFromMenu() {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            await CapabilityEventLogger.shared.record("diagnostics", "copy requested")
-            let summary = await diagnosticsSummary()
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(summary, forType: .string)
-            barState.contextStatus = "Diagnostics summary copied. It contains status only, not file contents or paths."
-            await CapabilityEventLogger.shared.record("diagnostics", "copied")
-        }
-    }
-
-    private func diagnosticsSummary() async -> String {
-        await CapabilityDiagnostics.makeSummary(
-            appState: appState,
-            selectedFiles: selectedFileContext.snapshot(),
-            bookmarkStore: bookmarkStore,
-            screenMonitoringActive: screenMonitoring.isActive,
-            focusSessionActive: focusSession.isActive
-        )
-    }
-
-    private func showDiagnosticsPanel(_ summary: String) {
-        let alert = NSAlert()
-        alert.messageText = "Alfred Diagnostics"
-        alert.informativeText = "Local-only capability status. No contents, screenshots, secrets, or full paths are included."
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "OK")
-        alert.addButton(withTitle: "Copy Summary")
-
-        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 520, height: 300))
-        textView.string = summary
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-
-        let scrollView = NSScrollView(frame: textView.frame)
-        scrollView.hasVerticalScroller = true
-        scrollView.documentView = textView
-        alert.accessoryView = scrollView
-
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertSecondButtonReturn {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(summary, forType: .string)
-            barState.contextStatus = "Diagnostics summary copied."
-        }
-    }
-
-    @objc private func chooseFileFromMenu() {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            await CapabilityEventLogger.shared.record("file access", "choose files requested")
-            let urls = await fileAccess.chooseFiles()
-            if urls.isEmpty {
-                barState.contextStatus = "No file selected."
-                await CapabilityEventLogger.shared.record("file access", "choose files cancelled")
-                return
-            }
-
-            selectedFileContext.selectFiles(urls)
-            let names = urls.map(\.lastPathComponent).joined(separator: ", ")
-            barState.contextStatus = urls.count == 1
-                ? "Selected file: \(names)"
-                : "Selected \(urls.count) files: \(names)"
-            await CapabilityEventLogger.shared.record("file access", "files selected", detail: "\(urls.count) file(s)")
-        }
-    }
-
-    @objc private func chooseFolderFromMenu() {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            await CapabilityEventLogger.shared.record("file access", "choose folder requested")
-            guard let url = await fileAccess.chooseFolder() else {
-                barState.contextStatus = "No folder selected."
-                await CapabilityEventLogger.shared.record("file access", "choose folder cancelled")
-                return
-            }
-
-            selectedFileContext.selectFolder(url)
-            barState.contextStatus = "Selected folder: \(url.lastPathComponent)"
-            await CapabilityEventLogger.shared.record("file access", "folder selected", detail: url.lastPathComponent)
-        }
-    }
-
-    @objc private func clearSelectedFilesFromMenu() {
-        selectedFileContext.clear()
-        barState.contextStatus = "Selected files cleared."
-        Task { await CapabilityEventLogger.shared.record("file access", "selected context cleared") }
-    }
-
-    @objc private func rememberSelectedFileAccessFromMenu() {
-        let urls = selectedFileContext.fileURLs
-        guard !urls.isEmpty else {
-            barState.contextStatus = "Choose one or more files before remembering file access."
-            Task { await CapabilityEventLogger.shared.record("bookmarks", "remember files refused", detail: "no selected files") }
-            return
-        }
-
-        do {
-            try bookmarkStore.rememberFiles(urls)
-            selectedFileContext.selectFiles(urls, remembered: true)
-            let names = urls.map(\.lastPathComponent).joined(separator: ", ")
-            barState.contextStatus = urls.count == 1
-                ? "Remembered file access: \(names)"
-                : "Remembered access for \(urls.count) files."
-            Task { await CapabilityEventLogger.shared.record("bookmarks", "remember files succeeded", detail: "\(urls.count) file(s)") }
-        } catch {
-            barState.contextStatus = "Could not remember file access: \(error.localizedDescription)"
-            Task { await CapabilityEventLogger.shared.record("bookmarks", "remember files failed", detail: error.localizedDescription) }
-        }
-    }
-
-    @objc private func rememberSelectedFolderAccessFromMenu() {
-        guard let url = selectedFileContext.folderURL else {
-            barState.contextStatus = "Choose a folder before remembering folder access."
-            Task { await CapabilityEventLogger.shared.record("bookmarks", "remember folder refused", detail: "no selected folder") }
-            return
-        }
-
-        do {
-            try bookmarkStore.rememberFolder(url)
-            selectedFileContext.selectFolder(url, remembered: true)
-            barState.contextStatus = "Remembered folder access: \(url.lastPathComponent)"
-            Task { await CapabilityEventLogger.shared.record("bookmarks", "remember folder succeeded", detail: url.lastPathComponent) }
-        } catch {
-            barState.contextStatus = "Could not remember folder access: \(error.localizedDescription)"
-            Task { await CapabilityEventLogger.shared.record("bookmarks", "remember folder failed", detail: error.localizedDescription) }
-        }
-    }
-
-    @objc private func forgetRememberedFileAccessFromMenu() {
-        bookmarkStore.forgetFiles()
-        if selectedFileContext.usesRememberedFileAccess {
-            selectedFileContext.clear()
-        }
-        barState.contextStatus = "Forgot remembered file access."
-        Task { await CapabilityEventLogger.shared.record("bookmarks", "forgot file access") }
-    }
-
-    @objc private func forgetRememberedFolderAccessFromMenu() {
-        bookmarkStore.forgetFolder()
-        if selectedFileContext.usesRememberedFolderAccess {
-            selectedFileContext.clear()
-        }
-        barState.contextStatus = "Forgot remembered folder access."
-        Task { await CapabilityEventLogger.shared.record("bookmarks", "forgot folder access") }
-    }
-
-    @objc func enableScreenMonitoringFromMenu() {
-        appState.screenMonitoringEnabled = true
-        screenMonitoring.start()
-        barState.contextStatus = "Screen monitoring enabled. Captures stay in memory and are not sent to the model automatically."
-        Task { await CapabilityEventLogger.shared.record("screen monitoring", "enabled") }
-    }
-
-    @objc func disableScreenMonitoringFromMenu() {
-        appState.screenMonitoringEnabled = false
-        screenMonitoring.stop()
-        barState.contextStatus = "Screen monitoring disabled. In-memory screen context cleared."
-        Task { await CapabilityEventLogger.shared.record("screen monitoring", "disabled") }
-    }
-
-    @objc private func startVoiceInputFromMenu() {
-        guard VoiceInputCapability.isAuthorized else {
-            barState.contextStatus = "Voice input not authorized. Grant speech recognition in System Settings."
-            Task { await CapabilityEventLogger.shared.record("voice input", "not authorized") }
-            return
-        }
-        guard let voiceInput = VoiceInputCapability() else {
-            barState.contextStatus = "Voice input unavailable on this Mac."
-            Task { await CapabilityEventLogger.shared.record("voice input", "unavailable") }
-            return
-        }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            barState.contextStatus = "Listening…"
-            self.showBar()
-            var fullTranscript = ""
-            do {
-                for try await partial in voiceInput.transcribe() {
-                    fullTranscript = partial
-                }
-                barState.contextStatus = "Transcribed. Processing…"
-                guard !fullTranscript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    barState.contextStatus = "No speech detected."
-                    return
-                }
-                handleQuery(fullTranscript)
-            } catch {
-                barState.contextStatus = "Voice input failed: \(error.localizedDescription)"
-                Task { await CapabilityEventLogger.shared.record("voice input", "failed", detail: error.localizedDescription) }
-            }
-        }
-    }
-
-    @objc private func showTodaysEventsFromMenu() {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.showBar()
-            barState.isProcessing = true
-            barState.responseText = "Fetching your calendar…"
-            let cal = CalendarRemindersCapability()
-            do {
-                let events = try await cal.readUpcomingEvents(limit: 10)
-                let reminders = try await cal.readReminders(limit: 10)
-                barState.responseText = "📅 Today & Upcoming\n\n\(events)\n\n\(reminders)"
-            } catch {
-                barState.responseText = "Could not fetch calendar: \(error.localizedDescription)"
-                Task { await CapabilityEventLogger.shared.record("calendar", "failed", detail: error.localizedDescription) }
-            }
-            barState.isProcessing = false
-        }
-    }
-
-    @objc private func startFocusSessionFromMenu() {
-        guard let goal = promptForFocusGoal() else {
-            barState.contextStatus = "Focus session not started."
-            return
-        }
-
-        focusSession.start(goal: goal)
-        screenMonitoring.start()
-        contextMonitor?.start()
-        barState.contextStatus = "Focus session started: \(goal)"
-        updateScreenMonitoringIndicator(isActive: screenMonitoring.isActive)
-        Task { await CapabilityEventLogger.shared.record("focus session", "started") }
-    }
-
-    @objc private func pauseFocusSessionFromMenu() {
-        focusSession.pause()
-        barState.contextStatus = "Focus session paused."
-        updateScreenMonitoringIndicator(isActive: screenMonitoring.isActive)
-        Task { await CapabilityEventLogger.shared.record("focus session", "paused") }
-    }
-
-    @objc private func resumeFocusSessionFromMenu() {
-        focusSession.resume()
-        screenMonitoring.start()
-        contextMonitor?.start()
-        barState.contextStatus = "Focus session resumed: \(focusSession.currentGoal)"
-        updateScreenMonitoringIndicator(isActive: screenMonitoring.isActive)
-        Task { await CapabilityEventLogger.shared.record("focus session", "resumed") }
-    }
-
-    @objc private func endFocusSessionFromMenu() {
-        focusSession.end()
-        if !appState.screenMonitoringEnabled {
-            screenMonitoring.stop()
-        }
-        if !appState.proactiveSuggestionsEnabled {
-            contextMonitor?.stop()
-        }
-        barState.contextStatus = "Focus session ended. Monitoring for this session stopped."
-        updateScreenMonitoringIndicator(isActive: screenMonitoring.isActive)
-        Task { await CapabilityEventLogger.shared.record("focus session", "ended") }
-    }
-
-    @objc private func cycleFocusSensitivityFromMenu() {
-        let all = FocusSensitivity.allCases
-        let current = focusSession.sensitivity
-        let nextIndex = ((all.firstIndex(of: current) ?? 1) + 1) % all.count
-        let next = all[nextIndex]
-        focusSession.sensitivity = next
-        appState.focusSensitivity = next.rawValue
-        barState.contextStatus = "Focus sensitivity set to \(next.displayName)."
-        updateScreenMonitoringIndicator(isActive: screenMonitoring.isActive)
-    }
-
-    private func promptForFocusGoal() -> String? {
-        let alert = NSAlert()
-        alert.messageText = "Start Focus Session"
-        alert.informativeText = "What should Alfred help you stay focused on?"
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Start")
-        alert.addButton(withTitle: "Cancel")
-
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        input.placeholderString = "e.g. work on Alfred file reading"
-        alert.accessoryView = input
-
-        NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
-        guard response == .alertFirstButtonReturn else { return nil }
-
-        let goal = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        return goal.isEmpty ? nil : goal
-    }
-
-    @objc private func stopComputerControlFromMenu() {
-        computerControl.cancel()
-        barState.contextStatus = "Computer control stop requested."
-        Task { await CapabilityEventLogger.shared.record("computer control", "stopped by menu") }
-    }
-
-    @objc private func runWorkflowDetectionFromMenu() {
-        let count = workflowDetectionService?.detectWorkflows().count ?? 0
-        barState.contextStatus = count > 0
-            ? "Detected \(count) new workflow pattern(s)"
-            : "Workflow detection complete. No new patterns found."
-    }
-
-    @objc private func listWorkflowsFromMenu() {
-        let workflows = workflowDetectionService?.allWorkflows ?? []
-        if workflows.isEmpty {
-            barState.contextStatus = "No workflows available. Run detection first."
-            return
-        }
-        let lines = workflows.map { "• \($0.title) (\($0.steps.count) steps, used \($0.useCount)x)" }.joined(separator: "\n")
-        let alert = NSAlert()
-        alert.messageText = "Available Workflows"
-        alert.informativeText = lines
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "OK")
-        NSApp.activate(ignoringOtherApps: true)
-        _ = alert.runModal()
-    }
-
-    @objc private func runMemoryReflectionFromMenu() {
-        let count = memoryReflectionService?.runReflectionNow() ?? 0
-        if count > 0 {
-            barState.contextStatus = "Memory reflection generated \(count) new insight(s)"
-        } else {
-            barState.contextStatus = "No new insights found. May need more relationship memories."
-        }
-    }
-
-    @objc private func showReflectionsFromMenu() {
-        let reflections = memoryReflectionService?.getReflections() ?? []
-        if reflections.isEmpty {
-            barState.contextStatus = "No reflections available yet."
-            return
-        }
-
-        let summary = memoryReflectionService?.generateReflectionSummary() ?? "No summary available."
-        let alert = NSAlert()
-        alert.messageText = "Memory Reflections"
-        alert.informativeText = "Generated insights from your relationship memories.\n\n\(summary)"
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "OK")
-        NSApp.activate(ignoringOtherApps: true)
-        _ = alert.runModal()
-    }
-
-    private var personalizationWindow: NSWindow?
-
-    @objc private func showPersonalizationDashboardFromMenu() {
-        if let existing = personalizationWindow {
-            existing.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
-        }
-
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 560),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.center()
-        window.title = "Personalization Dashboard"
-        window.minSize = NSSize(width: 700, height: 500)
-        window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 380, height: 400)
-
-        let projects = projectAwareness?.activeProjects() ?? []
-        let interests = learningService?.topInterests() ?? []
-        let preferredTypes = learningService?.preferredSuggestionTypes() ?? []
-        let recentEvents = learningEventLog?.recent(days: 7) ?? []
-        let context = personalContextService?.structuredContext()
-
-        let rootView = PersonalizationDashboardView(
-            activeProjects: projects,
-            topInterests: interests,
-            preferredTypes: preferredTypes,
-            recentEvents: recentEvents,
-            personalContext: context,
-            onShowExplanation: { _ in }
-        )
-        .frame(width: 440, height: 520)
-
-        let hostingView = NSHostingView(rootView: rootView)
-        hostingView.frame = window.contentView?.bounds ?? .zero
-        hostingView.autoresizingMask = [.width, .height]
-        window.contentView = hostingView
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        personalizationWindow = window
-    }
-
-    @objc private func testNotificationFromMenu() {
-        Task {
-            await CapabilityEventLogger.shared.record("notifications", "test requested")
-            do {
-                let sent = try await NotificationManager.shared.send(
-                    title: "Alfred",
-                    body: "Notifications are ready. Nothing dramatic, thankfully.",
-                    identifier: "alfred.test-notification"
-                )
-                if !sent {
-                    await MainActor.run {
-                        self.barState.contextStatus = "Notifications are disabled in System Settings."
-                    }
-                    await CapabilityEventLogger.shared.record("notifications", "refused", detail: "permission denied")
-                } else {
-                    await CapabilityEventLogger.shared.record("notifications", "test sent")
-                }
-            } catch {
-                await MainActor.run {
-                    self.barState.contextStatus = "Notification failed: \(error.localizedDescription)"
-                }
-                await CapabilityEventLogger.shared.record("notifications", "failed")
-            }
-        }
-    }
-
-    @objc private func quitFromMenu() {
-        NSApp.terminate(nil)
-    }
-
-    // MARK: - Menu bar status item
-
-    /// The menu-bar control (Blueprint §1). Provides the only reliable way to quit a resident,
-    /// Dock-less app — required before launchd KeepAlive can be safely re-enabled.
-    private func setupStatusItem() {
-        guard statusItem == nil else { return }
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = item.button {
-            button.image = MenuBarIcon.make()
-            button.toolTip = "Alfred"
-            button.target = self
-            button.action = #selector(statusItemClicked)
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        }
-        // Right-click menu — a reliable escape hatch to Quit even if the popover misbehaves.
-        let menu = NSMenu()
-        menu.addItem(withTitle: "Show Alfred", action: #selector(showBarFromMenu), keyEquivalent: "")
-        menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit Alfred", action: #selector(quitFromMenu), keyEquivalent: "q")
-        menu.items.forEach { $0.target = self }
-        statusMenu = menu
-        statusItem = item
-    }
-
-    @objc private func statusItemClicked() {
-        let isRight = NSApp.currentEvent.map {
-            $0.type == .rightMouseUp || $0.modifierFlags.contains(.control)
-        } ?? false
-        if isRight, let item = statusItem, let menu = statusMenu {
-            item.menu = menu
-            item.button?.performClick(nil)
-            item.menu = nil   // reset so the next left-click opens the popover
-        } else {
-            togglePopover()
-        }
-    }
-
-    /// The menu-bar popover panel (weather-widget style) — Alfred's control surface.
-    private func togglePopover() {
-        guard let button = statusItem?.button else { return }
-        if let pop = popover, pop.isShown {
-            pop.performClose(nil)
-            return
-        }
-        guard let store = memoryStore else { return }
-        if syllabusService == nil, let r = llmRouter { syllabusService = SyllabusImportService(router: r) }
-        let panel = AlfredPanelView(
-            store: store,
-            screenTextMonitor: screenTextMonitor,
-            meetingManager: meetingManager,
-            syllabusService: syllabusService,
-            ownerName: appState.ownerName,
-            onRunNow: { [weak self] routine in self?.routineScheduler?.runNow(routine) },
-            onQuit: { [weak self] in self?.quitFromMenu() },
-            onScreenTextToggle: { [weak self] on in
-                self?.appState.screenTextCaptureEnabled = on
-                if on { self?.screenTextMonitor?.start() } else { self?.screenTextMonitor?.stop() }
-            },
-            appState: appState
-        )
-        let pop = NSPopover()
-        pop.behavior = .transient
-        pop.contentSize = NSSize(width: 340, height: 460)
-        pop.contentViewController = NSHostingController(rootView: panel)
-        pop.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover = pop
-        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc private func showBarFromMenu() { showBar() }
 
-    // MARK: - Hotkey
+    /// Esc, or a click outside the bar.
+    private func handleCollapse() {
+        // Esc while a control confirmation is up means "no". Collapsing without
+        // answering would leave the agent suspended until it timed out, and would
+        // make dismissal look like consent.
+        if barState.pendingConfirmation != nil {
+            ControlConfirmationBroker.shared.resolve(false, source: "escape-key")
+            barState.responseText = "Cancelled."
+            barState.presenceState = .expanded
+            return
+        }
+
+        // Interrupt a running turn, so dismissing the bar also stops the agent
+        // rather than leaving it working unseen.
+        if barState.isProcessing {
+            hermesTask?.cancel()
+            Task { await hermes.cancel() }
+            barState.isProcessing = false
+        }
+        hideBar()
+    }
+
+    // MARK: Hotkey
 
     private func startHotkeyListener() {
         guard hotkeyListener == nil else { return }
@@ -1710,575 +245,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         listener.start()
     }
 
-    private func showBar() {
-        NSApp.activate(ignoringOtherApps: true)
-        barWindow?.orderFrontRegardless()
-        barState.presenceState = .expanded
-        barWindow?.expand(toHeight: expandedBarHeight(
-            text: barState.responseText,
-            isProcessing: barState.isProcessing,
-            suggestions: barState.suggestions
-        ))
-        barState.focusToken += 1
-    }
-
-    private func toggleBar() {
-        guard let window = barWindow else { return }
-        switch barState.presenceState {
-        case .hidden:
-            contextMonitor?.refresh(forceBrowserRead: true)
-            barState.presenceState = .expanded
-            window.expand(toHeight: expandedBarHeight(
-                text: barState.responseText,
-                isProcessing: barState.isProcessing,
-                suggestions: barState.suggestions
-            ))
-            barState.focusToken += 1
-        case .collapsed:
-            barState.presenceState = .expanded
-            window.expand(toHeight: expandedBarHeight(
-                text: barState.responseText,
-                isProcessing: barState.isProcessing,
-                suggestions: barState.suggestions
-            ))
-            barState.focusToken += 1
-        case .expanded, .thinking, .responding, .listening:
-            hideBar()
-        }
-    }
-
-    /// Fully remove the bar from screen (hotkey-only model). The last response is kept so the
-    /// conversation resumes where it left off when the bar is brought back with the shortcut.
-    /// Write SOUL.md / USER.md into `$HERMES_HOME` so Hermes speaks as Alfred.
-    ///
-    /// Owner facts come from the owner's own configuration via
-    /// `PersonaTemplate.ownerBlock` — never from memory or screen captures, since
-    /// these files are sent to the model provider on every turn.
-    @MainActor
-    private func exportPersonaToHermes(writingStyle: WritingStyleStore?) {
-        let snapshot = ownerConfigStore?.currentSnapshot()
-        // The profile, not generateStyleContext() — the exporter derives an
-        // aggregate-only description from it. See PersonaExporter.styleDescription
-        // for why verbatim excerpts must not go into a file that is uploaded on
-        // every turn.
-        let styleProfile = writingStyle?.getWritingProfile()
-
-        for outcome in PersonaExporter.export(snapshot: snapshot, styleProfile: styleProfile) {
-            switch outcome {
-            case let .written(url):
-                logger.info("Hermes persona written: \(url.lastPathComponent, privacy: .public)")
-            case .unchanged:
-                break
-            case let .skippedUserAuthored(url):
-                // Their file, their call — say so rather than silently doing nothing.
-                logger.info("Left \(url.lastPathComponent, privacy: .public) alone — it looks hand-edited.")
-            case let .failed(url, error):
-                logger.error("Could not write \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
-            }
-        }
-    }
-
-    /// Bring the bar up carrying a computer-control confirmation.
-    ///
-    /// Presented in the bar the user is already looking at rather than as a system
-    /// modal — see ControlConfirmationBroker for why the modal approach was
-    /// abandoned.
-    func presentControlConfirmation(_ request: PendingControlConfirmation) {
-        barState.pendingConfirmation = request
-        // Cancel any in-flight streaming state so the confirmation isn't competing
-        // with a spinner for the same space.
-        barState.isProcessing = false
-        showBar()
-    }
-
-    func dismissControlConfirmation() {
-        barState.pendingConfirmation = nil
-    }
-
-    private func hideBar() {
-        shownByHover = false
-        hideOnLeaveTimer?.invalidate()
-        barState.isProcessing = false
-        pendingInboundReply = nil   // leaving the bar exits any inbound-reply session
-        barState.presenceState = .hidden
-        barWindow?.hideImmediately()
-    }
-
-    private func dismissBar() {
-        shownByHover = false
-        hideOnLeaveTimer?.invalidate()
-        pendingInboundReply = nil   // leaving the bar exits any inbound-reply session
-        barState.presenceState = .collapsed
-        barWindow?.collapse()
-    }
-
-    // MARK: - Notch hover
-
-    private func startNotchHoverMonitor() {
-        notchHoverMonitor = NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.handleMouseMove() }
-        }
-    }
-
-    private func handleMouseMove() {
-        let loc = NSEvent.mouseLocation
-        guard let screen = NSScreen.screens.first(where: {
-            NSMouseInRect(loc, $0.frame, false)
-        }) ?? NSScreen.main else { return }
-
-        let hoverZone = loc.y >= screen.visibleFrame.maxY - 8
-            && abs(loc.x - screen.visibleFrame.midX) < 150
-
-        if hoverZone {
-            hideOnLeaveTimer?.invalidate()
-
-            switch barState.presenceState {
-            case .hidden:
-                barWindow?.showCollapsed()
-                fallthrough
-            case .collapsed:
-                shownByHover = true
-                barState.presenceState = .expanded
-                barWindow?.expand(toHeight: expandedBarHeight(
-                    text: barState.responseText,
-                    isProcessing: barState.isProcessing,
-                    suggestions: barState.suggestions
-                ))
-            default:
-                break
-            }
-            return
-        }
-
-        guard shownByHover else { return }
-
-        switch barState.presenceState {
-        case .expanded, .collapsed:
-            let barFrame = barWindow?.frame ?? .zero
-            let tolerance = barFrame.insetBy(dx: -20, dy: -20)
-            if NSMouseInRect(loc, tolerance, false) {
-                hideOnLeaveTimer?.invalidate()
-            } else {
-                scheduleHoverHide()
-            }
-        default:
-            break
-        }
-    }
-
-    private func scheduleHoverHide() {
-        guard hideOnLeaveTimer?.isValid != true else { return }
-        hideOnLeaveTimer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: false) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self, self.shownByHover else { return }
-                guard self.barWindow?.isKeyWindow != true else { return }
-                self.shownByHover = false
-                self.collapseToStrip()
-            }
-        }
-    }
-
-    private func collapseToStrip() {
-        barState.responseText = ""
-        barState.isProcessing = false
-        barState.presenceState = .collapsed
-        barWindow?.collapse()
-    }
-
-    // MARK: - Presence actions
-
-    private func handleSuggestionTap(_ suggestion: ProactiveSuggestion) {
-        handleQuery(suggestion.prompt)
-    }
-
-    private func handlePresenceCollapse() {
-        // Esc while a control confirmation is up means "no". Collapsing the bar
-        // without answering would leave the agent suspended until it timed out,
-        // and would make dismissal look like consent.
-        if barState.pendingConfirmation != nil {
-            ControlConfirmationBroker.shared.resolve(false, source: "escape-key")
-            barState.responseText = "Cancelled."
-            barState.presenceState = .expanded
-            return
-        }
-        // During an inbound-reply session, Esc means "just chat instead" (as the prompt promises):
-        // drop the reply but keep the bar open in normal chat mode rather than dismissing it.
-        if pendingInboundReply != nil {
-            pendingInboundReply = nil
-            barState.responseText = "Okay, dropped that. What can I help with?"
-            barState.isProcessing = false
-            barState.presenceState = .expanded
-            barState.focusToken += 1
-            return
-        }
-        // Interrupt any turn still running, so dismissing the bar also stops the
-        // agent rather than leaving it working (and billing) unseen.
-        if barState.isProcessing {
-            hermesTask?.cancel()
-            Task { await hermes.cancel() }
-            barState.isProcessing = false
-        }
-        // Escape handler: fully dismiss (hotkey-only model — same as pressing the shortcut).
-        hideBar()
-    }
-
-    // MARK: - Query handling
-
-    /// Log a synchronous bar action (text/email/file op) to the `runs` audit, deriving status from
-    /// its human-readable result. These return before the dispatcher's audit, so log them directly.
-    private func auditBarAction(prompt: String, result: String, commandClass: String, dataSentToCloud: String? = nil) {
-        let lower = result.lowercased()
-        let status: String
-        if lower.contains("cancelled") {
-            status = "blocked"
-        } else if lower.contains("couldn't") || lower.contains("could not") || lower.contains("failed")
-                    || lower.hasPrefix("invalid") || lower.hasPrefix("no ") || lower.contains("not run") {
-            status = "failed"
-        } else {
-            status = "success"
-        }
-        memoryStore?.recordAction(prompt: prompt, status: status, commandClass: commandClass,
-                                  outputSummary: result, dataSentToCloud: dataSentToCloud)
-    }
-
-    /// Builds the drafting brain on demand — the LLM router plus the learned writing voice and
-    /// per-recipient relationship memory. Returns nil until the router is ready.
-    @MainActor
-    private func draftingService() -> DraftingService? {
-        guard let router = llmRouter else { return nil }
-        return DraftingService(router: router,
-                               writingStyle: writingStyleStore,
-                               relationships: memoryStore?.relationshipStore,
-                               ownerName: appState.ownerName)
-    }
-
-    /// Drives a tap on an inbound "want me to respond?" notification. Instead of silently drafting a
-    /// one-shot reply, it opens the Alfred bar and starts an INTERACTIVE reply session: it seeds the
-    /// bar with the incoming message and arms `pendingInboundReply`, so the user's next bar input is
-    /// captured as a drafting instruction. Alfred drafts in the user's voice; the user can refine
-    /// ("make it warmer") or ask about it, and only an explicit "yes" sends. Never auto-sends.
-    @MainActor
-    func respondToInboundNotification(_ userInfo: [String: String]) {
-        guard let channel = userInfo["channel"] else { return }
-        let sender = userInfo["sender"] ?? "them"
-        let handle = userInfo["handle"] ?? ""
-        let preview = userInfo["preview"] ?? ""
-        let subject = userInfo["subject"]
-
-        pendingTextRecipient = nil   // don't collide with the other two-turn flow
-        pendingInboundReply = InboundReplyContext(channel: channel, sender: sender, handle: handle,
-                                                  subject: subject, preview: preview, lastDraft: nil)
-
-        let verb = channel == "email" ? "emailed" : "texted"
-        let noun = channel == "email" ? "email" : "message"
-        barState.isProcessing = true
-        barState.responseText = "Reading \(sender)'s \(noun)…"
-        showBar()   // showBar activates the app and orders the bar front
-
-        // Summarize rather than echo the whole thing — length scales with the message. The full
-        // text is kept on `pendingInboundReply`, so "show the full message" / questions still work.
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.barState.isProcessing = false; self.barState.presenceState = .expanded }
-            let summary = await self.summarizeInbound(channel: channel, sender: sender,
-                                                      subject: subject, preview: preview)
-            guard self.pendingInboundReply != nil else { return }   // Esc during summarize → bail
-            self.barState.responseText = "\(sender) \(verb) you. \(summary)\n\n"
-                + "What do you want to say back? I'll write it in your voice. Ask me for more or to "
-                + "show the full \(noun) anytime, or press Esc to just chat."
-        }
-    }
-
-    /// Summarizes an incoming message for the reply prompt. The summary length scales with the
-    /// content — a one-liner for a short text, a few sentences for a long email. No emojis are added.
-    @MainActor
-    private func summarizeInbound(channel: String, sender: String, subject: String?, preview: String) async -> String {
-        let trimmed = preview.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "It came through with no readable content." }
-        guard let router = llmRouter else { return String(trimmed.prefix(280)) }
-        let noun = channel == "email" ? "email" : "message"
-        // Word budget grows with the source length: ~one line for a short text, a few sentences for
-        // a long email. Roughly one summary word per 12 source chars, clamped to a sane band.
-        let budget = min(60, max(12, trimmed.count / 12))
-        let system = """
-        You summarize an incoming \(noun) so a busy person instantly knows what it's about and what, \
-        if anything, is being asked of them. Write plain prose — no greeting, no sign-off, no markdown, \
-        and do NOT add any emojis. Keep it to about \(budget) words or fewer; a short \(noun) gets a \
-        single short sentence, a long one gets a few. Refer to the sender in the third person.
-        """
-        var user = ""
-        if let subject, !subject.isEmpty { user += "Subject: \(subject)\n" }
-        user += "\(noun.capitalized) from \(sender):\n\(String(trimmed.prefix(1000)))"
-        guard let raw = try? await router.complete(prompt: user, system: system) else {
-            return String(trimmed.prefix(280))
-        }
-        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    /// Answers a question the user asks about the incoming message during a reply session, using only
-    /// the message text as context. Keeps them in the session (they can still draft afterward).
-    @MainActor
-    private func answerInboundQuestion(_ ctx: InboundReplyContext, question: String) async -> String {
-        guard let router = llmRouter else { return "I can't look into that right now." }
-        let noun = ctx.channel == "email" ? "email" : "message"
-        let system = """
-        You help someone understand an incoming \(noun) from \(ctx.sender). Answer their question \
-        using ONLY the \(noun) below. Be concise and plain — no markdown, and do NOT add any emojis. \
-        If the answer isn't in the \(noun), say so plainly.
-        """
-        var user = ""
-        if let subject = ctx.subject, !subject.isEmpty { user += "Subject: \(subject)\n" }
-        user += "\(noun.capitalized):\n\(String(ctx.preview.prefix(1000)))\n\nQuestion: \(question)"
-        guard let raw = try? await router.complete(prompt: user, system: system) else {
-            return "I couldn't look into that."
-        }
-        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    /// Runs a routine's drafted write after the owner tapped "Run now" on the confirmation
-    /// notification. Attended (a human tap) → the write is allowed to happen, mirroring running the
-    /// same command from the AlfredBar. Routed here from NotificationManager.didReceive.
-    @MainActor
-    func confirmRoutineFromNotification(_ userInfo: [String: String]) {
-        guard userInfo["kind"] == "routine_confirm",
-              let ridStr = userInfo["routineId"], let rid = Int64(ridStr) else { return }
-        let pendingRunId = userInfo["runId"].flatMap { Int64($0) }
-        routineScheduler?.confirmAndRun(routineId: rid, pendingRunId: pendingRunId)
-    }
-
-    /// One turn of an active inbound-reply session (armed by `respondToInboundNotification`). Exit
-    /// words ("cancel", "nvm", …) drop the reply; once a draft exists a send word ("send", "yes")
-    /// sends it; anything else is a drafting instruction or a refinement applied to the current draft.
-    /// Leaving the bar (Esc) also clears the session — see hideBar/dismissBar.
-    @MainActor
-    private func handleInboundReplyTurn(_ text: String) {
-        guard var ctx = pendingInboundReply else { return }
-        let input = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !input.isEmpty else { return }
-        let lower = input.lowercased()
-
-        // Word-based escape hatch → drop the reply and go back to normal chatting.
-        let exitWords: Set<String> = ["cancel", "stop", "nvm", "nevermind", "never mind",
-                                      "forget it", "exit", "quit", "leave it", "not now"]
-        if exitWords.contains(lower) {
-            pendingInboundReply = nil
-            barState.responseText = "Okay, dropped that. What can I help with?"
-            barState.isProcessing = false
-            barState.presenceState = .expanded
-            return
-        }
-
-        // "Show me the whole thing" → print the stored message verbatim (any emojis in it are the
-        // sender's, not ours). The reply session stays open.
-        let showFullTriggers: Set<String> = [
-            "show full message", "show the full message", "show me the full message", "full message",
-            "the full message", "show message", "show the message", "show me the message",
-            "read it", "read the message", "read the full message", "read the whole message",
-            "read the whole thing", "show the whole thing", "whole message", "read full", "show full",
-            "full email", "show the full email", "show the email", "read the full email", "read the email"]
-        if showFullTriggers.contains(lower) {
-            let noun = ctx.channel == "email" ? "email" : "message"
-            let full = ctx.preview.trimmingCharacters(in: .whitespacesAndNewlines)
-            barState.responseText = (full.isEmpty ? "There's no full \(noun) text to show." :
-                "Full \(noun) from \(ctx.sender):\n\n\(full)")
-                + "\n\nTell me what to say back, or press Esc to just chat."
-            barState.isProcessing = false
-            barState.presenceState = .expanded
-            return
-        }
-
-        // A question or a request for more detail about the message → answer it, don't draft a reply.
-        if Self.looksLikeInboundQuestion(lower) {
-            barState.responseText = "One sec…"
-            barState.isProcessing = true
-            barState.presenceState = .thinking
-            Task { @MainActor [weak self] in
+    /// Global Esc, so computer control can be stopped while another app is focused.
+    private func installEscapeMonitor() {
+        escapeMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == 53 else { return }   // Esc
+            Task { @MainActor in
                 guard let self else { return }
-                defer { self.barState.isProcessing = false; self.barState.presenceState = .expanded }
-                let answer = await self.answerInboundQuestion(ctx, question: input)
-                guard self.pendingInboundReply != nil else { return }
-                self.barState.responseText = answer
-                    + "\n\nWant me to draft a reply? Tell me what to say, or press Esc to just chat."
-            }
-            return
-        }
-
-        // A pending draft + an explicit send word → send it. (Refinements are anything else.)
-        if let draft = ctx.lastDraft, Self.isSendWord(lower) {
-            pendingInboundReply = nil
-            barState.responseText = "Sending…"
-            barState.isProcessing = true
-            barState.presenceState = .thinking
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                defer { self.barState.isProcessing = false; self.barState.presenceState = .expanded }
-                self.barState.responseText = await self.sendInboundReply(ctx, body: draft)
-                self.auditBarAction(prompt: "reply to \(ctx.channel) from \(ctx.sender)",
-                                    result: self.barState.responseText, commandClass: "high-risk write")
-            }
-            return
-        }
-
-        // First turn drafts from the gist; later turns revise the current draft with the change.
-        let priorDraft = ctx.lastDraft
-        barState.responseText = priorDraft == nil ? "Drafting…" : "Reworking…"
-        barState.isProcessing = true
-        barState.presenceState = .thinking
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.barState.isProcessing = false; self.barState.presenceState = .expanded }
-            guard let drafter = self.draftingService() else {
-                self.barState.responseText = "Drafting isn't available right now."
-                self.pendingInboundReply = nil
-                return
-            }
-            let instruction = priorDraft.map { "Revise this draft so it: \(input). Current draft: \"\($0)\"" } ?? input
-            let body = await drafter.draftBody(
-                channel: ctx.channel == "email" ? .email : .text,
-                recipientName: ctx.sender, recipientDisplay: ctx.sender,
-                instruction: instruction, threadContext: ctx.preview)
-            if let body {
-                ctx.lastDraft = body
-                self.pendingInboundReply = ctx
-                self.barState.responseText = "Draft to \(ctx.sender):\n\n\(body)\n\n"
-                    + "— reply “send” to send it, tell me a change, or press Esc to cancel."
-            } else {
-                self.barState.responseText = "I couldn't draft that. Tell me the gist again, or press Esc to cancel."
+                if self.barState.pendingConfirmation != nil {
+                    ControlConfirmationBroker.shared.resolve(false, source: "global-escape")
+                }
             }
         }
     }
 
-    /// Words that confirm sending the current draft (kept distinct from drafting instructions so a
-    /// refinement like "yeah make it shorter" isn't mistaken for a send).
-    private static func isSendWord(_ lower: String) -> Bool {
-        let words: Set<String> = ["send", "send it", "send that", "send it now", "yes", "yes send",
-                                  "yep", "yeah", "yup", "ok send", "okay send", "go", "do it", "perfect"]
-        return words.contains(lower)
+    // MARK: Status item
+
+    private func setupStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = NSImage(systemSymbolName: "sparkle", accessibilityDescription: "Alfred")
+
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Show Alfred  ⌘⇧J",
+                                action: #selector(showBarFromMenu), keyEquivalent: ""))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Computer Control",
+                                action: #selector(toggleComputerControl), keyEquivalent: ""))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit Alfred",
+                                action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        for menuItem in menu.items where menuItem.action == #selector(showBarFromMenu)
+            || menuItem.action == #selector(toggleComputerControl) {
+            menuItem.target = self
+        }
+        item.menu = menu
+        statusItem = item
+        refreshComputerControlItem()
     }
 
-    /// True when the user is asking ABOUT the incoming message (answer it) rather than telling Alfred
-    /// what to write (draft it). Imperative drafting instructions ("make it warmer", "say yes") don't
-    /// start with a question word, so this stays out of their way.
-    private static func looksLikeInboundQuestion(_ lower: String) -> Bool {
-        if lower.hasSuffix("?") { return true }
-        let starters = ["what", "who", "when", "where", "why", "how", "which", "whose", "is it",
-                        "are they", "does", "did", "do they", "tell me more", "more info",
-                        "more information", "more detail", "explain", "summarize", "summarise"]
-        return starters.contains { lower == $0 || lower.hasPrefix($0 + " ") }
+    /// The gate that decides whether Hermes may click and type on this Mac. Ships
+    /// off; see AlfredToolServer.runComputerControl.
+    @objc private func toggleComputerControl() {
+        let enabled = !UserDefaults.standard.bool(forKey: "computerControlEnabled")
+        UserDefaults.standard.set(enabled, forKey: "computerControlEnabled")
+        refreshComputerControlItem()
     }
 
-    /// Sends an approved inbound reply over the originating channel (already confirmed in the bar).
-    @MainActor
-    private func sendInboundReply(_ ctx: InboundReplyContext, body: String) async -> String {
-        if ctx.channel == "email" {
-            guard ctx.handle.contains("@"), let r = await mailCompose.resolveEmail(for: ctx.handle) else {
-                return "Couldn't find an email address to reply to \(ctx.sender)."
-            }
-            let replySubject = (ctx.subject?.isEmpty == false) ? "Re: \(ctx.subject!)" : nil
-            return mailCompose.compose(to: r.email, display: r.display, subject: replySubject,
-                                       body: body, send: true, confirmed: true)
-        } else {
-            guard let recipient = await messaging.resolveRecipient(for: ctx.handle.isEmpty ? ctx.sender : ctx.handle) else {
-                return "Couldn't find a way to reply to \(ctx.sender)."
-            }
-            return messaging.send(message: body, toHandle: recipient.handle)
-                ? "Sent to \(recipient.display)." : "Couldn't send to \(recipient.display)."
-        }
+    private func refreshComputerControlItem() {
+        guard let menu = statusItem?.menu else { return }
+        let enabled = UserDefaults.standard.bool(forKey: "computerControlEnabled")
+        menu.items
+            .first { $0.action == #selector(toggleComputerControl) }?
+            .state = enabled ? .on : .off
     }
 
-    func handleQuery(_ text: String) {
-        // Active inbound-reply session (from a notification tap) — each turn drafts/refines/sends.
-        // This is the notification feature's own state machine, not agent routing, so it stays
-        // ahead of Hermes.
-        if pendingInboundReply != nil { handleInboundReplyTurn(text); return }
-
-        barState.responseText = ""
-        barState.isProcessing = true
-        barState.presenceState = .thinking
-
-        // Two-turn text flow: if Alfred just asked "what to send to X", this input IS the message.
-        if let recipient = pendingTextRecipient {
-            pendingTextRecipient = nil
-            let message = text
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.barState.responseText = self.messaging.confirmAndSend(message: message, to: recipient)
-                self.auditBarAction(prompt: "text \(recipient.display): \(message)",
-                                    result: self.barState.responseText, commandClass: "high-risk write")
-                self.barState.isProcessing = false
-                self.barState.presenceState = .expanded
-            }
-            return
-        }
-
-        let normalizedQuery = QueryNormalizer.normalize(text)
-            .lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // MARK: Local UI commands
-        //
-        // These act on Alfred itself rather than on the world, so they are answered
-        // here instead of spending an agent turn. Everything else goes to Hermes.
-
-        // Real conversation reset. Wipes local history *and* restarts the Hermes
-        // session — Hermes keeps context server-side, so clearing only the local DB
-        // would leave a stale thread that keeps colouring later replies.
-        if ["clear", "new chat", "new conversation", "reset", "start over", "start fresh",
-            "forget this", "clear chat", "clear conversation"].contains(normalizedQuery) {
-            try? memoryStore?.clearHistory()
-            // Also drop any armed GitHub write so it can't survive a reset and fire on a later "yes".
-            Task { await GitHubWriteGate.shared.clear() }
-            hermesTask?.cancel()
-            Task { await hermes.restart() }
-            barState.responseText = "Cleared — starting fresh. What can I do for you?"
-            barState.isProcessing = false
-            barState.presenceState = .expanded
-            return
-        }
-
-        // Open the Routines manager (Blueprint §3) from the bar.
-        if ["routines", "show routines", "manage routines", "open routines", "my routines", "panel"].contains(normalizedQuery) {
-            barState.responseText = "Opening the Alfred panel from the menu bar…"
-            barState.isProcessing = false
-            barState.presenceState = .expanded
-            togglePopover()
-            return
-        }
-
-        // Open the Full Disk Access pane so Alfred can reach every folder without per-folder prompts.
-        if ["full disk access", "grant full disk access", "grant full access", "file permissions",
-            "grant permissions", "give alfred full access"].contains(normalizedQuery) {
-            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!)
-            barState.responseText = "Opening Full Disk Access. Click +, add Alfred (/Applications/Alfred.app), turn it on, then relaunch Alfred. That gives Alfred access to every folder on your Mac."
-            barState.isProcessing = false
-            barState.presenceState = .expanded
-            return
-        }
-
-        // Writing-style personalization (M8): record the user's message on-device to build their
-        // style profile. Local SQLite write; it never egresses. This is what Phase 3 reads to
-        // generate SOUL.md, so it stays even though Hermes now owns conversational memory.
-        if FeatureScope.personalizationEnabled {
-            writingStyleStore?.recordWritingSample(text: text, source: .chat)
-        }
-
-        runHermesTurn(text)
-    }
+    // MARK: Querying
 
     /// Stream one Hermes turn into the bar.
     ///
-    /// This replaces the former ~480-line keyword-dispatch chain
-    /// (`CalendarEventCapability.detect(in:)`, `MailComposeCapability.detect(in:)`,
-    /// `QueryIntent` substring tables, …). Alfred no longer decides what a request
-    /// *means*; Hermes does, with real tool calling. Adding a capability is now a
-    /// matter of exposing a tool, not extending an if-chain.
-    private func runHermesTurn(_ text: String) {
-        let runId = memoryStore?.startRun(source: "bar", prompt: text)
+    /// Alfred does no routing, no intent detection and no tool selection — Hermes
+    /// decides what a request means. Adding a capability means exposing a tool in
+    /// AlfredToolServer, not extending a branch here.
+    func handleQuery(_ text: String) {
+        barState.responseText = ""
+        barState.isProcessing = true
+        barState.presenceState = .thinking
 
         hermesTask?.cancel()
         hermesTask = Task { @MainActor [weak self] in
             guard let self else { return }
 
-            var streamed = ""          // assistant text only, excludes tool placeholders
+            var streamed = ""            // assistant text only, excludes tool placeholders
             var showingToolStatus = false
             var failure: String?
 
@@ -2297,28 +333,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.barState.responseText += chunk
 
                 case .thought:
-                    break  // reasoning stays hidden in v1
+                    break  // reasoning stays hidden
 
                 case .toolStarted(_, let title, _):
-                    // Only show progress while there is no answer yet — a tool firing
-                    // mid-sentence must not clobber text the user is already reading.
+                    // Only while there is no answer yet — a tool firing mid-sentence
+                    // must not clobber text the user is already reading.
                     if streamed.isEmpty {
                         showingToolStatus = true
                         self.barState.responseText = "\(title)…"
                     }
 
-                case .toolProgress:
-                    // Deliberately silent. A failed step is usually retried and
-                    // recovered from, and when it isn't, Hermes reports the real
-                    // reason as assistant text (rate limits, auth, provider
-                    // errors). Surfacing a generic "that step failed" here only
-                    // buried the actual message.
-                    break
-
-                case .usage:
-                    break  // context meter lands with the dashboard (Phase 5)
-
-                case .finished:
+                case .toolProgress, .usage, .finished:
                     break
 
                 case .failed(let message):
@@ -2329,615 +354,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let failure {
                 self.barState.responseText = failure
             } else if self.barState.responseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                // The model can return an empty completion; never leave the bar looking dead.
-                self.barState.responseText = "I'm sorry, but I don't have an answer for that."
+                // A model can return an empty completion; never leave the bar dead.
+                self.barState.responseText = "I don't have an answer for that."
             }
 
             self.barState.isProcessing = false
             self.barState.presenceState = .expanded
-
-            if let runId {
-                self.memoryStore?.completeRun(
-                    id: runId,
-                    status: failure == nil ? "success" : "failed",
-                    modelUsed: "hermes",
-                    routeReason: "hermes-acp",
-                    commandClass: "agent",
-                    outputFull: self.barState.responseText,
-                    outputSummary: String(self.barState.responseText.prefix(200)),
-                    errorText: failure
-                )
-            }
         }
     }
 
-    private func handleWorkflow(plan: WorkflowPlan, selectedFiles: SelectedFileSnapshot) {
-        guard confirmWorkflow(plan: plan) else {
-            barState.responseText = "Workflow cancelled."
-            barState.isProcessing = false
-            Task { await CapabilityEventLogger.shared.record("workflow", "cancelled by user") }
-            memoryStore?.learningLoopStore.recordWorkflowCancelled()
-            return
-        }
-        Task { await CapabilityEventLogger.shared.record("workflow", "started", detail: "\(plan.steps.count) step(s)") }
+    // MARK: Computer-control confirmation
 
-        let ownerName = appState.ownerName
-        let screenContextEnabled = appState.screenContextEnabled
-        let shellExecutionEnabled = appState.shellExecutionEnabled
-        let memoryExtractionEnabled = appState.memoryExtractionEnabled
-        let conversationHistoryEnabled = appState.conversationHistoryEnabled
-        let memoryRetentionDays = appState.memoryRetentionDays
-        let core = assistantCore
-
-        barState.responseText = "Starting workflow...\n\(plan.summary)"
-
-        Task {
-            defer {
-                Task { @MainActor [weak self] in
-                    self?.barState.isProcessing = false
-                }
-            }
-
-            guard let core else {
-                await MainActor.run { [weak self] in
-                    self?.barState.responseText = "Workflow not run: Alfred is not ready."
-                }
-                return
-            }
-
-            do {
-                _ = try await core.processWorkflow(
-                    plan: plan,
-                    ownerName: ownerName,
-                    screenContextEnabled: screenContextEnabled,
-                    shellExecutionEnabled: shellExecutionEnabled,
-                    memoryExtractionEnabled: memoryExtractionEnabled,
-                    computerControlEnabled: appState.computerControlEnabled,
-                    selectedFiles: selectedFiles,
-                    conversationHistoryEnabled: conversationHistoryEnabled,
-                    memoryRetentionDays: memoryRetentionDays
-                ) { [weak self] progress in
-                    Task { @MainActor [weak self] in
-                        self?.barState.contextStatus = progress
-                    }
-                } onToken: { [weak self] token in
-                    Task { @MainActor [weak self] in
-                        self?.barState.responseText = token
-                    }
-                }
-                await CapabilityEventLogger.shared.record("workflow", "completed")
-                let planCopy = plan
-                await MainActor.run { [weak self] in
-                    self?.recordWorkflowExecution(planCopy)
-                }
-            } catch {
-                await MainActor.run { [weak self] in
-                    self?.barState.responseText = "Workflow error: \(error.localizedDescription)"
-                }
-                await CapabilityEventLogger.shared.record("workflow", "failed")
-            }
-        }
+    /// Bring the bar up carrying a confirmation. Presented here rather than as a
+    /// system modal — see ControlConfirmationBroker for why.
+    func presentControlConfirmation(_ request: PendingControlConfirmation) {
+        barState.pendingConfirmation = request
+        // Cancel streaming state so the confirmation isn't competing with a spinner.
+        barState.isProcessing = false
+        showBar()
     }
 
-    private func recordWorkflowExecution(_ plan: WorkflowPlan) {
-        let stepCount = plan.steps.count
-        memoryStore?.timelineStore.recordEvent(
-            type: .workflowExecuted,
-            applicationName: "Alfred",
-            metadata: ["steps": "\(stepCount)", "summary": String(plan.summary.prefix(200))]
-        )
-        memoryStore?.learningLoopStore.recordWorkflowCompleted(
-            metadata: ["steps": "\(stepCount)", "summary": String(plan.summary.prefix(100))]
-        )
+    func dismissControlConfirmation() {
+        barState.pendingConfirmation = nil
     }
-
-    private func confirmWorkflow(plan: WorkflowPlan) -> Bool {
-        let alert = NSAlert()
-        alert.messageText = "Run this Alfred workflow?"
-        alert.informativeText = """
-        Proposed plan:
-
-        \(plan.summary)
-
-        Side-effect steps: \(plan.sideEffectCount). Alfred will still use native confirmation panels for file saves and existing permission checks for app, shell, or computer-control actions.
-        """
-        alert.alertStyle = plan.sideEffectCount > 1 ? .warning : .informational
-        alert.addButton(withTitle: "Run Workflow")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        return alert.runModal() == .alertFirstButtonReturn
-    }
-
-    private func confirmHighRisk(_ decision: DispatchDecision) -> Bool {
-        let alert = NSAlert()
-        alert.messageText = "Confirm this \(decision.commandClass.rawValue)?"
-        alert.informativeText = decision.query
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Proceed")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        return alert.runModal() == .alertFirstButtonReturn
-    }
-
-    private func confirmShellCommand(_ command: String) -> Bool {
-        let alert = NSAlert()
-        alert.messageText = "Run this shell command?"
-        alert.informativeText = """
-        Alfred will execute this command with /bin/bash -c:
-
-        \(command)
-        """
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Run Command")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        return alert.runModal() == .alertFirstButtonReturn
-    }
-
-    func pruneConversationHistoryNow() {
-        do {
-            try memoryStore?.pruneConversationHistory(olderThanDays: appState.memoryRetentionDays)
-            barState.contextStatus = "Conversation history pruned."
-        } catch {
-            barState.contextStatus = "Could not prune conversation history: \(error.localizedDescription)"
-        }
-    }
-
-    func clearConversationHistoryFromSettings() {
-        guard confirmDestructiveSettingsAction(
-            title: "Clear conversation history?",
-            message: "This deletes saved user and assistant messages from Alfred memory. Extracted memories remain."
-        ) else { return }
-
-        do {
-            try memoryStore?.clearHistory()
-            barState.contextStatus = "Conversation history cleared."
-        } catch {
-            barState.contextStatus = "Could not clear conversation history: \(error.localizedDescription)"
-        }
-    }
-
-    func clearExtractedMemoriesFromSettings() {
-        guard confirmDestructiveSettingsAction(
-            title: "Clear extracted memories?",
-            message: "This deletes saved long-term memory facts. Conversation history remains."
-        ) else { return }
-
-        do {
-            try memoryStore?.clearMemories()
-            barState.contextStatus = "Extracted memories cleared."
-        } catch {
-            barState.contextStatus = "Could not clear extracted memories: \(error.localizedDescription)"
-        }
-    }
-
-    private func confirmDestructiveSettingsAction(title: String, message: String) -> Bool {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Delete")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        return alert.runModal() == .alertFirstButtonReturn
-    }
-
-    /// Natural-language computer control as a bounded plan-act-observe loop. Because the screen
-    /// changes after every action, the Semantic Object Map is re-captured each step and the LLM
-    /// (cloud or local) decides the next 1-3 actions until it reports DONE / CANNOT or the step cap
-    /// is hit. The user authorizes the autonomous session once; every step still passes the
-    /// sensitive/destructive guards, progress is shown live, and Esc / Stop Computer Control aborts.
-    private func planAndRunComputerControl(task: String, originalQuery: String) {
-        guard computerControl.hasAccessibilityPermission else {
-            computerControl.requestAccessibilityPermission()
-            barState.responseText = "Accessibility permission is required for computer control. Grant access in System Settings, then try again."
-            barState.isProcessing = false
-            return
-        }
-        guard let router = llmRouter else {
-            barState.responseText = "No AI provider is configured for planning actions."
-            barState.isProcessing = false
-            return
-        }
-
-        // A real target app is required — otherwise the Semantic Object Map would capture Alfred's
-        // own bar. ContextMonitor tracks the last non-Alfred frontmost app.
-        guard let targetBundleId = contextMonitor?.context?.bundleIdentifier,
-              let targetApp = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == targetBundleId }) else {
-            barState.responseText = "Open or click the app you want me to control first (for example Safari), then ask again."
-            barState.isProcessing = false
-            return
-        }
-        // No per-action confirmation: enabling Computer control in Settings is the standing consent.
-        // Sensitive/destructive actions are still BLOCKED outright (not merely confirmed), and Esc /
-        // Stop Computer Control aborts at any time.
-        let maxSteps = 8
-        barState.responseText = "Working on: \(task)…"
-        barState.presenceState = .thinking
-        Task { await CapabilityEventLogger.shared.record("computer control", "session started", detail: task) }
-        AgentDebugLog.log("=== SESSION · target=\(targetApp.localizedName ?? "?") (\(targetBundleId)) · goal=\(task)")
-
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.barState.isProcessing = false; self.barState.presenceState = .expanded }
-            // Bring the Alfred cursor out of the menu-bar icon for the duration of the session.
-            await self.cursorOverlay.wake(from: self.menuBarCursorAnchor())
-            defer { Task { await self.cursorOverlay.sleep() } }
-            let planner = LLMComputerControlPlanner()
-            var history: [String] = []
-            var successes = 0
-            var consecutiveFailures = 0
-            var lastScript = ""
-
-            for step in 1...maxSteps {
-                // Bring the target app forward and read its CURRENT elements (they change each step).
-                targetApp.activate()
-                try? await Task.sleep(nanoseconds: 400_000_000)
-                self.contextMonitor?.refresh(forceBrowserRead: true)
-                let objectMap = self.computerControl.semanticObjectMapText(targetBundleId: targetBundleId)
-                let windowContext = self.currentWindowContext()
-                let elementCount = objectMap.isEmpty ? 0 : objectMap.split(separator: "\n").count
-                AgentDebugLog.log("step \(step): window=\(windowContext.isEmpty ? "?" : windowContext) · \(elementCount) elements")
-                let outcome = await planner.nextStep(goal: task, objectMap: objectMap, windowContext: windowContext, history: history, router: router)
-
-                switch outcome {
-                case .done:
-                    AgentDebugLog.log("step \(step): model says DONE")
-                    self.barState.responseText = successes == 0 ? "That already looks done." : "Done — \(successes) step\(successes == 1 ? "" : "s") completed."
-                    await CapabilityEventLogger.shared.record("computer control", "completed", detail: "\(successes) steps")
-                    return
-                case .cannot(let reason):
-                    AgentDebugLog.log("step \(step): model says CANNOT: \(reason)")
-                    self.barState.responseText = "I can't finish that on screen: \(reason)"
-                    await CapabilityEventLogger.shared.record("computer control", "planner declined", detail: reason)
-                    return
-                case .actions(let script):
-                    AgentDebugLog.log("step \(step): script=\(script.replacingOccurrences(of: "\n", with: " | "))")
-                    // The agent can't always see the result (empty element map, no page text). If it
-                    // proposes the same action it just ran, it's stuck or the goal is already met —
-                    // stop instead of re-doing it (e.g. re-typing a URL into a page that already loaded).
-                    let normalized = script.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                    if normalized == lastScript {
-                        self.barState.responseText = successes == 0 ? "That already looks done." : "Done — \(successes) step\(successes == 1 ? "" : "s") completed."
-                        await CapabilityEventLogger.shared.record("computer control", "completed", detail: "repeat-stop after \(successes) steps")
-                        return
-                    }
-                    lastScript = normalized
-                    do {
-                        let plan = try self.computerControl.planFromActionScript(script)
-                        self.barState.contextStatus = "Step \(step): \(plan.summary)"
-                        _ = try await self.computerControl.execute(
-                            plan,
-                            onStep: { [weak self] desc in
-                                self?.barState.contextStatus = "Step \(step): \(desc)"
-                            },
-                            onActionStart: { [weak self] action in
-                                // Narrate the live step in the bar's visible response area.
-                                self?.barState.responseText = action.narration
-                                self?.barState.contextStatus = action.narration
-                                await self?.animateCursor(for: action)
-                            }
-                        )
-                        AgentDebugLog.log("step \(step): ran OK — \(plan.summary)")
-                        history.append("Step \(step): \(plan.summary) — done")
-                        successes += 1
-                        consecutiveFailures = 0
-                    } catch let error as ComputerControlCapability.ControlError where Self.isCancellation(error) {
-                        self.barState.responseText = "Stopped — you cancelled."
-                        await CapabilityEventLogger.shared.record("computer control", "stopped")
-                        return
-                    } catch {
-                        // Don't kill the session on one bad step — feed the failure back so the model
-                        // can adjust (e.g. use a keyboard shortcut instead of clicking a missing element).
-                        consecutiveFailures += 1
-                        AgentDebugLog.log("step \(step): FAILED — \(error.localizedDescription)")
-                        history.append("Step \(step) FAILED: \(error.localizedDescription). Use a different approach — prefer keyboard actions (hotkey / type / press key) over clicking elements that aren't in the list.")
-                        self.barState.contextStatus = "Step \(step) didn't work — adjusting…"
-                        if consecutiveFailures >= 3 {
-                            self.barState.responseText = "Computer control stopped after repeated failures: \(error.localizedDescription)"
-                            await CapabilityEventLogger.shared.record("computer control", "stopped", detail: "repeated failures")
-                            return
-                        }
-                    }
-                }
-                try? await Task.sleep(nanoseconds: 300_000_000)
-            }
-            self.barState.responseText = "Stopped after \(maxSteps) steps. Ask me to continue if it's not finished."
-            await CapabilityEventLogger.shared.record("computer control", "step cap reached")
-        }
-    }
-
-    private static func isCancellation(_ error: ComputerControlCapability.ControlError) -> Bool {
-        if case .cancelled = error { return true }
-        return false
-    }
-
-    /// Best-effort description of the target app's current window/URL, so the agent can tell when a
-    /// goal is already achieved (e.g. the address bar already shows the requested site).
-    private func currentWindowContext() -> String {
-        guard let ctx = contextMonitor?.context else { return "" }
-        var parts = [ctx.appName]
-        if let url = ctx.browserURL, !url.isEmpty { parts.append(url) }
-        else if let title = ctx.windowTitle, !title.isEmpty { parts.append(title) }
-        return parts.joined(separator: " — ")
-    }
-
-    /// The menu-bar icon's center in global AppKit coordinates — where the visual cursor emerges
-    /// from and returns to. Falls back to the top-right of the main screen before the status item
-    /// has a backing window.
-    private func menuBarCursorAnchor() -> CGPoint {
-        if let window = statusItem?.button?.window {
-            let f = window.frame
-            return CGPoint(x: f.midX, y: f.minY)
-        }
-        let screen = NSScreen.main?.frame ?? .zero
-        return CGPoint(x: screen.maxX - 24, y: screen.maxY - 12)
-    }
-
-    /// Drive the visual cursor for one action about to fire: glide to its target, and pulse a click
-    /// ripple for click-type actions. Awaited before the real event so the cursor lands on time.
-    private func animateCursor(for action: ComputerControlCapability.Action) async {
-        guard let point = action.targetPoint else { return }
-        await cursorOverlay.move(toGlobalCG: point)
-        switch action {
-        case .click, .doubleClick, .clickElement:
-            await cursorOverlay.tap()
-        default:
-            break
-        }
-    }
-
-
-    private func handleComputerControl(plan: ComputerControlCapability.Plan, originalQuery: String, targetBundleId: String? = nil) {
-        guard computerControl.hasAccessibilityPermission else {
-            computerControl.requestAccessibilityPermission()
-            barState.responseText = "Accessibility permission is required for computer control. Grant access in System Settings, then try again."
-            barState.isProcessing = false
-            Task { await CapabilityEventLogger.shared.record("computer control", "refused", detail: "accessibility missing") }
-            return
-        }
-
-        // No confirmation prompt — Settings opt-in is the consent; destructive actions are blocked.
-        Task { await CapabilityEventLogger.shared.record("computer control", "running", detail: "\(plan.actions.count) action(s)") }
-        barState.responseText = "Running computer control...\n\(plan.summary)"
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.barState.isProcessing = false }
-            await self.cursorOverlay.wake(from: self.menuBarCursorAnchor())
-            defer { Task { await self.cursorOverlay.sleep() } }
-            do {
-                // Bring the target app to the front (post-confirm) so clicks and typing land there
-                // rather than on Alfred's bar.
-                if let bid = targetBundleId,
-                   let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bid }) {
-                    app.activate()
-                    try? await Task.sleep(nanoseconds: 250_000_000)
-                }
-                let message = try await self.computerControl.execute(
-                    plan,
-                    onStep: { [weak self] step in
-                        self?.barState.contextStatus = "Computer control: \(step)"
-                    },
-                    onActionStart: { [weak self] action in
-                        // Narrate the live step in the bar's visible response area.
-                        self?.barState.responseText = action.narration
-                        self?.barState.contextStatus = action.narration
-                        await self?.animateCursor(for: action)
-                    }
-                )
-                self.barState.responseText = message
-                self.barState.contextStatus = message
-                await CapabilityEventLogger.shared.record("computer control", "completed")
-            } catch {
-                self.barState.responseText = "Computer control stopped: \(error.localizedDescription)"
-                self.barState.contextStatus = "Computer control stopped."
-                await CapabilityEventLogger.shared.record("computer control", "stopped")
-            }
-        }
-    }
-
-    // MARK: - Onboarding
-
-    private func observeOnboardingCompletion() {
-        appState.$isOnboardingComplete
-            .dropFirst()
-            .filter { $0 }
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.onboardingWindow?.close()
-                self?.onboardingWindow = nil
-                self?.startHotkeyListener()
-                self?.startRoutineScheduler()
-            }
-            .store(in: &cancellables)
-    }
-
-    func showOnboarding(initialStep: Int = 0) {
-        // Reuse existing window — always replace content so step is correct
-        if let existing = onboardingWindow {
-            existing.contentView = NSHostingView(
-                rootView: OnboardingView(initialStep: initialStep)
-                    .environmentObject(appState)
-            )
-            existing.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            existing.orderFrontRegardless()
-            return
-        }
-
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 480),
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
-        )
-        window.center()
-        window.title = "Alfred Setup"
-        window.minSize = NSSize(width: 700, height: 500)
-        window.isReleasedWhenClosed = false
-        window.contentView = NSHostingView(
-            rootView: OnboardingView(initialStep: initialStep)
-                .environmentObject(appState)
-        )
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        onboardingWindow = window
-    }
-
-    // MARK: - Proactive Memory Surfacing
-
-    private weak var proactiveMenuItem: NSMenuItem?
-
-    private func updateProactiveBadge(hasActive: Bool) {
-    }
-
-    @objc private func toggleProactiveSuggestionsFromMenu() {
-        appState.proactiveSuggestionsEnabled.toggle()
-        proactiveSurfacingService?.proactiveEnabled = appState.proactiveSuggestionsEnabled
-        barState.contextStatus = appState.proactiveSuggestionsEnabled
-            ? "Proactive suggestions enabled"
-            : "Proactive suggestions disabled"
-    }
-
-    @objc private func showProactiveSuggestionsFromMenu() {
-        let suggestions = proactiveSurfacingService?.forceCheck() ?? []
-        if suggestions.isEmpty {
-            barState.contextStatus = "No proactive suggestions available right now."
-            return
-        }
-        let lines = suggestions.map { "• \($0.title): \($0.subtitle)" }.joined(separator: "\n")
-        let alert = NSAlert()
-        alert.messageText = "Proactive Suggestions"
-        alert.informativeText = lines
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Dismiss All")
-        alert.addButton(withTitle: "OK")
-        NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
-        if response == .alertFirstButtonReturn {
-            for s in suggestions {
-                proactiveSurfacingService?.dismissSuggestion(id: s.id)
-            }
-            barState.contextStatus = "Suggestions dismissed."
-        }
-    }
-
-    // MARK: - Memory Dashboard
-
-    @objc private func openMemoryDashboardFromMenu() {
-        MemoryDashboardController.shared.showDashboard()
-    }
-
-    @objc private func exportAllMemoriesFromMenu() {
-        guard let relationshipMemoryService else {
-            barState.contextStatus = "Memory service unavailable."
-            return
-        }
-        guard let json = relationshipMemoryService.exportToJSON(includeArchived: false) else {
-            barState.contextStatus = "No memories to export."
-            return
-        }
-        let panel = NSSavePanel()
-        panel.title = "Export Memories"
-        panel.allowedContentTypes = [.json]
-        panel.nameFieldStringValue = "alfred_memories_\(ISO8601DateFormatter().string(from: Date())).json"
-        NSApp.activate(ignoringOtherApps: true)
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            try json.write(to: url, atomically: true, encoding: String.Encoding.utf8)
-            barState.contextStatus = "Memories exported to \(url.lastPathComponent)"
-        } catch {
-            barState.contextStatus = "Export failed: \(error.localizedDescription)"
-        }
-    }
-
-    @objc private func clearAllMemoriesFromMenu() {
-        let alert = NSAlert()
-        alert.messageText = "Delete all relationship memories?"
-        alert.informativeText = "This cannot be undone. All relationship memories and reflections will be permanently deleted."
-        alert.alertStyle = .critical
-        alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Delete All")
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertSecondButtonReturn else { return }
-        relationshipMemoryService?.deleteAllMemories(includeArchived: true)
-        memoryReflectionService?.resetAll()
-        barState.contextStatus = "All memories cleared."
-    }
-
-    @objc private func exportTrainingDataFromMenu() {
-        guard let store = memoryStore else {
-            barState.contextStatus = "Memory store unavailable."
-            return
-        }
-        let exporter = TrainingDatasetExporter(
-            learningLoopStore: store.learningLoopStore,
-            writingStyleStore: store.writingStyleStore!,
-            rewardEngine: store.rewardEngine
-        )
-        do {
-            let url = try exporter.exportToJSONL()
-            let alert = NSAlert()
-            alert.messageText = "Training Data Exported"
-            alert.informativeText = "Exported to:\n\(url.path)"
-            alert.alertStyle = .informational
-            alert.addButton(withTitle: "OK")
-            NSApp.activate(ignoringOtherApps: true)
-            alert.runModal()
-            barState.contextStatus = "Training data exported to \(url.lastPathComponent)"
-        } catch {
-            barState.contextStatus = "Training export failed: \(error.localizedDescription)"
-        }
-    }
-
-    // MARK: - Backup
-
-    @objc private func backupNowFromMenu() {
-        guard let bs = backupService else {
-            barState.contextStatus = "Backup service unavailable."
-            return
-        }
-        let meta = bs.createBackup(encrypted: false)
-        if meta != nil {
-            barState.contextStatus = "Backup created: \(meta!.filename)"
-        } else {
-            barState.contextStatus = "Backup failed."
-        }
-    }
-
-    @objc private func toggleAutoBackupFromMenu() {
-        guard let bs = backupService else { return }
-        bs.autoBackupEnabled.toggle()
-        if bs.autoBackupEnabled {
-            bs.startAutoBackup()
-        } else {
-            bs.stopAutoBackup()
-        }
-        barState.contextStatus = bs.autoBackupEnabled ? "Auto-backup enabled" : "Auto-backup disabled"
-    }
-
-    @objc func exportForSyncFromMenu() {
-        guard let bs = backupService else {
-            barState.contextStatus = "Backup service unavailable."
-            return
-        }
-        guard let data = bs.exportForSync() else {
-            barState.contextStatus = "Export failed."
-            return
-        }
-        let panel = NSSavePanel()
-        panel.title = "Export for Sync"
-        panel.nameFieldStringValue = "alfred_sync_backup.\(bs.encryptByDefault ? "alfredbackup" : "json")"
-        NSApp.activate(ignoringOtherApps: true)
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            try data.write(to: url, options: .atomic)
-            barState.contextStatus = "Sync export saved to \(url.lastPathComponent)"
-        } catch {
-            barState.contextStatus = "Export failed: \(error.localizedDescription)"
-        }
 }
-
-}
-
-

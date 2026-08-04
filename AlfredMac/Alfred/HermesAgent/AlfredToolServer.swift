@@ -263,23 +263,6 @@ final class AlfredToolServer {
                 "required": ["script"],
             ],
         ],
-        [
-            "name": "memory_search",
-            "description": """
-                Search Alfred's on-device memory of this user: things they told \
-                Alfred, and text seen on their screen over time. Use for personal \
-                recall ("what was that link I was looking at", "what did I say \
-                about the trip"). This is local to the Mac and never leaves it.
-                """,
-            "inputSchema": [
-                "type": "object",
-                "properties": [
-                    "query": ["type": "string", "description": "What to search for."],
-                    "limit": ["type": "integer", "description": "Max results. Default 10."],
-                ],
-                "required": ["query"],
-            ],
-        ],
     ]
 
     private enum ToolError: LocalizedError {
@@ -359,27 +342,6 @@ final class AlfredToolServer {
             // through Alfred rather than Hermes' own computer-use backend.
             return try await runComputerControl(script: script)
 
-        case "memory_search":
-            guard let query = arguments["query"] as? String, !query.isEmpty else {
-                throw ToolError.missingArgument("query")
-            }
-            let limit = arguments["limit"] as? Int ?? 10
-            guard let store = await MainActor.run(body: { AppDelegate.shared?.memoryStore }) else {
-                throw ToolError.unavailable("Alfred's memory isn't ready yet.")
-            }
-
-            var lines: [String] = []
-            if let records = try? store.search(query: query, limit: limit), !records.isEmpty {
-                lines.append("Remembered:")
-                lines.append(contentsOf: records.map { "- \($0.content)" })
-            }
-            let seen = store.searchScreenText(query, limit: min(limit, 10))
-            if !seen.isEmpty {
-                lines.append("\nSeen on screen:")
-                lines.append(contentsOf: seen.prefix(limit).map { "- \($0.text.prefix(300))" })
-            }
-            return lines.isEmpty ? "Nothing found for '\(query)'." : lines.joined(separator: "\n")
-
         default:
             throw ToolError.unknown(tool)
         }
@@ -396,7 +358,9 @@ final class AlfredToolServer {
         // This carries the safety weight because confirmControl below CANNOT be
         // relied on — see the comment there. Fail closed if AppState isn't
         // reachable rather than assuming permission.
-        guard let appState = AppDelegate.shared?.appState, appState.computerControlEnabled else {
+        // Read the default directly: AppState went with the rest of Alfred's
+        // assistant machinery. The menu-bar toggle writes the same key.
+        guard UserDefaults.standard.bool(forKey: "computerControlEnabled") else {
             throw ToolError.unavailable("""
                 Computer control is turned off. The user must enable it in Alfred's \
                 Settings (menu bar → Settings → Computer control) before you can click \

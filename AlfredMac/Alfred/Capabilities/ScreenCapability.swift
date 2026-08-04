@@ -3,6 +3,21 @@ import ScreenCaptureKit
 import CoreGraphics
 import ImageIO
 
+/// Errors from screen capture.
+///
+/// Previously these threw `LLMError.networkError`, which was never accurate — it
+/// came from Alfred's own LLM layer, deleted when Hermes took over the model
+/// path. Capture failures are local and have nothing to do with a network.
+enum ScreenCaptureError: LocalizedError {
+    case failed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .failed(let why): return why
+        }
+    }
+}
+
 actor ScreenCapability {
 
     // MARK: - Public API
@@ -17,7 +32,7 @@ actor ScreenCapability {
         let content = try await fetchShareableContent()
 
         guard let display = content.displays.first else {
-            throw LLMError.networkError("No display found")
+            throw ScreenCaptureError.failed("No display found")
         }
 
         let filter = SCContentFilter(display: display, excludingWindows: [])
@@ -88,23 +103,23 @@ actor ScreenCapability {
             let nsError = error as NSError
             // SCK error 1 = permission denied (kSCStreamErrorUserDeclined)
             if nsError.domain == "com.apple.ScreenCaptureKit.SCStreamError" && nsError.code == -3801 {
-                throw LLMError.networkError(
+                throw ScreenCaptureError.failed(
                     "Screen Recording permission denied. Grant access in System Settings → Privacy & Security → Screen Recording."
                 )
             }
-            throw LLMError.networkError("ScreenCaptureKit error: \(error.localizedDescription)")
+            throw ScreenCaptureError.failed("ScreenCaptureKit error: \(error.localizedDescription)")
         }
     }
 
     private func jpegData(from image: CGImage) throws -> Data {
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil) else {
-            throw LLMError.networkError("Failed to create image destination")
+            throw ScreenCaptureError.failed("Failed to create image destination")
         }
         let options: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.75]
         CGImageDestinationAddImage(dest, image, options as CFDictionary)
         guard CGImageDestinationFinalize(dest) else {
-            throw LLMError.networkError("Failed to encode screenshot as JPEG")
+            throw ScreenCaptureError.failed("Failed to encode screenshot as JPEG")
         }
         return data as Data
     }
