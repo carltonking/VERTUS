@@ -3,6 +3,7 @@
 //  Alfred
 //
 
+import Combine  // Timer.publish(…).autoconnect() below
 import SwiftUI
 
 struct MessageBubble: View {
