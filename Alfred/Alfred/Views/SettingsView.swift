@@ -7,7 +7,6 @@ import SwiftUI
 
 struct SettingsView: View {
     @Environment(AppSettings.self) private var settings
-    @Environment(\.dismiss) private var dismiss
 
     @State private var testState: TestState = .idle
 
@@ -102,18 +101,11 @@ struct SettingsView: View {
                 .scrollContentBackground(.hidden)
             }
             .navigationTitle("Settings")
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationBarTitleDisplayMode(.large)
             .toolbarBackground(Theme.backgroundTop, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { dismiss() }
-                        .fontWeight(.semibold)
-                }
-            }
         }
-        .tint(Theme.accentBright)
-        .preferredColorScheme(.dark)
+        // Tint and colour scheme come from RootView, so every tab agrees on them.
     }
 
     private func capability(_ name: String, available: Bool) -> some View {

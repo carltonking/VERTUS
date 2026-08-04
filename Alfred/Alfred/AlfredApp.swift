@@ -17,7 +17,7 @@ struct AlfredApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ChatView()
+            RootView()
                 .environment(settings)
                 .environment(chat)
         }

@@ -1,17 +1,21 @@
 //
-//  ChatView.swift
+//  HomeView.swift
 //  Alfred
 //
-//  The whole app, essentially: a conversation with Alfred.
+//  The main page: a greeting, and the conversation with Alfred underneath it.
+//
+//  The chat lives here rather than in a tab of its own because talking to Alfred *is* the app —
+//  Email and Calendar are structured views onto things he can already discuss.
 //
 
 import SwiftUI
 
-struct ChatView: View {
+struct HomeView: View {
+    @Binding var selection: AlfredTab
+
     @Environment(AppSettings.self) private var settings
     @Environment(ChatStore.self) private var chat
 
-    @State private var showingSettings = false
     @State private var showingClearConfirmation = false
 
     var body: some View {
@@ -22,18 +26,13 @@ struct ChatView: View {
                 if settings.isConfigured {
                     conversation
                 } else {
-                    NotConnectedState { showingSettings = true }
+                    NotConnectedState { selection = .settings }
                 }
             }
             .navigationTitle("")
             .toolbar { toolbar }
             .toolbarBackground(Theme.backgroundTop, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
-        }
-        .tint(Theme.accentBright)
-        .preferredColorScheme(.dark)
-        .sheet(isPresented: $showingSettings) {
-            SettingsView()
         }
         .confirmationDialog(
             "Clear this conversation?",
@@ -60,7 +59,7 @@ struct ChatView: View {
                     // Deliberately outside the ScrollView: .defaultScrollAnchor(.bottom) pins short
                     // content to the bottom of the viewport, which would shove the welcome screen
                     // down against the composer instead of centring it.
-                    EmptyState { prompt in
+                    WelcomeState { prompt in
                         Task { await chat.send(prompt, settings: settings) }
                     }
                 } else {
@@ -128,25 +127,15 @@ struct ChatView: View {
         }
 
         ToolbarItem(placement: .topBarTrailing) {
-            Menu {
-                Button {
-                    showingClearConfirmation = true
-                } label: {
-                    Label("New conversation", systemImage: "square.and.pencil")
-                }
-                .disabled(chat.messages.isEmpty)
-
-                Button {
-                    showingSettings = true
-                } label: {
-                    Label("Settings", systemImage: "gearshape")
-                }
+            Button {
+                showingClearConfirmation = true
             } label: {
-                Image(systemName: "ellipsis.circle")
-                    .font(.system(size: 17))
+                Image(systemName: "square.and.pencil")
+                    .font(.system(size: 16))
                     .foregroundStyle(Theme.textSecondary)
             }
-            .accessibilityLabel("Menu")
+            .disabled(chat.messages.isEmpty)
+            .accessibilityLabel("New conversation")
         }
     }
 }

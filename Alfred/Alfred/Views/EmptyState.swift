@@ -2,75 +2,82 @@
 //  EmptyState.swift
 //  Alfred
 //
-//  The first thing you see on a fresh conversation. The prompts aren't decoration — they're the
-//  capabilities the cloud brain actually has today (api/_lib/route.ts), so tapping one always works.
+//  The two things Home shows when there's no conversation yet: a greeting, or an honest door if
+//  the app isn't connected to a deployment.
 //
 
 import SwiftUI
 
-struct EmptyState: View {
+struct WelcomeState: View {
     let onPick: (String) -> Void
 
+    /// Hardcoded while Alfred has exactly one owner. It becomes a setting the moment a second
+    /// person installs this.
+    private let ownerName = "Carlton"
+
+    /// Not decoration — these are capabilities the cloud brain has today (api/_lib/route.ts),
+    /// so tapping one always reaches something real.
     private let suggestions = [
         ("calendar", "What's on my calendar tomorrow?"),
         ("calendar.badge.plus", "Put dentist Friday 15:00 on my calendar"),
         ("newspaper", "What's in the news today?"),
-        ("wave.3.right", "/models"),
     ]
 
     var body: some View {
-        VStack(spacing: 0) {
-            Spacer(minLength: 24)
+        ScrollView {
+            VStack(spacing: 0) {
+                AlfredMark(lineWidth: 1.5)
+                    .frame(width: 64, height: 64)
+                    .opacity(0.9)
+                    .padding(.top, 36)
 
-            AlfredMark(lineWidth: 1.5)
-                .frame(width: 76, height: 76)
-                .opacity(0.9)
+                Text("Welcome, \(ownerName)")
+                    .font(.system(size: 30, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Theme.textPrimary)
+                    .padding(.top, 18)
 
-            Text("Alfred")
-                .font(.system(size: 26, weight: .semibold, design: .rounded))
-                .foregroundStyle(Theme.textPrimary)
-                .padding(.top, 14)
+                Text("What can I take off your plate?")
+                    .font(.system(size: 16))
+                    .foregroundStyle(Theme.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.top, 8)
+                    .padding(.horizontal, 32)
 
-            Text("Ask me anything, or start with one of these.")
-                .font(.system(size: 15))
-                .foregroundStyle(Theme.textSecondary)
-                .multilineTextAlignment(.center)
-                .padding(.top, 6)
-                .padding(.horizontal, 32)
-
-            VStack(spacing: 10) {
-                ForEach(suggestions, id: \.1) { icon, prompt in
-                    Button {
-                        onPick(prompt)
-                    } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: icon)
-                                .font(.system(size: 15))
-                                .foregroundStyle(Theme.accentBright)
-                                .frame(width: 22)
-                            Text(prompt)
-                                .font(.system(size: 15))
-                                .foregroundStyle(Theme.textPrimary)
-                                .multilineTextAlignment(.leading)
-                            Spacer(minLength: 0)
+                VStack(spacing: 10) {
+                    ForEach(suggestions, id: \.1) { icon, prompt in
+                        Button {
+                            onPick(prompt)
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: icon)
+                                    .font(.system(size: 15))
+                                    .foregroundStyle(Theme.accentBright)
+                                    .frame(width: 22)
+                                Text(prompt)
+                                    .font(.system(size: 15))
+                                    .foregroundStyle(Theme.textPrimary)
+                                    .multilineTextAlignment(.leading)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 12)
+                            .background(Theme.surface.opacity(0.7))
+                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .strokeBorder(Theme.surfaceBorder, lineWidth: 1)
+                            )
                         }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 12)
-                        .background(Theme.surface.opacity(0.7))
-                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                .strokeBorder(Theme.surfaceBorder, lineWidth: 1)
-                        )
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
+                .padding(.top, 30)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 24)
             }
-            .padding(.top, 28)
-            .padding(.horizontal, 20)
-
-            Spacer(minLength: 24)
         }
+        .scrollBounceBehavior(.basedOnSize)
+        .scrollDismissesKeyboard(.interactively)
     }
 }
 
