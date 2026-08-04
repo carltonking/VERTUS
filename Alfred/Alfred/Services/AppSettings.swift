@@ -36,11 +36,15 @@ final class AppSettings {
     }
 
     /// The `/api/app` URL, built from whatever shape the user pasted in.
+    var endpoint: URL? { Self.endpoint(forHost: host) }
+
+    /// Normalisation, kept static and free of stored state so it can be tested without constructing
+    /// an AppSettings — which would read the Keychain and write the real UserDefaults.
     ///
     /// People paste a bare host, a full deployment URL, one with a trailing slash, or the endpoint
     /// path itself — all four mean the same thing, so normalise rather than making them guess the
     /// format the app wants.
-    var endpoint: URL? {
+    static func endpoint(forHost host: String) -> URL? {
         var raw = host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else { return nil }
 
