@@ -1,6 +1,7 @@
 # Alfred Lite (Vercel) only needs api/ + website/ + the root configs. Exclude the giant macOS Swift
 # app and build artifacts so the upload stays under Vercel's file limit.
 AlfredMac
+Alfred
 .build
 build
 node_modules

@@ -5,7 +5,7 @@ import { sendMessage, downloadFile, largestPhotoId } from "./_lib/telegram";
 import { answerChat, macOnlyReply } from "./_lib/chat";
 import { handleWatch, hasYouTubeUrl, activeVideo, watchFollowUp } from "./_lib/watch";
 import { kvConfigured, kvSetNX } from "./_lib/kv";
-import { extractFromText, extractFromImage, extractSyllabus, SyllabusItem, SyllabusItemType, ExtractedEvent, AlarmSpec, USER_TZ } from "./_lib/extract";
+import { extractFromImage, extractSyllabus, SyllabusItem, SyllabusItemType, ExtractedEvent, AlarmSpec, USER_TZ } from "./_lib/extract";
 import { createEvent, createEvents, deleteSchool, diagnose, listSchoolDiag } from "./_lib/caldav";
 import { planStudySessions } from "./_lib/study";
 import { itemKey, batchId, normCode, schoolURL, schoolToken, schoolCategories } from "./_lib/keys";
@@ -13,6 +13,7 @@ import { setLocation } from "./_lib/location";
 import { getRoutines, addRoutine, removeRoutine, setRoutineEnabled, parseWhen } from "./_lib/routines";
 import { handleEmail, emailTriage, isEmailCheck } from "./_lib/emailflow";
 import { chainStatus } from "./_lib/llm";
+import { isCalendarAdd, addEventFromText } from "./_lib/route";
 
 const HELP = [
   "Commands:",
@@ -342,10 +343,7 @@ async function handleRoutine(args: string, token: string, chatId: string): Promi
 }
 
 async function addFromText(text: string, token: string, chatId: string): Promise<void> {
-  const ev = await extractFromText(text, new Date());
-  if (!ev) return sendMessage(token, chatId, "I couldn't find an event in that. Try: /calendar dentist tomorrow 15:00 at 5th ave.");
-  const res = await createEvent(ev);
-  await sendMessage(token, chatId, res.message);
+  await sendMessage(token, chatId, await addEventFromText(text));
 }
 
 async function handlePhoto(fileId: string, caption: string | undefined, token: string, chatId: string): Promise<void> {
@@ -362,15 +360,6 @@ async function handlePhoto(fileId: string, caption: string | undefined, token: s
   if (!ev) return sendMessage(token, chatId, "I couldn't find an event in that image. Try a clearer photo, or type the details.");
   const res = await createEvent(ev);
   await sendMessage(token, chatId, res.message);
-}
-
-/** Natural-language "add X to my calendar" (not a read like "what's on my calendar"). */
-function isCalendarAdd(text: string): boolean {
-  const q = text.toLowerCase();
-  if (!q.includes("calendar") && !q.includes("schedule")) return false;
-  const addVerb = ["add", "put", "create", "schedule", "save", "make", "set up", "new event", "book"].some((v) => q.includes(v));
-  const read = ["what", "show", "list", "check", "do i have", "upcoming"].some((v) => q.includes(v));
-  return addVerb && !read;
 }
 
 // MARK: - Syllabus
