@@ -37,6 +37,10 @@ AlfredBar/AlfredBar
 AlfredBar/.build/
 AlfredBar/*.xcodeproj/
 
+# Xcode per-user state — window positions and scheme ordering, not project configuration
+**/xcuserdata/
+*.xcuserstate
+
 # Local app/release artifacts
 *.app/
 *.dmg
