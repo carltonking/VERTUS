@@ -55,34 +55,18 @@ struct ChatView: View {
         @Bindable var chat = chat
 
         return ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 14) {
-                    if chat.messages.isEmpty {
-                        EmptyState { prompt in
-                            Task { await chat.send(prompt, settings: settings) }
-                        }
-                        .frame(minHeight: 420)
+            Group {
+                if chat.messages.isEmpty && !chat.isThinking {
+                    // Deliberately outside the ScrollView: .defaultScrollAnchor(.bottom) pins short
+                    // content to the bottom of the viewport, which would shove the welcome screen
+                    // down against the composer instead of centring it.
+                    EmptyState { prompt in
+                        Task { await chat.send(prompt, settings: settings) }
                     }
-
-                    ForEach(chat.messages) { message in
-                        MessageBubble(message: message) {
-                            Task { await chat.retry(message, settings: settings) }
-                        }
-                        .id(message.id)
-                    }
-
-                    if chat.isThinking {
-                        ThinkingIndicator().id(Self.thinkingAnchor)
-                    }
+                } else {
+                    transcript(proxy)
                 }
-                .padding(.horizontal, 14)
-                .padding(.top, 12)
-                .padding(.bottom, 8)
             }
-            .scrollDismissesKeyboard(.interactively)
-            .defaultScrollAnchor(.bottom)
-            .onChange(of: chat.messages.count) { scrollToEnd(proxy) }
-            .onChange(of: chat.isThinking) { scrollToEnd(proxy) }
             .safeAreaInset(edge: .bottom) {
                 Composer(text: $chat.draft, isThinking: chat.isThinking) {
                     let text = chat.draft
@@ -91,6 +75,30 @@ struct ChatView: View {
                 }
             }
         }
+    }
+
+    private func transcript(_ proxy: ScrollViewProxy) -> some View {
+        ScrollView {
+            LazyVStack(spacing: 14) {
+                ForEach(chat.messages) { message in
+                    MessageBubble(message: message) {
+                        Task { await chat.retry(message, settings: settings) }
+                    }
+                    .id(message.id)
+                }
+
+                if chat.isThinking {
+                    ThinkingIndicator().id(Self.thinkingAnchor)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 12)
+            .padding(.bottom, 8)
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .defaultScrollAnchor(.bottom)
+        .onChange(of: chat.messages.count) { scrollToEnd(proxy) }
+        .onChange(of: chat.isThinking) { scrollToEnd(proxy) }
     }
 
     private static let thinkingAnchor = "thinking"

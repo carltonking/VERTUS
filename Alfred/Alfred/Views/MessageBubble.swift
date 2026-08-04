@@ -88,9 +88,13 @@ struct MessageBubble: View {
 /// whether the tap registered.
 struct ThinkingIndicator: View {
     @State private var phase = 0
-    @State private var elapsed = 0
+    @State private var ticks = 0
 
     private let tick = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
+
+    /// ~10s at 0.4s a tick. Long enough that a normal answer never trips it, short enough that a
+    /// genuinely slow one stops looking like a hang.
+    private static let reassureAfterTicks = 25
 
     var body: some View {
         HStack(spacing: 8) {
@@ -112,7 +116,7 @@ struct ThinkingIndicator: View {
                     .strokeBorder(Theme.surfaceBorder, lineWidth: 1)
             )
 
-            if elapsed > 12 {
+            if ticks > Self.reassureAfterTicks {
                 Text("still working…")
                     .font(.system(size: 13))
                     .foregroundStyle(Theme.textFaint)
@@ -123,9 +127,11 @@ struct ThinkingIndicator: View {
         }
         .onReceive(tick) { _ in
             phase = (phase + 1) % 3
-            elapsed += 1
+            // Stop counting once the message is showing — an indicator left up for minutes
+            // shouldn't keep incrementing an integer forever.
+            if ticks <= Self.reassureAfterTicks { ticks += 1 }
         }
-        .animation(.easeInOut, value: elapsed > 12)
+        .animation(.easeInOut, value: ticks > Self.reassureAfterTicks)
         .accessibilityLabel("Alfred is thinking")
     }
 }

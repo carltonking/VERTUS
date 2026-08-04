@@ -90,9 +90,6 @@ struct SettingsView: View {
                     }
 
                     Section {
-                        LabeledContent("What Alfred can do here") {
-                            EmptyView()
-                        }
                         capability("Answer questions", available: true)
                         capability("Read your calendar", available: true)
                         capability("Add calendar events", available: true)

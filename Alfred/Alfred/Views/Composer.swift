@@ -24,7 +24,9 @@ struct Composer: View {
                 .foregroundStyle(Theme.textPrimary)
                 .tint(Theme.accentBright)
                 .focused($isFocused)
-                .submitLabel(.send)
+                // No .submitLabel(.send): with a vertical-axis field the return key inserts a
+                // newline and never submits, so labelling the key "send" would promise something
+                // that doesn't happen. The arrow button is the send affordance.
                 .padding(.horizontal, 16)
                 .padding(.vertical, 11)
                 .background(Theme.surface)
