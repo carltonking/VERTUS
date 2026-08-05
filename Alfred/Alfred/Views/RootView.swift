@@ -4,18 +4,39 @@
 //
 //  The places Alfred lives on the phone, and the one spot the chosen theme enters the view tree.
 //
-//  Tab selection is held here rather than inside any one tab, so a screen can send you somewhere
-//  else — an unconfigured Home needs to hand you to Settings, and a tapped suggestion needs to open
-//  Chat with the answer already on its way. Neither works if each tab owns its navigation alone.
+//  Selection is held here rather than inside any one page, so a page can send you somewhere else —
+//  an unconfigured Home needs to hand you to Settings. That wouldn't work if each page owned its
+//  navigation alone.
 //
 
 import SwiftUI
 
-/// Five, deliberately. iPhone shows at most five tabs and folds the rest into a "More" list — a
-/// sixth tab doesn't add a destination, it demotes two of them behind an extra tap. Settings is the
-/// one that gives up its slot, since it's configuration rather than a place you work.
-enum AlfredTab: Hashable {
-    case home, chat, messages, email, calendar
+enum AlfredTab: String, CaseIterable, Identifiable, Hashable {
+    case home, chat, messages, email, calendar, settings
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .home: return "Home"
+        case .chat: return "Chat"
+        case .messages: return "Messages"
+        case .email: return "Email"
+        case .calendar: return "Calendar"
+        case .settings: return "Settings"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .home: return "house.fill"
+        case .chat: return "bubble.left.and.bubble.right.fill"
+        case .messages: return "message.fill"
+        case .email: return "envelope.fill"
+        case .calendar: return "calendar"
+        case .settings: return "gearshape.fill"
+        }
+    }
 }
 
 struct RootView: View {
@@ -24,30 +45,31 @@ struct RootView: View {
     @State private var selection: AlfredTab = .home
 
     var body: some View {
-        TabView(selection: $selection) {
-            Tab("Home", systemImage: "house.fill", value: AlfredTab.home) {
-                HomeView(selection: $selection)
-            }
-
-            Tab("Chat", systemImage: "bubble.left.and.bubble.right.fill", value: AlfredTab.chat) {
-                ChatView()
-            }
-
-            Tab("Messages", systemImage: "message.fill", value: AlfredTab.messages) {
-                MessagesView()
-            }
-
-            Tab("Email", systemImage: "envelope.fill", value: AlfredTab.email) {
-                EmailView()
-            }
-
-            Tab("Calendar", systemImage: "calendar", value: AlfredTab.calendar) {
-                CalendarView()
-            }
+        ZStack {
+            // Each page keeps its own view identity, so switching tabs doesn't reset a half-typed
+            // message or a scroll position the way rebuilding a single view would.
+            page(.home) { HomeView(selection: $selection) }
+            page(.chat) { ChatView() }
+            page(.messages) { MessagesView() }
+            page(.email) { EmailView() }
+            page(.calendar) { CalendarView() }
+            page(.settings) { SettingsView() }
+        }
+        .safeAreaInset(edge: .bottom) {
+            AlfredTabBar(selection: $selection)
         }
         .environment(\.palette, settings.theme.palette)
         .tint(settings.theme.palette.accentBright)
         .preferredColorScheme(.dark)
         .animation(.easeInOut(duration: 0.25), value: settings.theme)
+    }
+
+    @ViewBuilder
+    private func page<Content: View>(_ tab: AlfredTab, @ViewBuilder content: () -> Content) -> some View {
+        content()
+            .opacity(selection == tab ? 1 : 0)
+            // Hidden pages must not swallow taps meant for the visible one.
+            .allowsHitTesting(selection == tab)
+            .accessibilityHidden(selection != tab)
     }
 }

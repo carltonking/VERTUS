@@ -17,8 +17,6 @@ struct HomeView: View {
     @Environment(ChatStore.self) private var chat
     @Environment(\.palette) private var palette
 
-    @State private var showingSettings = false
-
     /// Hardcoded while Alfred has exactly one owner. It becomes a setting the moment a second
     /// person installs this.
     private let ownerName = "Carlton"
@@ -68,21 +66,7 @@ struct HomeView: View {
             .navigationTitle("")
             .toolbarBackground(palette.backgroundTop, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showingSettings = true
-                    } label: {
-                        Image(systemName: "gearshape.fill")
-                            .font(.system(size: 15))
-                            .foregroundStyle(palette.textSecondary)
-                    }
-                    .accessibilityLabel("Settings")
-                }
-            }
-        }
-        .sheet(isPresented: $showingSettings) {
-            SettingsView()
+            // No gear here: Settings has its own icon in the bottom bar.
         }
     }
 
@@ -126,7 +110,7 @@ struct HomeView: View {
 
     private var connectButton: some View {
         Button {
-            showingSettings = true
+            selection = .settings
         } label: {
             Text("Open Settings")
                 .font(.system(size: 16, weight: .semibold))
