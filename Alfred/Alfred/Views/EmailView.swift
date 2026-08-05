@@ -6,10 +6,12 @@
 import SwiftUI
 
 struct EmailView: View {
+    @Environment(\.palette) private var palette
+
     var body: some View {
         NavigationStack {
             ZStack {
-                Theme.background
+                palette.background
 
                 ComingSoon(
                     icon: "envelope.fill",
@@ -20,7 +22,7 @@ struct EmailView: View {
             }
             .navigationTitle("Email")
             .navigationBarTitleDisplayMode(.large)
-            .toolbarBackground(Theme.backgroundTop, for: .navigationBar)
+            .toolbarBackground(palette.backgroundTop, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
         }
     }

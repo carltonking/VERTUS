@@ -11,6 +11,8 @@
 import SwiftUI
 
 struct ComingSoon: View {
+    @Environment(\.palette) private var palette
+
     let icon: String
     let title: String
     let promise: String
@@ -24,7 +26,7 @@ struct ComingSoon: View {
                 .font(.system(size: 40, weight: .light))
                 .foregroundStyle(
                     LinearGradient(
-                        colors: [Theme.accentSoft, Theme.accent],
+                        colors: [palette.accentSoft, palette.accent],
                         startPoint: .top,
                         endPoint: .bottom
                     )
@@ -32,12 +34,12 @@ struct ComingSoon: View {
 
             Text(title)
                 .font(.system(size: 24, weight: .semibold, design: .rounded))
-                .foregroundStyle(Theme.textPrimary)
+                .foregroundStyle(palette.textPrimary)
                 .padding(.top, 18)
 
             Text(promise)
                 .font(.system(size: 16))
-                .foregroundStyle(Theme.textSecondary)
+                .foregroundStyle(palette.textSecondary)
                 .multilineTextAlignment(.center)
                 .padding(.top, 10)
                 .padding(.horizontal, 36)
@@ -45,19 +47,19 @@ struct ComingSoon: View {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: "hammer.fill")
                     .font(.system(size: 13))
-                    .foregroundStyle(Theme.textFaint)
+                    .foregroundStyle(palette.textFaint)
                 Text(blockedOn)
                     .font(.system(size: 14))
-                    .foregroundStyle(Theme.textFaint)
+                    .foregroundStyle(palette.textFaint)
                     .multilineTextAlignment(.leading)
                 Spacer(minLength: 0)
             }
             .padding(14)
-            .background(Theme.surface.opacity(0.6))
+            .background(palette.surface.opacity(0.6))
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(Theme.surfaceBorder, lineWidth: 1)
+                    .strokeBorder(palette.surfaceBorder, lineWidth: 1)
             )
             .padding(.top, 28)
             .padding(.horizontal, 24)

@@ -6,6 +6,8 @@
 import SwiftUI
 
 struct Composer: View {
+    @Environment(\.palette) private var palette
+
     @Binding var text: String
     let isThinking: Bool
     let onSend: () -> Void
@@ -21,19 +23,19 @@ struct Composer: View {
             TextField("Ask Alfred…", text: $text, axis: .vertical)
                 .lineLimit(1...6)
                 .font(.system(size: 16))
-                .foregroundStyle(Theme.textPrimary)
-                .tint(Theme.accentBright)
+                .foregroundStyle(palette.textPrimary)
+                .tint(palette.accentBright)
                 .focused($isFocused)
                 // No .submitLabel(.send): with a vertical-axis field the return key inserts a
                 // newline and never submits, so labelling the key "send" would promise something
                 // that doesn't happen. The arrow button is the send affordance.
                 .padding(.horizontal, 16)
                 .padding(.vertical, 11)
-                .background(Theme.surface)
+                .background(palette.surface)
                 .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .strokeBorder(isFocused ? Theme.accent.opacity(0.6) : Theme.surfaceBorder, lineWidth: 1)
+                        .strokeBorder(isFocused ? palette.accent.opacity(0.6) : palette.surfaceBorder, lineWidth: 1)
                 )
                 .animation(.easeInOut(duration: 0.15), value: isFocused)
 
@@ -46,15 +48,15 @@ struct Composer: View {
                         Circle().fill(
                             canSend
                                 ? AnyShapeStyle(LinearGradient(
-                                    colors: [Theme.accent, Theme.accentDeep],
+                                    colors: [palette.accent, palette.accentDeep],
                                     startPoint: .top,
                                     endPoint: .bottom
                                   ))
-                                : AnyShapeStyle(Theme.surface)
+                                : AnyShapeStyle(palette.surface)
                         )
                     )
                     .overlay(
-                        Circle().strokeBorder(canSend ? .clear : Theme.surfaceBorder, lineWidth: 1)
+                        Circle().strokeBorder(canSend ? .clear : palette.surfaceBorder, lineWidth: 1)
                     )
             }
             .disabled(!canSend)
@@ -66,7 +68,7 @@ struct Composer: View {
         .padding(.bottom, 8)
         .background(.ultraThinMaterial)
         .overlay(alignment: .top) {
-            Rectangle().fill(Theme.surfaceBorder).frame(height: 0.5)
+            Rectangle().fill(palette.surfaceBorder).frame(height: 0.5)
         }
     }
 }

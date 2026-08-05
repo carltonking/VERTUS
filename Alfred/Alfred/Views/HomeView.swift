@@ -2,10 +2,10 @@
 //  HomeView.swift
 //  Alfred
 //
-//  The main page: a greeting, and the conversation with Alfred underneath it.
+//  The landing page: a greeting, and the shortest route into whatever you actually came to do.
 //
-//  The chat lives here rather than in a tab of its own because talking to Alfred *is* the app —
-//  Email and Calendar are structured views onto things he can already discuss.
+//  It deliberately isn't the chat. Once Chat has a tab of its own, a Home that duplicated it would
+//  leave two places showing the same transcript and no reason to prefer either.
 //
 
 import SwiftUI
@@ -15,127 +15,128 @@ struct HomeView: View {
 
     @Environment(AppSettings.self) private var settings
     @Environment(ChatStore.self) private var chat
+    @Environment(\.palette) private var palette
 
-    @State private var showingClearConfirmation = false
+    @State private var showingSettings = false
+
+    /// Hardcoded while Alfred has exactly one owner. It becomes a setting the moment a second
+    /// person installs this.
+    private let ownerName = "Carlton"
+
+    private var shortcuts: [(icon: String, label: String, prompt: String)] {
+        [
+            ("calendar", "What's on today?", "What's on my calendar today?"),
+            ("calendar.badge.plus", "Add an event", "Put dentist Friday 15:00 on my calendar"),
+            ("newspaper", "Catch me up", "What's in the news today?"),
+        ]
+    }
 
     var body: some View {
         NavigationStack {
             ZStack {
-                Theme.background
+                palette.background
 
-                if settings.isConfigured {
-                    conversation
-                } else {
-                    NotConnectedState { selection = .settings }
+                ScrollView {
+                    VStack(spacing: 0) {
+                        AlfredMark(lineWidth: 1.5)
+                            .frame(width: 62, height: 62)
+                            .padding(.top, 28)
+
+                        Text("Welcome, \(ownerName)")
+                            .font(.system(size: 30, weight: .semibold, design: .rounded))
+                            .foregroundStyle(palette.textPrimary)
+                            .padding(.top, 18)
+
+                        Text(settings.isConfigured
+                             ? "What can I take off your plate?"
+                             : "Connect me to your deployment and I'll get to work.")
+                            .font(.system(size: 16))
+                            .foregroundStyle(palette.textSecondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.top, 8)
+                            .padding(.horizontal, 32)
+
+                        if settings.isConfigured {
+                            shortcutList
+                        } else {
+                            connectButton
+                        }
+                    }
+                    .padding(.bottom, 28)
                 }
             }
             .navigationTitle("")
-            .toolbar { toolbar }
-            .toolbarBackground(Theme.backgroundTop, for: .navigationBar)
+            .toolbarBackground(palette.backgroundTop, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
-        }
-        .confirmationDialog(
-            "Clear this conversation?",
-            isPresented: $showingClearConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("Clear", role: .destructive) { chat.clear() }
-            Button("Keep", role: .cancel) {}
-        } message: {
-            Text("The transcript on this phone is deleted. Alfred keeps nothing either way.")
-        }
-    }
-
-    // MARK: - Conversation
-
-    private var conversation: some View {
-        // `chat` is @Observable, so bind through a local copy to hand the composer a Binding
-        // to its draft without making the store a @State of this view.
-        @Bindable var chat = chat
-
-        return ScrollViewReader { proxy in
-            Group {
-                if chat.messages.isEmpty && !chat.isThinking {
-                    // Deliberately outside the ScrollView: .defaultScrollAnchor(.bottom) pins short
-                    // content to the bottom of the viewport, which would shove the welcome screen
-                    // down against the composer instead of centring it.
-                    WelcomeState { prompt in
-                        Task { await chat.send(prompt, settings: settings) }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showingSettings = true
+                    } label: {
+                        Image(systemName: "gearshape.fill")
+                            .font(.system(size: 15))
+                            .foregroundStyle(palette.textSecondary)
                     }
-                } else {
-                    transcript(proxy)
-                }
-            }
-            .safeAreaInset(edge: .bottom) {
-                Composer(text: $chat.draft, isThinking: chat.isThinking) {
-                    let text = chat.draft
-                    chat.draft = ""
-                    Task { await chat.send(text, settings: settings) }
+                    .accessibilityLabel("Settings")
                 }
             }
         }
+        .sheet(isPresented: $showingSettings) {
+            SettingsView()
+        }
     }
 
-    private func transcript(_ proxy: ScrollViewProxy) -> some View {
-        ScrollView {
-            LazyVStack(spacing: 14) {
-                ForEach(chat.messages) { message in
-                    MessageBubble(message: message) {
-                        Task { await chat.retry(message, settings: settings) }
+    private var shortcutList: some View {
+        VStack(spacing: 10) {
+            ForEach(shortcuts, id: \.prompt) { shortcut in
+                Button {
+                    // Send it and follow it — landing on Chat with an empty screen while the
+                    // answer arrives elsewhere would be worse than not offering the shortcut.
+                    Task { await chat.send(shortcut.prompt, settings: settings) }
+                    selection = .chat
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: shortcut.icon)
+                            .font(.system(size: 15))
+                            .foregroundStyle(palette.accentBright)
+                            .frame(width: 22)
+                        Text(shortcut.label)
+                            .font(.system(size: 16))
+                            .foregroundStyle(palette.textPrimary)
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(palette.textFaint)
                     }
-                    .id(message.id)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 15)
+                    .background(palette.surface.opacity(0.7))
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .strokeBorder(palette.surfaceBorder, lineWidth: 1)
+                    )
                 }
-
-                if chat.isThinking {
-                    ThinkingIndicator().id(Self.thinkingAnchor)
-                }
+                .buttonStyle(.plain)
             }
-            .padding(.horizontal, 14)
-            .padding(.top, 12)
-            .padding(.bottom, 8)
         }
-        .scrollDismissesKeyboard(.interactively)
-        .defaultScrollAnchor(.bottom)
-        .onChange(of: chat.messages.count) { scrollToEnd(proxy) }
-        .onChange(of: chat.isThinking) { scrollToEnd(proxy) }
+        .padding(.top, 30)
+        .padding(.horizontal, 20)
     }
 
-    private static let thinkingAnchor = "thinking"
-
-    private func scrollToEnd(_ proxy: ScrollViewProxy) {
-        withAnimation(.easeOut(duration: 0.25)) {
-            if chat.isThinking {
-                proxy.scrollTo(Self.thinkingAnchor, anchor: .bottom)
-            } else if let last = chat.messages.last {
-                proxy.scrollTo(last.id, anchor: .bottom)
-            }
+    private var connectButton: some View {
+        Button {
+            showingSettings = true
+        } label: {
+            Text("Open Settings")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 26)
+                .padding(.vertical, 13)
+                .background(palette.accentGradient)
+                .clipShape(Capsule())
         }
-    }
-
-    // MARK: - Chrome
-
-    @ToolbarContentBuilder
-    private var toolbar: some ToolbarContent {
-        ToolbarItem(placement: .topBarLeading) {
-            HStack(spacing: 8) {
-                AlfredMark(lineWidth: 1.4)
-                    .frame(width: 20, height: 20)
-                Text("Alfred")
-                    .font(.system(size: 18, weight: .semibold, design: .rounded))
-                    .foregroundStyle(Theme.textPrimary)
-            }
-        }
-
-        ToolbarItem(placement: .topBarTrailing) {
-            Button {
-                showingClearConfirmation = true
-            } label: {
-                Image(systemName: "square.and.pencil")
-                    .font(.system(size: 16))
-                    .foregroundStyle(Theme.textSecondary)
-            }
-            .disabled(chat.messages.isEmpty)
-            .accessibilityLabel("New conversation")
-        }
+        .buttonStyle(.plain)
+        .padding(.top, 28)
     }
 }

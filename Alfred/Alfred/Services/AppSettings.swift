@@ -14,6 +14,12 @@ final class AppSettings {
     private enum Keys {
         static let host = "alfred.host"
         static let token = "alfred.token"
+        static let theme = "alfred.theme"
+    }
+
+    /// Which of the three palettes the app draws with. Persisted so it survives a relaunch.
+    var theme: ThemeChoice {
+        didSet { UserDefaults.standard.set(theme.rawValue, forKey: Keys.theme) }
     }
 
     /// What the user typed — a hostname or full URL, kept verbatim so the settings field
@@ -29,6 +35,8 @@ final class AppSettings {
     init() {
         host = UserDefaults.standard.string(forKey: Keys.host) ?? ""
         token = Keychain.get(Keys.token) ?? ""
+        theme = UserDefaults.standard.string(forKey: Keys.theme)
+            .flatMap(ThemeChoice.init(rawValue:)) ?? .eclipse
     }
 
     var isConfigured: Bool {
@@ -44,7 +52,7 @@ final class AppSettings {
     /// People paste a bare host, a full deployment URL, one with a trailing slash, or the endpoint
     /// path itself — all four mean the same thing, so normalise rather than making them guess the
     /// format the app wants.
-    static func endpoint(forHost host: String) -> URL? {
+    nonisolated static func endpoint(forHost host: String) -> URL? {
         var raw = host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else { return nil }
 

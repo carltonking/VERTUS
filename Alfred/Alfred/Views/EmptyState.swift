@@ -2,18 +2,16 @@
 //  EmptyState.swift
 //  Alfred
 //
-//  The two things Home shows when there's no conversation yet: a greeting, or an honest door if
-//  the app isn't connected to a deployment.
+//  What Chat shows when there's nothing in it yet, and what it shows when the app has nowhere
+//  to send a message.
 //
 
 import SwiftUI
 
-struct WelcomeState: View {
-    let onPick: (String) -> Void
+struct ConversationEmptyState: View {
+    @Environment(\.palette) private var palette
 
-    /// Hardcoded while Alfred has exactly one owner. It becomes a setting the moment a second
-    /// person installs this.
-    private let ownerName = "Carlton"
+    let onPick: (String) -> Void
 
     /// Not decoration — these are capabilities the cloud brain has today (api/_lib/route.ts),
     /// so tapping one always reaches something real.
@@ -27,21 +25,19 @@ struct WelcomeState: View {
         ScrollView {
             VStack(spacing: 0) {
                 AlfredMark(lineWidth: 1.5)
-                    .frame(width: 64, height: 64)
+                    .frame(width: 58, height: 58)
                     .opacity(0.9)
-                    .padding(.top, 36)
+                    .padding(.top, 40)
 
-                Text("Welcome, \(ownerName)")
-                    .font(.system(size: 30, weight: .semibold, design: .rounded))
-                    .foregroundStyle(Theme.textPrimary)
-                    .padding(.top, 18)
+                Text("Ask me anything")
+                    .font(.system(size: 22, weight: .semibold, design: .rounded))
+                    .foregroundStyle(palette.textPrimary)
+                    .padding(.top, 16)
 
-                Text("What can I take off your plate?")
-                    .font(.system(size: 16))
-                    .foregroundStyle(Theme.textSecondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.top, 8)
-                    .padding(.horizontal, 32)
+                Text("Or start with one of these.")
+                    .font(.system(size: 15))
+                    .foregroundStyle(palette.textSecondary)
+                    .padding(.top, 6)
 
                 VStack(spacing: 10) {
                     ForEach(suggestions, id: \.1) { icon, prompt in
@@ -51,27 +47,27 @@ struct WelcomeState: View {
                             HStack(spacing: 12) {
                                 Image(systemName: icon)
                                     .font(.system(size: 15))
-                                    .foregroundStyle(Theme.accentBright)
+                                    .foregroundStyle(palette.accentBright)
                                     .frame(width: 22)
                                 Text(prompt)
                                     .font(.system(size: 15))
-                                    .foregroundStyle(Theme.textPrimary)
+                                    .foregroundStyle(palette.textPrimary)
                                     .multilineTextAlignment(.leading)
                                 Spacer(minLength: 0)
                             }
                             .padding(.horizontal, 14)
                             .padding(.vertical, 12)
-                            .background(Theme.surface.opacity(0.7))
+                            .background(palette.surface.opacity(0.7))
                             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                             .overlay(
                                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                    .strokeBorder(Theme.surfaceBorder, lineWidth: 1)
+                                    .strokeBorder(palette.surfaceBorder, lineWidth: 1)
                             )
                         }
                         .buttonStyle(.plain)
                     }
                 }
-                .padding(.top, 30)
+                .padding(.top, 26)
                 .padding(.horizontal, 20)
                 .padding(.bottom, 24)
             }
@@ -81,48 +77,30 @@ struct WelcomeState: View {
     }
 }
 
-/// Shown instead of the conversation until an address and token are saved — a chat box that can
-/// only ever fail is worse than an honest door.
-struct NotConnectedState: View {
-    let onOpenSettings: () -> Void
+/// Shown instead of the composer until an address and token are saved — a chat box that can only
+/// ever fail is worse than an honest notice.
+struct NotConnectedNotice: View {
+    @Environment(\.palette) private var palette
 
     var body: some View {
         VStack(spacing: 0) {
             Spacer()
 
             AlfredMark(lineWidth: 1.5)
-                .frame(width: 76, height: 76)
+                .frame(width: 70, height: 70)
                 .opacity(0.5)
 
-            Text("Connect to Alfred")
+            Text("Not connected")
                 .font(.system(size: 22, weight: .semibold, design: .rounded))
-                .foregroundStyle(Theme.textPrimary)
+                .foregroundStyle(palette.textPrimary)
                 .padding(.top, 16)
 
-            Text("Point this app at your Alfred deployment and enter its app token.")
+            Text("Add your Alfred address and app token in Settings, and this becomes a conversation.")
                 .font(.system(size: 15))
-                .foregroundStyle(Theme.textSecondary)
+                .foregroundStyle(palette.textSecondary)
                 .multilineTextAlignment(.center)
                 .padding(.top, 8)
                 .padding(.horizontal, 40)
-
-            Button(action: onOpenSettings) {
-                Text("Open Settings")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 26)
-                    .padding(.vertical, 13)
-                    .background(
-                        LinearGradient(
-                            colors: [Theme.accent, Theme.accentDeep],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-                    .clipShape(Capsule())
-            }
-            .buttonStyle(.plain)
-            .padding(.top, 26)
 
             Spacer()
             Spacer()

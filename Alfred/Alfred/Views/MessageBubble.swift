@@ -7,6 +7,8 @@ import Combine  // Timer.publish(…).autoconnect() below
 import SwiftUI
 
 struct MessageBubble: View {
+    @Environment(\.palette) private var palette
+
     let message: Message
     var onRetry: () -> Void = {}
 
@@ -26,7 +28,7 @@ struct MessageBubble: View {
                             .font(.system(size: 14, weight: .medium))
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(Theme.accentBright)
+                    .foregroundStyle(palette.accentBright)
                 }
             }
             .padding(.horizontal, 14)
@@ -55,8 +57,8 @@ struct MessageBubble: View {
     private var foreground: Color {
         switch message.role {
         case .user: return .white
-        case .alfred: return Theme.textPrimary
-        case .error: return Theme.danger
+        case .alfred: return palette.textPrimary
+        case .error: return palette.danger
         }
     }
 
@@ -64,22 +66,22 @@ struct MessageBubble: View {
         switch message.role {
         case .user:
             LinearGradient(
-                colors: [Theme.accent, Theme.accentDeep],
+                colors: [palette.accent, palette.accentDeep],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
         case .alfred:
-            Theme.surface
+            palette.surface
         case .error:
-            Theme.danger.opacity(0.12)
+            palette.danger.opacity(0.12)
         }
     }
 
     private var border: Color {
         switch message.role {
         case .user: return .clear
-        case .alfred: return Theme.surfaceBorder
-        case .error: return Theme.danger.opacity(0.35)
+        case .alfred: return palette.surfaceBorder
+        case .error: return palette.danger.opacity(0.35)
         }
     }
 }
@@ -88,6 +90,8 @@ struct MessageBubble: View {
 /// then a model call), so after a few seconds it says so rather than leaving the user to wonder
 /// whether the tap registered.
 struct ThinkingIndicator: View {
+    @Environment(\.palette) private var palette
+
     @State private var phase = 0
     @State private var ticks = 0
 
@@ -102,7 +106,7 @@ struct ThinkingIndicator: View {
             HStack(spacing: 4) {
                 ForEach(0..<3, id: \.self) { index in
                     Circle()
-                        .fill(Theme.accentBright)
+                        .fill(palette.accentBright)
                         .frame(width: 7, height: 7)
                         .opacity(phase == index ? 1 : 0.3)
                         .animation(.easeInOut(duration: 0.3), value: phase)
@@ -110,17 +114,17 @@ struct ThinkingIndicator: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
-            .background(Theme.surface)
+            .background(palette.surface)
             .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .strokeBorder(Theme.surfaceBorder, lineWidth: 1)
+                    .strokeBorder(palette.surfaceBorder, lineWidth: 1)
             )
 
             if ticks > Self.reassureAfterTicks {
                 Text("still working…")
                     .font(.system(size: 13))
-                    .foregroundStyle(Theme.textFaint)
+                    .foregroundStyle(palette.textFaint)
                     .transition(.opacity)
             }
 
