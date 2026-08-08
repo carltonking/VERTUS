@@ -36,6 +36,7 @@ AlfredMac/.swiftpm/
 AlfredBar/AlfredBar
 AlfredBar/.build/
 AlfredBar/*.xcodeproj/
+Alfred/build/
 
 # Xcode per-user state — window positions and scheme ordering, not project configuration
 **/xcuserdata/
@@ -55,3 +56,4 @@ AlfredBar/*.xcodeproj/
 *~
 .vercel
 node_modules/
+.env*.local

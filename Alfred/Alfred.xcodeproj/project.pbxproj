@@ -175,6 +175,11 @@
 				TargetAttributes = {
 					4C1AB28A30227729008DE299 = {
 						CreatedOnToolsVersion = 26.6;
+						SystemCapabilities = {
+							com.apple.Push = {
+								enabled = 1;
+							};
+						};
 					};
 					4C1AB2973022772B008DE299 = {
 						CreatedOnToolsVersion = 26.6;
@@ -393,10 +398,15 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = Alfred/Alfred.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Tools/ExtraInfo.plist;
+				INFOPLIST_KEY_NSCalendarsFullAccessUsageDescription = "Alfred shows your schedule in the Calendar tab. Your events stay on this phone.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Alfred hears you when you talk to him over voice — the audio goes straight to your computer, no further.";
+				INFOPLIST_KEY_NSRemindersFullAccessUsageDescription = "Alfred shows and manages your reminders in the Reminders tab. They stay on this phone.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -424,10 +434,15 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = Alfred/Alfred.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Tools/ExtraInfo.plist;
+				INFOPLIST_KEY_NSCalendarsFullAccessUsageDescription = "Alfred shows your schedule in the Calendar tab. Your events stay on this phone.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Alfred hears you when you talk to him over voice — the audio goes straight to your computer, no further.";
+				INFOPLIST_KEY_NSRemindersFullAccessUsageDescription = "Alfred shows and manages your reminders in the Reminders tab. They stay on this phone.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

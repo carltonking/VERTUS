@@ -8,6 +8,7 @@ import { llmText } from "./llm";
 import { listUpcomingEvents, CalendarEvent } from "./caldav";
 import { searchHeadlines } from "./news";
 import { USER_TZ } from "./extract";
+import { getLocationTimezone } from "./location";
 
 const CHAT_SYSTEM =
   "You are Alfred, Carlton's personal assistant, reachable on his phone as an always-on cloud service. " +
@@ -61,8 +62,23 @@ function fmtEvent(e: CalendarEvent, tz: string): string {
   return `- ${day} ${time} — ${e.title}${e.location ? ` @ ${e.location}` : ""}`;
 }
 
+/**
+ * The current time in Carlton's timezone, shown to the model before every turn.
+ *
+ * The timezone comes from the latest phone location (see location.ts); with no
+ * fresh fix it falls back to the static USER_TZ. No location store at all →
+ * the ISO fallback below, so the model is never left guessing what "now" is.
+ */
+async function nowBlock(): Promise<string> {
+  const tz = (await getLocationTimezone().catch(() => null)) ?? USER_TZ;
+  const now = new Date();
+  const date = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long", month: "long", day: "numeric" }).format(now);
+  const clock = new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).format(now);
+  return `\n\n[now: ${date}, ${clock} (${tz})]`;
+}
+
 export async function answerChat(text: string): Promise<string> {
-  let context = "";
+  let context = await nowBlock();
 
   if (wantsCalendar(text)) {
     const events = await listUpcomingEvents(96).catch(() => [] as CalendarEvent[]);

@@ -1,25 +1,29 @@
 // "Time to leave" watcher — the cloud twin of the Mac's DepartureWatcher, so leave-by nudges fire even
 // when the Mac is off. Each tick: read the latest phone location (shared via Telegram Live Location),
-// look at upcoming located calendar events (CalDAV), estimate travel time (Google Routes), and text ONE
-// nudge per event when it's time to start wrapping up (leave-by − pack-up lead). Never sends anything
-// outward beyond the owner's own Telegram, and only reads the calendar.
+// look at upcoming located calendar events (CalDAV), estimate travel time (Google Routes), and nudge
+// ONCE per event when it's time to start wrapping up (leave-by − pack-up lead). Push goes to the
+// Alfred iOS app via APNs when a device token is registered (api/device), else falls back to a
+// Telegram DM. Never sends anything outward beyond the owner's own phone, and only reads the calendar.
 //
 // This has no Vercel cron entry (Hobby can't run per-few-minutes) — an external pinger hits it every
 // ~1-5 min. Auth mirrors cron-briefing: `CRON_SECRET` bearer if set, else a manual ?run=<OWNER>.
 //
-// Tunables (env, all optional): DEPART_MODE (transit|driving|walking|bicycling, default transit),
+// Tunables (env, all optional): DEPART_MODE (transit|driving|walking|bicycling, default walking),
 // DEPART_ARRIVE_EARLY_MIN (default 5), DEPART_PACKUP_LEAD_MIN (default 10), DEPART_WINDOW_HOURS (3),
 // DEPART_LOCATION_MAX_AGE_MIN (how fresh the phone fix must be, default 30), USER_TZ.
 
 import type { IncomingMessage, ServerResponse } from "http";
 import { sendMessage } from "./_lib/telegram";
+import { sendApnsPush } from "./_lib/push";
 import { listUpcomingLocatedEvents } from "./_lib/caldav";
 import { estimateTravel, parseMode } from "./_lib/travel";
 import { getLocation } from "./_lib/location";
 import { kvGet, kvSet, kvConfigured } from "./_lib/kv";
 
 const TZ = process.env.USER_TZ || "America/New_York";
-const MODE = parseMode(process.env.DEPART_MODE);
+// Walking is the right default here: the reference use case is one class to the
+// next around a campus, minutes apart. Set DEPART_MODE=transit/driving to opt out.
+const MODE = process.env.DEPART_MODE ? parseMode(process.env.DEPART_MODE) : "walking";
 const ARRIVE_EARLY_MS = num(process.env.DEPART_ARRIVE_EARLY_MIN, 5) * 60_000;
 const PACKUP_LEAD_MS = num(process.env.DEPART_PACKUP_LEAD_MIN, 10) * 60_000;
 const WINDOW_HOURS = num(process.env.DEPART_WINDOW_HOURS, 3);
@@ -86,7 +90,12 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     const mins = Math.max(1, Math.round(est.seconds / 60));
     const via = est.usedMode === "transit" ? " by transit" : est.usedMode === "driving" ? " driving" : est.usedMode === "bicycling" ? " by bike" : " on foot";
     const body = `🚶 ~${mins} min${via} to ${ev.title} — leave by ${hhmm(new Date(leaveBy))} to arrive early. Start wrapping up.`;
-    await sendMessage(token, owner, body);
+    const pushed = await sendApnsPush({
+      title: "Time to head out",
+      body: `${mins} min${via} to ${ev.title} — leave by ${hhmm(new Date(leaveBy))}.`,
+    });
+    // Push first; Telegram only if APNs isn't configured, so the owner isn't double-nudged.
+    if (!pushed) await sendMessage(token, owner, body);
 
     // Keep the marker until ~1h past start so we never re-nudge the same occurrence.
     await kvSet(dedupeKey, "1", Math.ceil((startMs - now) / 1000) + 3600);

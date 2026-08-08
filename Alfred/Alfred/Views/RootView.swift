@@ -2,7 +2,7 @@
 //  RootView.swift
 //  Alfred
 //
-//  The places Alfred lives on the phone, and the one spot the chosen theme enters the view tree.
+//  The places Alfred lives on the phone, and the one spot the palette enters the view tree.
 //
 //  Selection is held here rather than inside any one page, so a page can send you somewhere else —
 //  an unconfigured Home needs to hand you to Settings. That wouldn't work if each page owned its
@@ -12,7 +12,7 @@
 import SwiftUI
 
 enum AlfredTab: String, CaseIterable, Identifiable, Hashable {
-    case home, chat, messages, email, calendar, settings
+    case home, chat, email, calendar, reminders, settings
 
     var id: String { rawValue }
 
@@ -20,9 +20,9 @@ enum AlfredTab: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .home: return "Home"
         case .chat: return "Chat"
-        case .messages: return "Messages"
         case .email: return "Email"
         case .calendar: return "Calendar"
+        case .reminders: return "Reminders"
         case .settings: return "Settings"
         }
     }
@@ -31,9 +31,9 @@ enum AlfredTab: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .home: return "house.fill"
         case .chat: return "bubble.left.and.bubble.right.fill"
-        case .messages: return "message.fill"
         case .email: return "envelope.fill"
         case .calendar: return "calendar"
+        case .reminders: return "checklist"
         case .settings: return "gearshape.fill"
         }
     }
@@ -41,7 +41,6 @@ enum AlfredTab: String, CaseIterable, Identifiable, Hashable {
 
 struct RootView: View {
     @Environment(AppSettings.self) private var settings
-
     @State private var selection: AlfredTab = .home
 
     var body: some View {
@@ -49,19 +48,29 @@ struct RootView: View {
             // Each page keeps its own view identity, so switching tabs doesn't reset a half-typed
             // message or a scroll position the way rebuilding a single view would.
             page(.home) { HomeView(selection: $selection) }
-            page(.chat) { ChatView() }
-            page(.messages) { MessagesView() }
+            page(.chat) { ChatView(goBackHome: { selection = .home }) }
             page(.email) { EmailView() }
             page(.calendar) { CalendarView() }
+            page(.reminders) { RemindersView() }
             page(.settings) { SettingsView() }
         }
         .safeAreaInset(edge: .bottom) {
-            AlfredTabBar(selection: $selection)
+            // Chat owns the whole screen while it's open: the composer sits over
+            // the inset every other tab gives the bar, so the bar would bury it.
+            // Full-screen chat, navigable back to Home via its leading button.
+            if selection != .chat {
+                AlfredTabBar(selection: $selection)
+            }
         }
-        .environment(\.palette, settings.theme.palette)
-        .tint(settings.theme.palette.accentBright)
+        .environment(\.palette, .mono)
+        .tint(Palette.mono.accentBright)
         .preferredColorScheme(.dark)
-        .animation(.easeInOut(duration: 0.25), value: settings.theme)
+        .task {
+            // Once the app has a server configured, offer leave-now push reminders.
+            // No-op afterward: the check is idempotent.
+            guard settings.isConfigured else { return }
+            await PushRegistration.shared.request()
+        }
     }
 
     @ViewBuilder
