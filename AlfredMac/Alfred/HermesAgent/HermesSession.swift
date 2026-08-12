@@ -738,7 +738,7 @@ actor HermesSession {
         }
 
         proc.terminationHandler = { [weak self] p in
-            Task { await self?.handleTermination(p.terminationStatus) }
+            Task { await self?.handleTermination(p.terminationStatus, processID: p.processIdentifier) }
         }
 
         do {
@@ -750,29 +750,43 @@ actor HermesSession {
         process = proc
         stdinPipe = inPipe
 
-        // 1. initialize — advertise no filesystem capability; Alfred reaches the
-        //    Mac through its own MCP tools (Phase 2), not through ACP's fs hooks.
-        _ = try await request("initialize", [
-            "protocolVersion": 1,
-            "clientCapabilities": ["fs": ["readTextFile": false, "writeTextFile": false]],
-            "clientInfo": ["name": "alfred", "version": Self.appVersion],
-        ])
+        // The ACP handshake is atomic: if initialize or session/new throws, the
+        // process is already spawned but sessionID is still nil. Left alone that
+        // is a half-started session — start() guards on `process`, so every later
+        // prompt would no-op past it and fail with "no active session" until the
+        // app restarts. Tear down on any handshake failure so the next start()
+        // is a clean spawn.
+        do {
+            // 1. initialize — advertise no filesystem capability; Alfred reaches
+            //    the Mac through its own MCP tools (Phase 2), not through ACP's
+            //    fs hooks.
+            _ = try await request("initialize", [
+                "protocolVersion": 1,
+                "clientCapabilities": ["fs": ["readTextFile": false, "writeTextFile": false]],
+                "clientInfo": ["name": "alfred", "version": Self.appVersion],
+            ])
 
-        // 2. session/new, injecting Alfred's macOS tools for this session only,
-        //    plus any external capability bridges declared in
-        //    ~/.alfred/agent-servers.json.
-        //
-        // Per-session registration rather than `hermes mcp add`: it leaves
-        // ~/.hermes untouched, keeps the bar self-contained, and means a Hermes
-        // run started from anywhere else doesn't inherit control of this Mac.
-        let session = try await request("session/new", [
-            "cwd": workingDirectory,
-            "mcpServers": Self.sessionMCPServers(),
-        ])
-        guard let sid = session["sessionId"] as? String else {
-            throw HermesError.protocolError("session/new returned no sessionId")
+            // 2. session/new, injecting Alfred's macOS tools for this session
+            //    only, plus any external capability bridges declared in
+            //    ~/.alfred/agent-servers.json.
+            //
+            // Per-session registration rather than `hermes mcp add`: it leaves
+            // ~/.hermes untouched, keeps the bar self-contained, and means a
+            // Hermes run started from anywhere else doesn't inherit control of
+            // this Mac.
+            let session = try await request("session/new", [
+                "cwd": workingDirectory,
+                "mcpServers": Self.sessionMCPServers(),
+            ])
+            guard let sid = session["sessionId"] as? String else {
+                throw HermesError.protocolError("session/new returned no sessionId")
+            }
+            sessionID = sid
+        } catch {
+            NSLog("[hermes] session handshake failed — tearing down: %@", error.localizedDescription)
+            shutdown()
+            throw error
         }
-        sessionID = sid
     }
 
     private static var appVersion: String {
@@ -853,10 +867,18 @@ actor HermesSession {
         }
     }
 
-    /// Terminate the agent. Safe to call repeatedly.
+    /// Terminate the agent and end any running turn's stream. Safe to call repeatedly.
     func shutdown() {
         eventSink?.finish()
         eventSink = nil
+        teardownProcess()
+    }
+
+    /// Kill the subprocess and drop session state *without* touching the running
+    /// turn's stream. Used when a turn is about to retry against a fresh session
+    /// (watchdog timeout, lost session): the caller keeps streaming into the same
+    /// continuation, so the retried answer still reaches the UI.
+    private func teardownProcess() {
         for (_, cont) in pending { cont.resume(throwing: HermesError.agentExited(0)) }
         pending.removeAll()
         stdinPipe?.fileHandleForWriting.closeFile()
@@ -866,11 +888,15 @@ actor HermesSession {
             Darwin.kill(process.processIdentifier, SIGCONT)
             isSuspended = false
         }
-        process?.terminate()
+        // Clear `process` before terminating so the termination handler sees a
+        // mismatch and skips (a rebuild's stale handler must not clear the fresh
+        // session). Terminate via the captured reference.
+        let oldProcess = process
         process = nil
         stdinPipe = nil
         sessionID = nil
         readBuffer.removeAll()
+        oldProcess?.terminate()
     }
 
     /// Drop the conversation and start a clean one.
@@ -883,13 +909,48 @@ actor HermesSession {
         try? await start()
     }
 
-    private func handleTermination(_ status: Int32) {
+    /// The session id to prompt with, spawning the agent if it isn't running or
+    /// rebuilding if the running process has no session (a failed handshake).
+    /// Throws only when the agent genuinely can't be started.
+    private func activeSessionID() async throws -> String {
+        if let sid = sessionID, process != nil { return sid }
+        return try await rebuildSession()
+    }
+
+    /// Tear down the current process (without ending the running turn's stream)
+    /// and spawn a fresh session, returning its id.
+    private func rebuildSession() async throws -> String {
+        teardownProcess()
+        try await start()
+        guard let sid = sessionID else {
+            throw HermesError.protocolError("no active session")
+        }
+        return sid
+    }
+
+    /// True when a protocol error means the session id Alfred holds is no longer
+    /// valid on the agent's side — the recoverable "the session went away"
+    /// class, distinct from prompt-level failures (permission, tool errors).
+    private static func sessionLost(_ message: String) -> Bool {
+        let m = message.lowercased()
+        return m.contains("no active session")
+            || m.contains("session not found")
+            || m.contains("no such session")
+            || m.contains("invalid session")
+    }
+
+    private func handleTermination(_ status: Int32, processID: Int32) {
+        // Only the *current* process's death ends the turn. A rebuild tears the
+        // old process down while a fresh one is spawning; the stale handler must
+        // not clear the new session or finish its stream.
+        guard process?.processIdentifier == processID else { return }
         eventSink?.yield(.failed(HermesError.agentExited(status).localizedDescription))
         eventSink?.finish()
         eventSink = nil
         for (_, cont) in pending { cont.resume(throwing: HermesError.agentExited(status)) }
         pending.removeAll()
         process = nil
+        sessionID = nil
     }
 
     // MARK: - Prompting
@@ -914,15 +975,15 @@ actor HermesSession {
     private func runTurn(_ text: String, attachment: FileAttachment? = nil, into continuation: AsyncStream<HermesEvent>.Continuation, capture: Bool = true) async {
         isTurnActive = true
         defer { isTurnActive = false }
+        // Ensure a live session before prompting. Rebuilds if the agent isn't
+        // running or a previous handshake left no session behind — a bare guard
+        // failure here would otherwise surface to the user as a permanent
+        // "no active session" until the app restarts.
+        let sid: String
         do {
-            try await start()  // no-op when already running
+            sid = try await activeSessionID()
         } catch {
             continuation.yield(.failed(error.localizedDescription))
-            continuation.finish()
-            return
-        }
-        guard let sid = sessionID else {
-            continuation.yield(.failed(HermesError.protocolError("no active session").localizedDescription))
             continuation.finish()
             return
         }
@@ -971,13 +1032,17 @@ actor HermesSession {
                 ], timeout: turnDeadline)
             } catch HermesError.turnTimedOut {
                 NSLog("[hermes] turn watchdog: no response in \(Int(turnDeadline))s — restarting session and retrying")
-                shutdown()
-                try await start()
-                guard let freshSID = sessionID else {
-                    continuation.yield(.failed(HermesError.protocolError("session lost after restart").localizedDescription))
-                    continuation.finish()
-                    return
-                }
+                let freshSID = try await rebuildSession()
+                result = try await request("session/prompt", [
+                    "sessionId": freshSID,
+                    "prompt": blocks,
+                ], timeout: turnDeadline)
+            } catch let HermesError.protocolError(message) where Self.sessionLost(message) {
+                // Hermes dropped or expired the session server-side, so the
+                // prompt came back "no active session". Rebuild and retry the
+                // same prompt once instead of handing the user the raw error.
+                NSLog("[hermes] session lost (\"%@\") — rebuilding and retrying", message)
+                let freshSID = try await rebuildSession()
                 result = try await request("session/prompt", [
                     "sessionId": freshSID,
                     "prompt": blocks,
