@@ -931,12 +931,21 @@ actor HermesSession {
     /// True when a protocol error means the session id Alfred holds is no longer
     /// valid on the agent's side — the recoverable "the session went away"
     /// class, distinct from prompt-level failures (permission, tool errors).
-    private static func sessionLost(_ message: String) -> Bool {
+    ///
+    /// Hermes phrases this variously ("no active session", "Session c8f… is no
+    /// longer active", "session does not exist", …) and can surface it in
+    /// either the error `message` or the richer `data.details` — match the
+    /// family, not one spelling.
+    static func sessionLost(_ message: String) -> Bool {
         let m = message.lowercased()
         return m.contains("no active session")
             || m.contains("session not found")
             || m.contains("no such session")
             || m.contains("invalid session")
+            || m.contains("session is not active")
+            || m.contains("no longer active")
+            || m.contains("does not exist")
+            || m.contains("session inactive")
     }
 
     private func handleTermination(_ status: Int32, processID: Int32) {
