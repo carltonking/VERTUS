@@ -57,3 +57,18 @@ Alfred/build/
 .vercel
 node_modules/
 .env*.local
+
+# Vendored engines and external repos — never commit
+AlfredMac/Frameworks/
+AlfredMac/Server/MiniOmni/
+freellmpool/
+
+# Python virtualenvs (agent-bridge, voice bridge)
+.venvs/
+
+# Runtime state (stream store, session bins)
+data/
+
+# Local artifacts
+AlfredMac/dist/
+*.bak
