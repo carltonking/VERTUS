@@ -22,7 +22,7 @@ Generated fixtures are written to `AlfredMac/QA/Fixtures/Generated/`.
 - Alfred should not persist extracted file text, extracted document text, screenshots, or screen observations.
 - Alfred should not include full file paths in copied diagnostics.
 - Alfred should not execute shell commands unless the user explicitly uses shell syntax and shell execution is enabled.
-- Alfred should not control the computer unless the user explicitly asks and confirms the action plan.
+- Alfred should not control the computer unless the user explicitly asks (the ask is the approval).
 
 ## Diagnostics
 
@@ -427,17 +427,134 @@ Privacy assertions:
 Steps:
 
 1. Ask `click 100 100`.
-2. Confirm the action plan.
 
 Expected:
 
-- Alfred performs the single click.
+- Alfred performs the single click without a bar confirmation (the ask is the permission).
 - Esc or **Stop Computer Control** can cancel active execution.
 
 Privacy assertions:
 
-- No action happens before user confirmation.
-- Alfred does not type secrets or payment information.
+- Alfred still refuses destructive requests and never types secrets or payment information.
+
+## Calendar And Reminders
+
+### Permission Check
+
+Steps:
+
+1. If Calendar permission is not granted, ask `add a calendar event tomorrow at 3pm called Standup`.
+
+Expected:
+
+- Alfred asks for Calendar access before reading or writing any event.
+
+Privacy assertions:
+
+- No event is created before the user grants Calendar access.
+
+### Create Calendar Event
+
+Steps:
+
+1. Ask `add a calendar event called Lunch with Sam on Monday at 12:30pm`.
+
+Expected:
+
+- An event appears in Apple Calendar (and iCloud/iPhone) titled "Lunch with Sam" without any bar confirmation.
+- Alfred's reply includes the event id.
+
+Privacy assertions:
+
+- Alfred only writes events the user asked about.
+
+### List And Edit Event
+
+Steps:
+
+1. Ask `what's on my calendar this week`.
+2. Ask `edit the event for <id> and move it to 4pm`.
+
+Expected:
+
+- The list includes an `id=` per event.
+- The chosen event's start time is updated in Apple Calendar.
+
+### Delete Event
+
+Steps:
+
+1. Ask `delete the event <id>`.
+2. Confirm the delete action plan, which notes it is not reversible.
+
+Expected:
+
+- The event is removed from Apple Calendar.
+
+### Create And Complete Reminder
+
+Steps:
+
+1. Ask `remind me to water the plants tomorrow`.
+2. Ask `mark the reminder <id> complete`.
+
+Expected:
+
+- A reminder appears in Reminders (and iCloud/iPhone) with no bar confirmation.
+- Marking it complete reflects in the Reminders app.
+
+### Delete Reminder
+
+Steps:
+
+1. Ask `delete the reminder <id>`.
+2. Confirm.
+
+Expected:
+
+- The reminder disappears from Reminders.
+
+## Terminal
+
+### Disabled Gate
+
+Steps:
+
+1. Ensure **Terminal** is off in Alfred Settings.
+2. Ask `run: ls -la`.
+
+Expected:
+
+- Alfred explains Terminal is off and points to Settings; it does not run the command.
+
+Privacy assertions:
+
+- No shell command runs while the setting is off.
+
+### Run A Command
+
+Steps:
+
+1. Enable **Terminal** in Alfred Settings.
+2. Ask `run pwd`.
+
+Expected:
+
+- Alfred runs a fresh `zsh` without any bar confirmation and returns the home-directory path plus Exit code 0.
+
+### Destructive Command Refused
+
+Steps:
+
+1. Ask `run: rm -rf ~/Library`.
+
+Expected:
+
+- Alfred refuses outright (no bar approval prompt) and tells the user it won't run the command.
+
+Privacy assertions:
+
+- No destructive command is ever offered for approval, let alone run.
 
 ## Workflows
 

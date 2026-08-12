@@ -23,7 +23,7 @@ actor ScreenCapability {
     // MARK: - Public API
 
     func captureScreen() async throws -> Data {
-        try jpegData(from: try await captureCGImage())
+        try Self.jpegData(from: try await captureCGImage())
     }
 
     /// The raw screenshot as a `CGImage` — used by on-device OCR (Vision) so callers don't pay a JPEG
@@ -71,14 +71,14 @@ actor ScreenCapability {
         // The returned width/height are the DOWNSCALED pixel size, which the caller scales back to
         // display points — so accuracy is unaffected.
         let image = Self.downscaled(full, maxLongEdge: 1280) ?? full
-        let data = try jpegData(from: image)
+        let data = try Self.jpegData(from: image)
         return Screenshot(base64: data.base64EncodedString(),
                           mediaType: "image/jpeg",
                           width: image.width,
                           height: image.height)
     }
 
-    private static func downscaled(_ image: CGImage, maxLongEdge: Int) -> CGImage? {
+    static func downscaled(_ image: CGImage, maxLongEdge: Int) -> CGImage? {
         let longEdge = max(image.width, image.height)
         guard longEdge > maxLongEdge else { return image }
         let scale = Double(maxLongEdge) / Double(longEdge)
@@ -111,7 +111,9 @@ actor ScreenCapability {
         }
     }
 
-    private func jpegData(from image: CGImage) throws -> Data {
+    // Internal (not private): the screen-monitoring loop reuses these two
+    // helpers to encode its own captures without duplicating the ImageIO code.
+    static func jpegData(from image: CGImage) throws -> Data {
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil) else {
             throw ScreenCaptureError.failed("Failed to create image destination")

@@ -62,7 +62,7 @@ final class HotkeyListener {
 
         guard handlerStatus == noErr else {
             cleanupRetainedSelf()
-            logger.error("Failed to install hotkey event handler: \(handlerStatus)")
+            NSLog("[hotkey] handler install failed: \(handlerStatus)")
             return
         }
 
@@ -83,9 +83,10 @@ final class HotkeyListener {
 
         guard registerStatus == noErr else {
             stop()
-            logger.error("Failed to register Cmd+Shift+J: \(registerStatus)")
+            NSLog("[hotkey] register failed: \(registerStatus)")
             return
         }
+        NSLog("[hotkey] registered Cmd+Shift+J (noErr)")
     }
 
     func stop() {

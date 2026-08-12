@@ -11,7 +11,7 @@ import SwiftUI
 struct PresenceRootView: View {
     @Binding var presenceState: AssistantPresenceState
     @ObservedObject var barState: BarState
-    let onSubmit: (String) -> Void
+    let onSubmit: (String, FileAttachment?) -> Void
     let onCollapse: () -> Void
 
     var body: some View {
@@ -28,6 +28,7 @@ struct PresenceRootView: View {
                 responseText: $barState.responseText,
                 isProcessing: $barState.isProcessing,
                 pendingConfirmation: $barState.pendingConfirmation,
+                pendingEmailReply: $barState.pendingEmailReply,
                 focusToken: barState.focusToken,
                 onSubmit: onSubmit,
                 onEscape: onCollapse

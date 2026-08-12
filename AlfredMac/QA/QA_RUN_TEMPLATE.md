@@ -21,6 +21,7 @@
 | Fixture generation result | Pending | `./scripts/generate_qa_fixtures.sh` |
 | App icon generation result | Pending | `./scripts/generate_app_icon.sh` |
 | Clean build result | Pending | `./scripts/build_app.sh --clean` |
+| Agent bridge smoke test result | Pending | `python3 agent-bridge/smoke_test_servers.py --concurrency 4` — exit 0 = all MCP servers boot and list tools; any nonzero = hold. Run bare (piping masks the exit code). |
 | App launch result | Pending | `open build/Alfred.app` |
 | Info.plist version/build/bundle ID result | Pending | `plutil -p build/Alfred.app/Contents/Info.plist` |
 | Release ZIP result | Pending | `scripts/package_release.sh` |

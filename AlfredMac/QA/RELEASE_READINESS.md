@@ -7,6 +7,7 @@ Use this checklist before shipping a local build, release candidate, or packaged
 | Gate | Status | Notes |
 | --- | --- | --- |
 | Clean build passes with `./scripts/build_app.sh --clean`. | Pending | |
+| Agent bridge smoke test passes with `python3 agent-bridge/smoke_test_servers.py --concurrency 4`. | Pending | Every MCP server must launch and answer `tools/list`; any nonzero exit holds the release. Run bare (no pipe — piping masks the exit code). See `agent-bridge/README.md`. |
 | Alfred launches as a real `.app` bundle. | Pending | |
 | `AppIcon.icns` exists and `CFBundleIconFile` is set to `AppIcon`. | Pending | Generate with `scripts/generate_app_icon.sh`. |
 | Bundle identifier is correct for the release channel. | Pending | Default: `com.alfred.app`. |
@@ -57,6 +58,7 @@ Use this checklist before shipping a local build, release candidate, or packaged
 
 - **Ship** only if every required gate is passing or explicitly accepted as a documented limitation.
 - **Hold** if any privacy, permission, hidden-write, hidden-scan, background-monitoring, or computer-control gate fails.
+- **Hold** if the agent bridge smoke test fails: `smoke_test_servers.py` exits nonzero when any registered MCP server can't boot or answer `tools/list` (e.g. a renamed script the config still points at, a missing backing binary, or a wedged npx wrapper). Run it bare — a pipe (e.g. `| tail`) hides the exit code and can make a failure look green. Fix the server or the config, re-run, and only then ship.
 
 ## Release Notes Inputs
 

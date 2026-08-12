@@ -81,6 +81,9 @@ if [[ -f "$APP_ICON_SOURCE" ]]; then
   <string>AppIcon</string>"
 fi
 
+step "Ensuring hermes engine (vendored fork) is current"
+bash "$SCRIPT_DIR/build_hermes_engine.sh"
+
 step "Building Swift package"
 # Capture the bin path first (a graph query), then do the actual compile — avoids re-entering
 # SwiftPM a second time purely to read the path after the build. The real build still runs below and

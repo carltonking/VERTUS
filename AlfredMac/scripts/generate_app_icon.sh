@@ -21,7 +21,7 @@ die() { echo "✗ ERROR: $*" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
-SOURCE="$REPO_ROOT/Alfred/Resources/alfred-small-logo.png"
+SOURCE="$(dirname "$REPO_ROOT")/Logos/small logo.png"
 OUTPUT="$REPO_ROOT/Alfred/Resources/AppIcon.icns"
 
 while [[ $# -gt 0 ]]; do
