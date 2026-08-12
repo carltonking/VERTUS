@@ -1,6 +1,15 @@
 # Alfred Codebase Audit — Summary
 
-## Architecture Overview
+> **HISTORICAL — superseded (August 2026).** This audit describes the
+> pre-refactor architecture (GRDB memory store, AssistantCore pipeline,
+> LLMRouter, 26-file capability monolith). That architecture has since been
+> replaced by the Hermes-client refactor and the unified memory consolidation.
+> See `ARCHITECTURE_REPORT.md` and `ALFRED_MAP.md` for the current state. Kept
+> as a record of what the audit found and which personalization gaps were
+> subsequently closed (structured user model, behavioral learning, entity
+> graph, session coherence).
+
+## Architecture Overview (as audited — superseded)
 
 Alfred is a macOS AI assistant (`@main` struct `AlfredApp` → `AppDelegate`) with a **notch-triggered floating bar window** (`BarWindow`). The architecture follows a **pipeline pattern**:
 
