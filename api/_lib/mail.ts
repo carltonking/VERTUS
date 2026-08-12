@@ -1,25 +1,16 @@
 // Multi-account mail — the cloud stand-in for the Mac's Apple Mail reader. Reads recent INBOX messages
-// over IMAP and sends replies over SMTP, for one or more accounts configured by env. iCloud and personal
-// Gmail both work with an app-specific password (no OAuth): iCloud reuses the same APPLE_APP_PASSWORD as
-// CalDAV; Gmail needs 2-Step Verification + an app password.
+// over IMAP and sends replies over SMTP. iCloud and personal Gmail both work with an app-specific
+// password (no OAuth): iCloud reuses the same APPLE_APP_PASSWORD as CalDAV; Gmail needs 2-Step
+// Verification + an app password.
 //
-// Env:
-//   iCloud → APPLE_ID + APPLE_APP_PASSWORD (or MAIL_ICLOUD_APP_PASSWORD to use a different one)
-//   Gmail  → GMAIL_ADDRESS + GMAIL_APP_PASSWORD
-//   extra  → MAIL_ACCOUNTS = JSON array of {label,user,pass,imapHost,imapPort?,smtpHost?,smtpPort?}
+// *Which* mailboxes exist is accounts.ts's problem (env-deployed plus the ones added from the phone);
+// this file only knows how to talk to one once it's handed over.
 
 import { ImapFlow } from "imapflow";
 import nodemailer from "nodemailer";
+import { resolveAccounts, type MailAccount } from "./accounts";
 
-export interface MailAccount {
-  label: string;
-  imapHost: string;
-  imapPort: number;
-  smtpHost: string;
-  smtpPort: number;
-  user: string; // full email address
-  pass: string; // app-specific password
-}
+export type { MailAccount };
 
 export interface MailMsg {
   account: string; // account label
@@ -31,49 +22,6 @@ export interface MailMsg {
   messageId?: string;
   snippet: string;
   seen: boolean;
-}
-
-export function getAccounts(): MailAccount[] {
-  const accts: MailAccount[] = [];
-
-  const appleUser = process.env.APPLE_ID;
-  const applePass = process.env.MAIL_ICLOUD_APP_PASSWORD || process.env.APPLE_APP_PASSWORD;
-  if (appleUser && applePass) {
-    accts.push({ label: "iCloud", imapHost: "imap.mail.me.com", imapPort: 993, smtpHost: "smtp.mail.me.com", smtpPort: 587, user: appleUser, pass: applePass });
-  }
-
-  const gUser = process.env.GMAIL_ADDRESS;
-  const gPass = process.env.GMAIL_APP_PASSWORD;
-  if (gUser && gPass) {
-    accts.push({ label: "Gmail", imapHost: "imap.gmail.com", imapPort: 993, smtpHost: "smtp.gmail.com", smtpPort: 587, user: gUser, pass: gPass });
-  }
-
-  try {
-    const extra = process.env.MAIL_ACCOUNTS ? JSON.parse(process.env.MAIL_ACCOUNTS) : [];
-    if (Array.isArray(extra)) {
-      for (const a of extra) {
-        if (a?.user && a?.pass && a?.imapHost) {
-          accts.push({
-            label: a.label || a.user,
-            imapHost: a.imapHost,
-            imapPort: a.imapPort || 993,
-            smtpHost: a.smtpHost || a.imapHost.replace(/^imap/, "smtp"),
-            smtpPort: a.smtpPort || 587,
-            user: a.user,
-            pass: a.pass,
-          });
-        }
-      }
-    }
-  } catch {
-    /* ignore malformed MAIL_ACCOUNTS */
-  }
-
-  return accts;
-}
-
-export function mailConfigured(): boolean {
-  return getAccounts().length > 0;
 }
 
 async function withClient<T>(acct: MailAccount, fn: (c: ImapFlow) => Promise<T>): Promise<T> {
@@ -179,12 +127,86 @@ export async function fetchRecent(acct: MailAccount, opts: { max?: number; since
   });
 }
 
+export interface AccountFailure {
+  account: string;
+  error: string;
+}
+
+/**
+ * Recent messages across ALL accounts, newest first, *with* the per-account failures.
+ *
+ * The failures matter: one bad app password silently contributing zero messages looks exactly like a
+ * quiet inbox, and the owner has no way to tell those apart from a phone. Callers that genuinely
+ * don't care can use `fetchAllRecent`.
+ */
+export async function fetchAllRecentDetailed(
+  opts: { max?: number; sinceHours?: number; unseenOnly?: boolean } = {},
+): Promise<{ messages: MailMsg[]; failures: AccountFailure[] }> {
+  const accounts = await resolveAccounts();
+  const failures: AccountFailure[] = [];
+
+  const results = await Promise.all(
+    accounts.map((a) =>
+      fetchRecent(a, opts).catch((e: any) => {
+        failures.push({ account: a.label, error: String(e?.message ?? e) });
+        return [] as MailMsg[];
+      }),
+    ),
+  );
+
+  return { messages: results.flat().sort((a, b) => b.date.localeCompare(a.date)), failures };
+}
+
 /** Recent messages across ALL configured accounts, newest first. Per-account failures are skipped. */
 export async function fetchAllRecent(opts: { max?: number; sinceHours?: number; unseenOnly?: boolean } = {}): Promise<MailMsg[]> {
-  const results = await Promise.all(
-    getAccounts().map((a) => fetchRecent(a, opts).catch(() => [] as MailMsg[])),
-  );
-  return results.flat().sort((a, b) => b.date.localeCompare(a.date));
+  return (await fetchAllRecentDetailed(opts)).messages;
+}
+
+async function accountByLabel(label: string): Promise<MailAccount> {
+  const accounts = await resolveAccounts();
+  const acct = accounts.find((a) => a.label === label) || accounts[0];
+  if (!acct) throw new Error("no mail account configured");
+  return acct;
+}
+
+/**
+ * The readable body of one message. Kept separate from `fetchRecent` because pulling full bodies for
+ * a whole inbox is slow and mostly wasted — the list only ever shows the snippet.
+ */
+export async function fetchBody(accountLabel: string, uid: number): Promise<string> {
+  const acct = await accountByLabel(accountLabel);
+  return withClient(acct, async (client) => {
+    const lock = await client.getMailboxLock("INBOX");
+    try {
+      const msg = await client.fetchOne(String(uid), { uid: true, bodyStructure: true }, { uid: true });
+      if (!msg) throw new Error("that message is no longer in the inbox");
+
+      const part = firstTextPart((msg as any).bodyStructure);
+      if (!part) return "(this message has no text part — it's probably an attachment or an image-only mail)";
+
+      const dl = await client.download(String(uid), part.part, { uid: true });
+      if (!dl?.content) return "(couldn't download the message body)";
+
+      const raw = await streamToString(dl.content, 256 * 1024);
+      const text = part.type === "text/html" ? stripHtml(raw) : raw;
+      return text.replace(/\r\n/g, "\n").trim() || "(empty message)";
+    } finally {
+      lock.release();
+    }
+  });
+}
+
+/** Mark a message read, so opening it on the phone agrees with every other mail client. */
+export async function markSeen(accountLabel: string, uid: number): Promise<void> {
+  const acct = await accountByLabel(accountLabel);
+  await withClient(acct, async (client) => {
+    const lock = await client.getMailboxLock("INBOX");
+    try {
+      await client.messageFlagsAdd(String(uid), ["\\Seen"], { uid: true });
+    } finally {
+      lock.release();
+    }
+  });
 }
 
 /** Send a reply from `accountLabel` (defaults to the first account). Throws on SMTP failure. */
@@ -192,8 +214,7 @@ export async function sendMail(
   accountLabel: string,
   opts: { to: string; subject: string; text: string; inReplyTo?: string; references?: string },
 ): Promise<void> {
-  const acct = getAccounts().find((a) => a.label === accountLabel) || getAccounts()[0];
-  if (!acct) throw new Error("no mail account configured");
+  const acct = await accountByLabel(accountLabel);
   const transport = nodemailer.createTransport({
     host: acct.smtpHost,
     port: acct.smtpPort,

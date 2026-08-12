@@ -4,9 +4,9 @@
 // /watch <url>) starts a short-lived "video session" stored per chat in Upstash, so plain follow-up
 // questions are answered about that same video until it's stopped or expires.
 
-import { sendMessage, sendChatAction } from "./telegram";
 import { llmVideo } from "./llm";
 import { kvGet, kvSet, kvDel } from "./kv";
+import type { Reply } from "./reply";
 
 const activeKey = (chatId: string) => `watch:active:${chatId}`;
 const SESSION_TTL_S = 30 * 60; // a video session lasts 30 min of inactivity
@@ -49,13 +49,13 @@ export function hasYouTubeUrl(text: string): boolean {
   return /youtube\.com|youtu\.be/i.test(text) && youtubeIdFrom(text) !== null;
 }
 
-async function setActive(chatId: string, url: string): Promise<void> {
-  await kvSet(activeKey(chatId), JSON.stringify({ url, at: Date.now() }), SESSION_TTL_S);
+async function setActive(chatKey: string, url: string): Promise<void> {
+  await kvSet(activeKey(chatKey), JSON.stringify({ url, at: Date.now() }), SESSION_TTL_S);
 }
 
 /** The active video URL for this chat, or null. */
-export async function activeVideo(chatId: string): Promise<string | null> {
-  const raw = await kvGet(activeKey(chatId));
+export async function activeVideo(chatKey: string): Promise<string | null> {
+  const raw = await kvGet(activeKey(chatKey));
   if (!raw) return null;
   try {
     const v = JSON.parse(raw);
@@ -66,42 +66,43 @@ export async function activeVideo(chatId: string): Promise<string | null> {
 }
 
 /** Answer `question` about `url`, refreshing the session. Shows a typing status while it watches. */
-async function answerAbout(url: string, question: string, token: string, chatId: string): Promise<void> {
-  await sendChatAction(token, chatId);
+async function answerAbout(url: string, question: string, reply: Reply, chatKey: string): Promise<void> {
+  // (Telegram showed a typing indicator here; it has no cross-transport
+  // equivalent, and emitting it as a message would be noise in the app.)
   const answer = await llmVideo(WATCH_SYSTEM, question, url);
-  await setActive(chatId, url); // keep the session warm on each interaction
+  await setActive(chatKey, url); // keep the session warm on each interaction
   if (!answer) {
-    return sendMessage(token, chatId, "I couldn't get through that video — it may be private, age-restricted, too long, or unavailable. Try another link.");
+    return reply("I couldn't get through that video — it may be private, age-restricted, too long, or unavailable. Try another link.");
   }
-  await sendMessage(token, chatId, answer);
+  await reply(answer);
 }
 
 /** Entry for `/watch …` and for a bare YouTube link. Handles start, ask-about-active, and stop. */
-export async function handleWatch(args: string, token: string, chatId: string): Promise<void> {
+export async function handleWatch(args: string, reply: Reply, chatKey: string): Promise<void> {
   const trimmed = args.trim();
   if (/^(stop|off|done|clear|end)\b/i.test(trimmed)) {
-    await kvDel(activeKey(chatId));
-    return sendMessage(token, chatId, "Stopped watching. Send a new link anytime.");
+    await kvDel(activeKey(chatKey));
+    return reply("Stopped watching. Send a new link anytime.");
   }
 
   const url = youtubeUrlFrom(trimmed);
   if (url) {
     const question = trimmed.replace(/\S*(youtube\.com|youtu\.be)\S*/gi, "").trim();
-    await sendMessage(token, chatId, "🎬 Watching that video… (can take up to a minute)");
-    await answerAbout(url, question || "Give a concise summary: what is this video about and its key points?", token, chatId);
-    await sendMessage(token, chatId, "Ask me anything about it — /watch stop when you're done.");
+    await reply("🎬 Watching that video… (can take up to a minute)");
+    await answerAbout(url, question || "Give a concise summary: what is this video about and its key points?", reply, chatKey);
+    await reply("Ask me anything about it — /watch stop when you're done.");
     return;
   }
 
   // No URL in the message → treat as a question about the active video, else show help.
-  const active = await activeVideo(chatId);
-  if (active) return answerAbout(active, trimmed || "Summarize the key points.", token, chatId);
-  return sendMessage(token, chatId, WATCH_HELP);
+  const active = await activeVideo(chatKey);
+  if (active) return answerAbout(active, trimmed || "Summarize the key points.", reply, chatKey);
+  return reply(WATCH_HELP);
 }
 
 /** A plain follow-up message while a video session is active. */
-export async function watchFollowUp(text: string, token: string, chatId: string): Promise<void> {
-  const active = await activeVideo(chatId);
+export async function watchFollowUp(text: string, reply: Reply, chatKey: string): Promise<void> {
+  const active = await activeVideo(chatKey);
   if (!active) return; // caller checked, but guard anyway
-  return answerAbout(active, text, token, chatId);
+  return answerAbout(active, text, reply, chatKey);
 }

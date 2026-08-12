@@ -1,6 +1,10 @@
-// Alfred's JSON front door for the iOS app. The Telegram webhook speaks Telegram's protocol and can
-// only be driven by Telegram; this is the same brain reached over plain HTTP so a native client can
-// talk to it.
+// Alfred's JSON front door for the iOS app.
+//
+// This is the same brain AND the same pipeline as the Telegram webhook — both call
+// routeMessage. Commands (/email, /routine, /school, /watch), natural-language
+// calendar adds, inbox triage and YouTube sessions all work here. The one thing
+// still Telegram-only is attachments (syllabus PDFs and event photos), because the
+// iOS client has no way to send a file, not because the server can't take one.
 //
 //   POST /api/app
 //   Authorization: Bearer <APP_TOKEN>
@@ -14,7 +18,8 @@
 
 import type { IncomingMessage, ServerResponse } from "http";
 import { timingSafeEqual } from "crypto";
-import { routeText } from "./_lib/route";
+import { routeMessage } from "./_lib/route";
+import { collectingReply, APP_CHAT_KEY } from "./_lib/reply";
 
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -76,8 +81,12 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   }
 
   try {
-    const reply = await routeText(text);
-    return json(res, 200, { ok: true, reply });
+    // Same pipeline Telegram runs. Handlers that emit several messages (email
+    // triage sends progress, then the triage itself) are collected in order and
+    // joined, so the app sees one coherent reply instead of losing all but the last.
+    const sink = collectingReply();
+    await routeMessage(text, sink.reply, APP_CHAT_KEY);
+    return json(res, 200, { ok: true, reply: sink.text() || "I didn't have a reply for that." });
   } catch (e: any) {
     // Surface the reason: this endpoint has exactly one consumer, and a silent 500 on a phone is
     // far harder to debug than an honest message on screen.

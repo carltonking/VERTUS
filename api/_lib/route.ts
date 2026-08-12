@@ -5,10 +5,18 @@
 // makes them unusable from any other front door. This module is the seam: the paths that resolve to a
 // single reply live here, so both the Telegram webhook and the iOS app (api/app.ts) can share them.
 //
-// Not here yet — the flows that push several messages or need per-chat session state, which still
-// live in api/telegram.ts: /syllabus, /email, /routine, /school, and YouTube watch sessions.
+// Handlers now take a `Reply` sink and a `chatKey` (see _lib/reply.ts) rather than
+// (token, chatId), so the multi-message and session-stateful flows — /email,
+// /routine, /school, YouTube watch sessions — live here too and work from either
+// surface. Only file uploads (/syllabus, event photos) remain Telegram-only, and
+// that is a client limitation: the iOS app has no attachment UI to send one.
 
 import { answerChat, macOnlyReply } from "./chat";
+import { handleEmail, isEmailCheck } from "./emailflow";
+import { routineCommand, ROUTINE_HELP } from "./routines";
+import { schoolCommand } from "./school";
+import { handleWatch, hasYouTubeUrl, activeVideo, watchFollowUp } from "./watch";
+import type { Reply } from "./reply";
 import { extractFromText } from "./extract";
 import { createEvent } from "./caldav";
 import { chainStatus } from "./llm";
@@ -19,7 +27,10 @@ export const APP_HELP = [
   "calendar — add an event: \"put dentist tomorrow 15:00 on my calendar\"",
   "/models — which AI backends are up",
   "",
-  "Email, syllabus imports, routines and video Q&A are still Telegram-only for now.",
+  "/email — triage your inbox · /routine — scheduled jobs · /school — course items",
+  "/watch <youtube url> — watch a video and answer questions about it",
+  "",
+  "Syllabus imports still need Telegram — they take a PDF or photo attachment.",
 ].join("\n");
 
 /** Natural-language "add X to my calendar" (not a read like "what's on my calendar"). */
@@ -39,55 +50,91 @@ export async function addEventFromText(text: string): Promise<string> {
   return res.message;
 }
 
+
 /**
- * Route one message to one reply. Mirrors the plain-text path of the Telegram webhook's handleUpdate,
- * minus the flows that can't answer in a single message.
+ * Route one message through Alfred's full pipeline.
+ *
+ * This mirrors the Telegram webhook's text path exactly, in the same order, so
+ * the two surfaces cannot drift: whatever Telegram does with a message, the app
+ * now does too. Telegram keeps its own entry point only for what is genuinely
+ * Telegram-shaped — attachments, and the webhook envelope itself.
+ *
+ * `chatKey` scopes per-conversation state (email drafts, the numbered message
+ * list, an active video session). Telegram passes its chat id; the app passes
+ * APP_CHAT_KEY, deliberately separate so the two don't clobber each other's
+ * drafts.
  */
-export async function routeText(text: string): Promise<string> {
+export async function routeMessage(text: string, reply: Reply, chatKey: string): Promise<void> {
   const t = text.trim();
-  if (!t) return "Say something and I'll answer.";
+  if (!t) return reply("Say something and I'll answer.");
 
-  if (t.startsWith("/")) {
-    const [wordRaw, ...rest] = t.slice(1).split(" ");
-    const word = (wordRaw.split("@")[0] || "").toLowerCase();
-    const args = rest.join(" ").trim();
-    switch (word) {
-      case "calendar":
-      case "cal":
-      case "event":
-        if (!args) return "Add the details — e.g. /calendar dentist tomorrow 15:00.";
-        return addEventFromText(args);
-      case "models":
-      case "llm":
-        return chainStatus();
-      case "help":
-      case "start":
-        return APP_HELP;
-      // Deliberately explicit rather than falling through to the model, which would happily
-      // pretend it had done the thing.
-      case "email":
-      case "inbox":
-      case "mail":
-      case "routine":
-      case "routines":
-      case "syllabus":
-      case "syl":
-      case "school":
-      case "class":
-      case "course":
-      case "watch":
-      case "video":
-        return `“/${word}” isn't wired into the app yet — use Telegram for that one.`;
-      default:
-        return `Unknown command “/${word}”. Try /help.`;
-    }
-  }
+  if (t.startsWith("/")) return routeCommand(t, reply, chatKey);
+  if (hasYouTubeUrl(t)) return handleWatch(t, reply, chatKey);
+  if (isCalendarAdd(t)) return reply(await addEventFromText(t));
+  if (isEmailCheck(t)) return handleEmail("", reply, chatKey);
 
-  if (isCalendarAdd(t)) return addEventFromText(t);
-
-  // Genuinely Mac-only asks get an honest decline rather than a hallucinated answer.
+  // Genuinely Mac-only asks get an honest decline rather than a hallucinated success.
   const macOnly = macOnlyReply(t);
-  if (macOnly) return macOnly;
+  if (macOnly) return reply(macOnly);
 
-  return answerChat(t);
+  // Inside an active video session, plain messages are follow-ups about that video.
+  if (await activeVideo(chatKey)) return watchFollowUp(t, reply, chatKey);
+
+  return reply(await answerChat(t));
+}
+
+async function routeCommand(cmd: string, reply: Reply, chatKey: string): Promise<void> {
+  const [wordRaw, ...rest] = cmd.slice(1).split(" ");
+  const word = (wordRaw.split("@")[0] || "").toLowerCase();
+  const args = rest.join(" ").trim();
+
+  switch (word) {
+    case "calendar":
+    case "cal":
+    case "event":
+      if (!args) return reply("Add the details — e.g. /calendar dentist tomorrow 15:00.");
+      return reply(await addEventFromText(args));
+
+    case "school":
+    case "class":
+    case "course":
+      return schoolCommand(args, reply, chatKey);
+
+    case "routine":
+    case "routines":
+      return routineCommand(args, reply, chatKey);
+
+    case "email":
+    case "inbox":
+    case "mail":
+      return handleEmail(args, reply, chatKey);
+
+    case "watch":
+    case "video":
+      return handleWatch(args, reply, chatKey);
+
+    case "models":
+    case "llm":
+      return reply(await chainStatus());
+
+    case "help":
+    case "start":
+      return reply(APP_HELP);
+
+    case "syllabus":
+    case "syl":
+      // The only remaining Telegram-only path, and honestly so: importing a
+      // syllabus needs a PDF or photo, and the iOS app has no way to attach one.
+      return reply("Send the syllabus as a PDF or clear photo with the course in the caption — that needs Telegram for now:\n/syllabus CS 101");
+
+    default:
+      return reply(`Unknown command "/${word}". Try /help.`);
+  }
+}
+
+/** Back-compat single-reply wrapper. Prefer routeMessage. */
+export async function routeText(text: string): Promise<string> {
+  const parts: string[] = [];
+  await routeMessage(text, async (t) => { if (t.trim()) parts.push(t.trim()); }, "app");
+  return parts.join("\n\n") || "I didn't have a reply for that.";
 }

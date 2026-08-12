@@ -14,6 +14,20 @@ export function kvConfigured(): boolean {
   return !!(restUrl() && restToken());
 }
 
+/**
+ * How long a single Redis round trip may take before it is abandoned.
+ *
+ * `fetch` has no default timeout, so a store that accepts the connection and then
+ * says nothing leaves the promise pending forever. That is not a slow request —
+ * it is an unkillable one, and it takes the whole function down with it: the relay
+ * in api/mac.ts polls inside a loop whose 25s deadline is only re-checked *between*
+ * iterations, so one hung call runs to the 60s maxDuration and the caller gets
+ * FUNCTION_INVOCATION_TIMEOUT instead of an answer. Every caller here already
+ * treats null as "store unavailable", so a bounded failure is strictly better than
+ * an unbounded wait.
+ */
+const COMMAND_TIMEOUT_MS = 5_000;
+
 /** POST a single Redis command (`["SET","k","v","EX",60]`) to the Upstash REST endpoint. */
 async function command(args: (string | number)[]): Promise<unknown> {
   const url = restUrl();
@@ -24,11 +38,19 @@ async function command(args: (string | number)[]): Promise<unknown> {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify(args),
+      signal: AbortSignal.timeout(COMMAND_TIMEOUT_MS),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      // Logged rather than swallowed: a 401 from a rotated token and a 429 from a
+      // hit quota both surface here as "everything quietly stopped working", and
+      // there is no other signal that the store is the reason.
+      console.warn(`[kv] ${args[0]} failed: HTTP ${res.status}`);
+      return null;
+    }
     const json: any = await res.json();
     return json?.result ?? null;
-  } catch {
+  } catch (e: any) {
+    console.warn(`[kv] ${args[0]} failed: ${e?.name === "TimeoutError" ? `no response in ${COMMAND_TIMEOUT_MS}ms` : e?.message ?? e}`);
     return null;
   }
 }
@@ -41,6 +63,13 @@ export async function kvGet(key: string): Promise<string | null> {
 /** SET key=value, optionally expiring after `ttlSeconds` (so stale location/markers self-clean). */
 export async function kvSet(key: string, value: string, ttlSeconds?: number): Promise<void> {
   await command(ttlSeconds && ttlSeconds > 0 ? ["SET", key, value, "EX", Math.ceil(ttlSeconds)] : ["SET", key, value]);
+}
+
+/** SET that reports whether the store actually took it. `kvSet` swallows failures because a dropped
+ *  location ping or dedupe marker is survivable; a dropped mail account is not — the user would be
+ *  told their mailbox was connected and then find it missing. */
+export async function kvSetOK(key: string, value: string): Promise<boolean> {
+  return (await command(["SET", key, value])) === "OK";
 }
 
 export async function kvDel(key: string): Promise<void> {
