@@ -30,6 +30,7 @@ struct AlfredClient {
 
     enum Failure: LocalizedError {
         case notConfigured
+        case macUnreachable
         case unauthorized
         case tokenMissingOnServer
         case server(String)
@@ -43,6 +44,10 @@ struct AlfredClient {
             switch self {
             case .notConfigured:
                 return "Alfred isn't connected yet. Add your address and token in Settings."
+            case .macUnreachable:
+                // The relay accepted the message but the Mac never claimed it. That is a
+                // specific, fixable situation — say so rather than blaming the network.
+                return "Your Mac didn't pick that up. Alfred only answers while your Mac is awake and running."
             case .unauthorized:
                 return "That token was rejected. Check it in Settings — it has to match APP_TOKEN on the server."
             case .tokenMissingOnServer:
@@ -100,21 +105,29 @@ struct AlfredClient {
         case 200:
             guard let reply = decoded?.reply, decoded?.ok == true else { throw Failure.malformedResponse }
             return reply
+        case 202:
+            // Queued, but no answer came back before the relay's hold expired.
+            throw Failure.macUnreachable
         case 401:
             throw Failure.unauthorized
         case 503:
             throw Failure.tokenMissingOnServer
         default:
-            // api/app.ts deliberately returns its real reason on 500 — surface it rather than
+            // api/mac.ts deliberately returns its real reason on 500 — surface it rather than
             // flattening every failure into "something went wrong", which is unfixable from a phone.
             if let message = decoded?.error, !message.isEmpty { throw Failure.server(message) }
             throw Failure.http(http.statusCode)
         }
     }
 
-    /// Settings' "Test connection". Uses `/models`, which reports the LLM chain's health — so a pass
-    /// proves the address, the token *and* that Alfred has a working brain behind him.
+    /// Settings' "Test connection".
+    ///
+    /// Sends a real message rather than probing a health endpoint, because the
+    /// interesting failures are all downstream: the relay can be perfectly healthy
+    /// while the Mac is asleep, or awake with Hermes misconfigured. A round trip
+    /// proves the address, the token, that the Mac claimed it, and that the local
+    /// model answered. It is slow for the same reason — that is the real latency.
     func testConnection(endpoint: URL?, token: String) async throws -> String {
-        try await send("/models", to: endpoint, token: token)
+        try await send("Reply with just: connected", to: endpoint, token: token)
     }
 }

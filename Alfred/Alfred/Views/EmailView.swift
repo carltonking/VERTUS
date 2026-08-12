@@ -2,6 +2,19 @@
 //  EmailView.swift
 //  Alfred
 //
+//  The Email tab, rooted on the Mac-driven unified inbox: every account Himalaya
+//  is configured with on the Mac, one list, one place to act. The phone never
+//  needs its own IMAP connection — it reads the Mac's cache over the WebSocket
+//  and sends actions back as JSON-RPC (`mail.*`).
+//
+//  The cloud client (the /api/mail relay) is still reachable from the inbox's
+//  toolbar menu — "Server mailboxes" — for the older account-management flow,
+//  but the Mac inbox is the default because it's the same mail Alfred reads.
+//
+//  The store lives here so the badge and the tab share one copy of the truth,
+//  and its update loop starts with the app (see RootView) so new mail lands on
+//  the badge even before this tab is opened.
+//
 
 import SwiftUI
 
@@ -10,20 +23,7 @@ struct EmailView: View {
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                palette.background
-
-                ComingSoon(
-                    icon: "envelope.fill",
-                    title: "Email",
-                    promise: "Triage what landed, read what matters, and reply in your own voice.",
-                    blockedOn: "Alfred already does this over Telegram. Moving it here needs the triage flow to answer without a back-and-forth conversation, since /api/app returns exactly one reply per request."
-                )
-            }
-            .navigationTitle("Email")
-            .navigationBarTitleDisplayMode(.large)
-            .toolbarBackground(palette.backgroundTop, for: .navigationBar)
-            .toolbarBackground(.visible, for: .navigationBar)
+            MacInboxView()
         }
     }
 }

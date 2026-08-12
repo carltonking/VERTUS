@@ -53,7 +53,28 @@ struct AlfredTabBar: View {
             .frame(maxWidth: .infinity)
             .frame(height: 44)
             .background(selectionPill(visible: isSelected))
+            .overlay(alignment: .topTrailing) {
+                badge(for: tab)
+            }
             .contentShape(Rectangle())
+    }
+
+    /// The unread count on the Email tab, fed by the Mac's mail pushes. Nothing
+    /// on the other tabs — the badge is a mail-only signal.
+    @ViewBuilder
+    private func badge(for tab: AlfredTab) -> some View {
+        if tab == .email {
+            let unread = MacMailStore.shared.totalUnread
+            if unread > 0 {
+                Text(unread > 99 ? "99+" : "\(unread)")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(palette.backgroundTop)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1.5)
+                    .background(Capsule().fill(palette.accentBright))
+                    .offset(x: 8, y: -2)
+            }
+        }
     }
 
     @ViewBuilder

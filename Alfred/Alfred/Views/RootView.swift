@@ -12,7 +12,7 @@
 import SwiftUI
 
 enum AlfredTab: String, CaseIterable, Identifiable, Hashable {
-    case home, chat, email, calendar, reminders, settings
+    case home, chat, email, calendar, reminders, routines, code, settings
 
     var id: String { rawValue }
 
@@ -23,6 +23,8 @@ enum AlfredTab: String, CaseIterable, Identifiable, Hashable {
         case .email: return "Email"
         case .calendar: return "Calendar"
         case .reminders: return "Reminders"
+        case .routines: return "Routines"
+        case .code: return "Code"
         case .settings: return "Settings"
         }
     }
@@ -34,6 +36,8 @@ enum AlfredTab: String, CaseIterable, Identifiable, Hashable {
         case .email: return "envelope.fill"
         case .calendar: return "calendar"
         case .reminders: return "checklist"
+        case .routines: return "bolt.fill"
+        case .code: return "chevron.left.forwardslash.chevron.right"
         case .settings: return "gearshape.fill"
         }
     }
@@ -52,6 +56,8 @@ struct RootView: View {
             page(.email) { EmailView() }
             page(.calendar) { CalendarView() }
             page(.reminders) { RemindersView() }
+            page(.routines) { RoutinesView() }
+            page(.code) { CodeView() }
             page(.settings) { SettingsView() }
         }
         .safeAreaInset(edge: .bottom) {
@@ -70,6 +76,20 @@ struct RootView: View {
             // No-op afterward: the check is idempotent.
             guard settings.isConfigured else { return }
             await PushRegistration.shared.request()
+        }
+        .task {
+            // The live link: connect to the Mac's socket once configured. Discovery
+            // is bounded and the client reconnects on its own, so this never blocks
+            // the UI and never needs to be called again.
+            guard settings.isConfigured else { return }
+            await AlfredWebSocketClient.shared.connectToAlfred()
+        }
+        .task {
+            // Mail pushes (sync completions, unread changes) drive the Email tab
+            // badge. The store starts consuming them once configured — before the
+            // Email tab is ever opened — so new mail lands on the badge.
+            guard settings.isConfigured else { return }
+            MacMailStore.shared.start()
         }
     }
 

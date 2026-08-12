@@ -95,7 +95,7 @@ struct NotConnectedNotice: View {
                 .foregroundStyle(palette.textPrimary)
                 .padding(.top, 16)
 
-            Text("Add your Alfred address and app token in Settings, and this becomes a conversation.")
+            Text("You can type below — Alfred just won't answer until you add your address and app token in Settings.")
                 .font(.system(size: 15))
                 .foregroundStyle(palette.textSecondary)
                 .multilineTextAlignment(.center)

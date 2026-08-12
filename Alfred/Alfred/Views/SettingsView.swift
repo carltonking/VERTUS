@@ -18,6 +18,15 @@ struct SettingsView: View {
         case failed(String)
     }
 
+    private enum SocketTestState: Equatable {
+        case idle
+        case testing
+        case passed(String)
+        case failed(String)
+    }
+
+    @State private var socketTestState: SocketTestState = .idle
+
     var body: some View {
         @Bindable var settings = settings
 
@@ -26,10 +35,11 @@ struct SettingsView: View {
                 palette.background
 
                 Form {
-                    themeSection
-
                     Section {
-                        TextField("alfredai.vercel.app", text: $settings.host)
+                        // The project's actual production alias. "alfredai.vercel.app" is a
+                        // different deployment entirely, so offering it as the example sent people
+                        // to a host that 404s every endpoint.
+                        TextField("alfredassistant.vercel.app", text: $settings.host)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                             .keyboardType(.URL)
@@ -55,6 +65,72 @@ struct SettingsView: View {
                         Text("Must match APP_TOKEN in the deployment's environment. Stored in the iPhone's Keychain, never in a backup.")
                     }
 
+                    Section {
+                        TextField("e.g. 192.168.1.40", text: $settings.voiceHost)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .keyboardType(.numbersAndPunctuation)
+                            .foregroundStyle(palette.textPrimary)
+                            .accessibilityIdentifier("settings.voiceHost")
+                    } header: {
+                        Text("Mac address (voice)")
+                    } footer: {
+                        Text("The Mac's address on this network — where the voice bridge listens on port 8765. Only needed for talking out loud.")
+                    }
+
+                    Section {
+                        TextField("Auto-discovered", text: $settings.socketHost)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .keyboardType(.numbersAndPunctuation)
+                            .foregroundStyle(palette.textPrimary)
+                            .accessibilityIdentifier("settings.socketHost")
+
+                        HStack {
+                            Text("Status")
+                            Spacer()
+                            connectionStatusLabel
+                        }
+
+                        Button {
+                            runSocketTest()
+                        } label: {
+                            HStack {
+                                Text("Test direct link")
+                                Spacer()
+                                if socketTestState == .testing { ProgressView() }
+                            }
+                        }
+                        .disabled(socketTestState == .testing)
+
+                        switch socketTestState {
+                        case .passed(let detail):
+                            Label {
+                                Text(detail)
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(palette.textSecondary)
+                            } icon: {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(palette.success)
+                            }
+                        case .failed(let detail):
+                            Label {
+                                Text(detail)
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(palette.textSecondary)
+                            } icon: {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(palette.danger)
+                            }
+                        case .idle, .testing:
+                            EmptyView()
+                        }
+                    } header: {
+                        Text("Mac address (direct link)")
+                    } footer: {
+                        Text("The live link to your Mac — streaming chat, briefings and updates without a cloud relay. Left blank, Alfred finds the Mac automatically over mDNS or Tailscale; type an address here to pin it. Leave the port empty for the default (\(AlfredWebSocketClient.defaultPort)).")
+                    }
+
                     connectionSection
 
                     Section {
@@ -78,60 +154,6 @@ struct SettingsView: View {
             .toolbarBackground(.visible, for: .navigationBar)
         }
         // Tint and colour scheme come from RootView, so every tab agrees on them.
-    }
-
-    // MARK: - Theme
-
-    /// AppSettings is a reference type, so this mutates the shared object directly — no Binding
-    /// needs threading through.
-    private var themeSection: some View {
-        Section {
-            ForEach(ThemeChoice.allCases) { choice in
-                Button {
-                    settings.theme = choice
-                } label: {
-                    HStack(spacing: 12) {
-                        swatch(for: choice)
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(choice.displayName)
-                                .font(.system(size: 16))
-                                .foregroundStyle(palette.textPrimary)
-                            Text(choice.blurb)
-                                .font(.system(size: 13))
-                                .foregroundStyle(palette.textSecondary)
-                        }
-
-                        Spacer(minLength: 0)
-
-                        if settings.theme == choice {
-                            Image(systemName: "checkmark")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(palette.accentBright)
-                        }
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("theme.\(choice.rawValue)")
-            }
-        } header: {
-            Text("Theme")
-        }
-    }
-
-    /// Three stacked circles — ground, surface, accent — so the choice is legible without
-    /// applying it first.
-    private func swatch(for choice: ThemeChoice) -> some View {
-        HStack(spacing: -8) {
-            ForEach(Array(choice.swatch.enumerated()), id: \.offset) { _, colour in
-                Circle()
-                    .fill(colour)
-                    .frame(width: 20, height: 20)
-                    .overlay(Circle().strokeBorder(.white.opacity(0.18), lineWidth: 1))
-            }
-        }
-        .frame(width: 56, alignment: .leading)
     }
 
     // MARK: - Connection
@@ -199,6 +221,48 @@ struct SettingsView: View {
                 let description = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 testState = .failed(description)
             }
+        }
+    }
+
+    /// The live state of the socket, rendered from the shared client so Settings
+    /// and every other tab agree on what they're showing.
+    private var connectionStatusLabel: some View {
+        let socket = AlfredWebSocketClient.shared
+        let (icon, text): (String, String)
+        switch socket.state {
+        case .idle:
+            (icon, text) = ("circle.dashed", "Not connected")
+        case .connecting:
+            (icon, text) = ("arrow.triangle.2.circlepath", "Connecting…")
+        case .connected:
+            (icon, text) = ("checkmark.circle.fill", "Connected")
+        case .reconnecting(let attempt):
+            (icon, text) = ("arrow.triangle.2.circlepath", "Reconnecting… (\(attempt))")
+        case .failed(let message):
+            (icon, text) = ("exclamationmark.triangle.fill", message)
+        }
+        return HStack(spacing: 6) {
+            Image(systemName: icon)
+                .foregroundStyle(socket.isConnected ? palette.success : palette.textFaint)
+            Text(text)
+                .font(.system(size: 13))
+                .foregroundStyle(socket.isConnected ? palette.textPrimary : palette.textSecondary)
+        }
+    }
+
+    /// Prove the direct link works end to end: a JSON-RPC ping over the socket.
+    private func runSocketTest() {
+        socketTestState = .testing
+        // Normalise through socketURL so whatever shape was pasted (bare host,
+        // host:port, full ws:// URL) resolves to one host+port pair.
+        let url = settings.socketURL ?? URL(string: "ws://alfred.local:\(settings.socketPort)")
+        let host = url?.host ?? "alfred.local"
+        let port = url?.port ?? settings.socketPort
+        Task {
+            let ok = await TailscaleConnection().validateConnection(host: host, port: port)
+            socketTestState = ok
+                ? .passed("Alfred's Mac answered on \(url?.absoluteString ?? "the socket").")
+                : .failed("Nothing answered there. Check the address, make sure the Mac is awake, and that the socket server is running.")
         }
     }
 }

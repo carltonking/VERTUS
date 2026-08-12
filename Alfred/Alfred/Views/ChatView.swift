@@ -12,18 +12,18 @@ struct ChatView: View {
     @Environment(ChatStore.self) private var chat
     @Environment(\.palette) private var palette
 
+    /// Chat runs full-screen with the tab bar hidden; this pops back to Home.
+    let goBackHome: () -> Void
+
     @State private var showingClearConfirmation = false
+    @State private var showingVoice = false
 
     var body: some View {
         NavigationStack {
             ZStack {
                 palette.background
 
-                if settings.isConfigured {
-                    conversation
-                } else {
-                    NotConnectedNotice()
-                }
+                conversation
             }
             .navigationTitle("Chat")
             .navigationBarTitleDisplayMode(.inline)
@@ -41,6 +41,9 @@ struct ChatView: View {
         } message: {
             Text("The transcript on this phone is deleted. Alfred keeps nothing either way.")
         }
+        .fullScreenCover(isPresented: $showingVoice) {
+            VoiceView()
+        }
     }
 
     // MARK: - Conversation
@@ -50,25 +53,30 @@ struct ChatView: View {
         // to its draft without making the store a @State of this view.
         @Bindable var chat = chat
 
-        return ScrollViewReader { proxy in
-            Group {
-                if chat.messages.isEmpty && !chat.isThinking {
-                    // Deliberately outside the ScrollView: .defaultScrollAnchor(.bottom) pins short
-                    // content to the bottom of the viewport, which would shove this down against
-                    // the composer instead of centring it.
-                    ConversationEmptyState { prompt in
-                        Task { await chat.send(prompt, settings: settings) }
+        return VStack(spacing: 0) {
+            ScrollViewReader { proxy in
+                Group {
+                    if chat.messages.isEmpty && !chat.isThinking {
+                        // Deliberately outside the transcript ScrollView: .defaultScrollAnchor(.bottom)
+                        // pins short content to the bottom of the viewport, which would shove this down
+                        // against the composer instead of centring it.
+                        if settings.isConfigured {
+                            ConversationEmptyState { prompt in
+                                Task { await chat.send(prompt, settings: settings) }
+                            }
+                        } else {
+                            NotConnectedNotice()
+                        }
+                    } else {
+                        transcript(proxy)
                     }
-                } else {
-                    transcript(proxy)
                 }
             }
-            .safeAreaInset(edge: .bottom) {
-                Composer(text: $chat.draft, isThinking: chat.isThinking) {
-                    let text = chat.draft
-                    chat.draft = ""
-                    Task { await chat.send(text, settings: settings) }
-                }
+
+            Composer(text: $chat.draft, isThinking: chat.isThinking) {
+                let text = chat.draft
+                chat.draft = ""
+                Task { await chat.send(text, settings: settings) }
             }
         }
     }
@@ -113,6 +121,26 @@ struct ChatView: View {
 
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            Button(action: goBackHome) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(palette.accentBright)
+            }
+            .accessibilityLabel("Back to Home")
+        }
+
+        ToolbarItem(placement: .topBarTrailing) {
+            Button {
+                showingVoice = true
+            } label: {
+                Image(systemName: "mic.fill")
+                    .font(.system(size: 16))
+                    .foregroundStyle(palette.accentBright)
+            }
+            .accessibilityLabel("Talk to Alfred")
+        }
+
         ToolbarItem(placement: .topBarTrailing) {
             Button {
                 showingClearConfirmation = true

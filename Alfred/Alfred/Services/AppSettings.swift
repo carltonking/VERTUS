@@ -8,35 +8,99 @@
 import Foundation
 import Observation
 
+/// File-scope so the `nonisolated` persistence helper below can reach the keys:
+/// a nested enum inside a `@MainActor` class is itself MainActor-isolated, which
+/// would break the background discovery path. Must also be explicitly
+/// `nonisolated`: the project sets SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor, so
+/// even file-scope types default to MainActor isolation unless told otherwise.
+private nonisolated enum SettingsKeys {
+    static let host = "alfred.host"
+    static let token = "alfred.token"
+    static let voiceHost = "alfred.voiceHost"
+    static let socketHost = "alfred.socketHost"
+    static let socketPort = "alfred.socketPort"
+}
+
 @MainActor
 @Observable
 final class AppSettings {
-    private enum Keys {
-        static let host = "alfred.host"
-        static let token = "alfred.token"
-        static let theme = "alfred.theme"
-    }
-
-    /// Which of the three palettes the app draws with. Persisted so it survives a relaunch.
-    var theme: ThemeChoice {
-        didSet { UserDefaults.standard.set(theme.rawValue, forKey: Keys.theme) }
-    }
 
     /// What the user typed — a hostname or full URL, kept verbatim so the settings field
     /// shows them back what they entered rather than a normalised form they didn't write.
     var host: String {
-        didSet { UserDefaults.standard.set(host, forKey: Keys.host) }
+        didSet { UserDefaults.standard.set(host, forKey: SettingsKeys.host) }
     }
 
     var token: String {
-        didSet { Keychain.set(token, for: Keys.token) }
+        didSet { Keychain.set(token, for: SettingsKeys.token) }
+    }
+
+    /// The Mac's LAN address for voice — reachable directly on this network, unlike the relay
+    /// host above. Empty until told where Alfred's voice bridge lives.
+    var voiceHost: String {
+        didSet { UserDefaults.standard.set(voiceHost, forKey: SettingsKeys.voiceHost) }
+    }
+
+    /// The Mac's address for the live socket — auto-discovered over mDNS/Tailscale, or typed
+    /// by hand in Settings as the fallback. Host only; the port lives in `socketPort`.
+    var socketHost: String {
+        didSet { UserDefaults.standard.set(socketHost, forKey: SettingsKeys.socketHost) }
+    }
+
+    /// The port the Mac's ACP-over-WebSocket server listens on. Defaults to the shared
+    /// constant; a non-default port is kept here so manual entry can point at a custom setup.
+    var socketPort: Int {
+        didSet { UserDefaults.standard.set(socketPort, forKey: SettingsKeys.socketPort) }
+    }
+
+    /// The `ws://host:port` URL for the live socket, or nil when no host is set.
+    /// Tolerates what a person might actually paste: a full `ws://host:port` URL,
+    /// a `host:port` shorthand, or a bare hostname (which uses `socketPort`).
+    var socketURL: URL? {
+        var raw = socketHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return nil }
+        if raw.hasPrefix("ws://") || raw.hasPrefix("wss://") {
+            return URL(string: raw)
+        }
+        var port = socketPort
+        if let colon = raw.lastIndex(of: ":"), colon > raw.startIndex {
+            let digits = raw[raw.index(after: colon)...]
+            if let explicit = Int(digits), (1...65535).contains(explicit) {
+                port = explicit
+                raw = String(raw[..<colon])
+            }
+        }
+        return URL(string: "ws://\(raw):\(port)")
     }
 
     init() {
-        host = UserDefaults.standard.string(forKey: Keys.host) ?? ""
-        token = Keychain.get(Keys.token) ?? ""
-        theme = UserDefaults.standard.string(forKey: Keys.theme)
-            .flatMap(ThemeChoice.init(rawValue:)) ?? .eclipse
+        host = UserDefaults.standard.string(forKey: SettingsKeys.host) ?? ""
+        var storedToken = Keychain.get(SettingsKeys.token) ?? ""
+        #if DEBUG
+        // Simulator seeding: the token lives in the Keychain, which simctl can't write
+        // directly. A debug-only env var lets CI/automation bootstrap it on first launch.
+        if storedToken.isEmpty, let seeded = ProcessInfo.processInfo.environment["ALFRED_SEED_TOKEN"], !seeded.isEmpty {
+            storedToken = seeded
+        }
+        #endif
+        token = storedToken
+        voiceHost = UserDefaults.standard.string(forKey: SettingsKeys.voiceHost) ?? ""
+        socketHost = UserDefaults.standard.string(forKey: SettingsKeys.socketHost) ?? ""
+        socketPort = UserDefaults.standard.object(forKey: SettingsKeys.socketPort) as? Int
+            ?? AlfredWebSocketClient.defaultPort
+    }
+
+    /// Persist a discovered host, so discovery doesn't have to run every launch.
+    func saveSocketHost(_ host: String, port: Int) {
+        socketHost = host
+        socketPort = port
+    }
+
+    /// Nonisolated twin for callers off the main actor (TailscaleConnection runs
+    /// its discovery on a background task). Writes the same two keys.
+    nonisolated static func persistSocketHost(_ host: String, port: Int) {
+        UserDefaults.standard.set(host, forKey: SettingsKeys.socketHost)
+        UserDefaults.standard.set(port, forKey: SettingsKeys.socketPort)
     }
 
     var isConfigured: Bool {
@@ -61,8 +125,10 @@ final class AppSettings {
         guard scheme == "https" || scheme == "http" else { return nil }
         guard let hostName = components.host, hostName.contains(".") || hostName == "localhost" else { return nil }
 
-        // Drop any path they pasted (…/api/app, or a stray trailing slash) and re-add the canonical one.
-        components.path = "/api/app"
+        // Drop any path they pasted and re-add the canonical one. This is /api/mac,
+        // not /api/app: messages are relayed to Alfred on the Mac and answered there
+        // by Hermes with the local model, rather than answered in the cloud.
+        components.path = "/api/mac"
         components.query = nil
         components.fragment = nil
         return components.url
