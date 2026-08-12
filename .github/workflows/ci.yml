@@ -2,12 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/ship-working-build]
   pull_request:
     branches: [main]
 
 jobs:
-  build-and-test:
+  macos-build-and-test:
     runs-on: macos-15
 
     steps:
@@ -32,8 +32,45 @@ jobs:
         run: swift test
         working-directory: AlfredMac
 
+  ios-build:
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      # Unsigned simulator build. Xcode 16 synchronized groups mean the new
+      # view/service files are picked up without touching project.pbxproj.
+      - name: Build iOS app (unsigned, simulator)
+        run: |
+          xcodebuild -project Alfred/Alfred.xcodeproj -scheme Alfred \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath /tmp/alfred-dd \
+            CODE_SIGNING_ALLOWED=NO build | tail -20
+
+  alfredcode-typecheck:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: AlfredCode/package-lock.json
+
+      - name: Install + typecheck AlfredCode TUI
+        working-directory: AlfredCode
+        run: |
+          npm ci
+          npm run typecheck
+
   lint-python:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -47,6 +84,7 @@ jobs:
           files=$(find . -name '*.py' \
             -not -path '*/.build/*' -not -path '*/build/*' \
             -not -path '*/venv/*' -not -path '*/.venv/*' \
-            -not -path '*/alfred_env/*' -not -path '*/node_modules/*')
+            -not -path '*/.venvs/*' -not -path '*/alfred_env/*' \
+            -not -path '*/node_modules/*' -not -path '*/Frameworks/*')
           if [ -z "$files" ]; then echo "No Python files to check."; exit 0; fi
           echo "$files" | xargs -I{} python3 -m py_compile "{}"
