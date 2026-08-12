@@ -1,0 +1,65 @@
+# Graphiti MCP Server configuration for Alfred.
+#
+# Alfred runs graphiti on free-tier providers: Groq for the LLM (entity
+# extraction, summaries, search) and Google Gemini for embeddings. Both keys
+# come from Alfred's ProviderKeyRing (GROQ_API_KEY / GEMINI_API_KEY) and are
+# injected into this server's environment by the graphiti-mcp-wrapper.sh.
+#
+# This file lives at ~/.alfred/graphiti-config.yaml (copied by setup.sh) and
+# is read by the graphiti MCP server via --config.
+
+server:
+  transport: "stdio"  # Alfred talks to this server over MCP stdio
+
+llm:
+  provider: "gemini"             # free tier; generous TPM vs groq's 6-12k cap
+  model: ${MODEL_NAME:gemini-flash-latest}
+  max_tokens: 4096
+  structured_output_mode: ${LLM_STRUCTURED_OUTPUT_MODE:json_schema}
+
+  providers:
+    gemini:
+      api_key: ${GOOGLE_API_KEY}
+
+embedder:
+  provider: "gemini"             # free tier; key mapped from GEMINI_API_KEY
+  model: ${EMBEDDER_MODEL:gemini-embedding-001}
+  dimensions: 3072
+
+  providers:
+    gemini:
+      api_key: ${GOOGLE_API_KEY}
+
+database:
+  provider: "falkordb"           # Docker container alfred-graphiti-falkordb
+  providers:
+    falkordb:
+      uri: ${FALKORDB_URI:redis://127.0.0.1:6379}
+      password: ${FALKORDB_PASSWORD:}
+      database: ${FALKORDB_DATABASE:alfred}
+
+graphiti:
+  group_id: ${GRAPHITI_GROUP_ID:alfred}
+  episode_id_prefix: ${EPISODE_ID_PREFIX:}
+  user_id: ${USER_ID:alfred}
+  entity_types:
+    - name: "Person"
+      description: "An individual human referenced in the content"
+    - name: "Organization"
+      description: "Companies, institutions, groups, or formal entities"
+    - name: "Preference"
+      description: "User preferences, choices, opinions, or selections"
+    - name: "Requirement"
+      description: "Specific needs, features, or functionality that must be fulfilled"
+    - name: "Procedure"
+      description: "Standard operating procedures and sequential instructions"
+    - name: "Location"
+      description: "Physical or virtual places where activities occur"
+    - name: "Event"
+      description: "Time-bound activities, occurrences, or experiences"
+    - name: "Document"
+      description: "Information content in various forms (books, articles, reports, videos, etc.)"
+    - name: "Topic"
+      description: "Subject of conversation, interest, or knowledge domain"
+    - name: "Object"
+      description: "Physical items, tools, devices, or possessions"

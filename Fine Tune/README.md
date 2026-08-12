@@ -49,7 +49,7 @@ Avoid over-weighting counseling data unless you want the assistant to behave lik
 
 Train on tool-call transcripts using your exact Alfred tool schemas. Public data:
 
-- `NousResearch/hermes-function-calling-v1`
+- `hermes-function-calling-v1` (originally published under NousResearch)
 - `Agent-Ark/Toucan-1.5M`
 - `vonjack/Phi-3.5-mini-instruct-hermes-fc-json`
 - `google/mobile-actions`

@@ -1,0 +1,23 @@
+{
+  "name": "alfred-code",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AlfredCode — a Claude Code-style terminal TUI powered by freebuff (or opencode) over ACP (JSON-RPC 2.0).",
+  "type": "module",
+  "scripts": {
+    "start": "tsx main.ts",
+    "dev": "tsx watch main.ts",
+    "typecheck": "tsc --noEmit",
+    "probe": "tsx scripts/agent-probe.ts"
+  },
+  "dependencies": {
+    "ink": "^5.0.1",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.3.3",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  }
+}

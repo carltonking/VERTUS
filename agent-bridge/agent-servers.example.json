@@ -1,0 +1,94 @@
+{
+  "_comment": "External capability bridges injected into every Hermes session Alfred starts. Edit freely — changes apply on the next Alfred launch. Servers: odysseus memory/rag/email/image-gen, omp (oh-my-pi coding agent, successor of pi), openswarm (multi-agent deliverables), browser-use (browser automation), agentmemory (persistent coding-agent memory), prime-agent (self-improving RLM coding agent), graphiti (temporal knowledge graph), memory-graph (merged agentmemory+graphiti people/relationship search).",
+  "servers": [
+    {
+      "name": "odyssey-memory",
+      "command": "python3",
+      "args": [
+        "/Users/carltonking/02 - REPOS/odysseus/mcp_servers/memory_server.py"
+      ],
+      "env": []
+    },
+    {
+      "name": "odyssey-rag",
+      "command": "python3",
+      "args": [
+        "/Users/carltonking/02 - REPOS/odysseus/mcp_servers/rag_server.py"
+      ],
+      "env": []
+    },
+    {
+      "name": "odyssey-email",
+      "command": "python3",
+      "args": [
+        "/Users/carltonking/02 - REPOS/odysseus/mcp_servers/email_server.py"
+      ],
+      "env": []
+    },
+    {
+      "name": "odyssey-image-gen",
+      "command": "python3",
+      "args": [
+        "/Users/carltonking/02 - REPOS/odysseus/mcp_servers/image_gen_server.py"
+      ],
+      "env": []
+    },
+    {
+      "name": "omp-agent",
+      "command": "python3",
+      "args": [
+        "/Users/carltonking/01 - PROJECTS/ALFRED/agent-bridge/omp_mcp_server.py"
+      ],
+      "env": []
+    },
+    {
+      "name": "openswarm",
+      "command": "python3",
+      "args": [
+        "/Users/carltonking/01 - PROJECTS/ALFRED/agent-bridge/openswarm_mcp_server.py"
+      ],
+      "env": []
+    },
+    {
+      "name": "browser-use",
+      "command": "/bin/bash",
+      "args": [
+        "/Users/carltonking/01 - PROJECTS/ALFRED/agent-bridge/browser-use-mcp-wrapper.sh"
+      ],
+      "env": []
+    },
+    {
+      "name": "agentmemory",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@agentmemory/mcp"
+      ],
+      "env": []
+    },
+    {
+      "name": "prime-agent",
+      "command": "python3",
+      "args": [
+        "/Users/carltonking/01 - PROJECTS/ALFRED/agent-bridge/prime_mcp_server.py"
+      ],
+      "env": []
+    },
+    {
+      "name": "graphiti",
+      "command": "/bin/bash",
+      "args": [
+        "/Users/carltonking/01 - PROJECTS/ALFRED/agent-bridge/graphiti-mcp-wrapper.sh"
+      ],
+      "env": []
+    },
+    {
+      "name": "memory-graph",
+      "command": "python3",
+      "args": [
+        "/Users/carltonking/01 - PROJECTS/ALFRED/agent-bridge/memory_graph_mcp_server.py"
+      ],
+      "env": []
+    }
+  ]
+}

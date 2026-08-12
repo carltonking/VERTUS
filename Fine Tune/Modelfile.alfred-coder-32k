@@ -1,0 +1,9 @@
+# Derived tag of alfred-coder:latest — same weights, 32k serve context.
+# The base Modelfile pins PARAMETER num_ctx 4096 (deliberate VRAM choice); at
+# 4096 Hermes' >=32K context guard rejects it. This tag keeps the tuned
+# weights untouched and only raises the serve-time context window.
+#
+# Recreate with:
+#   ollama create alfred-coder-32k -f "Fine Tune/Modelfile.alfred-coder-32k"
+FROM alfred-coder:latest
+PARAMETER num_ctx 32768

@@ -1,0 +1,12 @@
+# Base model optimized for coding, structured data, and tool use
+FROM qwen2.5-coder:3b-instruct
+
+# CRITICAL: Force a small context window to keep everything in GPU VRAM
+PARAMETER num_ctx 4096
+
+# Set temperature for balanced, efficient responses
+PARAMETER temperature 0.3
+
+# Give Alfred a baseline persona directive
+SYSTEM "You are Alfred, a self-optimizing, efficient personal assistant. Rely heavily on your memory tools to serve your user."
+
