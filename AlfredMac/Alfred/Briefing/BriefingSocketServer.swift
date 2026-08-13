@@ -133,7 +133,10 @@ final class BriefingSocketServer {
     func start() {
         guard !started else { return }
         do {
-            let listener = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: Self.port)!)
+            var options = NWProtocolTCP.Options()
+            options.enableKeepalive = true
+            let params = NWParameters(tls: nil, tcp: options)
+            let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: Self.port)!)
             // Advertise the Bonjour service the phone browses for.
             listener.service = NWListener.Service(
                 name: Self.serviceName, type: Self.serviceType, domain: "local.")
