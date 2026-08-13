@@ -516,6 +516,13 @@ final class AlfredToolServer {
                 that means iMessage — use messages_send, not this tool. The user's request \
                 is the permission; sending goes straight out. Use email_list + \
                 email_read to find the recipient's address and thread context first.
+
+                Siri rule: if the user says "email [name]" but has NOT told you \
+                what to write, do not call this tool — reply with a short \
+                confirmation question instead, e.g. "What would you like to say to \
+                [name]?" Never invent message content they didn't dictate. When \
+                they DO include the content ("email mom I'm running late"), \
+                send it immediately — no confirmation needed.
                 """,
             "inputSchema": [
                 "type": "object",
@@ -553,6 +560,12 @@ final class AlfredToolServer {
                 text, so you send to their real handle instead of inventing one. \
                 If the contact's phone is an iPhone number the sent message arrives \
                 as iMessage; otherwise as SMS.
+
+                If the search returns several plausible people (or you're not sure \
+                which "[name]" they mean), ask which one instead of guessing. If \
+                the user asked to text someone but gave no message content yet, \
+                resolving the contact here is fine — but still ask what to say \
+                before sending (see messages_send's rule).
                 """,
             "inputSchema": [
                 "type": "object",
@@ -606,6 +619,15 @@ final class AlfredToolServer {
                 reply inside an existing conversation) or `participant` (a phone \
                 number like "+15555550132" or Apple ID email, from contacts_find) \
                 to start a new conversation.
+
+                Siri rule: when the user says "text [name]" WITHOUT telling you \
+                what to say, do not call this tool — reply with a short \
+                confirmation question instead: "What would you like to say to \
+                [name]?" (resolve the name via contacts_find only if useful; do \
+                not send anything). Never invent message content. When they DO \
+                include the content ("text mom I'm running late"), send it \
+                immediately — no confirmation needed. If the contact lookup is \
+                ambiguous, ask which person they mean before sending.
                 """,
             "inputSchema": [
                 "type": "object",
@@ -746,6 +768,59 @@ final class AlfredToolServer {
                     ],
                 ],
                 "required": ["action"],
+            ],
+        ],
+        [
+            "name": "timer_set",
+            "description": """
+                Start a timer for the user. Prefers the real Clock app (the \
+                countdown appears in the menu-bar clock, exactly like Siri) and \
+                falls back to Alfred's own menu-bar timer + a notification when \
+                it ends — the user gets a visible countdown either way. Use when \
+                the user says "set a timer for X minutes/seconds", "timer for \
+                X", "count down X". Do NOT use this for stopwatches, reminders, \
+                or calendar events — those have their own tools.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "minutes": [
+                        "type": "number",
+                        "description": "Duration in minutes (accepts fractions for seconds, e.g. 0.5 = 30s). Min 1 second.",
+                    ],
+                    "label": [
+                        "type": "string",
+                        "description": "Optional name for the timer, e.g. \"pasta\". Shown in the notification.",
+                    ],
+                ],
+                "required": ["minutes"],
+            ],
+        ],
+        [
+            "name": "timer_status",
+            "description": """
+                Report what timers are currently running and how much time is \
+                left on each. Call this when the user asks "how much time is \
+                left?", "is my timer still running?", or before setting a new \
+                timer if they've set several.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [:],
+                "required": [] as [String],
+            ],
+        ],
+        [
+            "name": "timer_cancel",
+            "description": """
+                Stop every running timer (the Clock app's and Alfred's own) and \
+                clear their menu-bar countdowns. Use when the user says "cancel \
+                the timer", "stop the timer", "turn it off".
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [:],
+                "required": [] as [String],
             ],
         ],
     ]
@@ -1100,6 +1175,21 @@ final class AlfredToolServer {
                 throw ToolError.missingArgument("valid arguments (action, current_app)")
             }
             return ToolHandlers.handleHabitPredict(request).text
+
+        case "timer_set":
+            guard let minutes = arguments["minutes"] as? Double,
+                  minutes > 0
+            else {
+                throw ToolError.missingArgument("minutes (positive number)")
+            }
+            let label = arguments["label"] as? String
+            return await TimerCapability.shared.setTimer(minutes: minutes, label: label)
+
+        case "timer_status":
+            return await TimerCapability.shared.status()
+
+        case "timer_cancel":
+            return await TimerCapability.shared.cancelAll()
 
         default:
             throw ToolError.unknown(tool)
