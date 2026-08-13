@@ -479,6 +479,36 @@ final class BriefingSocketServer {
                 respondMailMove(id: id, params: frame["params"] as? [String: Any] ?? [:], role: "trash", on: client)
             case "mail.archive":
                 respondMailMove(id: id, params: frame["params"] as? [String: Any] ?? [:], role: "archive", on: client)
+            case "mail.unarchive":
+                respondMailMove(id: id, params: frame["params"] as? [String: Any] ?? [:], role: "inbox", on: client)
+            case "mail.classify":
+                respondMailClassify(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "mail.summarize":
+                respondMailSummarize(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "mail.extract_tasks":
+                respondMailExtractTasks(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "mail.draft_reply":
+                respondMailDraftReply(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "mail.search_ai":
+                respondMailSearchAI(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "mail.scan":
+                respondMailScan(id: id, on: client)
+            case "mail.scan_summary":
+                respondMailScanSummary(id: id, on: client)
+            case "mail.settings":
+                respondMailSettings(id: id, on: client)
+            case "mail.set_settings":
+                respondMailSetSettings(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "mail.folder_messages":
+                respondMailFolderMessages(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "mail.move_folder":
+                respondMailMoveFolder(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "mail.save_draft":
+                respondMailSaveDraft(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "mail.draft_alternatives":
+                respondMailDraftAlternatives(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "mail.draft_revise":
+                respondMailDraftRevise(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
             case "ping":
                 // Deliberate -32601: a live ACP endpoint answers ping with
                 // "method not found", and the phone's heartbeat treats any
@@ -1125,6 +1155,10 @@ final class BriefingSocketServer {
                     body: params["body"] as? String ?? "",
                     accountID: params["account_id"] as? String ?? "",
                     inReplyTo: params["in_reply_to"] as? String)
+                // What the owner actually sends teaches the drafter.
+                MailLearningService.shared.observeSent(
+                    subject: params["subject"] as? String ?? "",
+                    body: params["body"] as? String ?? "")
                 let response: [String: Any] = [
                     "jsonrpc": "2.0", "id": id,
                     "result": ["sent": true, "message": "Message sent."],
@@ -1152,11 +1186,21 @@ final class BriefingSocketServer {
             let manager = MailManager.shared
             do {
                 let parts = try await manager.messageParts(account: account, mailbox: mailbox, uid: uid)
-                let subject = parts.subject.hasPrefix("Re:") ? parts.subject : "Re: " + parts.subject
+                // The review screen can override subject/cc; defaults keep the
+                // standard Re: subject and no cc.
+                let subject: String
+                if let override = params["subject"] as? String, !override.isEmpty {
+                    subject = override
+                } else {
+                    subject = parts.subject.hasPrefix("Re:") ? parts.subject : "Re: " + parts.subject
+                }
+                let cc = (params["cc"] as? String).flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
                 try await manager.send(
-                    to: parts.fromAddress, cc: nil, subject: subject, body: body,
+                    to: parts.fromAddress, cc: cc, subject: subject, body: body,
                     accountID: account,
                     inReplyTo: parts.messageID.isEmpty ? nil : parts.messageID)
+                // Replies are sent mail too — they teach the drafter.
+                MailLearningService.shared.observeSent(subject: subject, body: body)
                 let response: [String: Any] = [
                     "jsonrpc": "2.0", "id": id,
                     "result": ["sent": true, "message": "Reply sent to \(parts.fromAddress)."],
@@ -1234,6 +1278,300 @@ final class BriefingSocketServer {
                                   message: error.localizedDescription, on: client)
             }
         }
+    }
+
+    // MARK: - Mail AI (JSON-RPC)
+
+    /// Classify a message for the inline list chips and the reader's tone line.
+    /// Runs through MailAIService (Hermes + 24h cache); a busy session returns
+    /// a null classification, which the phone renders as "no chip yet" rather
+    /// than an error.
+    private func respondMailClassify(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let triple = Self.mailTriple(from: params) else {
+            respondError(id: id, code: -32602,
+                         message: "account_id, mailbox and uid are required", on: client)
+            return
+        }
+        Task { @MainActor in
+            let classification = await MailAIService.shared.classify(
+                account: triple.account, mailbox: triple.mailbox, uid: triple.uid)
+            let result: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["classification": classification.map(Self.mailClassificationWire) as Any],
+            ]
+            self.send(text: Self.jsonString(result), on: client)
+        }
+    }
+
+    /// Summarize a message (and its conversation) for the reader's AI panel.
+    private func respondMailSummarize(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let triple = Self.mailTriple(from: params) else {
+            respondError(id: id, code: -32602,
+                         message: "account_id, mailbox and uid are required", on: client)
+            return
+        }
+        Task { @MainActor in
+            let summary = await MailAIService.shared.summarize(
+                account: triple.account, mailbox: triple.mailbox, uid: triple.uid)
+            let result: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["summary": summary.map(Self.mailSummaryWire) as Any],
+            ]
+            self.send(text: Self.jsonString(result), on: client)
+        }
+    }
+
+    /// Extract action items for the reader's Tasks popover.
+    private func respondMailExtractTasks(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let triple = Self.mailTriple(from: params) else {
+            respondError(id: id, code: -32602,
+                         message: "account_id, mailbox and uid are required", on: client)
+            return
+        }
+        Task { @MainActor in
+            let tasks = await MailAIService.shared.extractTasks(
+                account: triple.account, mailbox: triple.mailbox, uid: triple.uid)
+            let result: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["tasks": tasks.map(Self.mailTaskWire)],
+            ]
+            self.send(text: Self.jsonString(result), on: client)
+        }
+    }
+
+    /// Draft a reply in the owner's voice, for the reader's quick reply.
+    private func respondMailDraftReply(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let triple = Self.mailTriple(from: params) else {
+            respondError(id: id, code: -32602,
+                         message: "account_id, mailbox and uid are required", on: client)
+            return
+        }
+        Task { @MainActor in
+            let draft = await MailAIService.shared.draftReply(
+                account: triple.account, mailbox: triple.mailbox, uid: triple.uid,
+                tone: params["tone"] as? String)
+            let result: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["draft": draft.map(Self.mailDraftWire) as Any],
+            ]
+            self.send(text: Self.jsonString(result), on: client)
+        }
+    }
+
+    /// Natural-language search: the model compiles the query into a filter
+    /// that runs over the cached inbox, plus a one-line note for the phone's
+    /// results header. Degrades to plain LIKE search (note: null) when Hermes
+    /// is busy — search itself never fails.
+    private func respondMailSearchAI(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let query = params["query"] as? String, !query.isEmpty else {
+            respondError(id: id, code: -32602, message: "query is required", on: client)
+            return
+        }
+        Task { @MainActor in
+            let manager = MailManager.shared
+            let result = await MailAIService.shared.search(
+                query: query, accountID: params["account_id"] as? String)
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": [
+                    "messages": result.messages.map(manager.messageWire),
+                    "note": (result.note.isEmpty ? NSNull() : result.note) as Any,
+                ],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    // MARK: - Mail scan, settings & draft review (JSON-RPC)
+
+    /// Run a full folder sweep now and return its summary (the scan header's
+    /// pull-to-refresh). The periodic sweep also broadcasts `mail.scan_complete`.
+    private func respondMailScan(id: Any, on client: BriefingClient) {
+        Task { @MainActor in
+            let summary = await MailScanService.shared.scanNow()
+                ?? MailScanService.persistedSummary()
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["scan": Self.mailScanSummaryWire(summary)],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// The last completed sweep — what the phone's scan header shows without
+    /// paying for a fresh one.
+    private func respondMailScanSummary(id: Any, on client: BriefingClient) {
+        let summary = MailScanService.persistedSummary()
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": ["scan": Self.mailScanSummaryWire(summary)],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    /// Read the current email settings (signature, tone, scan frequency…).
+    private func respondMailSettings(id: Any, on client: BriefingClient) {
+        let settings = MailSettingsStore.shared.current
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": ["settings": Self.mailSettingsWire(settings)],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    /// Update email settings from the phone; re-arm the sweep timer if the
+    /// frequency changed.
+    private func respondMailSetSettings(id: Any, params: [String: Any], on client: BriefingClient) {
+        let frequency = params["scan_frequency_minutes"] as? Int
+        let tone = params["draft_tone"] as? String
+        let autoLearn = params["auto_learn_sent"] as? Bool
+        let notify = params["notify_on_important"] as? Bool
+        let excluded = params["excluded_folders"] as? [String]
+        let signature = params["signature"] as? String
+        let signatureAccount = params["signature_account"] as? String
+
+        Task { @MainActor in
+            MailSettingsStore.shared.update { settings in
+                if let frequency, [5, 15, 30, 60].contains(frequency) {
+                    settings.scanFrequencyMinutes = frequency
+                }
+                if let tone { settings.draftTone = tone }
+                if let autoLearn { settings.autoLearnSent = autoLearn }
+                if let notify { settings.notifyOnImportant = notify }
+                if let excluded { settings.excludedFolders = excluded }
+                if let signatureAccount, let signature {
+                    settings.signatures[signatureAccount] = signature
+                }
+            }
+            MailScanService.shared.reschedule()
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": [
+                    "success": true,
+                    "settings": Self.mailSettingsWire(MailSettingsStore.shared.current),
+                ],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// Messages cached for one folder (every folder when folder_id is omitted)
+    /// — the "By Folder" drill-down.
+    private func respondMailFolderMessages(id: Any, params: [String: Any], on client: BriefingClient) {
+        let accountID = params["account_id"] as? String
+        let folderID = params["folder_id"] as? String
+        let limit = (params["limit"] as? Int).map { min(max($0, 1), 200) } ?? 100
+        Task { @MainActor in
+            let manager = MailManager.shared
+            let messages = manager.folderMessages(accountID: accountID, mailbox: folderID, limit: limit)
+                .map(manager.messageWire)
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["messages": messages],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// Move a message to an explicit destination folder — the one-tap "Move to
+    /// Inbox" for junk finds, and general re-organization.
+    private func respondMailMoveFolder(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let triple = Self.mailTriple(from: params),
+              let destination = params["destination"] as? String, !destination.isEmpty else {
+            respondError(id: id, code: -32602,
+                         message: "account_id, mailbox, uid and destination are required", on: client)
+            return
+        }
+        Task { @MainActor in
+            do {
+                try await MailManager.shared.moveToFolder(
+                    account: triple.account, mailbox: triple.mailbox,
+                    uid: triple.uid, destination: destination)
+                self.send(text: Self.jsonString([
+                    "jsonrpc": "2.0", "id": id, "result": ["success": true],
+                ]), on: client)
+            } catch {
+                self.respondError(id: id, code: -32602,
+                                  message: error.localizedDescription, on: client)
+            }
+        }
+    }
+
+    /// Save a message as a draft (the review screen's "Save as Draft").
+    private func respondMailSaveDraft(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let to = params["to"] as? String, !to.isEmpty else {
+            respondError(id: id, code: -32602, message: "to is required", on: client)
+            return
+        }
+        Task { @MainActor in
+            do {
+                try await MailManager.shared.saveDraft(
+                    to: to,
+                    cc: params["cc"] as? String,
+                    subject: params["subject"] as? String ?? "",
+                    body: params["body"] as? String ?? "",
+                    accountID: params["account_id"] as? String ?? "",
+                    inReplyTo: params["in_reply_to"] as? String)
+                self.send(text: Self.jsonString([
+                    "jsonrpc": "2.0", "id": id,
+                    "result": ["saved": true, "message": "Draft saved."],
+                ]), on: client)
+            } catch {
+                self.respondError(id: id, code: -32602,
+                                  message: error.localizedDescription, on: client)
+            }
+        }
+    }
+
+    /// The review screen's "Show alternatives" — three tones for one message.
+    private func respondMailDraftAlternatives(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let triple = Self.mailTriple(from: params) else {
+            respondError(id: id, code: -32602,
+                         message: "account_id, mailbox and uid are required", on: client)
+            return
+        }
+        Task { @MainActor in
+            let drafts = await MailAIService.shared.draftAlternatives(
+                account: triple.account, mailbox: triple.mailbox, uid: triple.uid)
+            let result: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["alternatives": drafts.map(Self.mailDraftWire)],
+            ]
+            self.send(text: Self.jsonString(result), on: client)
+        }
+    }
+
+    /// Revise a draft in place from a natural-language instruction.
+    private func respondMailDraftRevise(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let triple = Self.mailTriple(from: params),
+              let instruction = params["instruction"] as? String, !instruction.isEmpty else {
+            respondError(id: id, code: -32602,
+                         message: "account_id, mailbox, uid and instruction are required", on: client)
+            return
+        }
+        Task { @MainActor in
+            let draft = await MailAIService.shared.reviseDraft(
+                account: triple.account, mailbox: triple.mailbox, uid: triple.uid,
+                currentSubject: params["subject"] as? String ?? "",
+                currentBody: params["body"] as? String ?? "",
+                instruction: instruction)
+            let result: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["draft": draft.map(Self.mailDraftWire) as Any],
+            ]
+            self.send(text: Self.jsonString(result), on: client)
+        }
+    }
+
+    /// The (account, mailbox, uid) triple every message-addressed mail method
+    /// guards on.
+    private static func mailTriple(from params: [String: Any])
+        -> (account: String, mailbox: String, uid: String)? {
+        guard let account = params["account_id"] as? String,
+              let mailbox = params["mailbox"] as? String,
+              let uid = params["uid"] as? String
+        else { return nil }
+        return (account, mailbox, uid)
     }
 
     // MARK: - Code sessions (wire helpers)
@@ -1438,6 +1776,94 @@ final class BriefingSocketServer {
                 client.connection.send(content: self.textFrame(json), completion: .contentProcessed { _ in })
             }
         }
+    }
+
+    /// A MailClassification as the phone expects it. The sweep fields ride
+    /// along when the model produced them; older cached classifications simply
+    /// omit them.
+    static func mailClassificationWire(_ classification: MailClassification) -> [String: Any] {
+        var dict: [String: Any] = [
+            "label": classification.label,
+            "tone": classification.tone,
+            "summary": classification.summary,
+        ]
+        if let importance = classification.importance { dict["importance"] = importance }
+        if let category = classification.category { dict["category"] = category }
+        if let confidence = classification.confidence { dict["confidence"] = confidence }
+        if let reason = classification.reason { dict["reason"] = reason }
+        return dict
+    }
+
+    /// A MailDraft as the phone expects it.
+    static func mailDraftWire(_ draft: MailDraft) -> [String: Any] {
+        ["subject": draft.subject, "body": draft.body]
+    }
+
+    /// A MailScanItem as the phone expects it.
+    static func mailScanItemWire(_ item: MailScanItem) -> [String: Any] {
+        [
+            "account_id": item.account,
+            "mailbox": item.mailbox,
+            "uid": item.uid,
+            "from": item.fromName,
+            "from_address": item.fromAddress,
+            "subject": item.subject,
+            "date": item.date,
+            "snippet": item.snippet,
+            "importance": item.importance,
+            "category": item.category,
+            "confidence": item.confidence,
+            "reason": item.reason,
+        ]
+    }
+
+    /// A MailFolderStat as the phone expects it.
+    static func mailFolderStatWire(_ stat: MailFolderStat) -> [String: Any] {
+        [
+            "account_id": stat.account,
+            "id": stat.id,
+            "name": stat.name,
+            "role": stat.role,
+            "total": stat.total,
+            "unseen": stat.unseen,
+            "flagged": stat.flagged,
+        ]
+    }
+
+    /// An EmailScanSummary as the phone expects it (also the `mail.scan_complete`
+    /// broadcast payload).
+    static func mailScanSummaryWire(_ summary: EmailScanSummary) -> [String: Any] {
+        [
+            "folders": summary.folders.map(mailFolderStatWire),
+            "unread_total": summary.unreadTotal,
+            "flagged_total": summary.flaggedTotal,
+            "important": summary.important.map(mailScanItemWire),
+            "spam_miss": summary.spamMiss.map(mailScanItemWire),
+            "scanned_at": summary.scannedAt,
+        ]
+    }
+
+    /// MailSettings as the phone expects it.
+    static func mailSettingsWire(_ settings: MailSettings) -> [String: Any] {
+        [
+            "scan_frequency_minutes": settings.scanFrequencyMinutes,
+            "signatures": settings.signatures,
+            "draft_tone": settings.draftTone,
+            "auto_learn_sent": settings.autoLearnSent,
+            "excluded_folders": settings.excludedFolders,
+            "notify_on_important": settings.notifyOnImportant,
+            "learned_phrase_count": settings.learnedPhraseCount,
+        ]
+    }
+
+    /// A MailSummary as the phone expects it.
+    static func mailSummaryWire(_ summary: MailSummary) -> [String: Any] {
+        ["bullets": summary.bullets, "tone": summary.tone]
+    }
+
+    /// A MailTaskItem as the phone expects it.
+    static func mailTaskWire(_ task: MailTaskItem) -> [String: Any] {
+        ["title": task.title, "detail": task.detail]
     }
 
     /// The `mail.sync_complete` payload — what the sync pass found.

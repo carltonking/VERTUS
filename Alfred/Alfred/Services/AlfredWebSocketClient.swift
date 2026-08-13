@@ -66,6 +66,13 @@ final class AlfredWebSocketClient {
     private var heartbeatTask: Task<Void, Never>?
     private var connectAttempt = 0
 
+    /// The URL of the current connection. Needed because
+    /// `socket.originalRequest?.url` normalises `ws://` to `http://` — feeding
+    /// that back into a WebSocket task crashes with "WebSocket tasks can only
+    /// be created with ws or wss schemes". Kept as the *actual* URL we connected
+    /// with, for the heartbeat and reconnect paths.
+    private var connectionURL: URL?
+
     /// True while we're allowed to reconnect. Set false by `disconnect()`, so a
     /// deliberate close doesn't spin a reconnect loop.
     private var shouldReconnect = false
@@ -94,12 +101,50 @@ final class AlfredWebSocketClient {
     private let session: URLSession
     private let logger = Logger(subsystem: "com.carlton.alfred", category: "socket")
 
+    /// Debug trace for connection troubleshooting. Plain NSLog (not the os Logger)
+    /// so it lands in the Xcode console and Console.app under one grep-able prefix
+    /// — `[socket]` — no matter which logging pipeline the system is using.
+    private static func debugLog(_ message: String) {
+        NSLog("[socket] %@", message)
+    }
+
+    /// Trusts the Mac's socket endpoint however it presents itself on the trusted
+    /// links: the Tailscale 100.x range, localhost, and .local names. Today the
+    /// server presents no certificate at all (plain ws://), so this is mostly
+    /// defensive — but if someone later adds TLS with a self-signed cert, a
+    /// challenge here is accepted instead of killing the connection. Every other
+    /// host gets default handling, and every challenge is logged so the TLS
+    /// handshake is visible in the console.
+    private class SelfSignedDelegate: NSObject, URLSessionDelegate {
+        func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+            let space = challenge.protectionSpace
+            let host = space.host
+            // Tailscale addresses live in 100.64.0.0/10 — every one starts with 100.
+            let isTrustedLink = host.starts(with: "100.")
+                || host == "localhost"
+                || host.hasSuffix(".local")
+            if isTrustedLink, let trust = space.serverTrust {
+                NSLog("[socket] TLS challenge from %@ (%@) — trusting self-signed cert", host, space.authenticationMethod)
+                completionHandler(.useCredential, URLCredential(trust: trust))
+            } else {
+                NSLog("[socket] TLS challenge from %@ — %@", host, isTrustedLink ? "no server trust; default handling" : "default handling")
+                completionHandler(.performDefaultHandling, nil)
+            }
+        }
+    }
+
     private init() {
         let config = URLSessionConfiguration.ephemeral
         config.waitsForConnectivity = false
+        // The request timeout bounds each send-receive round trip and the
+        // handshake; the heartbeat keeps it from firing on a quiet-but-healthy
+        // socket. The resource timeout is a hard lifetime cap for the *whole*
+        // task — 30s would kill a long-lived socket that pings can't save — so
+        // it is set far above any realistic session length; the heartbeat and
+        // reconnect loop are what actually police a dead link.
         config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 30
-        session = URLSession(configuration: config)
+        config.timeoutIntervalForResource = 600
+        session = URLSession(configuration: config, delegate: SelfSignedDelegate(), delegateQueue: nil)
     }
 
     // MARK: - Connection
@@ -109,6 +154,7 @@ final class AlfredWebSocketClient {
     /// method is `async` (not `async throws`); failures surface as the receive
     /// loop errors, flipping state to `.reconnecting` and retrying on its own.
     func connect(to url: URL) async {
+        Self.debugLog("connect(to:) — \(url.absoluteString)")
         shouldReconnect = true
         connectAttempt = 0
         // A manual connect while auto-reconnect is backing off must cancel the
@@ -121,6 +167,7 @@ final class AlfredWebSocketClient {
 
     /// Tear down and stay down.
     func disconnect() {
+        Self.debugLog("disconnect()")
         shouldReconnect = false
         connectAttempt = 0
         reconnectTask?.cancel()
@@ -141,20 +188,46 @@ final class AlfredWebSocketClient {
     /// (manual host, or discovered), then connect.
     func connectToAlfred() async {
         let settings = AppSettings()
-        guard settings.isConfigured else { return }
+        Self.debugLog("connectToAlfred() — isConfigured=\(settings.isConfigured), socketHost=\"\(settings.socketHost)\", socketPort=\(settings.socketPort)")
+        guard settings.isConfigured || !settings.socketHost.isEmpty else {
+            Self.debugLog("connectToAlfred() — no relay host and no socket host; nothing to connect to")
+            return
+        }
 
         if let url = settings.socketURL {
-            await connect(to: url)
+            Self.debugLog("connectToAlfred() — resolved socket URL: \(url.absoluteString)")
+            // ATS on current iOS refuses ws:// to IP literals even with
+            // NSAllowsArbitraryLoads set, while the Mac's Bonjour name
+            // (alfred.local) is allowed. A pinned IP therefore resolves to the
+            // Mac's name first; the pin stays as the fallback.
+            let manualHost = url.host ?? ""
+            let manualPort = url.port ?? settings.socketPort
+            let resolved = await Task.detached(priority: .utility) {
+                await TailscaleConnection().resolveSocketEndpoint(manualHost: manualHost, port: manualPort)
+            }.value
+            if let resolved, let resolvedURL = URL(string: "ws://\(resolved.host):\(resolved.port)") {
+                Self.debugLog("connectToAlfred() — connecting via \(resolvedURL.absoluteString)")
+                await connect(to: resolvedURL)
+            } else {
+                Self.debugLog("connectToAlfred() — no host resolution; connecting to pinned URL")
+                await connect(to: url)
+            }
             return
         }
         // No manual host — try discovery once. It's slow-ish (mDNS timeout), so
         // run it off the main thread.
+        Self.debugLog("connectToAlfred() — no manual socket host; running mDNS/Tailscale discovery")
         let discovered = await Task.detached(priority: .utility) {
             await TailscaleConnection().discoverAlfredOnTailscale()
         }.value
-        guard let (host, port) = discovered else { return }
+        guard let (host, port) = discovered else {
+            Self.debugLog("connectToAlfred() — discovery found nothing; staying disconnected")
+            return
+        }
+        Self.debugLog("connectToAlfred() — discovered \(host):\(port)")
         settings.saveSocketHost(host, port: port)
         guard let url = settings.socketURL else { return }
+        Self.debugLog("connectToAlfred() — resolved discovered socket URL: \(url.absoluteString)")
         await connect(to: url)
     }
 
@@ -175,6 +248,7 @@ final class AlfredWebSocketClient {
         ]
         return try await withCheckedThrowingContinuation { continuation in
             guard socket != nil else {
+                Self.debugLog("sendCommand() — \"\(name)\" dropped: socket nil (not connected)")
                 continuation.resume(throwing: HermesSocketError.notConnected)
                 return
             }
@@ -568,6 +642,7 @@ final class AlfredWebSocketClient {
         let delay = delay(forAttempt: attempt)
         state = .reconnecting(attempt: attempt)
         logger.info("Socket dropped — reconnecting in \(delay)s (attempt \(attempt))")
+        Self.debugLog("scheduleReconnect() — attempt \(attempt) in \(delay)s")
 
         reconnectTask?.cancel()
         reconnectTask = Task { [weak self] in
@@ -583,12 +658,28 @@ final class AlfredWebSocketClient {
     // MARK: - Internals
 
     private func establish(_ url: URL) async {
+        // Defense in depth: URLSession throws an NSGenericException (a crash, not
+        // a recoverable error) if handed a non-ws/wss scheme — historically from
+        // `socket.originalRequest?.url` normalising ws:// to http://. Refuse
+        // instead of trusting every caller to get the scheme right.
+        guard url.scheme == "ws" || url.scheme == "wss" else {
+            Self.debugLog("establish() — refusing non-WebSocket scheme \(url.absoluteString)")
+            lastError = "Bad socket URL scheme: \(url.scheme ?? "none")"
+            state = .failed(lastError ?? "Bad socket URL")
+            return
+        }
+        Self.debugLog("establish() — creating URLSessionWebSocketTask for \(url.absoluteString)")
         state = .connecting
         lastError = nil
+        connectionURL = url
 
         let task = session.webSocketTask(with: url)
         socket = task
         task.resume()
+        // The handshake has no completion callback — the first received frame or
+        // the first receive() error is what actually proves the connection.
+        Self.debugLog("establish() — task resumed; waiting on the first frame to confirm the handshake")
+
 
         // The handshake has no completion handler, so connection failures surface
         // as the first receive() throwing — refused/DNS failures throw almost
@@ -619,6 +710,7 @@ final class AlfredWebSocketClient {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 20_000_000_000)  // 20s
                 guard let self, !Task.isCancelled, self.socket != nil else { return }
+                Self.debugLog("heartbeat — sending ping")
                 await self.ping()
             }
         }
@@ -628,7 +720,10 @@ final class AlfredWebSocketClient {
     /// endpoint answers ping with a "method not found" error, which still counts).
     /// No answer → drop and let the reconnect loop handle it.
     private func ping() async {
-        guard let socket, let url = socket.originalRequest?.url else { return }
+        // Not socket.originalRequest?.url: URLSession normalises ws:// to http://
+        // there, and a WebSocket task built from http:// crashes. Keep the URL
+        // we actually connected with.
+        guard let url = connectionURL else { return }
         do {
             _ = try await sendCommand(name: "ping", timeout: 5)
         } catch HermesSocketError.server {
@@ -637,6 +732,7 @@ final class AlfredWebSocketClient {
             return
         } catch {
             logger.info("Heartbeat ping failed: \(error.localizedDescription)")
+            Self.debugLog("ping() — heartbeat failed on \(url.absoluteString): \(error.localizedDescription)")
             lastError = error.localizedDescription
             dropAndReconnect(to: url)
         }
@@ -658,6 +754,7 @@ final class AlfredWebSocketClient {
                 guard socket === task else { return }
                 let description = (error as? URLError)?.localizedDescription ?? error.localizedDescription
                 logger.info("Socket receive failed: \(description)")
+                Self.debugLog("receiveLoop() — error on \(url.absoluteString): \(description)")
                 lastError = description
                 dropAndReconnect(to: url)
                 return
@@ -715,6 +812,7 @@ final class AlfredWebSocketClient {
                     // loop will notice too, but fail pending requests *now* so a
                     // caller isn't left awaiting a reply that can never come.
                     self.logger.info("Socket send failed: \(error.localizedDescription)")
+                    Self.debugLog("drain() — send failed: \(error.localizedDescription)")
                     self.lastError = error.localizedDescription
                     self.failPending(HermesSocketError.closed)
                     self.sendQueue.removeAll()

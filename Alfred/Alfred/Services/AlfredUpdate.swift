@@ -91,6 +91,9 @@ enum AlfredUpdate: Equatable {
     /// The Mac's total unread count changed — new mail arrived, or mail was
     /// read/archived somewhere. Drives the tab badge without a re-fetch.
     case mailUnreadChanged(unread: Int)
+    /// A full folder sweep finished on the Mac — fresh folder stats, important
+    /// finds, and any "important mail in Junk" rescue candidates.
+    case mailScanComplete(MailScanSummaryPayload)
     case codeUpdate(code: String, language: String)
     case pushNotification(title: String, body: String)
     case error(message: String)
@@ -174,6 +177,10 @@ enum AlfredUpdateParser {
 
         case "mail.unread_count_changed":
             return .mailUnreadChanged(unread: params["unread"] as? Int ?? 0)
+
+        case "mail.scan_complete":
+            guard let scan = MailScanSummaryPayload.fromJSON(params) else { return nil }
+            return .mailScanComplete(scan)
 
         case "push.notification":
             guard let title = params["title"] as? String else { return nil }

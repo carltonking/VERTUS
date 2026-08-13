@@ -823,6 +823,63 @@ final class AlfredToolServer {
                 "required": [] as [String],
             ],
         ],
+        [
+            "name": "email_scan",
+            "description": """
+                Summarize the user's whole mailbox in one glance: unread counts \
+                per folder, flagged follow-ups, and — most usefully — important \
+                emails found sitting in Junk that should be moved back to the \
+                Inbox. Use when the user says "scan my inbox", "any important \
+                email", "what's in my junk", or asks what they've missed.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "folder": [
+                        "type": "string",
+                        "description": "Optional mailbox name to dig into (e.g. \"Junk\"). Omit for the summary.",
+                    ]
+                ],
+                "required": [] as [String],
+            ],
+        ],
+        [
+            "name": "email_move",
+            "description": """
+                Move an email to a different mailbox (IMAP UID MOVE). Use for \
+                "move this to Inbox", "file it under X", or rescuing an \
+                important email that landed in Junk. The message id comes from \
+                email_list / email_scan; the user's request is the permission.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "id": ["type": "string", "description": "Message id from email_list or email_scan."],
+                    "from_mailbox": ["type": "string", "description": "Mailbox the message is in now, e.g. \"Junk\"."],
+                    "to_mailbox": ["type": "string", "description": "Destination mailbox, e.g. \"Inbox\"."],
+                    "account": ["type": "string", "description": "Account name (default: icloud)."],
+                ],
+                "required": ["id", "from_mailbox", "to_mailbox"],
+            ],
+        ],
+        [
+            "name": "email_save_draft",
+            "description": """
+                Save an email to the user's Drafts folder without sending it. \
+                Use when the user says "save that as a draft", "draft it and \
+                I'll send later". Never sends — this only saves.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "to": ["type": "string", "description": "Recipient address."],
+                    "subject": ["type": "string", "description": "Subject line."],
+                    "body": ["type": "string", "description": "Plain-text body."],
+                    "account": ["type": "string", "description": "Account name (default: icloud)."],
+                ],
+                "required": ["to", "subject", "body"],
+            ],
+        ],
     ]
 
     private enum ToolError: LocalizedError {
@@ -952,13 +1009,62 @@ final class AlfredToolServer {
             guard let id = arguments["id"] as? String, !id.isEmpty else {
                 throw ToolError.missingArgument("id")
             }
+            // Default to Inbox; a mailbox param lets the model open Junk/Archive
+            // messages it found via email_scan.
+            let mailbox = arguments["mailbox"] as? String ?? "Inbox"
             let message = try EmailCapability.shared.readMessage(
-                id: id, account: "icloud", mailbox: "Inbox")
+                id: id, account: "icloud", mailbox: mailbox)
             PersonalMemoryStore.shared.recordObservation(
                 source: "email",
                 text: message,
                 app: "Mail")
             return message
+
+        case "email_scan":
+            let summary = MailScanService.persistedSummary()
+            guard summary.scannedAt > 0 else {
+                return "No scan yet. Ask the user to wait a moment while Alfred checks every folder."
+            }
+            var lines = [summary.oneLine]
+            for item in summary.spamMiss {
+                let who = item.fromName.isEmpty ? item.fromAddress : item.fromName
+                lines.append("Junk → important: \(who) — \(item.subject) (id \(item.uid) in \(item.mailbox), \(Int(item.confidence * 100))%)")
+            }
+            for item in summary.important.prefix(5) {
+                let who = item.fromName.isEmpty ? item.fromAddress : item.fromName
+                lines.append("Important: \(who) — \(item.subject)")
+            }
+            let folder = arguments["folder"] as? String
+            if let folder, let stat = summary.folders.first(where: {
+                $0.name.caseInsensitiveCompare(folder) == .orderedSame || $0.role == folder.lowercased()
+            }) {
+                lines.append("\(stat.name): \(stat.unseen) unread of \(stat.total), \(stat.flagged) flagged")
+            }
+            return lines.joined(separator: "\n")
+
+        case "email_move":
+            guard let id = arguments["id"] as? String, !id.isEmpty,
+                  let from = arguments["from_mailbox"] as? String,
+                  let to = arguments["to_mailbox"] as? String else {
+                throw ToolError.missingArgument("id, from_mailbox and to_mailbox")
+            }
+            let account = arguments["account"] as? String ?? "icloud"
+            try EmailCapability.shared.moveMessage(
+                account: account, fromMailbox: from, toMailbox: to, messageID: id)
+            // Drop it from the cache so the phone's list reflects the move.
+            try? MailManager.purgeCachedMessage(account: account, mailbox: from, uid: id)
+            return "Moved \(id) from \(from) to \(to)."
+
+        case "email_save_draft":
+            guard let to = arguments["to"] as? String, !to.isEmpty,
+                  let subject = arguments["subject"] as? String,
+                  let body = arguments["body"] as? String else {
+                throw ToolError.missingArgument("to, subject and body")
+            }
+            let account = arguments["account"] as? String ?? "icloud"
+            return try EmailCapability.shared.saveDraft(
+                to: to, cc: nil, subject: subject, body: body,
+                inReplyTo: nil, account: account)
 
         case "calendar_list":
             let days = min(arguments["days"] as? Int ?? 7, 90)
@@ -1174,9 +1280,7 @@ final class AlfredToolServer {
             guard let request = ToolHandlers.decode(HabitPredictRequest.self, from: arguments) else {
                 throw ToolError.missingArgument("valid arguments (action, current_app)")
             }
-            return ToolHandlers.handleHabitPredict(request).text
-
-        case "timer_set":
+            return ToolHandlers.handleHabitPredict(request).text        case "timer_set":
             guard let minutes = arguments["minutes"] as? Double,
                   minutes > 0
             else {

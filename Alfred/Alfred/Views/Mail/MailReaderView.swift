@@ -1,19 +1,22 @@
 //
-//  MacMessageDetailView.swift
+//  MailReaderView.swift
 //  Alfred
 //
-//  The reader for a message from the Mac's inbox. The body is fetched from
-//  Himalaya on demand (`mail.message`) — the cache only holds envelopes — so
-//  opening a message is the one moment the phone touches the real mail server.
+//  The right pane: one open message, Apple Mail's layout with the copilot
+//  riding on top. The body renders through the hardened web view (remote
+//  content blocked until asked, JS off); above it the AI layer — the
+//  classification row ("Needs reply · Friendly, Urgent"), the collapsible ✨
+//  summary, and the Summarize / Draft Reply / Extract Tasks toolbar — loads
+//  asynchronously after the body, because the model reads on the Mac.
 //
-//  HTML bodies render through the same hardened web view the cloud client
-//  uses (remote content blocked, JS off); plain text is the fallback. Flagging
-//  and the More menu (archive/trash) go straight back to the Mac via JSON-RPC.
+//  Opening a message marks it read the way every other mail client does; the
+//  list is updated locally at the same time so going back doesn't refetch.
 //
 
 import SwiftUI
 
-struct MacMessageDetailView: View {
+struct MailReaderView: View {
+    @Environment(AppSettings.self) private var settings
     @Environment(\.palette) private var palette
     @Environment(\.dismiss) private var dismiss
 
@@ -21,13 +24,16 @@ struct MacMessageDetailView: View {
 
     private var store: MacMailStore { .shared }
 
-    /// The row's flag state, owned here. `message` is a let copy — toggling
-    /// must update this (and push to the store), not read the stale let.
     @State private var isFlagged: Bool
     @State private var detail: MacMailMessageDetail?
     @State private var loadFailed = false
     @State private var allowsRemote = false
     @State private var bodyHeight: CGFloat = 200
+
+    // AI layer
+    @State private var classification: MailClassificationPayload?
+    @State private var summary: MailSummaryPayload?
+    @State private var showSummary = false
     @State private var showingReply = false
 
     init(message: MacMailMessage) {
@@ -43,6 +49,14 @@ struct MacMessageDetailView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     headerCard
 
+                    if let classification {
+                        classificationCard(classification)
+                    }
+
+                    if let summary {
+                        MailAISummaryPanel(summary: summary, isExpanded: $showSummary)
+                    }
+
                     if let detail {
                         bodyCard(detail)
                         attachmentsCard(detail)
@@ -51,6 +65,8 @@ struct MacMessageDetailView: View {
                     } else {
                         loadingCard
                     }
+
+                    MailAIActionsToolbar(message: message)
                 }
                 .padding(16)
             }
@@ -59,59 +75,12 @@ struct MacMessageDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(palette.backgroundTop, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    Task { await toggleFlag() }
-                } label: {
-                    Image(systemName: isFlagged ? "star.fill" : "star")
-                        .foregroundStyle(isFlagged ? palette.accent : palette.textSecondary)
-                }
-                .accessibilityLabel(isFlagged ? "Unflag" : "Flag")
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Button {
-                        Task { await archive() }
-                    } label: {
-                        Label("Archive", systemImage: "archivebox")
-                    }
-                    Button(role: .destructive) {
-                        Task { await trash() }
-                    } label: {
-                        Label("Move to Trash", systemImage: "trash")
-                    }
-                    Button {
-                        Task { await store.markRead(message, read: !message.seen) }
-                    } label: {
-                        Label(message.seen ? "Mark as Unread" : "Mark as Read",
-                              systemImage: message.seen ? "envelope.badge" : "checkmark")
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                        .foregroundStyle(palette.textSecondary)
-                }
-            }
-        }
-        .toolbar {
-            ToolbarItem(placement: .bottomBar) {
-                HStack {
-                    Spacer()
-                    Button {
-                        showingReply = true
-                    } label: {
-                        Label("Reply", systemImage: "arrowshape.turn.up.left")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(palette.accentBright)
-                    }
-                    Spacer()
-                }
-            }
-        }
+        .toolbar { toolbarContent }
+        .safeAreaInset(edge: .bottom, spacing: 0) { quickReplyBar }
         .sheet(isPresented: $showingReply) {
             MacComposeView(replyTo: message)
         }
-        .task { await load() }
+        .task { await open() }
     }
 
     // MARK: - Header
@@ -131,6 +100,19 @@ struct MacMessageDetailView: View {
                             .foregroundStyle(palette.textFaint)
                     }
                 }
+
+                Spacer(minLength: 0)
+
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text(dateLabel)
+                        .font(.system(size: 12))
+                        .foregroundStyle(palette.textFaint)
+                    if isFlagged {
+                        Image(systemName: "star.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(palette.accent)
+                    }
+                }
             }
 
             Divider().overlay(palette.surfaceBorder.opacity(0.6))
@@ -140,12 +122,9 @@ struct MacMessageDetailView: View {
                 .foregroundStyle(palette.textPrimary)
 
             HStack(spacing: 6) {
-                Text("\(message.displayName) <\(message.fromAddress)>")
+                Text(message.fromAddress.isEmpty ? message.displayName : message.fromAddress)
                     .lineLimit(1)
                 Spacer(minLength: 8)
-                Text(dateLabel)
-                    .font(.system(size: 12))
-                    .foregroundStyle(palette.textFaint)
             }
             .font(.system(size: 12))
             .foregroundStyle(palette.textSecondary)
@@ -167,6 +146,47 @@ struct MacMessageDetailView: View {
             .background(palette.accent.opacity(0.18))
             .clipShape(Circle())
             .overlay(Circle().strokeBorder(palette.surfaceBorder, lineWidth: 1))
+    }
+
+    // MARK: - AI classification row
+
+    private func classificationCard(_ classification: MailClassificationPayload) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(palette.accentBright)
+                if let chip = classification.chipKind.text {
+                    Text(chip)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(classification.chipKind == .needsReply ? palette.accentBright : palette.textPrimary)
+                }
+                if !classification.tone.isEmpty {
+                    Text(classification.tone)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(palette.textSecondary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(palette.surfaceBorder.opacity(0.6))
+                        .clipShape(Capsule())
+                }
+                Spacer(minLength: 0)
+            }
+
+            if !classification.summary.isEmpty {
+                Text(classification.summary)
+                    .font(.system(size: 13))
+                    .foregroundStyle(palette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(palette.accent.opacity(0.10))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(palette.surfaceBorder, lineWidth: 1))
     }
 
     // MARK: - Body
@@ -287,7 +307,7 @@ struct MacMessageDetailView: View {
                 .foregroundStyle(palette.textPrimary)
             Button("Try again") {
                 loadFailed = false
-                Task { await load() }
+                Task { await open() }
             }
             .font(.system(size: 14, weight: .semibold))
             .foregroundStyle(palette.accentBright)
@@ -298,15 +318,110 @@ struct MacMessageDetailView: View {
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
-    // MARK: - Actions
+    // MARK: - Quick reply
 
-    private func load() async {
-        guard detail == nil, !loadFailed else { return }
-        if let fetched = await store.messageDetail(for: message) {
-            detail = fetched
-        } else {
-            loadFailed = true
+    private var quickReplyBar: some View {
+        HStack(spacing: 10) {
+            Text(message.initials)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(palette.accentBright)
+                .frame(width: 28, height: 28)
+                .background(palette.accent.opacity(0.18))
+                .clipShape(Circle())
+
+            Button {
+                showingReply = true
+            } label: {
+                Text("Reply…")
+                    .font(.system(size: 15))
+                    .foregroundStyle(palette.textSecondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .background(palette.surface.opacity(0.7))
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(palette.surfaceBorder, lineWidth: 1))
+            }
+            .buttonStyle(.plain)
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(palette.backgroundTop)
+        .overlay(alignment: .top) {
+            Divider().overlay(palette.surfaceBorder)
+        }
+    }
+
+    // MARK: - Toolbar
+
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Button {
+                Task { await toggleFlag() }
+            } label: {
+                Image(systemName: isFlagged ? "star.fill" : "star")
+                    .foregroundStyle(isFlagged ? palette.accent : palette.textSecondary)
+            }
+            .accessibilityLabel(isFlagged ? "Unflag" : "Flag")
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+            Menu {
+                Button {
+                    Task { await archive() }
+                } label: {
+                    Label("Archive", systemImage: "archivebox")
+                }
+                Button(role: .destructive) {
+                    Task { await trash() }
+                } label: {
+                    Label("Move to Trash", systemImage: "trash")
+                }
+                Button {
+                    Task { await store.markRead(message, read: !message.seen) }
+                } label: {
+                    Label(message.seen ? "Mark as Unread" : "Mark as Read",
+                          systemImage: message.seen ? "envelope.badge" : "checkmark")
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .foregroundStyle(palette.textSecondary)
+            }
+        }
+    }
+
+    // MARK: - Loading
+
+    private func open() async {
+        do {
+            if let fetched = await store.messageDetail(for: message) {
+                detail = fetched
+                loadFailed = false
+            } else {
+                loadFailed = true
+            }
+        }
+
+        // The AI layer loads after the body renders — the model reads on the
+        // Mac, so the reader shows the message first and lets the panel fill in.
+        await loadAI()
+
+        if !message.seen {
+            await store.markRead(message, read: true)
+        }
+    }
+
+    /// Summary and classification for one message can run in parallel (each is
+    /// keyed separately in the store's in-flight set). Both degrade to nil
+    /// when the Mac's session is busy — the panel simply doesn't appear.
+    private func loadAI() async {
+        async let classificationTask = store.classify(message)
+        async let summaryTask = store.summarize(message)
+        let (classificationResult, summaryResult) = await (classificationTask, summaryTask)
+        classification = classificationResult
+        summary = summaryResult
     }
 
     private func toggleFlag() async {

@@ -16,6 +16,9 @@ struct MacComposeView: View {
 
     /// Nil = new message; set = reply to this message.
     private let replyTo: MacMailMessage?
+    /// An AI-drafted reply to pre-fill (subject + body), still fully editable
+    /// — the copilot proposes, the owner disposes.
+    private let draft: MailDraftPayload?
 
     private var store: MacMailStore { .shared }
 
@@ -27,10 +30,12 @@ struct MacComposeView: View {
     @State private var messageBody = ""
     @State private var accountID = ""
     @State private var isSending = false
+    @State private var isSaving = false
     @State private var error: String?
 
-    init(replyTo: MacMailMessage? = nil) {
+    init(replyTo: MacMailMessage? = nil, draft: MailDraftPayload? = nil) {
         self.replyTo = replyTo
+        self.draft = draft
     }
 
     var body: some View {
@@ -98,6 +103,20 @@ struct MacComposeView: View {
                     Button("Cancel") { dismiss() }
                         .foregroundStyle(palette.textSecondary)
                 }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        Task { await saveDraft() }
+                    } label: {
+                        if isSaving {
+                            ProgressView()
+                        } else {
+                            Text("Save Draft")
+                                .foregroundStyle(palette.textSecondary)
+                        }
+                    }
+                    .disabled(isSaving || isSending
+                              || to.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     if isSending {
                         ProgressView()
@@ -139,6 +158,13 @@ struct MacComposeView: View {
         } else {
             accountID = store.accounts.first?.id ?? ""
         }
+
+        // An AI draft wins over the mechanical Re: subject and empty body —
+        // still editable, just pre-filled by the copilot.
+        if let draft {
+            if !draft.subject.isEmpty { subject = draft.subject }
+            messageBody = draft.body
+        }
     }
 
     private func send() async {
@@ -157,6 +183,24 @@ struct MacComposeView: View {
                     body: messageBody,
                     accountID: accountID)
             }
+            dismiss()
+        } catch {
+            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    /// Save to the account's Drafts mailbox instead of sending.
+    private func saveDraft() async {
+        guard !isSaving else { return }
+        isSaving = true
+        defer { isSaving = false }
+        do {
+            try await store.saveDraft(
+                to: to.trimmingCharacters(in: .whitespaces),
+                cc: cc.trimmingCharacters(in: .whitespaces).isEmpty ? nil : cc,
+                subject: subject,
+                body: messageBody,
+                accountID: accountID)
             dismiss()
         } catch {
             self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

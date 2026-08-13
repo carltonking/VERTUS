@@ -128,10 +128,29 @@ struct SettingsView: View {
                     } header: {
                         Text("Mac address (direct link)")
                     } footer: {
-                        Text("The live link to your Mac — streaming chat, briefings and updates without a cloud relay. Left blank, Alfred finds the Mac automatically over mDNS or Tailscale; type an address here to pin it. Leave the port empty for the default (\(AlfredWebSocketClient.defaultPort)).")
+                        Text("The live link to your Mac — streaming chat, briefings and updates without a cloud relay. Left blank, Alfred finds the Mac automatically over mDNS or Tailscale. If you pin an address, prefer the Mac's name (alfred.local, or its Tailscale name) over its IP — iOS blocks plain ws:// connections to IP addresses, and Alfred resolves an IP pin to the Mac's name automatically. The link is plain ws:// (the Mac's server has no TLS), so a pasted wss:// address is downgraded. Leave the port empty for the default (\(AlfredWebSocketClient.defaultPort)).")
                     }
 
                     connectionSection
+
+                    Section {
+                        NavigationLink {
+                            EmailSettingsView()
+                        } label: {
+                            HStack {
+                                Label("Email", systemImage: "envelope.fill")
+                                    .foregroundStyle(palette.textPrimary)
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(palette.textFaint)
+                            }
+                        }
+                    } header: {
+                        Text("Mail preferences")
+                    } footer: {
+                        Text("Scan frequency, drafting tone, signature, and learning — shared with the Mac over the live link.")
+                    }
 
                     Section {
                         capability("Answer questions", available: true)
@@ -259,9 +278,14 @@ struct SettingsView: View {
         let host = url?.host ?? "alfred.local"
         let port = url?.port ?? settings.socketPort
         Task {
-            let ok = await TailscaleConnection().validateConnection(host: host, port: port)
+            // A pinned IP is ATS-blocked for ws://, so resolve the Mac's Bonjour
+            // name first — exactly like the live connection path does.
+            let resolved = await TailscaleConnection().resolveSocketEndpoint(manualHost: host, port: port)
+            let testHost = resolved?.host ?? host
+            let testPort = resolved?.port ?? port
+            let ok = await TailscaleConnection().validateConnection(host: testHost, port: testPort)
             socketTestState = ok
-                ? .passed("Alfred's Mac answered on \(url?.absoluteString ?? "the socket").")
+                ? .passed("Alfred's Mac answered on ws://\(testHost):\(testPort).")
                 : .failed("Nothing answered there. Check the address, make sure the Mac is awake, and that the socket server is running.")
         }
     }

@@ -56,11 +56,21 @@ final class AppSettings {
     /// The `ws://host:port` URL for the live socket, or nil when no host is set.
     /// Tolerates what a person might actually paste: a full `ws://host:port` URL,
     /// a `host:port` shorthand, or a bare hostname (which uses `socketPort`).
+    ///
+    /// Always `ws://`, never `wss://`. The Mac's socket server (BriefingSocketServer)
+    /// is plain TCP — `NWParameters(tls: nil)` — so it has no certificate to present,
+    /// and a `wss://` URL dies at the TLS handshake no matter what the client's trust
+    /// delegate allows. A pasted `wss://` is downgraded here instead. Nothing is
+    /// lost: the phone and Mac talk over an encrypted tailnet (or a trusted LAN),
+    /// so the plain scheme rides on top of an already-secure link.
     var socketURL: URL? {
         var raw = socketHost.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else { return nil }
-        if raw.hasPrefix("ws://") || raw.hasPrefix("wss://") {
+        if raw.hasPrefix("ws://") {
             return URL(string: raw)
+        }
+        if raw.hasPrefix("wss://") {
+            raw = String(raw.dropFirst("wss://".count))
         }
         var port = socketPort
         if let colon = raw.lastIndex(of: ":"), colon > raw.startIndex {

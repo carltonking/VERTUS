@@ -262,21 +262,33 @@ final class MailManager {
     // MARK: - Inbox & search
 
     /// The cached inbox, newest first. `accountID` nil = the unified inbox.
+    ///
+    /// The folder sweep (MailScanService) caches Junk/Archive/Sent envelopes
+    /// in the same table, so the inbox only shows mailboxes that role-map to
+    /// "inbox" — otherwise the unified list would leak spam and drafts.
     func inbox(accountID: String?, limit: Int = 100) -> [MailMessage] {
         guard let db = try? Self.openDB() else { return [] }
         defer { sqlite3_close(db) }
 
         var sql = """
-            SELECT account, mailbox, uid, from_name, from_address, subject, date,
-                   snippet, seen, flagged, has_attachments
-            FROM mail_messages
+            SELECT m.account, m.mailbox, m.uid, m.from_name, m.from_address, m.subject,
+                   m.date, m.snippet, m.seen, m.flagged, m.has_attachments
+            FROM mail_messages m
             """
         var args: [Bind] = []
+        var clauses: [String] = []
+        if Self.hasFolderRows(db) {
+            clauses.append("""
+                EXISTS (SELECT 1 FROM mail_folders f
+                        WHERE f.account = m.account AND f.id = m.mailbox AND f.role = 'inbox')
+                """)
+        }
         if let accountID, !accountID.isEmpty {
-            sql += " WHERE account = ?"
+            clauses.append("m.account = ?")
             args.append(.text(accountID))
         }
-        sql += " ORDER BY date DESC LIMIT ?"
+        if !clauses.isEmpty { sql += " WHERE " + clauses.joined(separator: " AND ") }
+        sql += " ORDER BY m.date DESC LIMIT ?"
         args.append(.int(limit))
 
         var rows: [MailMessage] = []
@@ -292,7 +304,9 @@ final class MailManager {
 
     /// LIKE search across the cached inbox — subject, sender, and snippet.
     /// Instant (the cache is a few hundred rows) and good enough that FTS on a
-    /// local envelope cache would be over-engineering.
+    /// local envelope cache would be over-engineering. Restricted to inbox
+    /// mailboxes like `inbox` — the sweep's Junk/Archive rows are reachable
+    /// through `folderMessages`, not through search.
     func search(query: String, accountID: String?, limit: Int = 100) -> [MailMessage] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return inbox(accountID: accountID, limit: limit) }
@@ -304,18 +318,24 @@ final class MailManager {
             .replacingOccurrences(of: "_", with: "\\_") + "%"
 
         var sql = """
-            SELECT account, mailbox, uid, from_name, from_address, subject, date,
-                   snippet, seen, flagged, has_attachments
-            FROM mail_messages
-            WHERE (subject LIKE ? ESCAPE '\\' OR snippet LIKE ? ESCAPE '\\'
-                   OR from_name LIKE ? ESCAPE '\\' OR from_address LIKE ? ESCAPE '\\')
+            SELECT m.account, m.mailbox, m.uid, m.from_name, m.from_address, m.subject,
+                   m.date, m.snippet, m.seen, m.flagged, m.has_attachments
+            FROM mail_messages m
+            WHERE (m.subject LIKE ? ESCAPE '\\' OR m.snippet LIKE ? ESCAPE '\\'
+                   OR m.from_name LIKE ? ESCAPE '\\' OR m.from_address LIKE ? ESCAPE '\\')
             """
         var args: [Bind] = [.text(like), .text(like), .text(like), .text(like)]
+        if Self.hasFolderRows(db) {
+            sql += """
+                 AND EXISTS (SELECT 1 FROM mail_folders f
+                             WHERE f.account = m.account AND f.id = m.mailbox AND f.role = 'inbox')
+                """
+        }
         if let accountID, !accountID.isEmpty {
-            sql += " AND account = ?"
+            sql += " AND m.account = ?"
             args.append(.text(accountID))
         }
-        sql += " ORDER BY date DESC LIMIT ?"
+        sql += " ORDER BY m.date DESC LIMIT ?"
         args.append(.int(limit))
 
         var rows: [MailMessage] = []
@@ -329,10 +349,94 @@ final class MailManager {
         return rows
     }
 
-    /// One cached envelope, by the (account, mailbox, uid) triple.
+    /// One cached envelope, by the (account, mailbox, uid) triple — in any
+    /// folder, not just the inbox (the reader opens Junk/Archive messages too).
     func message(account: String, mailbox: String, uid: String) -> MailMessage? {
-        inbox(accountID: account, limit: 1000).first {
-            $0.account == account && $0.mailbox == mailbox && $0.uid == uid
+        folderMessages(accountID: account, mailbox: mailbox, limit: 1000)
+            .first { $0.uid == uid }
+    }
+
+    // MARK: - Folder messages (the sweep's cache)
+
+    /// Messages cached for one folder (nil mailbox = every cached folder),
+    /// newest first. This is what the phone's "By Folder" view reads.
+    func folderMessages(accountID: String?, mailbox: String?, limit: Int = 100) -> [MailMessage] {
+        guard let db = try? Self.openDB() else { return [] }
+        defer { sqlite3_close(db) }
+
+        var sql = """
+            SELECT account, mailbox, uid, from_name, from_address, subject, date,
+                   snippet, seen, flagged, has_attachments
+            FROM mail_messages
+            """
+        var clauses: [String] = []
+        var args: [Bind] = []
+        if let accountID, !accountID.isEmpty {
+            clauses.append("account = ?")
+            args.append(.text(accountID))
+        }
+        if let mailbox, !mailbox.isEmpty {
+            clauses.append("mailbox = ?")
+            args.append(.text(mailbox))
+        }
+        if !clauses.isEmpty { sql += " WHERE " + clauses.joined(separator: " AND ") }
+        sql += " ORDER BY date DESC LIMIT ?"
+        args.append(.int(limit))
+
+        var rows: [MailMessage] = []
+        try? Self.queryRows(db, sql: sql, args: args) { stmt in
+            rows.append(Self.message(stmt))
+        }
+        return rows
+    }
+
+    /// Upsert envelopes from any folder into the shared cache. Nonisolated so
+    /// the folder sweep can write from its detached fetch task — the write only
+    /// touches its own per-call FULLMUTEX connection, never the MainActor
+    /// singleton.
+    nonisolated static func cacheFolderEnvelopes(account: String, mailbox: String,
+                                                 envelopes: [EmailCapability.MailEnvelope]) {
+        try? replaceMessages(account: account, mailbox: mailbox, envelopes: envelopes)
+    }
+
+    /// True once any folder metadata is cached — guards the inbox EXISTS filter
+    /// against a folder list that never populated (fresh install, failed sync).
+    nonisolated private static func hasFolderRows(_ db: OpaquePointer) -> Bool {
+        var count = 0
+        try? queryRows(db, sql: "SELECT COUNT(*) FROM mail_folders") { stmt in
+            count = intColumn(stmt, 0)
+        }
+        return count > 0
+    }
+
+    // MARK: - Actions
+
+    /// Move a message to an explicit destination mailbox.
+    func moveToFolder(account: String, mailbox: String, uid: String, destination: String) async throws {
+        try await detachedHimalaya {
+            try EmailCapability.shared.moveMessage(
+                account: account, fromMailbox: mailbox, toMailbox: destination, messageID: uid)
+        }
+        Self.deleteMessage(account: account, mailbox: mailbox, uid: uid)
+    }
+
+    /// Move a message back to the account's inbox — the one-tap rescue for
+    /// "important email found in Junk".
+    func moveToInbox(account: String, mailbox: String, uid: String) async throws {
+        let folderList = await folders(accountID: account)
+        let inboxID = Self.inboxFolderID(in: folderList) ?? "Inbox"
+        try await moveToFolder(account: account, mailbox: mailbox, uid: uid, destination: inboxID)
+    }
+
+    /// Save a new message as a draft without sending.
+    func saveDraft(to: String, cc: String?, subject: String, body: String,
+                   accountID: String, inReplyTo: String?) async throws {
+        let account = accounts.first { $0.id == accountID } ?? accounts.first
+        guard let account else { throw MailError.noAccount }
+        try await detachedHimalaya {
+            _ = try EmailCapability.shared.saveDraft(
+                to: to, cc: cc, subject: subject, body: body,
+                inReplyTo: inReplyTo, account: account.id)
         }
     }
 
@@ -819,7 +923,7 @@ final class MailManager {
                     .double(env.date?.timeIntervalSince1970 ?? 0),
                     .text(String((env.subject ?? "").prefix(120))),
                     .int(env.isUnread ? 0 : 1),
-                    .int(0),   // envelope list carries no flagged state
+                    .int(env.isFlagged ? 1 : 0),
                     .int(0),
                 ])
         }
@@ -859,6 +963,12 @@ final class MailManager {
         try? exec(db, sql: """
             DELETE FROM mail_messages WHERE account = ? AND mailbox = ? AND uid = ?
             """, args: [.text(account), .text(mailbox), .text(uid)])
+    }
+
+    /// Public nonisolated twin of `deleteMessage`, for callers outside the
+    /// manager (the bar's email_move tool) running in detached contexts.
+    nonisolated static func purgeCachedMessage(account: String, mailbox: String, uid: String) {
+        deleteMessage(account: account, mailbox: mailbox, uid: uid)
     }
 
     /// Unread total for one account from the cached folder counts.

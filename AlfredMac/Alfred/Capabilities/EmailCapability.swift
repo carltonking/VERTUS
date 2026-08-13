@@ -69,6 +69,7 @@ struct EmailCapability: Sendable {
         let subject: String?
         let date: Date?
         let isUnread: Bool
+        let isFlagged: Bool
     }
 
     /// The most recent messages in a mailbox, as structured envelopes. Cheaper
@@ -92,7 +93,8 @@ struct EmailCapability: Sendable {
                 fromEmail: env.from?.first?.email ?? "?",
                 subject: env.subject,
                 date: env.date.flatMap { date.date(from: $0) },
-                isUnread: !env.flags.contains { $0.raw.lowercased().contains("seen") }
+                isUnread: !env.flags.contains { $0.raw.lowercased().contains("seen") },
+                isFlagged: env.flags.contains { $0.raw.lowercased().contains("flagged") }
             )
         }
     }
@@ -349,6 +351,16 @@ struct EmailCapability: Sendable {
         let raw = rawMessage(to: to, cc: cc, subject: subject, body: body, inReplyTo: inReplyTo)
         _ = try run(["--account", account, "message", "send", "--save", "sent"], stdin: raw)
         return "Message sent to \(to)."
+    }
+
+    /// Save a plain-text message to the account's Drafts mailbox without
+    /// sending it (himalaya's `message send --save drafts`). Same RFC 5322
+    /// builder as send — the only difference is the save target.
+    func saveDraft(to: String, cc: String?, subject: String, body: String,
+                   inReplyTo: String?, account: String) throws -> String {
+        let raw = rawMessage(to: to, cc: cc, subject: subject, body: body, inReplyTo: inReplyTo)
+        _ = try run(["--account", account, "message", "send", "--save", "drafts"], stdin: raw)
+        return "Draft saved to the \(account) Drafts mailbox."
     }
 
     /// Build an RFC 5322 message himalaya's `message send` can forward on

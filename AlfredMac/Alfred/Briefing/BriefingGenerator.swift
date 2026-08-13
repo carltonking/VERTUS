@@ -187,6 +187,9 @@ final class BriefingGenerator {
         var reminders: [(id: String, title: String, due: Date?)]
         var unreadMail: Int
         var importantSenders: [String]
+        /// The folder sweep's findings worth naming: important mail in Junk,
+        /// flagged follow-ups, professor sends. Rendered as an inbox summary.
+        var mailHighlights: [String]
         var people: [(name: String, role: String?)]
         var habitLine: String?
         var weather: String?
@@ -240,6 +243,19 @@ final class BriefingGenerator {
                 || sender.range(of: $0, options: .caseInsensitive) != nil }
         }
 
+        // The folder sweep's findings — important mail hiding in Junk, flagged
+        // follow-ups — so the briefing can point at what the inbox alone hides.
+        var mailHighlights: [String] = []
+        let scan = MailScanService.persistedSummary()
+        for item in scan.spamMiss.prefix(2) {
+            let who = item.fromName.isEmpty ? item.fromAddress : item.fromName
+            let confidence = Int((item.confidence * 100).rounded())
+            mailHighlights.append("\(who): \(item.subject) is in Junk (\(confidence)% important)")
+        }
+        if scan.flaggedTotal > 0 {
+            mailHighlights.append("\(scan.flaggedTotal) flagged message(s) for follow-up")
+        }
+
         // People worth naming in the summary. The unified graph's person
         // entities carry their best-known detail (role-ish context) in
         // `detail`.
@@ -265,6 +281,7 @@ final class BriefingGenerator {
             reminders: reminders,
             unreadMail: unreadMail,
             importantSenders: importantSenders,
+            mailHighlights: mailHighlights,
             people: people,
             habitLine: habitLine,
             weather: weather,
@@ -436,6 +453,9 @@ final class BriefingGenerator {
         if !context.importantSenders.isEmpty {
             lines.append("Important senders: \(context.importantSenders.joined(separator: ", ")).")
         }
+        if !context.mailHighlights.isEmpty {
+            lines.append("Mail highlights: \(context.mailHighlights.joined(separator: "; ")).")
+        }
         if !context.people.isEmpty {
             let peopleLine = context.people.map { person in
                 person.role.map { "\(person.name) (\($0))" } ?? person.name
@@ -480,6 +500,10 @@ final class BriefingGenerator {
             } else {
                 sentences.append("You have \(context.unreadMail) unread messages, including one from \(context.importantSenders.joined(separator: " and ")).")
             }
+        }
+
+        if !context.mailHighlights.isEmpty {
+            sentences.append(context.mailHighlights.joined(separator: " "))
         }
 
         if let habitLine = context.habitLine {

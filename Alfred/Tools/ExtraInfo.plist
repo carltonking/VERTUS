@@ -6,6 +6,19 @@
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
+		<!--
+		    The live socket to the Mac is plain ws:// (the Mac's BriefingSocketServer
+		    has no TLS — the tailnet/LAN is the encryption). NSAllowsLocalNetworking
+		    is what makes the hostname form (alfred.local, unqualified MagicDNS
+		    names) ATS-legal. Note: ATS on current iOS still blocks ws:// to bare
+		    IP literals even with the blanket exception below — that is why the
+		    client resolves an IP pin to the Mac's Bonjour name before connecting.
+		    NSAllowsArbitraryLoads is kept as belt-and-braces for OS versions that
+		    honour it for WebSocket; it changes nothing for the app's HTTPS relay
+		    traffic, which still negotiates TLS.
+		-->
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Alfred looks for your Mac on this network (and your Tailscale tailnet) so you can talk to it directly, without a cloud relay.</string>

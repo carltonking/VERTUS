@@ -178,6 +178,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mailWatcher.hermes = hermes
         mailWatcher.start()
 
+        // Mail copilot: the same session powers classification, summaries,
+        // task extraction, draft replies and natural-language search for the
+        // phone's mail tab. Runs behind MailWatcher's own turns, never across
+        // a conversation (MailAIService checks isTurnActive first).
+        MailAIService.shared.hermes = hermes
+
         AgentCompletionWatcher.shared.start()
 
         // Daily briefing: generate on the hour, serve it to phones over the
@@ -243,6 +249,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "mail.unread_count_changed", params: BriefingSocketServer.mailUnreadParams(unread))
         }
         MailManager.shared.start()
+
+        // Folder sweep (MailScanService): the configurable timer that checks
+        // every folder — Inbox, Junk, Archive, Sent, custom — for mail that
+        // matters, classifies it, and pushes the scan summary to phones
+        // (`mail.scan_complete`). Notifications for "important email in Junk"
+        // are the sweep's own (MailWatcher keeps new-inbox triage).
+        MailScanService.shared.onScanCompleted = { summary in
+            BriefingSocketServer.shared.broadcastMail(
+                "mail.scan_complete",
+                params: BriefingSocketServer.mailScanSummaryWire(summary))
+        }
+        MailScanService.shared.start()
 
         startRelayIfConfigured()
 

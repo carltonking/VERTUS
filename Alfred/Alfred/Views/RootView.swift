@@ -74,21 +74,21 @@ struct RootView: View {
         .task {
             // Once the app has a server configured, offer leave-now push reminders.
             // No-op afterward: the check is idempotent.
-            guard settings.isConfigured else { return }
+            guard settings.isConfigured || !settings.socketHost.isEmpty else { return }
             await PushRegistration.shared.request()
         }
         .task {
             // The live link: connect to the Mac's socket once configured. Discovery
             // is bounded and the client reconnects on its own, so this never blocks
             // the UI and never needs to be called again.
-            guard settings.isConfigured else { return }
+            guard settings.isConfigured || !settings.socketHost.isEmpty else { return }
             await AlfredWebSocketClient.shared.connectToAlfred()
         }
         .task {
             // Mail pushes (sync completions, unread changes) drive the Email tab
             // badge. The store starts consuming them once configured — before the
             // Email tab is ever opened — so new mail lands on the badge.
-            guard settings.isConfigured else { return }
+            guard settings.isConfigured || !settings.socketHost.isEmpty else { return }
             MacMailStore.shared.start()
         }
     }
