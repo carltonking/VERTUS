@@ -27,6 +27,18 @@ struct BriefingContent: Codable, Equatable {
     var generatedAt: TimeInterval
     var nextUpdateAt: TimeInterval
     var focusedDay: String
+    /// The self-optimization card ("Alfred Improvement"). Optional so an old
+    /// persisted briefing without the key still decodes, and nil while the
+    /// loop has nothing to report yet.
+    var improvement: ImprovementCard?
+    /// The Personal Tutor's "Weak Concepts" card. Optional so an old
+    /// persisted briefing without the key still decodes, and nil while the
+    /// tutor has nothing to report yet.
+    var tutoring: TutorCard?
+    /// The Study Routines card (exam prep readiness, problem sets, due
+    /// readings, weekly summary). Optional so an old persisted briefing
+    /// without the key still decodes, and nil while nothing is active.
+    var study: StudyBriefingCard?
 }
 
 /// A fingerprint of the gathered context, persisted so the next run can diff
@@ -167,7 +179,10 @@ final class BriefingGenerator {
             changes: changes,
             generatedAt: now,
             nextUpdateAt: nextUpdateTimeInterval(),
-            focusedDay: effectiveDay)
+            focusedDay: effectiveDay,
+            improvement: DSPyOptimizer.shared.improvementCard(),
+            tutoring: PersonalTutorSkill.shared.tutorCard(),
+            study: StudyRoutineManager.shared.briefingCard())
 
         current = content
         lastSnapshot = context.snapshot
@@ -193,6 +208,25 @@ final class BriefingGenerator {
         var people: [(name: String, role: String?)]
         var habitLine: String?
         var weather: String?
+        /// The job-hunt state worth naming — a sentence about the application
+        /// tracker ("4 applications, 1 interview — 2 follow-ups due"). Nil
+        /// while the tracker is empty, so an inactive job hunt never clogs the
+        /// briefing.
+        var jobsLine: String?
+        /// The MemPalace goals worth naming ("Exercise (weekly, streak 2)").
+        /// Nil while no goal has a streak yet, so an empty goal list never
+        /// clogs the briefing.
+        var memoryLine: String?
+        /// The NYU coursework worth naming ("3 assignments due this week…").
+        /// Nil while the semester is quiet, so an unconfigured or empty NYU
+        /// integration never clogs the briefing.
+        var assignmentsLine: String?
+        /// The NYU grades worth naming ("Current grades: Calculus 92.5…"). Nil
+        /// until the first graded course exists.
+        var gradesLine: String?
+        /// The study routines' compact state ("Calculus 85% ready; 1 problem
+        /// set in progress; 2 readings due"). Nil when nothing is active.
+        var studyLine: String?
         var snapshot: BriefingSnapshot
     }
 
@@ -276,6 +310,32 @@ final class BriefingGenerator {
             weather = await weatherProvider()
         }
 
+        // Jobs: the application tracker, when it has anything to say. The
+        // manager is main-actor; this generator runs on a generic executor, so
+        // the read hops across.
+        var jobsLine: String?
+        let summary = await MainActor.run { CareerOpsManager.shared.summary() }
+        if summary.applied > 0 {
+            jobsLine = summary.line
+        }
+
+        // Goals & learning: MemPalace streaks, when any goal is being kept.
+        var memoryLine: String?
+        let goals = MemPalaceManager.shared.goalsLine()
+        if !goals.isEmpty {
+            memoryLine = goals
+        }
+
+        // NYU coursework: assignment deadlines + current grades, when the
+        // integration is configured and has anything to say.
+        let nyu = await MainActor.run {
+            (assignments: NYUIntegrationManager.shared.assignmentsLine(),
+             grades: NYUIntegrationManager.shared.gradesLine())
+        }
+
+        // Study routines: exam prep readiness, problem sets, due readings.
+        let studyLine = StudyRoutineManager.shared.briefingLine()
+
         return Context(
             events: events,
             reminders: reminders,
@@ -285,6 +345,11 @@ final class BriefingGenerator {
             people: people,
             habitLine: habitLine,
             weather: weather,
+            jobsLine: jobsLine,
+            memoryLine: memoryLine,
+            assignmentsLine: nyu.assignments,
+            gradesLine: nyu.grades,
+            studyLine: studyLine,
             snapshot: BriefingSnapshot(
                 eventIDs: Set(events.map(\.id)),
                 eventTitles: Dictionary(events.map { ($0.id, $0.title) },
@@ -393,6 +458,8 @@ final class BriefingGenerator {
         calendar events, reminders, unread mail, people, and habits below. Always \
         end with one encouraging send-off sentence.
 
+        \(TasteSkillManager.shared.generationGuidance(scope: .briefing))
+
         Respond with EXACTLY ONE JSON object, nothing else, no markdown fences:
         {"summary": "your full briefing as one string"}
 
@@ -465,6 +532,21 @@ final class BriefingGenerator {
         if let habitLine = context.habitLine {
             lines.append("Habit: \(habitLine)")
         }
+        if let jobsLine = context.jobsLine {
+            lines.append("Job hunt: \(jobsLine)")
+        }
+        if let memoryLine = context.memoryLine {
+            lines.append("Goals & learning: \(memoryLine)")
+        }
+        if let assignmentsLine = context.assignmentsLine {
+            lines.append("Coursework: \(assignmentsLine)")
+        }
+        if let gradesLine = context.gradesLine {
+            lines.append("Grades: \(gradesLine)")
+        }
+        if let studyLine = context.studyLine {
+            lines.append("Study: \(studyLine)")
+        }
         if !changes.isEmpty {
             lines.append("Changed since the last briefing: \(changes.map(\.title).joined(separator: "; ")).")
         }
@@ -508,6 +590,26 @@ final class BriefingGenerator {
 
         if let habitLine = context.habitLine {
             sentences.append(habitLine)
+        }
+
+        if let jobsLine = context.jobsLine {
+            sentences.append("Job hunt: \(jobsLine)")
+        }
+
+        if let memoryLine = context.memoryLine {
+            sentences.append("Goals & learning: \(memoryLine)")
+        }
+
+        if let assignmentsLine = context.assignmentsLine {
+            sentences.append("Coursework: \(assignmentsLine)")
+        }
+
+        if let gradesLine = context.gradesLine {
+            sentences.append("Grades: \(gradesLine)")
+        }
+
+        if let studyLine = context.studyLine {
+            sentences.append("Study: \(studyLine)")
         }
 
         sentences.append("Enjoy your day.")

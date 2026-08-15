@@ -179,16 +179,80 @@ final class AlfredCodeManager {
         sessions.insert(session, at: 0)
         save()
 
+        // Graph first, agent after: indexing runs in the background (see
+        // ensureCodeGraphIndexed) so the session starts immediately, but the
+        // MCP entry + context below reflect whatever is already indexed.
+        ensureCodeGraphIndexed(projectPath: expanded)
+        // Understand-Anything (the interactive knowledge graph) rides the same
+        // hook when its analyze-on-load setting is on — see
+        // ensureUnderstandAnalyzed. Remember the project for routines that
+        // generate docs / onboarding tours against "the current project".
+        UserDefaults.standard.set(expanded, forKey: "alfred.lastCodeProjectPath")
+        ensureUnderstandAnalyzed(projectPath: expanded)
         // The agent is created lazily per session so multiple sessions can run
-        // independently and a crash in one never takes the app down.
+        // independently and a crash in one never takes the app down. CodeGraph
+        // rides along per-session: its MCP server serves the .codegraph/ of its
+        // working directory, and this session is spawned with the project as
+        // its cwd — so an entry here lands on the right project. A project that
+        // isn't indexed yet (first session in it) gets no entry; indexing was
+        // kicked off above and the next session picks up the tools.
         let agent = HermesSession(
             engine: engine,
             workingDirectory: expanded,
-            turnDeadline: Self.generationTimeout)
+            turnDeadline: Self.generationTimeout,
+            extraMCPServers: Self.codeGraphMCPServers(for: expanded))
         agents[session.sessionId] = agent
 
         beginGeneration(session.sessionId, prompt: trimmed, agent: agent)
         return session
+    }
+
+    /// Kick off CodeGraph indexing for a project in the background (fire and
+    /// forget — a first index can take 5-30s and must not stall session start).
+    /// The phone learns the outcome through the code.graph_status broadcast;
+    /// the next session in the project then gets the MCP tools + context.
+    /// The indexOnLoad gate lives here — the auto-index on session start is the
+    /// only path it governs; an explicit phone-side code.graph_index request
+    /// always indexes.
+    private func ensureCodeGraphIndexed(projectPath: String) {
+        guard CodeGraphManager.shared.isEnabled,
+              CodeGraphManager.shared.indexOnLoad else { return }
+        Task { @MainActor in
+            _ = await CodeGraphManager.shared.ensureIndexed(projectPath: projectPath)
+        }
+    }
+
+    /// Kick off Understand-Anything analysis in the background when the
+    /// setting is on (fire and forget — the pipeline runs LLM agents, so it's
+    /// opt-in; the code.understand_status broadcast reports the outcome and
+    /// the analysis session shows up in the Code tab).
+    private func ensureUnderstandAnalyzed(projectPath: String) {
+        guard UnderstandAnythingManager.shared.isEnabled,
+              UnderstandAnythingManager.shared.indexOnLoad else { return }
+        Task { @MainActor in
+            let state = await UnderstandAnythingManager.shared.ensureAnalyzed(projectPath: projectPath)
+            guard !state.isReady, !state.isAnalyzing else { return }
+            _ = await UnderstandAnythingManager.shared.analyze(projectPath: projectPath)
+        }
+    }
+
+    /// The most recently used code project — what routines that need a target
+    /// ("Generate visual docs", "Onboarding tour") act on.
+    func lastKnownProjectPath() -> String? {
+        UserDefaults.standard.string(forKey: "alfred.lastCodeProjectPath")
+    }
+
+    /// The per-session MCP entry that gives the coding agent CodeGraph's tools
+    /// (codegraph_explore / codegraph_search / codegraph_callers /
+    /// codegraph_impact), or [] when the graph isn't ready. The server inherits
+    /// the session's cwd — the project — so it serves the right graph.
+    private static func codeGraphMCPServers(for projectPath: String) -> [[String: Any]] {
+        guard CodeGraphManager.shared.isAvailable,
+              let binary = CodeGraphManager.shared.binaryPath,
+              FileManager.default.fileExists(
+                atPath: (projectPath as NSString).appendingPathComponent(".codegraph"))
+        else { return [] }
+        return [["name": "codegraph", "command": binary, "args": ["serve", "--mcp"], "env": []]]
     }
 
     /// Freeze a session's agent process. The agent stays alive (model context
@@ -273,10 +337,33 @@ final class AlfredCodeManager {
             need changing, and run the relevant checks if sensible. Then reply with a \
             concise summary of what you changed and why. If you wrote new code, include \
             the key parts in your reply so the phone can show them.
+
+            \(TasteSkillManager.shared.generationGuidance(scope: .code))
             """
+        // CodeGraph context: if the project has a graph, ask it what the task
+        // involves and hand the agent a bounded copy before it starts exploring
+        // — the "don't read the whole repo to find the auth module" win. Deep
+        // follow-up queries go through the codegraph MCP tools instead.
+        let systemWithGraph: String
+        if let projectPath = session(id: id)?.projectPath,
+           let graphContext = await CodeGraphManager.shared.context(for: prompt, projectPath: projectPath) {
+            systemWithGraph = """
+                \(system)
+
+                The project is indexed by CodeGraph. The graph's take on this task:
+                \(graphContext)
+
+                Use the codegraph_explore / codegraph_search tools for anything \
+                structural (where symbols live, what calls what) instead of \
+                searching files by hand.
+                """
+        } else {
+            systemWithGraph = system
+        }
+        _ = systemWithGraph
         setStatus(id, .generating)
         var transcript = ""
-        for await event in await agent.prompt(system, capture: false) {
+        for await event in await agent.prompt(systemWithGraph, capture: false) {
             switch event {
             case .text(let chunk):
                 transcript += chunk

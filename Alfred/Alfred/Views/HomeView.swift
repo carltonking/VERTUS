@@ -60,6 +60,13 @@ struct HomeView: View {
                         }
                         .padding(.top, 26)
 
+                        if let improvement = socket.latestBriefing?.improvement {
+                            SummaryCard {
+                                improvementCard(improvement)
+                            }
+                            .padding(.top, 16)
+                        }
+
                         SummaryCard {
                             dailyBriefCard
                         }
@@ -69,10 +76,6 @@ struct HomeView: View {
                             todosCard
                         }
                         .padding(.top, 16)
-
-                        if !settings.isConfigured {
-                            connectButton
-                        }
                     }
                     .padding(.bottom, 28)
                 }
@@ -161,6 +164,64 @@ struct HomeView: View {
                 }
             } else {
                 waitingState
+            }
+        }
+    }
+
+    /// The self-optimization card: week-over-week rating trend, per-domain
+    /// scores, and the learned rules now active in Alfred's prompts.
+    @ViewBuilder
+    private func improvementCard(_ card: ImprovementCardPayload) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            windowLabel("Alfred Improvement", icon: "chart.line.uptrend.xyaxis")
+
+            let delta = card.weekDelta
+            let deltaLine: String = delta > 0.05
+                ? String(format: "Average rating up %.1f stars ⬆︎", delta)
+                : delta < -0.05
+                    ? String(format: "Average rating down %.1f stars ⬇︎", abs(delta))
+                    : "Average rating holding steady"
+            Text(deltaLine)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(delta >= 0 ? palette.success : palette.danger)
+
+            if !card.perKind.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(card.perKind) { score in
+                        HStack {
+                            Text(score.displayName)
+                                .font(.system(size: 13))
+                                .foregroundStyle(palette.textSecondary)
+                            Spacer()
+                            let starsText: String = score.previous > 0
+                                ? String(format: "%.1f → %.1f stars", score.previous, score.current)
+                                : String(format: "%.1f stars", score.current)
+                            Text(starsText)
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(palette.textPrimary)
+                        }
+                    }
+                }
+            }
+
+            if !card.activeOptimizations.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Active optimizations (\(card.activeOptimizations.count))\(card.activeOptimizations.count > 3 ? ", shown \(3)" : "")")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(palette.textFaint)
+                    ForEach(card.activeOptimizations.prefix(3), id: \.self) { rule in
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "circle.fill")
+                                .font(.system(size: 4))
+                                .foregroundStyle(palette.accentBright)
+                                .padding(.top, 6)
+                            Text(rule)
+                                .font(.system(size: 12))
+                                .foregroundStyle(palette.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
             }
         }
     }
@@ -425,21 +486,6 @@ struct HomeView: View {
         }
     }
 
-    private var connectButton: some View {
-        Button {
-            selection = .settings
-        } label: {
-            Text("Open Settings")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 26)
-                .padding(.vertical, 13)
-                .background(palette.accentGradient)
-                .clipShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .padding(.top, 28)
-    }
 }
 
 // MARK: - Change detail sheet

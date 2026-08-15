@@ -1,0 +1,17 @@
+{
+  "name": "alfred-crawlee-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Crawlee-based web scraping bridge for Alfred. Two faces: a one-shot CLI (JSON request on stdin → JSON result on stdout) for Alfred's own deterministic orchestration (routines), and an MCP stdio server exposing the same engine as tools for Hermes. Local-only, no API keys.",
+  "scripts": {
+    "start": "node crawlee_cli.mjs",
+    "mcp": "node crawlee_mcp_server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "cheerio": "^1.0.0",
+    "crawlee": "^3.13.0",
+    "zod": "^3.24.0"
+  }
+}

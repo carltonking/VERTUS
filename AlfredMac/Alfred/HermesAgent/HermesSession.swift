@@ -111,6 +111,14 @@ enum HermesError: LocalizedError {
     /// wedge upstream (Ollama scheduler races, MCP stdio stalls) without
     /// exiting; the turn watchdog treats this as a recoverable fault.
     case turnTimedOut
+    /// The ACP handshake (initialize / session/new) didn't answer within the
+    /// handshake deadline. Hermes can stall *while starting* — an MCP stdio
+    /// bridge fetching a package over the network, or a wedged capability
+    /// server — and an unbounded handshake would leave the bar on "Working…"
+    /// forever. Distinct from turnTimedOut because the fix is different: the
+    /// session never existed, so there is nothing to recover — the caller
+    /// should surface the stall (and the keepalive retries the spawn).
+    case handshakeTimedOut
     /// Hermes has no `model.provider` set. Expected cold-start state, not a crash.
     case notConfigured(String)
 
@@ -128,6 +136,8 @@ enum HermesError: LocalizedError {
             return "Hermes sent something unexpected: \(m)"
         case .turnTimedOut:
             return "Hermes didn't answer within the turn deadline. The session restarted to recover."
+        case .handshakeTimedOut:
+            return "Hermes didn't finish starting within the handshake deadline — a capability bridge is probably stuck. Alfred will retry."
         case .notConfigured(let m):
             return m
         }
@@ -168,6 +178,14 @@ actor HermesSession {
     /// Permission posture for the opencode engine (ignored for hermes).
     private let posture: OpencodePosture
 
+    /// Extra MCP servers this session alone should carry, merged after the
+    /// global agent-servers.json list. Code sessions use this to inject
+    /// `codegraph serve --mcp`: CodeGraph's server serves the .codegraph/ of
+    /// its working directory, and this session is spawned with the project as
+    /// its cwd — so a per-session entry lands on the right project, while the
+    /// general bar session never sees it.
+    private let extraMCPServers: [[String: Any]]
+
     private let workingDirectory: String
 
     // MARK: Process
@@ -185,6 +203,20 @@ actor HermesSession {
     /// watchdog restarts the session and retries once instead of hanging.
     static let turnDeadline: TimeInterval = 180
 
+    /// Bound for the ACP `initialize` handshake. Hermes spawns every MCP stdio
+    /// bridge in agent-servers.json (odysseus x4, browser-use, agentmemory via
+    /// `npx -y`, openswarm, …) *before* initialize answers, and a cold `npx`
+    /// fetch of a bridge package can take well over a minute — a -1001
+    /// CFNetwork timeout was observed ~90s after launch. 120s keeps a
+    /// healthy-but-cold startup from being misread as a stall while still
+    /// turning a genuinely dead bridge into an honest, recoverable error.
+    static let handshakeDeadline: TimeInterval = 120
+
+    /// Bound for `session/new` once initialize has answered. Nothing slow
+    /// happens after the bridges are up, so this can be tighter than the
+    /// initialize deadline.
+    static let sessionNewDeadline: TimeInterval = 60
+
     /// This session's own deadline. Defaults to `turnDeadline`; the remote code
     /// manager raises it for coding sessions, where a generation can legitimately
     /// run several minutes before the first answer.
@@ -194,6 +226,23 @@ actor HermesSession {
     /// watchdog keeps re-arming instead of firing, so a paused session isn't
     /// killed by its own deadline — it's suspended, not stuck.
     private var isSuspended = false
+
+    /// True once the agent completed its ACP handshake at least once this run.
+    /// Distinguishes "started and died" (keepalive should respawn) from "never
+    /// started" (cloud mode spawns lazily on the first prompt — nothing to keep
+    /// alive yet).
+    private(set) var hasStartedOnce = false
+
+    /// True once a real spawn was attempted (the binary resolved and the
+    /// process was launched, even if the handshake then stalled or failed).
+    /// The keepalive respawns on this, not just on hasStartedOnce: a local-mode
+    /// first spawn can stall on an MCP bridge during the handshake, and without
+    /// this flag that failed first attempt would never be healed by the watch.
+    /// Set *after* resolveLauncher succeeds — a missing binary (binaryNotFound
+    /// / codingAgentUnavailable) never flips it, so the keepalive doesn't
+    /// thrash a hopeless retry every 60s and mask the real "not installed"
+    /// state.
+    private(set) var hasAttemptedStart = false
 
     // MARK: JSON-RPC
 
@@ -219,12 +268,14 @@ actor HermesSession {
          posture: OpencodePosture = .task,
          workingDirectory: String = NSHomeDirectory(),
          autoApprovePermissions: Bool = true,
-         turnDeadline: TimeInterval? = nil) {
+         turnDeadline: TimeInterval? = nil,
+         extraMCPServers: [[String: Any]] = []) {
         self.engine = engine
         self.posture = posture
         self.workingDirectory = workingDirectory
         self.autoApprovePermissions = autoApprovePermissions
         self.turnDeadline = turnDeadline ?? Self.turnDeadline
+        self.extraMCPServers = extraMCPServers
     }
 
     // MARK: - Binary resolution
@@ -749,6 +800,10 @@ actor HermesSession {
 
         process = proc
         stdinPipe = inPipe
+        // A real spawn happened — the handshake may yet stall, and that stalled
+        // first attempt is exactly what the keepalive must be able to heal (see
+        // the property doc). Set the flag only now, after the binary resolved.
+        hasAttemptedStart = true
 
         // The ACP handshake is atomic: if initialize or session/new throws, the
         // process is already spawned but sessionID is still nil. Left alone that
@@ -760,11 +815,20 @@ actor HermesSession {
             // 1. initialize — advertise no filesystem capability; Alfred reaches
             //    the Mac through its own MCP tools (Phase 2), not through ACP's
             //    fs hooks.
+            //
+            // Both handshake calls carry their own deadline: initialize gets
+            // the long one (it waits on every MCP stdio bridge in
+            // ~/.alfred/agent-servers.json — odysseus x4, browser-use,
+            // agentmemory via npx, openswarm, … — and a cold `npx` fetch can
+            // take a while), session/new the tight one. A deadline-less request
+            // would hang the bar on "Working…" forever; the watchdog turns a
+            // stall into a handshakeTimedOut, the spawn is torn down, and the
+            // keepalive retries on the next tick.
             _ = try await request("initialize", [
                 "protocolVersion": 1,
                 "clientCapabilities": ["fs": ["readTextFile": false, "writeTextFile": false]],
                 "clientInfo": ["name": "alfred", "version": Self.appVersion],
-            ])
+            ], timeout: Self.handshakeDeadline)
 
             // 2. session/new, injecting Alfred's macOS tools for this session
             //    only, plus any external capability bridges declared in
@@ -776,12 +840,23 @@ actor HermesSession {
             // this Mac.
             let session = try await request("session/new", [
                 "cwd": workingDirectory,
-                "mcpServers": Self.sessionMCPServers(),
-            ])
+                "mcpServers": Self.sessionMCPServers(extra: extraMCPServers),
+            ], timeout: Self.sessionNewDeadline)
             guard let sid = session["sessionId"] as? String else {
                 throw HermesError.protocolError("session/new returned no sessionId")
             }
             sessionID = sid
+            hasStartedOnce = true
+        } catch HermesError.turnTimedOut {
+            // The watchdog fires turnTimedOut for any deadline, but for the
+            // handshake the meaning is different: the session never existed, so
+            // there is nothing to recover and retrying the same prompt won't
+            // help. Surface it as handshakeTimedOut so the bar says what is
+            // actually wrong (a stuck startup), and the keepalive retries the
+            // spawn itself.
+            NSLog("[hermes] session handshake timed out after \(Int(Self.handshakeDeadline))s — tearing down")
+            shutdown()
+            throw HermesError.handshakeTimedOut
         } catch {
             NSLog("[hermes] session handshake failed — tearing down: %@", error.localizedDescription)
             shutdown()
@@ -832,10 +907,11 @@ actor HermesSession {
     /// Hermes' native backend — ddgs (DuckDuckGo, no key) is enabled in the
     /// config both model modes write, so web_search is available with no extra
     /// process.
-    private static func sessionMCPServers() -> [[String: Any]] {
+    private static func sessionMCPServers(extra: [[String: Any]]) -> [[String: Any]] {
         var servers: [[String: Any]] = []
         if let alfred = alfredMCPServer { servers.append(alfred) }
         servers.append(contentsOf: externalMCPServers())
+        servers.append(contentsOf: extra)
         return servers
     }
 
@@ -879,8 +955,15 @@ actor HermesSession {
     /// (watchdog timeout, lost session): the caller keeps streaming into the same
     /// continuation, so the retried answer still reaches the UI.
     private func teardownProcess() {
-        for (_, cont) in pending { cont.resume(throwing: HermesError.agentExited(0)) }
-        pending.removeAll()
+        // Remove-then-resume, key by key: the turn watchdog runs on the main
+        // thread and also removes-before-resuming, so if a death lands within
+        // milliseconds of the turn deadline the two could otherwise resume the
+        // same continuation twice (a crash). "Removed before resumed" holds
+        // per key regardless of interleaving.
+        for key in Array(pending.keys) {
+            guard let cont = pending.removeValue(forKey: key) else { continue }
+            cont.resume(throwing: HermesError.agentExited(0))
+        }
         stdinPipe?.fileHandleForWriting.closeFile()
         // A paused process ignores SIGTERM until it's continued — un-freeze it
         // first so the teardown actually lands.
@@ -948,16 +1031,57 @@ actor HermesSession {
             || m.contains("session inactive")
     }
 
+    /// True when a turn failure means the session itself is gone and the turn
+    /// should be retried once against a fresh session — the recoverable
+    /// transport/session class: the turn exceeded its deadline, the agent
+    /// process exited (even a clean exit 0 — upstream Ollama/provider faults
+    /// surface that way), the session id went stale, or stdin closed under us
+    /// (same death, caught before the request was written). Prompt-level
+    /// failures (permission, tool errors) are not fixed by a rebuild and must
+    /// surface as-is.
+    static func isRecoverableTurnFailure(_ error: HermesError) -> Bool {
+        switch error {
+        case .turnTimedOut, .agentExited:
+            return true
+        case .protocolError(let message):
+            return sessionLost(message) || message.lowercased().contains("stdin closed")
+        default:
+            return false
+        }
+    }
+
+    /// One-line log label for a recoverable fault (the watchdog, the exit
+    /// code, or the protocol message).
+    static func recoveryLabel(_ error: HermesError) -> String {
+        switch error {
+        case .turnTimedOut: return "turn watchdog: no response (deadline \(Int(HermesSession.turnDeadline))s)"
+        case .agentExited(let code): return "agent exited (code \(code))"
+        case .protocolError(let message): return message
+        default: return "session fault"
+        }
+    }
+
     private func handleTermination(_ status: Int32, processID: Int32) {
         // Only the *current* process's death ends the turn. A rebuild tears the
         // old process down while a fresh one is spawning; the stale handler must
         // not clear the new session or finish its stream.
         guard process?.processIdentifier == processID else { return }
-        eventSink?.yield(.failed(HermesError.agentExited(status).localizedDescription))
-        eventSink?.finish()
-        eventSink = nil
-        for (_, cont) in pending { cont.resume(throwing: HermesError.agentExited(status)) }
-        pending.removeAll()
+        // Resolve the in-flight request (the turn's `session/prompt`) with the
+        // exit — runTurn's recovery catches `.agentExited`, rebuilds the session
+        // and retries the same prompt once, so a transient death (even a clean
+        // exit 0) heals inside the turn instead of failing the user's query.
+        // The stream itself is deliberately NOT finished here: the retried turn
+        // streams into the same continuation, and finishing it would swallow
+        // the recovered answer. If no turn is active there is no sink and no
+        // pending request; the keepalive respawns the process.
+        // Remove-then-resume, key by key — see teardownProcess: the watchdog
+        // removes before resuming, so this must too, or a death that lands at
+        // the same instant as the turn deadline could resume the same
+        // continuation twice (a crash).
+        for key in Array(pending.keys) {
+            guard let cont = pending.removeValue(forKey: key) else { continue }
+            cont.resume(throwing: HermesError.agentExited(status))
+        }
         process = nil
         sessionID = nil
     }
@@ -1029,28 +1153,22 @@ actor HermesSession {
             }
         }
         do {
-            // Prompt with a turn deadline. On timeout, tear down and rebuild
+            // Prompt with a turn deadline. Recoverable session faults — the
+            // deadline passing, the session going stale server-side, or the
+            // agent process itself dying mid-turn (even a clean exit 0: upstream
+            // Ollama/provider faults surface that way) — tear down and rebuild
             // the agent (fresh process, fresh connection pools) and retry the
-            // same prompt once — the common hiatus causes (wedged keepalive
-            // connection, Ollama load stall) clear with a restart.
+            // same prompt once. The common hiatus causes (wedged keepalive
+            // connection, Ollama load stall, a transient process death) all
+            // clear with a restart; prompt-level failures surface as-is.
             let result: [String: Any]
             do {
                 result = try await request("session/prompt", [
                     "sessionId": sid,
                     "prompt": blocks,
                 ], timeout: turnDeadline)
-            } catch HermesError.turnTimedOut {
-                NSLog("[hermes] turn watchdog: no response in \(Int(turnDeadline))s — restarting session and retrying")
-                let freshSID = try await rebuildSession()
-                result = try await request("session/prompt", [
-                    "sessionId": freshSID,
-                    "prompt": blocks,
-                ], timeout: turnDeadline)
-            } catch let HermesError.protocolError(message) where Self.sessionLost(message) {
-                // Hermes dropped or expired the session server-side, so the
-                // prompt came back "no active session". Rebuild and retry the
-                // same prompt once instead of handing the user the raw error.
-                NSLog("[hermes] session lost (\"%@\") — rebuilding and retrying", message)
+            } catch let error as HermesError where Self.isRecoverableTurnFailure(error) {
+                NSLog("[hermes] recoverable session fault — \(Self.recoveryLabel(error)) — rebuilding and retrying once")
                 let freshSID = try await rebuildSession()
                 result = try await request("session/prompt", [
                     "sessionId": freshSID,
@@ -1121,6 +1239,24 @@ actor HermesSession {
         if !habitLine.isEmpty {
             context += context.isEmpty ? "" : "\n\n"
             context += "[habits: \(habitLine)]"
+        }
+        // The self-optimization loop's learned directives for this prompt's
+        // domain (code, email, summary, …). Empty until enough rated outputs
+        // have taught the optimizer a preference, so it never adds noise to a
+        // fresh install.
+        let optimizationLine = DSPyOptimizer.shared.promptInjection(for: text)
+        if !optimizationLine.isEmpty {
+            context += context.isEmpty ? "" : "\n\n"
+            context += optimizationLine
+        }
+        // The MemPalace layer: durable preferences, patterns and constraints
+        // the user confirmed or repeated enough to rise above the confidence
+        // threshold. Every session starts knowing them, so Alfred replies in
+        // line with what it has learned rather than starting from scratch.
+        let rememberedLine = MemPalaceManager.shared.wakeUpContext()
+        if !rememberedLine.isEmpty {
+            context += context.isEmpty ? "" : "\n\n"
+            context += "[remembered: \(rememberedLine)]"
         }
         guard !context.isEmpty else { return text }
         return "\(context)\n\n\(text)"
@@ -1209,7 +1345,12 @@ actor HermesSession {
             func armWatchdog() {
                 DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
                     guard let self, let cont = self.pending.removeValue(forKey: id) else { return }
-                    if self.isSuspended {
+                    // Re-arm only while a *turn* is suspended (eventSink set).
+                    // A paused turn is suspended, not stuck — but a handshake
+                    // request has no sink, so its deadline can never be
+                    // defeated by re-arming even if isSuspended were somehow
+                    // true during startup.
+                    if self.isSuspended, self.eventSink != nil {
                         self.pending[id] = cont
                         armWatchdog()
                         return

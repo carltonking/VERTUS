@@ -14,7 +14,7 @@ import SwiftUI
 /// draft and converts to the payload only on save.
 struct StepDraft: Identifiable {
     enum Kind: String, CaseIterable, Identifiable {
-        case briefing, hermes, shell, mail, reminder
+        case briefing, hermes, shell, mail, reminder, browser, scrape, career, understand, nyu
 
         var id: String { rawValue }
 
@@ -25,6 +25,11 @@ struct StepDraft: Identifiable {
             case .shell: return "Run command"
             case .mail: return "Mail"
             case .reminder: return "Reminder"
+            case .browser: return "Browse web"
+            case .scrape: return "Scrape web"
+            case .career: return "Job hunt"
+            case .understand: return "Knowledge graph"
+            case .nyu: return "NYU coursework"
             }
         }
 
@@ -35,6 +40,11 @@ struct StepDraft: Identifiable {
             case .shell: return "terminal"
             case .mail: return "envelope"
             case .reminder: return "checklist"
+            case .browser: return "globe"
+            case .scrape: return "doc.text.magnifyingglass"
+            case .career: return "briefcase"
+            case .understand: return "point.3.connected.trianglepath.dotted"
+            case .nyu: return "graduationcap.fill"
             }
         }
 
@@ -45,6 +55,11 @@ struct StepDraft: Identifiable {
             case .shell: return "Run a shell command on your Mac"
             case .mail: return "Check unread mail, or summarize the inbox"
             case .reminder: return "Set a reminder due in a little while"
+            case .browser: return "Open a page (or search) and report what it says — read-only, never submits"
+            case .scrape: return "Fetch a page or search results as text — lightweight and read-only, no browser needed"
+            case .career: return "Scan job boards against your profile, or list applications that went quiet — read-only"
+            case .understand: return "Analyze your latest project into a knowledge graph, or report its architecture / onboarding tour"
+            case .nyu: return "List assignments due in the next week (plus overdue), or force a Canvas sync — read-only"
             }
         }
     }
@@ -57,6 +72,13 @@ struct StepDraft: Identifiable {
     var mailAction: String = "check_unread"
     var reminderTitle: String = ""
     var dueIn: TimeInterval = 3600
+    var browserInstruction: String = ""
+    var browserURL: String = ""
+    var scrapeInstruction: String = ""
+    var scrapeURL: String = ""
+    var careerAction: String = "scan"
+    var understandAction: String = "docs"
+    var nyuAction: String = "check_deadlines"
 
     init(kind: Kind = .briefing) {
         self.kind = kind
@@ -80,6 +102,23 @@ struct StepDraft: Identifiable {
             kind = .reminder
             reminderTitle = title
             self.dueIn = dueIn
+        case .browser(let instruction, let url):
+            kind = .browser
+            browserInstruction = instruction
+            browserURL = url ?? ""
+        case .scrape(let instruction, let url):
+            kind = .scrape
+            scrapeInstruction = instruction
+            scrapeURL = url ?? ""
+        case .career(let action):
+            kind = .career
+            careerAction = action
+        case .understand(let action):
+            kind = .understand
+            understandAction = action
+        case .nyu(let action):
+            kind = .nyu
+            nyuAction = action
         }
     }
 
@@ -91,6 +130,20 @@ struct StepDraft: Identifiable {
         case .shell: return .shell(command: command)
         case .mail: return .mail(action: mailAction)
         case .reminder: return .reminder(title: reminderTitle, dueIn: dueIn)
+        case .browser:
+            let url = browserURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .browser(instruction: browserInstruction,
+                            url: url.isEmpty ? nil : url)
+        case .scrape:
+            let url = scrapeURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .scrape(instruction: scrapeInstruction,
+                           url: url.isEmpty ? nil : url)
+        case .career:
+            return .career(action: careerAction)
+        case .understand:
+            return .understand(action: understandAction)
+        case .nyu:
+            return .nyu(action: nyuAction)
         }
     }
 
@@ -101,6 +154,24 @@ struct StepDraft: Identifiable {
         case .shell: return command.isEmpty ? "Run command" : command
         case .mail: return "Mail — \(mailAction.replacingOccurrences(of: "_", with: " "))"
         case .reminder: return reminderTitle.isEmpty ? "Reminder" : reminderTitle
+        case .browser:
+            let label = browserInstruction.isEmpty ? "Browse web" : browserInstruction
+            let url = browserURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            return url.isEmpty ? label : "\(label) — \(url)"
+        case .scrape:
+            let label = scrapeInstruction.isEmpty ? "Scrape web" : scrapeInstruction
+            let url = scrapeURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            return url.isEmpty ? label : "\(label) — \(url)"
+        case .career:
+            return careerAction == "follow_ups" ? "Job hunt — follow-ups" : "Job hunt — scan jobs"
+        case .understand:
+            switch understandAction {
+            case "docs": return "Knowledge graph — visual docs"
+            case "onboarding": return "Knowledge graph — onboarding tour"
+            default: return "Knowledge graph — analyze project"
+            }
+        case .nyu:
+            return nyuAction == "sync" ? "NYU — sync Canvas" : "NYU — check deadlines"
         }
     }
 }
@@ -382,6 +453,12 @@ struct RoutineBuilderModal: View {
             case .reminder where step.reminderTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
                 errorText = "The reminder step needs a title."
                 return
+            case .browser where step.browserInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
+                errorText = "The Browse web step needs an instruction (what to look up)."
+                return
+            case .scrape where step.scrapeInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
+                errorText = "The Scrape web step needs an instruction (what to look up)."
+                return
             default:
                 break
             }
@@ -495,6 +572,39 @@ private struct StepEditorSheet: View {
                                 Text("3 hours").tag(TimeInterval(3 * 3600))
                                 Text("12 hours").tag(TimeInterval(12 * 3600))
                                 Text("Tomorrow").tag(TimeInterval(24 * 3600))
+                            }
+                            .pickerStyle(.inline)
+                        case .browser:
+                            TextField("What should Alfred look up?", text: $step.browserInstruction, axis: .vertical)
+                                .lineLimit(2...4)
+                            TextField("URL (optional — leave blank to search)", text: $step.browserURL)
+                                .textInputAutocapitalization(.never)
+                                .keyboardType(.URL)
+                                .font(.system(size: 13, design: .monospaced))
+                        case .scrape:
+                            TextField("What should Alfred fetch?", text: $step.scrapeInstruction, axis: .vertical)
+                                .lineLimit(2...4)
+                            TextField("URL (optional — leave blank to search)", text: $step.scrapeURL)
+                                .textInputAutocapitalization(.never)
+                                .keyboardType(.URL)
+                                .font(.system(size: 13, design: .monospaced))
+                        case .career:
+                            Picker("Action", selection: $step.careerAction) {
+                                Text("Scan job boards").tag("scan")
+                                Text("List follow-ups due").tag("follow_ups")
+                            }
+                            .pickerStyle(.inline)
+                        case .understand:
+                            Picker("Action", selection: $step.understandAction) {
+                                Text("Visual docs — architecture report").tag("docs")
+                                Text("Onboarding tour").tag("onboarding")
+                                Text("Analyze the project").tag("analyze")
+                            }
+                            .pickerStyle(.inline)
+                        case .nyu:
+                            Picker("Action", selection: $step.nyuAction) {
+                                Text("Check deadlines — due this week + overdue").tag("check_deadlines")
+                                Text("Sync Canvas first, then report").tag("sync")
                             }
                             .pickerStyle(.inline)
                         }

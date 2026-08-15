@@ -124,6 +124,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var escapeMonitor: Any?
     /// The turn currently streaming, so a new query supersedes it.
     private var hermesTask: Task<Void, Never>?
+    /// Respawns the agent session if it died while idle, so "Alfred is always
+    /// on" stays true between queries. See startHermesKeepAlive().
+    private var hermesKeepAlive: Timer?
     /// Answers messages from the iOS app. Nil until configured.
     private var relay: RelayWorker?
     /// Watches the inbox for important mail and posts notifications.
@@ -147,6 +150,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // its connection for only a few seconds.
         AlfredToolServer.shared.start()
 
+        // Token compression (Headroom): register its MCP server so every Hermes
+        // session can shrink large tool outputs before they eat context window
+        // space, and keep the local client warm for Alfred's own prompts (mail
+        // copilot bodies, briefing context). No-op when the binary isn't
+        // installed; the app works identically either way.
+        HeadroomMCPClient.shared.ensureRegisteredIfEnabled()
+
+        // Browser automation (browser-use): probe the venv binary once at
+        // launch so the Settings status line and the routine/email skill gates
+        // know the truth. The MCP server for Hermes is already registered in
+        // agent-servers.json (agent-bridge/setup.sh provisions it); nothing to
+        // start here — browser tasks need Chrome running and the harness daemon
+        // auto-starts on first use.
+        BrowserUseClient.shared.refreshBinary()
+
+        // Web scraping (Crawlee): probe the bridge's node + CLI once at launch
+        // so the Settings status line and the routine scrape step know the
+        // truth. The MCP server for Hermes is already registered in
+        // agent-servers.json (agent-bridge/setup.sh provisions it); nothing to
+        // start here — HTTP scraping is plain requests with no browser.
+        CrawleeClient.shared.refreshBinary()
+
+        // Career-ops: the job-hunt command center. Hermes writes the rubric
+        // judgments and tailored CVs; the tracker pushes changes to phones
+        // over the same socket the briefing and routines use (nothing to
+        // "start" — scans and follow-ups are on-demand or routine-driven).
+        CareerOpsManager.shared.hermes = hermes
+        CareerOpsManager.shared.onApplicationsChanged = {
+            BriefingSocketServer.shared.broadcastCareer(
+                "career.applications_changed",
+                params: BriefingSocketServer.summaryWire(CareerOpsManager.shared.summary()))
+        }
+
+        // NYU coursework: Canvas sync → SQLite store → briefing lines, deadline
+        // reminders and calendar events. The sync timer and the hourly
+        // reminder re-schedule live here; every completed sync pushes
+        // `nyu.sync_complete` to phones so the Courses tab refreshes on its own.
+        NYUIntegrationManager.shared.onSyncCompleted = { result in
+            BriefingSocketServer.shared.broadcastNYU(
+                "nyu.sync_complete",
+                params: NYUIntegrationManager.syncResultWire(result))
+        }
+        NYUIntegrationManager.shared.start()
+
         // Personal memory: index the Obsidian vault, and distill the day's
         // material into vault concepts on a quiet schedule. Best-effort and
         // never throw.
@@ -164,6 +211,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // warrant retraining the local model. Runs off the main thread;
         // heavy work happens in a detached Task.
         FineTuneManager.shared.start()
+
+        // Self-optimization loop (DSPy): collects 1–5 ratings of Alfred's
+        // outputs and compiles them into learned prompt rules weekly. Local
+        // only — nothing leaves the Mac. The scheduler tick checks
+        // `isCompileDue`, so starting it here is cheap and idle otherwise.
+        DSPyOptimizer.shared.start()
 
         // Unified memory: one-time harvest of the fragmented legacy systems
         // (GRDB-era tables, personal-memory.json, finetuning captures, the
@@ -185,6 +238,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MailAIService.shared.hermes = hermes
 
         AgentCompletionWatcher.shared.start()
+
+        // MemPalace: the persistent memory layer. Hermes drives preference
+        // inference (through the reflection pass and on-demand turns); the
+        // 6h timer runs the decay + prune consolidation.
+        MemPalaceManager.shared.hermes = hermes
+        MemPalaceManager.shared.start()
 
         // Daily briefing: generate on the hour, serve it to phones over the
         // socket, and push each fresh copy out the moment it lands.
@@ -213,7 +272,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "routine.completed",
                 params: BriefingSocketServer.routineCompletedParams(routine, result: result))
         }
+        RoutineManager.shared.onRoutinesChanged = {
+            BriefingSocketServer.shared.broadcastRoutinesChanged()
+        }
         RoutineManager.shared.start()
+
+        // Taste (anti-slop text): the same session rewrites generic drafts,
+        // routine names and summaries with specificity and the owner's voice.
+        // The deterministic boringness gate keeps model turns rare.
+        TasteSkillManager.shared.hermes = hermes
+
+        // Personal Tutor: the same session explains concepts the way this
+        // user learns, guides homework Socratically, and learns teaching
+        // methods that work from feedback. Bounded turns behind a turn gate,
+        // like taste — it can never hijack the conversation.
+        PersonalTutorSkill.shared.hermes = hermes
+
+        // Study Routines: exam prep, problem sets, readings, lecture notes and
+        // the weekly review — scheduled via the routine library and adapting
+        // to the tutor's live mastery + learning style. The notification
+        // ticker nags on due readings and the Sunday review.
+        StudyRoutineManager.shared.hermes = hermes
+        StudyRoutineManager.shared.start()
+
+        // Essay writing: full essays in the owner's voice with citations. The
+        // skill runs its turns on its own dedicated Hermes session (spawned
+        // lazily on first use), so the write_essay MCP tool can produce an
+        // essay while the user's main session is mid-turn.
 
         // Remote coding sessions (AlfredCode): the manager streams agent
         // output to phones over the same socket the briefing and routines use.
@@ -230,6 +315,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             params["session_id"] = sessionID.uuidString
             BriefingSocketServer.shared.broadcastCode("code.test_result", params: params)
         }
+        // CodeGraph indexing progress → the Code tab's "Analyzing project…"
+        // spinner, pushed as code.graph_status notifications.
+        CodeGraphManager.shared.onStateChange = { projectPath, state in
+            var payload: [String: Any] = ["project_path": projectPath]
+            let wire = BriefingSocketServer.graphStateWireForBroadcast(state)
+            for (key, value) in wire { payload[key] = value }
+            BriefingSocketServer.shared.broadcastCode("code.graph_status", params: payload)
+        }
+        // Understand-Anything: same idea for the interactive knowledge graph —
+        // when a background analysis finishes (or fails) the Code tab's
+        // Knowledge Graph sheet recovers through code.understand_status.
+        UnderstandAnythingManager.shared.onStateChange = { projectPath, state in
+            var payload: [String: Any] = ["project_path": projectPath]
+            let wire = BriefingSocketServer.understandStateWireForBroadcast(state)
+            for (key, value) in wire { payload[key] = value }
+            BriefingSocketServer.shared.broadcastCode("code.understand_status", params: payload)
+        }
+
         AlfredCodeManager.shared.onGitStatus = { sessionID, status in
             var params = BriefingSocketServer.gitStatusDictionary(status)
             params["session_id"] = sessionID.uuidString
@@ -284,6 +387,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Task.detached { ProviderKeyRing.shared.syncHermesFallbackChain() }
             }
         }
+
+        // Keep the agent alive. A prompt respawns a dead session lazily, but an
+        // idle death (hermes can exit cleanly under upstream faults — the
+        // "Hermes stopped unexpectedly (exit 0)" symptom) should heal before
+        // anyone asks. The watch keys on hasAttemptedStart rather than
+        // hasStartedOnce so a first spawn that stalled on the ACP handshake
+        // (an MCP bridge fetching over the network) also gets retried — that
+        // stalled first attempt is exactly the session that needs healing most.
+        startHermesKeepAlive()
+    }
+
+    /// Every 60s, if start() was ever attempted but no process is running,
+    /// respawn it. Harmless while a turn is active (start() is idempotent and
+    /// no-ops on a live process); the actual mid-turn death recovery lives in
+    /// HermesSession.runTurn, which rebuilds and retries the prompt itself.
+    private func startHermesKeepAlive() {
+        guard hermesKeepAlive == nil else { return }
+        let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let session = self.hermes
+                guard await session.hasAttemptedStart, !(await session.isProcessRunning()) else { return }
+                NSLog("[hermes] keepalive: session process gone while idle — respawning")
+                try? await session.start()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        hermesKeepAlive = timer
+        NSLog("[hermes] keepalive watch armed (60s)")
     }
 
     /// Answer messages from the iOS app, if a relay is configured.
@@ -306,12 +438,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
+        hermesKeepAlive?.invalidate()
+        hermesKeepAlive = nil
         AgentCompletionWatcher.shared.stop()
         AlfredToolServer.shared.stop()
         if let relay { Task { await relay.stop() } }
         ScreenMonitoringManager.shared.stop()
         MemoryReflectionService.shared.stop()
+        MemPalaceManager.shared.stop()
+        HomeworkAssistantSkill.shared.stop()
         FineTuneManager.shared.stop()
+        DSPyOptimizer.shared.stop()
         BriefingGenerator.shared.stop()
         RoutineManager.shared.stop()
         MailManager.shared.stop()
@@ -322,6 +459,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         BriefingSocketServer.shared.stop()
         Task { await hermes.shutdown() }
+        // Tear down the multi-agent team's sessions too, so no specialized
+        // Hermes process is left running after the app quits.
+        Task { await MultiAgentOrchestrator.shared.shutdownAll() }
+        // And the essay skill's dedicated agent, spawned on first write_essay.
+        Task { await EssayWritingSkill.shared.shutdown() }
+        // And the presentation skill's dedicated agent, spawned on first deck.
+        Task { await PresentationGeneratorSkill.shared.shutdown() }
     }
 
     // MARK: Bar window
@@ -435,10 +579,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Interrupt a running turn, so dismissing the bar also stops the agent
-        // rather than leaving it working unseen.
+        // rather than leaving it working unseen. A multi-agent run is stopped
+        // the same way — cancelling the pipeline cancels the in-flight agents.
         if barState.isProcessing {
             hermesTask?.cancel()
             Task { await hermes.cancel() }
+            MultiAgentOrchestrator.shared.cancelActiveRun()
             barState.isProcessing = false
         }
         hideBar()
@@ -707,6 +853,17 @@ private func enforceRetry(_ text: String, _ attachment: FileAttachment?, agent: 
             return
         }
 
+        // Multi-agent team: explicit requests (`multi:` / `/agents`) and marker
+        // phrases (deep research, weekly planning, job search, code review)
+        // run through the specialized-agent pipeline instead of one agent.
+        // Checked before engine routing so those markers reach the team, not
+        // the single general or coding agent. Off in Settings → the text falls
+        // through to the normal path unchanged.
+        if MultiAgentOrchestrator.shared.enabled, let task = MultiAgentOrchestrator.route(text) {
+            handleMultiAgentQuery(task: task)
+            return
+        }
+
         barState.responseText = ""
         barState.isProcessing = true
         barState.presenceState = .thinking
@@ -725,6 +882,58 @@ private func enforceRetry(_ text: String, _ attachment: FileAttachment?, agent: 
         hermesTask = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.handleQueryAsync(text: text, attachment: attachment, agent: agent)
+        }
+    }
+
+    // MARK: Multi-agent queries
+
+    /// Stream a multi-agent run into the bar: a header per agent, then the
+    /// agent's text as it streams. The last agent's deliverable is the answer;
+    /// the run's stage list is a bonus, not a leak — the user asked for the team.
+    private func handleMultiAgentQuery(task: String) {
+        barState.responseText = ""
+        barState.isProcessing = true
+        barState.presenceState = .thinking
+
+        hermesTask?.cancel()
+        hermesTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            // The run consumes quota on whichever provider is active, like a bar turn.
+            if let provider = self.providerKeys.activeKey?.provider {
+                UsageTracker.shared.record(provider: provider)
+            }
+            var failure: String?
+            for await event in MultiAgentOrchestrator.shared.run(task: task) {
+                switch event {
+                case .stageStarted(let role, let index, let total):
+                    if self.barState.presenceState == .thinking { self.barState.presenceState = .responding }
+                    self.barState.responseText += "\n\n👥 \(role.displayName) agent (\(index)/\(total))\n"
+
+                case .stageText(_, let chunk):
+                    self.barState.responseText += chunk
+
+                case .stageFinished:
+                    self.barState.responseText += "\n"
+
+                case .stageFailed(let role, let message):
+                    self.barState.responseText += "\n⚠️ \(role.displayName) agent failed: \(message)\n"
+
+                case .failed(let message):
+                    failure = message
+
+                case .finished(let stages, let duration):
+                    self.barState.responseText += "\n\n— Multi-agent run: \(stages) agents · \(Int(duration))s —"
+                }
+            }
+            if let failure {
+                if self.barState.responseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    self.barState.responseText = Self.rotatedIfQuota(failure)
+                } else {
+                    self.barState.responseText += "\n\n⚠️ \(failure)"
+                }
+            }
+            self.barState.isProcessing = false
+            self.barState.presenceState = .expanded
         }
     }
 

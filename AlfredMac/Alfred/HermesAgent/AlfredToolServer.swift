@@ -880,6 +880,897 @@ final class AlfredToolServer {
                 "required": ["to", "subject", "body"],
             ],
         ],
+        [
+            "name": "polish_text",
+            "description": """
+                Rewrite a piece of AI-generated text so it stops reading generic \
+                (anti-slop). Only touches text the deterministic boringness check \
+                flags as bland; specific writing passes through unchanged. Never \
+                invents facts. Use before delivering drafts, routine names, \
+                summaries or comments to the user.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "text": ["type": "string", "description": "The text to polish."],
+                    "style": ["type": "string", "description": "Optional voice: casual, formal, technical, or marketing."],
+                ],
+                "required": ["text"],
+            ],
+        ],
+        [
+            "name": "evaluate_boringness",
+            "description": """
+                Score how generic/bland a piece of text is, 0.0–1.0, with the \
+                phrases that pushed it up. Deterministic and instant — no model \
+                call. Use to decide whether a draft is worth polishing.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "text": ["type": "string", "description": "The text to score."],
+                ],
+                "required": ["text"],
+            ],
+        ],
+        [
+            "name": "suggest_improvements",
+            "description": """
+                Return concrete, actionable rewrite suggestions for a bland piece \
+                of text (what to replace and with what). Costs a model turn; \
+                prefer evaluate_boringness first.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "text": ["type": "string", "description": "The text to critique."],
+                ],
+                "required": ["text"],
+            ],
+        ],
+        [
+            "name": "understand_search",
+            "description": """
+                Search a project's Understand-Anything knowledge graph (the \
+                interactive graph at .ua/knowledge-graph.json). Returns the \
+                most relevant files, functions and classes for a natural \
+                question like "where is the auth logic" — name, type, path \
+                and a plain-English summary per hit. Deterministic and \
+                instant (no model call). Pass the project you're working in \
+                as project_path. Use instead of grepping when the graph \
+                exists; it answers structural "where does X live" questions \
+                in one shot.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "query": ["type": "string", "description": "What to look for, e.g. \"authentication\"."],
+                    "project_path": ["type": "string", "description": "Absolute path of the project (the working directory)."],
+                    "limit": ["type": "integer", "description": "Max results. Default 10."],
+                ],
+                "required": ["query", "project_path"],
+            ],
+        ],
+        [
+            "name": "understand_impact",
+            "description": """
+                Impact analysis over a project's knowledge graph: everything \
+                that breaks — directly or transitively — if the given symbol \
+                or file changes. Pass a function/class name or a node id \
+                (e.g. "authenticate", "file:src/auth.ts"). Use before a \
+                refactor to know exactly what to update, or to explain why a \
+                change would ripple. Deterministic, local, instant.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "target": ["type": "string", "description": "Symbol or node id to change, e.g. \"authenticate\"."],
+                    "project_path": ["type": "string", "description": "Absolute path of the project."],
+                    "max_depth": ["type": "integer", "description": "How many hops of dependents to include. Default 4."],
+                ],
+                "required": ["target", "project_path"],
+            ],
+        ],
+        [
+            "name": "understand_explain",
+            "description": """
+                Deep-dive on one node of a project's knowledge graph: its \
+                plain-English summary, signature, what it calls/imports (out) \
+                and what calls/imports it (in), plus the architectural layers \
+                it belongs to. Pass the node id ("file:src/auth.ts", \
+                "function:src/auth.ts:login") — get ids from understand_search. \
+                Use to understand a file or function without reading it.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "node_id": ["type": "string", "description": "Node id from understand_search."],
+                    "project_path": ["type": "string", "description": "Absolute path of the project."],
+                ],
+                "required": ["node_id", "project_path"],
+            ],
+        ],
+        [
+            "name": "understand_architecture",
+            "description": """
+                A project's architecture from its knowledge graph: the \
+                architectural layers (API, Service, Data, UI, …) with node \
+                counts and sample members, or — when the graph has no layers — \
+                a fallback grouping by top-level directory. Use to answer \
+                "what's the architecture / what are the layers" without \
+                reading the tree. Deterministic and local.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "project_path": ["type": "string", "description": "Absolute path of the project."],
+                ],
+                "required": ["project_path"],
+            ],
+        ],
+        [
+            "name": "get_assignments",
+            "description": """
+                The owner's Canvas assignments from the NYU integration: name, \
+                course, due date, status (not_started / in_progress / \
+                submitted / graded) and score. Sorted by due date, pending \
+                first. Use to answer \"what's due\", \"when is X due\", or \"what \
+                did I miss\" — and pass assignment ids to mark_submitted. \
+                Requires the NYU integration to be enabled with a Canvas \
+                token (Settings → NYU).
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "limit": ["type": "integer", "description": "Max rows. Default 25."],
+                ],
+            ],
+        ],
+        [
+            "name": "get_current_grades",
+            "description": """
+                The owner's current grades from the NYU Canvas integration: \
+                per-course score with trend (improving / declining / steady) \
+                and the projected final score when Canvas computes one. Use to \
+                answer \"where do I stand in my classes\" or check a target GPA. \
+                Requires the NYU integration to be enabled and synced.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [:],
+            ],
+        ],
+        [
+            "name": "get_next_deadline",
+            "description": """
+                The owner's single next assignment deadline (not yet submitted) \
+                from the NYU Canvas integration. Use to answer \"what's due \
+                next\" or \"what should I work on\". Returns nothing when every \
+                assignment is done or the integration isn't configured.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [:],
+            ],
+        ],
+        [
+            "name": "mark_submitted",
+            "description": """
+                Mark a Canvas assignment as submitted in Alfred's tracker (or \
+                back to in_progress / not_started). This only updates Alfred's \
+                local status — it never submits anything to Canvas. Pass the \
+                assignment id from get_assignments.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "assignment_id": ["type": "integer", "description": "Assignment id from get_assignments."],
+                    "status": ["type": "string", "description": "submitted | in_progress | not_started. Default submitted."],
+                ],
+                "required": ["assignment_id"],
+            ],
+        ],
+        [
+            "name": "get_syllabus_info",
+            "description": """
+                A course's syllabus from the NYU Canvas integration: grading \
+                breakdown, professor, meeting schedule, and the plain-text \
+                syllabus body. Pass the course id (from get_current_grades); \
+                with no id, returns all courses. Use to answer \"how is my \
+                grade computed\", \"when is the final exam\" or \"who teaches X\". \
+                The final exam date is a best-effort extraction from the \
+                syllabus text — verify it against Canvas.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "course_id": ["type": "integer", "description": "Canvas course id (optional — omit for all courses)."],
+                ],
+            ],
+        ],
+        [
+            "name": "multi_agent_run",
+            "description": """
+                Run a complex, multi-step request through Alfred's multi-agent \
+                team: a Planning agent designs the run, then specialized \
+                Research, Code, Review and Writing agents work in sequence — or \
+                in parallel where independent — sharing results through a \
+                mailbox so later agents build on earlier ones. Use for deep \
+                research, weekly planning, job search, code review and other \
+                multi-domain tasks where division of labor beats one agent \
+                doing everything. Returns each agent's deliverable, ending \
+                with the final answer. Multi-agent must be enabled in Settings.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "task": ["type": "string", "description": "The request to run through the team."],
+                ],
+                "required": ["task"],
+            ],
+        ],
+        [
+            "name": "create_presentation",
+            "description": """
+                Build a complete, ready-to-present slideshow on any topic: \
+                researches the topic (web search + relevant images), writes \
+                concise per-slide bullets and speaker notes, lays it out in a \
+                design style (modern | minimal | colorful | academic) and \
+                exports deck.pptx + deck.pdf into ~/.alfred/presentations/. \
+                Returns the deck id and file paths. Used when the user asks \
+                for slides or a presentation on a topic.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "topic": ["type": "string", "description": "Topic or title of the presentation."],
+                    "num_slides": ["type": "number", "description": "Slide count (3-30). Defaults to the Settings default."],
+                    "minutes": ["type": "number", "description": "Optional talk length in minutes — the slide count is derived (~1.5 min/slide)."],
+                    "tone": ["type": "string", "description": "academic | business | casual. Defaults to academic."],
+                    "style": ["type": "string", "description": "modern | minimal | colorful | academic. Defaults to the user's learned/settings style."],
+                    "include_notes": ["type": "boolean", "description": "Include speaker notes (default from Settings)."],
+                ],
+                "required": ["topic"],
+            ],
+        ],
+        [
+            "name": "add_speaker_notes",
+            "description": """
+                Refine an existing deck's speaker notes into a full presenting \
+                script — per-slide talking points with a time budget, plus a \
+                conclusion and Q&A section — written to speaker_notes.md in \
+                the deck's directory. Takes the presentation_id returned by \
+                create_presentation.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "presentation_id": ["type": "string", "description": "The deck's UUID from create_presentation."],
+                ],
+                "required": ["presentation_id"],
+            ],
+        ],
+        [
+            "name": "design_presentation",
+            "description": """
+                Re-render an existing deck in a different design style \
+                (modern | minimal | colorful | academic). Content is reused \
+                — no new model turn — the exports are rebuilt to match. Takes \
+                the presentation_id returned by create_presentation.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "presentation_id": ["type": "string", "description": "The deck's UUID from create_presentation."],
+                    "style": ["type": "string", "description": "modern | minimal | colorful | academic."],
+                ],
+                "required": ["presentation_id", "style"],
+            ],
+        ],
+        [
+            "name": "export_presentation",
+            "description": """
+                Re-export an existing deck in a given format: pptx, pdf or \
+                both. Rebuilds only the missing/allowed exports from the \
+                deck's saved content. Takes the presentation_id returned by \
+                create_presentation.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "presentation_id": ["type": "string", "description": "The deck's UUID from create_presentation."],
+                    "format": ["type": "string", "description": "pptx | pdf | both. Defaults to both."],
+                ],
+                "required": ["presentation_id"],
+            ],
+        ],
+        [
+            "name": "learn_preference",
+            "description": """
+                Store a durable preference, working pattern, person detail, \
+                goal, learning or constraint about the user in the MemPalace \
+                vault. Repeating the same content raises its confidence, so \
+                facts the user confirms several times climb above the \
+                threshold that grounds every future session.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "category": ["type": "string", "description": "preference | project_pattern | person | goal | learning | constraint"],
+                    "content": ["type": "string", "description": "One concise sentence."],
+                ],
+                "required": ["category", "content"],
+            ],
+        ],
+        [
+            "name": "get_learned_context",
+            "description": """
+                Fetch the highest-confidence memories about the user (above the \
+                settings threshold) — the durable preferences, patterns and \
+                constraints a fresh session should start knowing. No model \
+                call; instant.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "limit": ["type": "number", "description": "How many to return (default 6)."],
+                ],
+            ],
+        ],
+        [
+            "name": "recall_about_person",
+            "description": """
+                Fetch everything stored about one person (communication \
+                preferences, what they care about, inside knowledge). Empty \
+                when nothing is stored or the person category is \
+                privacy-excluded in settings.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "The person's name."],
+                ],
+                "required": ["name"],
+            ],
+        ],
+        [
+            "name": "search_memory",
+            "description": """
+                Search the MemPalace vault for anything matching a query — \
+                preferences, project patterns, people, learning, constraints. \
+                Instant and local.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "query": ["type": "string", "description": "What to look for."],
+                    "limit": ["type": "number", "description": "How many to return (default 12)."],
+                ],
+                "required": ["query"],
+            ],
+        ],
+        [
+            "name": "correct_memory",
+            "description": """
+                Learn from a user correction: replace a stored memory with the \
+                corrected version and lift its confidence hard, so the corrected \
+                fact outranks the old one everywhere.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "memory_id": ["type": "string", "description": "The memory id from search_memory / get_learned_context."],
+                    "correction": ["type": "string", "description": "The corrected fact."],
+                ],
+                "required": ["memory_id", "correction"],
+            ],
+        ],
+        [
+            "name": "update_goal_progress",
+            "description": """
+                Report completion (or a miss) for a tracked goal. A completion \
+                inside the cadence window extends the streak; a miss after the \
+                window lapses resets it.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "goal_id": ["type": "string", "description": "Goal id (see goals in the briefing or memory.search)."],
+                    "completed": ["type": "boolean", "description": "true = completed, false = missed."],
+                ],
+                "required": ["goal_id", "completed"],
+            ],
+        ],
+        [
+            "name": "get_optimization_report",
+            "description": """
+                Read Alfred's self-optimization report: the week-over-week \
+                average-rating trend per domain (code, email, summaries, \
+                routines, multi-step tasks), and the learned prompt rules \
+                currently active. Use when the user asks how Alfred is \
+                improving, what it has learned about their style, or for a \
+                status check on the learning loop. Local data, instant, no \
+                model call.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [:],
+                "required": [] as [String],
+            ],
+        ],
+        [
+            "name": "optimization_compile",
+            "description": """
+                Force a self-optimization compile pass now: gather the past \
+                week's rated outputs, learn new prompt rules from them, and \
+                return the fresh report. Use when the user asks to \
+                "optimize now", "relearn", or "update my prompts". Local and \
+                offline; can take up to a minute.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [:],
+                "required": [] as [String],
+            ],
+        ],
+        [
+            "name": "optimization_rollback",
+            "description": """
+                Revert one domain's learned prompt rules to its previous set \
+                (or to baseline if there is none). Use when a recent \
+                optimization made output worse and the user wants to undo it. \
+                kind is one of: code, email, summary, routine, multistep, \
+                general.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "kind": [
+                        "type": "string",
+                        "description": "Domain to roll back: code, email, summary, routine, multistep, or general.",
+                    ],
+                ],
+                "required": ["kind"],
+            ],
+        ],
+        [
+            "name": "explain_concept",
+            "description": """
+                Explain a concept the way THIS user learns (code examples, \
+                analogies, step-by-step…). Alfred checks the user's mastery \
+                level, prerequisites and learned learning style first, so the \
+                explanation is personal, not generic. Use for tutoring asks: \
+                "explain recursion", "I don't understand integrals", "what \
+                does this concept mean". The result ends with a check question \
+                — relay it, and when the user answers (yes / still confused / \
+                more detail / another angle), call tutor_feedback with their \
+                outcome so Alfred learns what worked.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "concept": ["type": "string", "description": "The concept to explain, e.g. \"recursion\" or \"integration by parts\"."],
+                    "course": ["type": "string", "description": "Optional course code, e.g. \"CSCI-UA 101\" — used for the default teaching style."],
+                ],
+                "required": ["concept"],
+            ],
+        ],
+        [
+            "name": "socratic_guide",
+            "description": """
+                Homework help in learning mode: generate guiding questions \
+                ("What's the base case?") instead of giving the answer, so the \
+                user figures it out themselves. Use when the user says "I'm \
+                stuck on this problem" or asks for help with homework. When \
+                the user reaches the answer, call tutor_feedback with outcome \
+                "understood" so Alfred records that the Socratic method \
+                worked for them. Respects the tutor's Socratic depth setting: \
+                heavy = questions only, light_hints = question + small hint, \
+                just_answer = solve it directly.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "problem": ["type": "string", "description": "The problem the user is stuck on."],
+                    "concept": ["type": "string", "description": "Optional concept name (e.g. \"recursion\") so mastery is tracked per concept."],
+                ],
+                "required": ["problem"],
+            ],
+        ],
+        [
+            "name": "track_mastery",
+            "description": """
+                Record the user's stated knowledge level for a concept (1–5). \
+                Use when the user tells you how well they know something \
+                ("I'm solid on loops", "I've never touched series") or asks \
+                you to note it. Updates the tutor's concept mastery map.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "concept": ["type": "string", "description": "The concept name."],
+                    "confidence": ["type": "integer", "description": "1–5 knowledge level."],
+                    "course": ["type": "string", "description": "Optional course code."],
+                ],
+                "required": ["concept", "confidence"],
+            ],
+        ],
+        [
+            "name": "tutor_feedback",
+            "description": """
+                Record how the user reacted to a tutoring explanation or \
+                guiding question. This is the learning signal: Alfred adapts \
+                future explanations and tracks concept mastery from it. Call \
+                it after every tutoring exchange (explain_concept / \
+                socratic_guide) once the user replies. outcome: \
+                "understood", "confused", "more_detail", "other_angle", or \
+                "abandoned".
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "concept": ["type": "string", "description": "The concept that was explained."],
+                    "outcome": ["type": "string", "description": "understood | confused | more_detail | other_angle | abandoned."],
+                    "course": ["type": "string", "description": "Optional course code."],
+                ],
+                "required": ["concept", "outcome"],
+            ],
+        ],
+        [
+            "name": "what_am_i_weak_at",
+            "description": """
+                List the concepts the user is still struggling with, weakest \
+                first — derived from the tutor's mastery tracking (asked about \
+                multiple times + still low confidence). Use for "what am I \
+                weak at?", "what should I review?".
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [:],
+                "required": [] as [String],
+            ],
+        ],
+        [
+            "name": "exam_prep_routine",
+            "description": """
+                Generate a focused exam-prep practice session: reviews what \
+                the user has learned, drills the weak concepts hardest, and \
+                produces practice problems at their difficulty level with \
+                immediate answers and explanations. Use for "prepare for my \
+                calculus exam", "practice for the test on Thursday".
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "exam_date": ["type": "string", "description": "Optional exam date or day, e.g. \"Friday\" or \"2026-12-15\"."],
+                    "topics": ["type": "array", "items": ["type": "string"], "description": "Optional topics to focus on, e.g. [\"integration\", \"series\"]. Defaults to the weakest concepts."],
+                ],
+                "required": [] as [String],
+            ],
+        ],
+        [
+            "name": "my_learning_style",
+            "description": """
+                Show how Alfred currently understands the user's learning \
+                style: preferred teaching methods (code examples, analogies, \
+                step-by-step…), structure, depth, and Socratic vs direct — \
+                learned from tutoring feedback over time. Use for "how do \
+                you teach me?", "what's my learning style?".
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [:],
+                "required": [] as [String],
+            ],
+        ],
+        [
+            "name": "start_exam_prep",
+            "description": """
+                Start an automated exam-prep plan: the Daily Exam Prep \
+                routine (and the briefing) drill the user's weak concepts \
+                daily until the exam, with a full timed practice test in the \
+                final week and a final review the day before. Use for \
+                "prepare for my calculus exam", "exam Friday". exam_date \
+                accepts YYYY-MM-DD, a weekday, or "in 14 days".
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "exam_date": ["type": "string", "description": "When the exam is — YYYY-MM-DD, a weekday, or \"in 14 days\"."],
+                    "topics": ["type": "array", "items": ["type": "string"], "description": "Optional topics to focus on. Defaults to the user's weakest concepts."],
+                    "course": ["type": "string", "description": "Optional course code, e.g. \"MATH-UA 122\"."],
+                ],
+                "required": [] as [String],
+            ],
+        ],
+        [
+            "name": "track_problem_set",
+            "description": """
+                Track a problem set: order the problems easy → hard and track \
+                completion. Re-post the list with `solved` (0-based indices \
+                already done) as the user finishes problems. Use when the \
+                professor posts a problem set or the user pastes one. source \
+                is canvas | manual.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "problems": ["type": "array", "items": ["type": "string"], "description": "The problem statements."],
+                    "course": ["type": "string", "description": "Optional course code."],
+                    "name": ["type": "string", "description": "Optional set name, e.g. \"HW 4\"."],
+                    "source": ["type": "string", "description": "canvas | manual. Default manual."],
+                    "solved": ["type": "array", "items": ["type": "integer"], "description": "0-based indices of problems already solved."],
+                ],
+                "required": ["problems"],
+            ],
+        ],
+        [
+            "name": "quiz_on_reading",
+            "description": """
+                Quiz the user on a reading assignment. Without `result`, \
+                generate comprehension questions and store the reading; with \
+                `result` (\"passed\", \"4/5\", \"80%\"), record how they did \
+                and schedule the next spaced-repetition quiz. Use for \"quiz \
+                me on chapter 3\".
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "chapter": ["type": "string", "description": "The reading's title or chapter."],
+                    "course": ["type": "string", "description": "Optional course code."],
+                    "content": ["type": "string", "description": "Optional pasted reading text to quiz on."],
+                    "result": ["type": "string", "description": "How the user did: \"passed\", \"failed\", \"4/5\", or \"80%\"."],
+                ],
+                "required": ["chapter"],
+            ],
+        ],
+        [
+            "name": "summarize_lecture",
+            "description": """
+                Turn lecture notes or a transcript into organized notes: a \
+                topic-organized summary, key points, and study questions. \
+                Use after class when the user dictates notes or pastes a \
+                transcript. Audio transcription is not wired up yet — for a \
+                recording path, ask the user to paste the transcript.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "recording_or_notes": ["type": "string", "description": "The dictated notes or pasted transcript text."],
+                    "course": ["type": "string", "description": "Optional course code."],
+                    "title": ["type": "string", "description": "Optional lecture title."],
+                ],
+                "required": ["recording_or_notes"],
+            ],
+        ],
+        [
+            "name": "weekly_review",
+            "description": """
+                Generate a weekly study progress report: what the user is \
+                strong in, what needs practice, and the focus for the week \
+                ahead — drawn from tutoring mastery, grades, problem sets, \
+                readings and lecture notes. Use for \"how was my week of \
+                studying?\", \"what should I focus on?\".
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [:],
+                "required": [] as [String],
+            ],
+        ],
+        [
+            "name": "write_essay",
+            "description": """
+                Write a complete, submission-ready essay in the user's own \
+                voice, with automatic citations. Research sources first, \
+                generate an outline, write the essay body, then append the \
+                reference list in the requested style. Use when the user says \
+                "write an essay on …", "draft a paper about …", or gives a \
+                prompt with a length or citation style. citation_style is \
+                mla, apa or chicago; tone is academic, analytical, personal, \
+                critical, or match_my_style (default: match the user's \
+                learned voice).
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "topic": ["type": "string", "description": "The essay prompt or topic."],
+                    "length": ["type": "string", "description": "Optional length, e.g. \"1500 words\" or \"5 pages\"."],
+                    "citation_style": ["type": "string", "description": "mla | apa | chicago. Defaults to the user's saved style."],
+                    "tone": ["type": "string", "description": "academic | analytical | personal | critical | match_my_style. Default match_my_style."],
+                ],
+                "required": ["topic"],
+            ],
+        ],
+        [
+            "name": "analyze_my_writing_style",
+            "description": """
+                Show Alfred's understanding of how the user writes essays: \
+                paragraph length, sentence variety, quote vs paraphrase \
+                preference, common transitions, argument structure and tone. \
+                Use for "how do I write?", "what's my essay style?". \
+                Instant, no model call.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [:],
+                "required": [] as [String],
+            ],
+        ],
+        [
+            "name": "learn_writing_style",
+            "description": """
+                Analyze a past essay and fold it into Alfred's learned model \
+                of the user's writing voice, so the next generated essay \
+                matches it. Use when the user shares a piece of their own \
+                writing and asks Alfred to learn their style from it.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "essay": ["type": "string", "description": "The full text of a past essay."],
+                ],
+                "required": ["essay"],
+            ],
+        ],
+        [
+            "name": "research_topic",
+            "description": """
+                Find credible web sources for a topic (via Crawlee search) and \
+                summarize each with quotable lines. Use when the user asks for \
+                research on a subject, or as the first step before writing. \
+                depth is light | medium | deep.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "topic": ["type": "string", "description": "The topic to research."],
+                    "depth": ["type": "string", "description": "light | medium | deep. Default light."],
+                ],
+                "required": ["topic"],
+            ],
+        ],
+        [
+            "name": "revise_essay",
+            "description": """
+                Revise an essay according to natural-language feedback, \
+                keeping the user's writing voice throughout. Use for \
+                "make this section more analytical", "add more evidence", \
+                "tighten the intro".
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "essay": ["type": "string", "description": "The essay text to revise."],
+                    "feedback": ["type": "string", "description": "What to change, in the user's words."],
+                    "tone": ["type": "string", "description": "Optional tone override: academic | analytical | personal | critical | match_my_style."],
+                ],
+                "required": ["essay", "feedback"],
+            ],
+        ],
+        [
+            "name": "check_citations",
+            "description": """
+                Verify an essay's citations are internally consistent: every \
+                reference-list entry is cited in the body, and the list has a \
+                proper header. Returns a list of problems (empty when clean). \
+                Use before the user submits. Deterministic, no model call.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "essay": ["type": "string", "description": "The essay with its reference list appended."],
+                    "citation_style": ["type": "string", "description": "mla | apa | chicago. Defaults to the user's saved style."],
+                ],
+                "required": ["essay"],
+            ],
+        ],
+        [
+            "name": "solve_problem",
+            "description": """
+                Solve a homework problem (code, math or physics — detected \
+                automatically). mode="teach" routes to the personal tutor's \
+                Socratic guidance (learn the type, hints not answers); \
+                mode="submit" (default) produces the complete \
+                submission-ready solution in the user's style. Records the \
+                problem type to the tracker either way.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "problem": ["type": "string", "description": "The problem statement."],
+                    "mode": ["type": "string", "description": "teach | submit. Defaults to the user's setting."],
+                ],
+                "required": ["problem"],
+            ],
+        ],
+        [
+            "name": "explain_problem",
+            "description": """
+                Walk the user through HOW to approach a homework problem \
+                without giving the answer away: the strategy, what to try \
+                first, and the pitfalls to avoid.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "problem": ["type": "string", "description": "The problem statement."],
+                ],
+                "required": ["problem"],
+            ],
+        ],
+        [
+            "name": "write_code",
+            "description": """
+                Write a submission-ready code solution for a homework \
+                problem, matched to the user's coding style (naming, error \
+                handling, comment structure) when the setting says so, with \
+                comments and test cases.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "requirements": ["type": "string", "description": "What the code must do."],
+                    "language": ["type": "string", "description": "Preferred language (e.g. python, java, swift). Optional."],
+                ],
+                "required": ["requirements"],
+            ],
+        ],
+        [
+            "name": "solve_math",
+            "description": """
+                Solve a math problem step by step, with alternative methods \
+                when they exist. LaTeX formatting honors the user's setting.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "problem": ["type": "string", "description": "The math problem."],
+                ],
+                "required": ["problem"],
+            ],
+        ],
+        [
+            "name": "solve_physics",
+            "description": """
+                Solve a physics problem: the concepts that apply, the setup \
+                and equations, the solution, and the intuition for why it \
+                makes sense.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "problem": ["type": "string", "description": "The physics problem."],
+                ],
+                "required": ["problem"],
+            ],
+        ],
+        [
+            "name": "format_solution",
+            "description": """
+                Re-format an existing solution: code wraps it in a markdown \
+                fence, latex wraps math in display-math delimiters, text \
+                returns it plain. Instant, no model call.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "solution": ["type": "string", "description": "The solution text to format."],
+                    "format": ["type": "string", "description": "code | latex | text. Defaults to text."],
+                ],
+                "required": ["solution"],
+            ],
+        ],
+        [
+            "name": "what_i_struggle_with",
+            "description": """
+                The problem types Alfred has watched you struggle with, most-struggled                 first — each with how many times it tripped the user up and how many                 submission solves came out the other end. Instant, no model call.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [],
+            ],
+        ],
     ]
 
     private enum ToolError: LocalizedError {
@@ -1295,9 +2186,648 @@ final class AlfredToolServer {
         case "timer_cancel":
             return await TimerCapability.shared.cancelAll()
 
+        case "polish_text":
+            guard let text = arguments["text"] as? String, !text.isEmpty else {
+                throw ToolError.missingArgument("text")
+            }
+            let style = arguments["style"] as? String
+            return await TasteSkillManager.shared.polishForAgent(text, style: style)
+
+        case "evaluate_boringness":
+            guard let text = arguments["text"] as? String, !text.isEmpty else {
+                throw ToolError.missingArgument("text")
+            }
+            let verdict = TasteBoringness.evaluate(
+                text, aggressiveness: TasteSkillManager.shared.aggressiveness)
+            let verdictJSON: [String: Any] = [
+                "boringness": verdict.score,
+                "needs_polish": verdict.needsPolish,
+                "matched_phrases": verdict.matchedPhrases,
+            ]
+            guard let data = try? JSONSerialization.data(withJSONObject: verdictJSON) else {
+                throw ToolError.unavailable("could not serialize the verdict")
+            }
+            return String(data: data, encoding: .utf8) ?? "{}"
+
+        case "suggest_improvements":
+            guard let text = arguments["text"] as? String, !text.isEmpty else {
+                throw ToolError.missingArgument("text")
+            }
+            guard let suggestions = await TasteSkillManager.shared.suggestImprovements(text) else {
+                return "[]"
+            }
+            guard let data = try? JSONSerialization.data(
+                withJSONObject: ["suggestions": suggestions]) else {
+                throw ToolError.unavailable("could not serialize suggestions")
+            }
+            return String(data: data, encoding: .utf8) ?? "[]"
+
+        case "multi_agent_run":
+            guard let task = arguments["task"] as? String, !task.isEmpty else {
+                throw ToolError.missingArgument("task")
+            }
+            guard await MultiAgentOrchestrator.shared.enabled else {
+                throw ToolError.unavailable(
+                    "Multi-agent is off in Alfred Settings — turn it on, or answer the request yourself.")
+            }
+            // Runs on its own per-role sessions, so it neither waits on nor
+            // blocks the shared bar session. The full transcript (headers +
+            // every agent's deliverable) comes back as the tool result.
+            return await MultiAgentOrchestrator.shared.runCollectingText(task: task)
+
+        case "create_presentation":
+            guard let topic = arguments["topic"] as? String, !topic.isEmpty else {
+                throw ToolError.missingArgument("topic")
+            }
+            let numSlides = arguments["num_slides"] as? Int
+            let minutes = arguments["minutes"] as? Int
+            let tone = PresentationTone(rawValue: arguments["tone"] as? String ?? "") ?? .academic
+            let style = arguments["style"] as? String
+            let includeNotes = arguments["include_notes"] as? Bool
+            // Own Hermes session + own exports: a deck build never blocks the
+            // bar session. May take a couple of minutes for a big deck.
+            let record = try await PresentationGeneratorSkill.shared.create(
+                topic: topic, numSlides: numSlides, minutes: minutes,
+                tone: tone, style: style, includeNotes: includeNotes)
+            return "id: \(record.id.uuidString)\n" + record.resultText
+
+        case "add_speaker_notes":
+            guard let raw = arguments["presentation_id"] as? String,
+                  let id = UUID(uuidString: raw) else {
+                throw ToolError.missingArgument("presentation_id (a UUID from create_presentation)")
+            }
+            let path = try await PresentationGeneratorSkill.shared.addSpeakerNotes(id: id)
+            return "Speaker notes written to \(path)"
+
+        case "design_presentation":
+            guard let raw = arguments["presentation_id"] as? String,
+                  let id = UUID(uuidString: raw) else {
+                throw ToolError.missingArgument("presentation_id (a UUID from create_presentation)")
+            }
+            guard let style = arguments["style"] as? String, !style.isEmpty else {
+                throw ToolError.missingArgument("style")
+            }
+            let updated = try await PresentationGeneratorSkill.shared.redesign(id: id, style: style)
+            return "Deck re-rendered: \(updated.style) — " + updated.resultText
+
+        case "export_presentation":
+            guard let raw = arguments["presentation_id"] as? String,
+                  let id = UUID(uuidString: raw) else {
+                throw ToolError.missingArgument("presentation_id (a UUID from create_presentation)")
+            }
+            let format = PresentationExportFormat(
+                rawValue: arguments["format"] as? String ?? "") ?? .both
+            let updated = try await PresentationGeneratorSkill.shared.export(id: id, format: format)
+            return "Re-exported \(format.displayName).\n" + updated.resultText
+
+        case "explain_concept":
+            guard let concept = arguments["concept"] as? String, !concept.isEmpty else {
+                throw ToolError.missingArgument("concept")
+            }
+            let course = arguments["course"] as? String
+            return await PersonalTutorSkill.shared.explain(concept: concept, course: course)
+
+        case "socratic_guide":
+            guard let problem = arguments["problem"] as? String, !problem.isEmpty else {
+                throw ToolError.missingArgument("problem")
+            }
+            let concept = arguments["concept"] as? String
+            return await PersonalTutorSkill.shared.socraticGuide(problem: problem, concept: concept)
+
+        case "track_mastery":
+            guard let concept = arguments["concept"] as? String, !concept.isEmpty else {
+                throw ToolError.missingArgument("concept")
+            }
+            guard let confidence = arguments["confidence"] as? Int else {
+                throw ToolError.missingArgument("confidence (1–5)")
+            }
+            let course = arguments["course"] as? String
+            guard let updated = PersonalTutorSkill.shared.trackMastery(
+                concept: concept, confidence: confidence, course: course) else {
+                throw ToolError.unavailable("Could not record mastery for '\(concept)'.")
+            }
+            return "Recorded: \(updated.name) is \(updated.confidence)/5"
+                + (updated.sessionCount > 0 ? " across \(updated.sessionCount) sessions." : ".")
+
+        case "tutor_feedback":
+            guard let concept = arguments["concept"] as? String, !concept.isEmpty else {
+                throw ToolError.missingArgument("concept")
+            }
+            guard let raw = arguments["outcome"] as? String,
+                  let outcome = TutoringOutcome(rawValue: raw) else {
+                throw ToolError.missingArgument("outcome (understood | confused | more_detail | other_angle | abandoned)")
+            }
+            let course = arguments["course"] as? String
+            if let updated = PersonalTutorSkill.shared.recordFeedback(
+                concept: concept, outcome: outcome, course: course) {
+                return "Logged: '\(updated.name)' is now \(updated.confidence)/5 (\(outcome.displayName))."
+            }
+            return "Logged feedback for '\(concept)' (\(outcome.displayName))."
+
+        case "what_am_i_weak_at":
+            return PersonalTutorSkill.shared.whatAmIWeakAt()
+
+        case "exam_prep_routine":
+            let examDate = arguments["exam_date"] as? String
+            let topics = arguments["topics"] as? [String] ?? []
+            return await PersonalTutorSkill.shared.examPrep(examDate: examDate, topics: topics)
+
+        case "my_learning_style":
+            return PersonalTutorSkill.shared.myLearningStyle()
+
+        case "start_exam_prep":
+            let examDate = arguments["exam_date"] as? String
+            let topics = arguments["topics"] as? [String] ?? []
+            let course = arguments["course"] as? String
+            return StudyRoutineManager.shared.startExamPrep(
+                examDate: examDate, topics: topics, course: course)
+
+        case "track_problem_set":
+            guard let problems = arguments["problems"] as? [String], !problems.isEmpty else {
+                throw ToolError.missingArgument("problems")
+            }
+            let course = arguments["course"] as? String
+            let name = arguments["name"] as? String
+            let source = arguments["source"] as? String ?? "manual"
+            let solved: [Int]
+            if let raw = arguments["solved"] as? [Int] {
+                solved = raw
+            } else if let raw = arguments["solved"] as? [NSNumber] {
+                solved = raw.map { $0.intValue }
+            } else {
+                solved = []
+            }
+            return StudyRoutineManager.shared.trackProblemSet(
+                problems: problems, course: course, name: name,
+                source: source, solvedIndices: solved)
+
+        case "quiz_on_reading":
+            guard let chapter = arguments["chapter"] as? String, !chapter.isEmpty else {
+                throw ToolError.missingArgument("chapter")
+            }
+            let course = arguments["course"] as? String
+            let content = arguments["content"] as? String
+            let result = arguments["result"] as? String
+            return await StudyRoutineManager.shared.quizOnReading(
+                chapter: chapter, course: course, content: content, result: result)
+
+        case "summarize_lecture":
+            guard let notes = arguments["recording_or_notes"] as? String, !notes.isEmpty else {
+                throw ToolError.missingArgument("recording_or_notes")
+            }
+            let course = arguments["course"] as? String
+            let title = arguments["title"] as? String
+            return await StudyRoutineManager.shared.summarizeLecture(
+                recordingOrNotes: notes, course: course, title: title)
+
+        case "weekly_review":
+            return await StudyRoutineManager.shared.weeklyReview()
+
+        case "understand_search":
+            guard let query = arguments["query"] as? String, !query.isEmpty else {
+                throw ToolError.missingArgument("query")
+            }
+            guard let projectPath = arguments["project_path"] as? String, !projectPath.isEmpty else {
+                throw ToolError.missingArgument("project_path")
+            }
+            let limit = arguments["limit"] as? Int ?? 10
+            let hits = await UnderstandAnythingManager.shared.search(
+                query: query, projectPath: projectPath, limit: limit)
+            guard !hits.isEmpty else {
+                return "No matches in the knowledge graph for '\(query)'. The project may not be analyzed yet — check for \(projectPath)/.ua/knowledge-graph.json."
+            }
+            return hits.map { hit -> String in
+                var line = "\(hit.name) [\(hit.type)]"
+                if let path = hit.filePath, !path.isEmpty { line += " — \(path)" }
+                if let summary = hit.summary, !summary.isEmpty {
+                    line += "\n  \(summary)"
+                }
+                return line + "\n  id: \(hit.id)"
+            }.joined(separator: "\n")
+
+        case "understand_impact":
+            guard let target = arguments["target"] as? String, !target.isEmpty else {
+                throw ToolError.missingArgument("target")
+            }
+            guard let projectPath = arguments["project_path"] as? String, !projectPath.isEmpty else {
+                throw ToolError.missingArgument("project_path")
+            }
+            let maxDepth = arguments["max_depth"] as? Int ?? 4
+            let hits = await UnderstandAnythingManager.shared.impact(
+                of: target, projectPath: projectPath, maxDepth: maxDepth)
+            guard !hits.isEmpty else {
+                return "Nothing in the knowledge graph depends on '\(target)' — changing it looks safe. (If that surprises you, the project may not be analyzed: check for \(projectPath)/.ua/knowledge-graph.json.)"
+            }
+            let direct = hits.filter { $0.depth == 0 }.count
+            let lines = hits.prefix(40).map { hit -> String in
+                let pad = String(repeating: "  ", count: min(hit.depth, 3))
+                return "\(pad)• \(hit.name) [\(hit.type)] — \(hit.filePath ?? hit.id) (depth \(hit.depth))"
+            }
+            return "\(hits.count) nodes depend on '\(target)' (\(direct) directly):\n" + lines.joined(separator: "\n")
+
+        case "understand_explain":
+            guard let nodeID = arguments["node_id"] as? String, !nodeID.isEmpty else {
+                throw ToolError.missingArgument("node_id")
+            }
+            guard let projectPath = arguments["project_path"] as? String, !projectPath.isEmpty else {
+                throw ToolError.missingArgument("project_path")
+            }
+            guard let explanation = await UnderstandAnythingManager.shared.explain(
+                nodeID: nodeID, projectPath: projectPath) else {
+                throw ToolError.unavailable("No node '\(nodeID)' in the project's knowledge graph.")
+            }
+            var lines: [String] = []
+            let node = explanation.node
+            lines.append("\(node.displayName) [\(node.type)] — \(node.id)")
+            if let signature = node.signature, !signature.isEmpty {
+                lines.append("Signature: \(signature)")
+            }
+            if let summary = node.summary, !summary.isEmpty {
+                lines.append("\n\(summary)")
+            }
+            if !explanation.layers.isEmpty {
+                lines.append("\nLayers: \(explanation.layers.joined(separator: ", "))")
+            }
+            let incoming = explanation.neighbors.filter { $0.direction == "in" }
+            let outgoing = explanation.neighbors.filter { $0.direction == "out" }
+            if !incoming.isEmpty {
+                lines.append("\nDepended on by (\(incoming.count)):")
+                lines.append(contentsOf: incoming.prefix(15).map {
+                    "  • \($0.node.displayName) [\($0.type)] — \($0.node.id)"
+                })
+            }
+            if !outgoing.isEmpty {
+                lines.append("\nDepends on (\(outgoing.count)):")
+                lines.append(contentsOf: outgoing.prefix(15).map {
+                    "  • \($0.node.displayName) [\($0.type)] — \($0.node.id)"
+                })
+            }
+            return lines.joined(separator: "\n")
+
+        case "understand_architecture":
+            guard let projectPath = arguments["project_path"] as? String, !projectPath.isEmpty else {
+                throw ToolError.missingArgument("project_path")
+            }
+            let layers = await UnderstandAnythingManager.shared.architecture(projectPath: projectPath)
+            guard !layers.isEmpty else {
+                return "No knowledge graph for \(projectPath) — analyze it first (check for \(projectPath)/.ua/knowledge-graph.json)."
+            }
+            let lines = layers.map { layer -> String in
+                var line = "\(layer.name) — \(layer.nodeCount) node\(layer.nodeCount == 1 ? "" : "s")"
+                if let description = layer.description, !description.isEmpty {
+                    line += "\n  \(description)"
+                }
+                if !layer.sampleNodes.isEmpty {
+                    line += "\n  e.g. \(layer.sampleNodes.joined(separator: ", "))"
+                }
+                return line
+            }
+            return lines.joined(separator: "\n")
+
+        case "get_assignments":
+            let limit = arguments["limit"] as? Int ?? 25
+            let rows = await MainActor.run { NYUIntegrationManager.shared.listAssignments() }
+            guard !rows.isEmpty else {
+                return "No assignments tracked. Enable the NYU integration with a Canvas token in Settings and sync — or there may be nothing due yet."
+            }
+            let lines = rows.prefix(limit).map { row -> String in
+                var line = "\(row.name) [\(row.courseName)] — \(AssignmentStatus(rawValue: row.status)?.displayName ?? row.status)"
+                if let due = row.dueAt {
+                    let when = Date(timeIntervalSince1970: due).formatted(date: .abbreviated, time: .omitted)
+                    line += row.isOverdue ? " (overdue, due \(when))" : " (due \(when))"
+                } else {
+                    line += " (no due date)"
+                }
+                if let score = row.score { line += " — scored \(score)" }
+                return line + " — id \(row.id)"
+            }
+            return "\(rows.count) assignment(s):\n" + lines.joined(separator: "\n")
+
+        case "get_current_grades":
+            let courses = await MainActor.run { NYUIntegrationManager.shared.listCourses() }
+            let graded = courses.filter { $0.currentScore != nil }
+            guard !graded.isEmpty else {
+                return "No grades yet — the NYU integration is either unconfigured or Canvas hasn't posted scores. Sync to refresh."
+            }
+            return graded.map { course -> String in
+                let score = String(format: "%.1f", course.currentScore ?? 0)
+                var line = "\(course.name): \(score) (\(course.trend))"
+                if let projected = course.projectedScore {
+                    line += " — projected \(String(format: "%.1f", projected))"
+                }
+                return line + " — course id \(course.id)"
+            }.joined(separator: "\n")
+
+        case "get_next_deadline":
+            let next = await MainActor.run { NYUIntegrationManager.shared.nextDeadline() }
+            guard let next else {
+                return "No upcoming deadlines — everything pending is either submitted, graded, or overdue. Sync to be sure."
+            }
+            let when = next.dueAt.map {
+                Date(timeIntervalSince1970: $0).formatted(date: .abbreviated, time: .shortened)
+            } ?? "no due date"
+            return "\(next.name) [\(next.courseName)] — due \(when) (id \(next.id))"
+
+        case "mark_submitted":
+            guard let assignmentID = arguments["assignment_id"] as? Int else {
+                throw ToolError.missingArgument("assignment_id")
+            }
+            let status = arguments["status"] as? String ?? AssignmentStatus.submitted.rawValue
+            let updated = await MainActor.run {
+                NYUIntegrationManager.shared.updateAssignmentStatus(id: assignmentID, status: status)
+            }
+            guard let updated else {
+                return "No assignment with id \(assignmentID). Get ids from get_assignments."
+            }
+            return "Marked '\(updated.name)' as \(AssignmentStatus(rawValue: updated.status)?.displayName ?? updated.status). This is local tracking only — nothing was submitted to Canvas."
+
+        case "get_syllabus_info":
+            let courseID = arguments["course_id"] as? Int
+            let courses = await MainActor.run {
+                courseID.map { NYUIntegrationManager.shared.courseInfo(id: $0).map { [$0] } ?? [] }
+                    ?? NYUIntegrationManager.shared.listCourses()
+            }
+            guard !courses.isEmpty else {
+                return "No course info — enable the NYU integration and sync."
+            }
+            return courses.map { course -> String in
+                var lines = ["\(course.name) (\(course.code)) — id \(course.id)"]
+                if !course.term.isEmpty { lines.append("  Term: \(course.term)") }
+                if !course.professor.isEmpty { lines.append("  Professor: \(course.professor)") }
+                if !course.schedule.isEmpty { lines.append("  Schedule: \(course.schedule)") }
+                if let finalExam = course.finalExamAt {
+                    lines.append("  Final exam: \(Date(timeIntervalSince1970: finalExam).formatted(date: .abbreviated, time: .omitted)) (best-effort from syllabus)")
+                }
+                if !course.gradingBreakdown.isEmpty {
+                    let breakdown = course.gradingBreakdown
+                        .sorted { $0.value > $1.value }
+                        .map { "\($0.key) \(Int($0.value))%" }
+                        .joined(separator: ", ")
+                    lines.append("  Grading: \(breakdown)")
+                }
+                if !course.syllabus.isEmpty {
+                    lines.append("  Syllabus: \(course.syllabus.prefix(400))")
+                }
+                return lines.joined(separator: "\n")
+            }.joined(separator: "\n\n")
+
+        case "learn_preference":
+            guard let content = arguments["content"] as? String, !content.isEmpty else {
+                throw ToolError.missingArgument("content")
+            }
+            let category = (arguments["category"] as? String)
+                .flatMap(MemoryCategory.init(rawValue:)) ?? .preference
+            let id = MemPalaceManager.shared.remember(
+                content: content, category: category, source: "manual",
+                confidence: 0.75)
+            guard !id.isEmpty else {
+                throw ToolError.unavailable("could not store the memory")
+            }
+            return "Stored: \(content) (category \(category.rawValue), id \(id))"
+
+        case "get_learned_context":
+            let limit = arguments["limit"] as? Int ?? 6
+            let entries = MemPalaceManager.shared.getLearnedContext(limit: limit)
+            guard !entries.isEmpty else {
+                return "No high-confidence memories yet — nothing above the threshold."
+            }
+            let lines = entries.map { entry -> String in
+                let pct = Int((entry.confidence * 100).rounded())
+                return "\(entry.content) (\(entry.category.rawValue), \(pct)%)"
+            }
+            return lines.joined(separator: "\n")
+
+        case "recall_about_person":
+            guard let name = arguments["name"] as? String, !name.isEmpty else {
+                throw ToolError.missingArgument("name")
+            }
+            let entries = MemPalaceManager.shared.recallAboutPerson(name)
+            guard !entries.isEmpty else {
+                return "Nothing stored about \(name)."
+            }
+            return entries.map { entry -> String in
+                let pct = Int((entry.confidence * 100).rounded())
+                return "\(entry.content) (\(pct)%)"
+            }.joined(separator: "\n")
+
+        case "search_memory":
+            guard let query = arguments["query"] as? String, !query.isEmpty else {
+                throw ToolError.missingArgument("query")
+            }
+            let limit = arguments["limit"] as? Int ?? 12
+            let entries = MemPalaceManager.shared.search(query, limit: limit)
+            guard !entries.isEmpty else {
+                return "No memories match '\(query)'."
+            }
+            let lines = entries.map { entry -> String in
+                let pct = Int((entry.confidence * 100).rounded())
+                return "\(entry.content) (\(entry.category.rawValue), \(pct)%, id \(entry.id))"
+            }
+            return lines.joined(separator: "\n")
+
+        case "correct_memory":
+            guard let memoryID = arguments["memory_id"] as? String, !memoryID.isEmpty,
+                  let correction = arguments["correction"] as? String, !correction.isEmpty else {
+                throw ToolError.missingArgument("memory_id and correction")
+            }
+            guard let corrected = MemPalaceManager.shared.correctMemory(
+                id: memoryID, correction: correction) else {
+                throw ToolError.unavailable("no memory with id \(memoryID)")
+            }
+            return "Corrected: \(corrected.content) (now \(Int((corrected.confidence * 100).rounded()))%)"
+
+        case "update_goal_progress":
+            guard let goalID = arguments["goal_id"] as? String, !goalID.isEmpty else {
+                throw ToolError.missingArgument("goal_id")
+            }
+            let completed = arguments["completed"] as? Bool ?? true
+            guard let goal = MemPalaceManager.shared.updateGoalProgress(
+                id: goalID, completed: completed) else {
+                throw ToolError.unavailable("no goal with id \(goalID)")
+            }
+            return "\(goal.title): streak \(goal.streak)"
+
+        case "get_optimization_report":
+            return Self.optimizationReportText()
+
+        case "optimization_compile":
+            // The manual trigger: run a compile pass now and report what it
+            // learned. Bounded (the DSPy bridge times out at 60s), and the
+            // store serializes its own SQLite connections, so this is safe to
+            // call from the MCP serving thread.
+            let compiled = DSPyOptimizer.shared.compile()
+            return Self.optimizationReportText(compiled)
+
+        case "optimization_rollback":
+            guard let raw = arguments["kind"] as? String,
+                  let kind = OptimizationKind(rawValue: raw) else {
+                throw ToolError.missingArgument("kind (code, email, summary, routine, multistep, or general)")
+            }
+            let rules = DSPyOptimizer.shared.rollback(kind: kind)
+            if rules.isEmpty {
+                return "\(kind.displayName) rolled back to baseline — no learned rules active."
+            }
+            let listed = rules.map(\.directive).joined(separator: "\n- ")
+            return "\(kind.displayName) rolled back to the previous rule set:\n- \(listed)"
+
+        case "write_essay":
+            guard let topic = arguments["topic"] as? String,
+                  !topic.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ToolError.missingArgument("topic")
+            }
+            let length = arguments["length"] as? String
+            let citationStyle = (arguments["citation_style"] as? String).flatMap(CitationStyle.init(rawValue:))
+            let tone = (arguments["tone"] as? String).flatMap(EssayTone.init(rawValue:))
+            let result = await EssayWritingSkill.shared.writeEssay(
+                topic: topic, length: length, citationStyle: citationStyle, tone: tone)
+            return result.essay
+
+        case "analyze_my_writing_style":
+            return EssayWritingSkill.shared.styleDescription()
+
+        case "learn_writing_style":
+            guard let essay = arguments["essay"] as? String,
+                  !essay.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ToolError.missingArgument("essay")
+            }
+            let profile = EssayWritingSkill.shared.learnStyle(from: essay)
+            let description = profile.summary.isEmpty ? profile.toPromptInjection() : profile.summary
+            return "Learned (now \(profile.sampleCount) sample\(profile.sampleCount == 1 ? "" : "s")): \(description)"
+
+        case "research_topic":
+            guard let topic = arguments["topic"] as? String,
+                  !topic.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ToolError.missingArgument("topic")
+            }
+            let depth = (arguments["depth"] as? String).flatMap(ResearchDepth.init(rawValue:))
+            let sources = await EssayWritingSkill.shared.research(topic: topic, depth: depth)
+            guard !sources.isEmpty else {
+                return "No sources found for “\(topic)”. The search bridge may be down or the topic returned nothing."
+            }
+            var lines: [String] = []
+            for (index, source) in sources.enumerated() {
+                lines.append("\(index + 1). \(source.title)")
+                if !source.url.isEmpty { lines.append("   \(source.url)") }
+                if !source.summary.isEmpty { lines.append("   \(source.summary)") }
+                for quote in source.keyQuotes { lines.append("   “\(quote)”") }
+            }
+            return lines.joined(separator: "\n")
+
+        case "revise_essay":
+            guard let essay = arguments["essay"] as? String,
+                  !essay.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ToolError.missingArgument("essay")
+            }
+            guard let feedback = arguments["feedback"] as? String,
+                  !feedback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ToolError.missingArgument("feedback")
+            }
+            let tone = (arguments["tone"] as? String).flatMap(EssayTone.init(rawValue:))
+            return await EssayWritingSkill.shared.revise(essay: essay, feedback: feedback, tone: tone)
+
+        case "check_citations":
+            guard let essay = arguments["essay"] as? String, !essay.isEmpty else {
+                throw ToolError.missingArgument("essay")
+            }
+            let style = (arguments["citation_style"] as? String).flatMap(CitationStyle.init(rawValue:))
+            let issues = EssayWritingSkill.shared.checkCitations(essay: essay, style: style)
+            guard !issues.isEmpty else {
+                return "Citations look consistent — every listed source is cited and the reference list is present."
+            }
+            return issues.map { "- \($0)" }.joined(separator: "\n")
+
+        case "solve_problem":
+            guard let problem = arguments["problem"] as? String, !problem.isEmpty else {
+                throw ToolError.missingArgument("problem")
+            }
+            return await HomeworkAssistantSkill.shared.solveProblem(
+                problem, mode: arguments["mode"] as? String)
+
+        case "explain_problem":
+            guard let problem = arguments["problem"] as? String, !problem.isEmpty else {
+                throw ToolError.missingArgument("problem")
+            }
+            return await HomeworkAssistantSkill.shared.explainProblem(problem)
+
+        case "write_code":
+            guard let requirements = arguments["requirements"] as? String,
+                  !requirements.isEmpty else {
+                throw ToolError.missingArgument("requirements")
+            }
+            return await HomeworkAssistantSkill.shared.writeCode(
+                requirements: requirements, language: arguments["language"] as? String)
+
+        case "solve_math":
+            guard let problem = arguments["problem"] as? String, !problem.isEmpty else {
+                throw ToolError.missingArgument("problem")
+            }
+            return await HomeworkAssistantSkill.shared.solveMath(problem)
+
+        case "solve_physics":
+            guard let problem = arguments["problem"] as? String, !problem.isEmpty else {
+                throw ToolError.missingArgument("problem")
+            }
+            return await HomeworkAssistantSkill.shared.solvePhysics(problem)
+
+        case "format_solution":
+            guard let solution = arguments["solution"] as? String else {
+                throw ToolError.missingArgument("solution")
+            }
+            return HomeworkAssistantSkill.shared.formatSolution(
+                solution, format: arguments["format"] as? String)
+
+        case "what_i_struggle_with":
+            return HomeworkAssistantSkill.shared.struggleSummary()
+
         default:
             throw ToolError.unknown(tool)
         }
+    }
+
+    /// Format the DSPy self-optimization report as plain text the model can
+    /// read and relay. Deliberately deterministic and instant — no model turn
+    /// is spent reading the agent's own trend.
+    private static func optimizationReportText() -> String {
+        optimizationReportText(DSPyOptimizer.shared.report())
+    }
+
+    private static func optimizationReportText(_ report: OptimizationReport) -> String {
+        guard report.totalRatings > 0 || !report.activeOptimizations.isEmpty else {
+            return "No optimization data yet. Rate Alfred's outputs and the weekly compile pass will start learning from them."
+        }
+
+        var lines: [String] = []
+        if report.weekDelta > 0.05 {
+            lines.append(String(format: "Average rating: %.1f stars (up %.1f week over week)",
+                                report.averageRating, report.weekDelta))
+        } else if report.weekDelta < -0.05 {
+            lines.append(String(format: "Average rating: %.1f stars (down %.1f week over week)",
+                                report.averageRating, abs(report.weekDelta)))
+        } else {
+            lines.append(String(format: "Average rating: %.1f stars (holding steady)",
+                                report.averageRating))
+        }
+
+        for score in report.perKind {
+            if score.previous > 0 {
+                lines.append("- \(score.displayName): \(String(format: "%.1f", score.previous)) → \(String(format: "%.1f", score.current)) (\(score.samples) rated)")
+            } else {
+                lines.append("- \(score.displayName): \(String(format: "%.1f", score.current)) (\(score.samples) rated)")
+            }
+        }
+
+        if !report.activeOptimizations.isEmpty {
+            lines.append("Active learned rules:")
+            for rule in report.activeOptimizations {
+                lines.append("- \(rule)")
+            }
+        }
+
+        if let lastRun = report.lastRun {
+            let outcome = lastRun.rolledBack ? "rolled back" : (lastRun.applied ? "applied" : "skipped")
+            lines.append("Last compile: \(lastRun.kind) v\(lastRun.version) \(outcome), \(lastRun.examples) example\(lastRun.examples == 1 ? "" : "s")")
+        }
+        return lines.joined(separator: "\n")
     }
 
     /// ComputerControlCapability is main-actor isolated (it drives AX and posts

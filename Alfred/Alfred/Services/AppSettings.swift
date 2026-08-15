@@ -19,6 +19,18 @@ private nonisolated enum SettingsKeys {
     static let voiceHost = "alfred.voiceHost"
     static let socketHost = "alfred.socketHost"
     static let socketPort = "alfred.socketPort"
+    static let routinesEnabled = "alfred.routinesEnabled"
+    static let codeSessionsEnabled = "alfred.codeSessionsEnabled"
+    static let codeSelectedProject = "alfred.codeSelectedProject"
+    static let understandEnabled = "alfred.understandEnabled"
+    static let understandIndexOnLoad = "alfred.understandIndexOnLoad"
+    static let nyuEnabled = "alfred.nyuEnabled"
+    static let nyuCanvasToken = "alfred.nyuCanvasToken"
+    static let nyuTargetGPA = "alfred.nyuTargetGPA"
+    static let nyuSyncFrequencyHours = "alfred.nyuSyncFrequencyHours"
+    static let nyuRemind24h = "alfred.nyuRemind24h"
+    static let nyuRemind1h = "alfred.nyuRemind1h"
+    static let nyuCalendarSync = "alfred.nyuCalendarSync"
 }
 
 @MainActor
@@ -51,6 +63,67 @@ final class AppSettings {
     /// constant; a non-default port is kept here so manual entry can point at a custom setup.
     var socketPort: Int {
         didSet { UserDefaults.standard.set(socketPort, forKey: SettingsKeys.socketPort) }
+    }
+
+    /// Whether the Routines tab shows live routines from the Mac. Defaults to on;
+    /// off hides the tab's content behind a pointer back to this switch.
+    var routinesEnabled: Bool {
+        didSet { UserDefaults.standard.set(routinesEnabled, forKey: SettingsKeys.routinesEnabled) }
+    }
+
+    /// Whether the Code tab shows live AlfredCode sessions from the Mac. Same
+    /// semantics as `routinesEnabled`.
+    var codeSessionsEnabled: Bool {
+        didSet { UserDefaults.standard.set(codeSessionsEnabled, forKey: SettingsKeys.codeSessionsEnabled) }
+    }
+
+    /// The project folder the Code tab's composer points at, kept verbatim
+    /// (it may be a `~/` shorthand the Mac resolves). Empty until the user
+    /// picks one — the composer's Send stays disabled without it.
+    var selectedProjectPath: String {
+        didSet { UserDefaults.standard.set(selectedProjectPath, forKey: SettingsKeys.codeSelectedProject) }
+    }
+
+    /// Understand-Anything (the interactive knowledge graph): whether the Code
+    /// tab's "Explore visually" sheet is active at all. Defaults on.
+    var understandEnabled: Bool {
+        didSet { UserDefaults.standard.set(understandEnabled, forKey: SettingsKeys.understandEnabled) }
+    }
+
+    /// Analyze a project automatically when a code session starts there.
+    /// Defaults off — the analysis runs LLM agents on the Mac, so it's opt-in.
+    var understandIndexOnLoad: Bool {
+        didSet { UserDefaults.standard.set(understandIndexOnLoad, forKey: SettingsKeys.understandIndexOnLoad) }
+    }
+
+    /// NYU coursework (mirrors the Mac's NYUIntegrationManager settings). The
+    /// token is sent to the Mac once via nyu.set_settings — the Mac holds it.
+    var nyuEnabled: Bool {
+        didSet { UserDefaults.standard.set(nyuEnabled, forKey: SettingsKeys.nyuEnabled) }
+    }
+
+    var nyuCanvasToken: String {
+        didSet { UserDefaults.standard.set(nyuCanvasToken, forKey: SettingsKeys.nyuCanvasToken) }
+    }
+
+    var nyuTargetGPA: Double {
+        didSet { UserDefaults.standard.set(nyuTargetGPA, forKey: SettingsKeys.nyuTargetGPA) }
+    }
+
+    var nyuSyncFrequencyHours: Int {
+        didSet { UserDefaults.standard.set(nyuSyncFrequencyHours, forKey: SettingsKeys.nyuSyncFrequencyHours) }
+    }
+
+    var nyuRemind24h: Bool {
+        didSet { UserDefaults.standard.set(nyuRemind24h, forKey: SettingsKeys.nyuRemind24h) }
+    }
+
+    var nyuRemind1h: Bool {
+        didSet { UserDefaults.standard.set(nyuRemind1h, forKey: SettingsKeys.nyuRemind1h) }
+    }
+
+    var nyuCalendarSync: Bool {
+        didSet { UserDefaults.standard.set(nyuCalendarSync, forKey: SettingsKeys.nyuCalendarSync) }
     }
 
     /// The `ws://host:port` URL for the live socket, or nil when no host is set.
@@ -98,6 +171,20 @@ final class AppSettings {
         socketHost = UserDefaults.standard.string(forKey: SettingsKeys.socketHost) ?? ""
         socketPort = UserDefaults.standard.object(forKey: SettingsKeys.socketPort) as? Int
             ?? AlfredWebSocketClient.defaultPort
+        // Defaults to on: the tabs are only visible after a Mac is configured,
+        // and the switch exists to turn the feature *off* when it isn't wanted.
+        routinesEnabled = UserDefaults.standard.object(forKey: SettingsKeys.routinesEnabled) as? Bool ?? true
+        codeSessionsEnabled = UserDefaults.standard.object(forKey: SettingsKeys.codeSessionsEnabled) as? Bool ?? true
+        selectedProjectPath = UserDefaults.standard.string(forKey: SettingsKeys.codeSelectedProject) ?? ""
+        understandEnabled = UserDefaults.standard.object(forKey: SettingsKeys.understandEnabled) as? Bool ?? true
+        understandIndexOnLoad = UserDefaults.standard.object(forKey: SettingsKeys.understandIndexOnLoad) as? Bool ?? false
+        nyuEnabled = UserDefaults.standard.object(forKey: SettingsKeys.nyuEnabled) as? Bool ?? false
+        nyuCanvasToken = UserDefaults.standard.string(forKey: SettingsKeys.nyuCanvasToken) ?? ""
+        nyuTargetGPA = UserDefaults.standard.object(forKey: SettingsKeys.nyuTargetGPA) as? Double ?? 0
+        nyuSyncFrequencyHours = UserDefaults.standard.object(forKey: SettingsKeys.nyuSyncFrequencyHours) as? Int ?? 6
+        nyuRemind24h = UserDefaults.standard.object(forKey: SettingsKeys.nyuRemind24h) as? Bool ?? true
+        nyuRemind1h = UserDefaults.standard.object(forKey: SettingsKeys.nyuRemind1h) as? Bool ?? true
+        nyuCalendarSync = UserDefaults.standard.object(forKey: SettingsKeys.nyuCalendarSync) as? Bool ?? false
     }
 
     /// Persist a discovered host, so discovery doesn't have to run every launch.

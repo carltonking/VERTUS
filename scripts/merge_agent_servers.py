@@ -50,6 +50,12 @@ NEW_SERVERS = [
         "args": [f"{BRIDGE}/memory_graph_mcp_server.py"],
         "env": [],
     },
+    {
+        "name": "crawlee",
+        "command": "/bin/bash",
+        "args": [f"{BRIDGE}/crawlee-mcp-wrapper.sh"],
+        "env": [],
+    },
 ]
 
 

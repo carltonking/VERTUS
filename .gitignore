@@ -72,3 +72,10 @@ data/
 # Local artifacts
 AlfredMac/dist/
 *.bak
+
+# Tool runtime state — never commit
+.freebuff/
+
+# Crawlee runtime state (request queues, session pools, crawler statistics)
+agent-bridge/storage/
+agent-bridge/crawlee/storage/

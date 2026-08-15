@@ -13,36 +13,50 @@ struct MessageBubble: View {
     var onRetry: () -> Void = {}
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            if message.role == .user { Spacer(minLength: 44) }
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text(rendered)
-                    .font(.system(size: 16))
-                    .foregroundStyle(foreground)
-                    .textSelection(.enabled)
-
-                if message.role == .error {
-                    Button(action: onRetry) {
-                        Label("Try again", systemImage: "arrow.clockwise")
-                            .font(.system(size: 14, weight: .medium))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(palette.accentBright)
-                }
+        HStack(alignment: .bottom, spacing: 10) {
+            if message.role == .user {
+                Spacer(minLength: 44)
+            } else {
+                avatar
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(background)
-            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .strokeBorder(border, lineWidth: 1)
-            )
 
-            if message.role != .user { Spacer(minLength: 44) }
+            Text(rendered)
+                .font(.system(size: 15.5))
+                .foregroundStyle(foreground)
+                .textSelection(.enabled)
+                .lineSpacing(6)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .background(background)
+                .clipShape(RoundedRectangle(cornerRadius: palette.bubbleRadius, style: .continuous))
+
+            if message.role == .error {
+                Button(action: onRetry) {
+                    Label("Try again", systemImage: "arrow.clockwise")
+                        .font(.system(size: 14, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(palette.accentBright)
+            }
+
+            if message.role != .user {
+                Spacer(minLength: 44)
+            }
         }
         .frame(maxWidth: .infinity, alignment: message.role == .user ? .trailing : .leading)
+        .alfredEntrance()
+    }
+
+    /// A small accent circle with Alfred's triangle — enough to mark the
+    /// speaker without calling attention away from the message itself.
+    private var avatar: some View {
+        ZStack {
+            Circle()
+                .fill(palette.accentGradient)
+            AlfredMark(lineWidth: 1.4)
+                .padding(6)
+        }
+        .frame(width: 20, height: 20)
     }
 
     /// Alfred writes in light markdown (the Telegram side has always rendered it). Parse inline
@@ -71,17 +85,9 @@ struct MessageBubble: View {
                 endPoint: .bottomTrailing
             )
         case .alfred:
-            palette.surface
+            palette.surface.opacity(0.85)
         case .error:
             palette.danger.opacity(0.12)
-        }
-    }
-
-    private var border: Color {
-        switch message.role {
-        case .user: return .clear
-        case .alfred: return palette.surfaceBorder
-        case .error: return palette.danger.opacity(0.35)
         }
     }
 }
@@ -116,10 +122,6 @@ struct ThinkingIndicator: View {
             .padding(.vertical, 12)
             .background(palette.surface)
             .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .strokeBorder(palette.surfaceBorder, lineWidth: 1)
-            )
 
             if ticks > Self.reassureAfterTicks {
                 Text("still working…")

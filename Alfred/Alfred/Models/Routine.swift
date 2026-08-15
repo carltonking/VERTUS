@@ -17,16 +17,35 @@ import Foundation
 ///   {"kind":"shell","command":"..."}
 ///   {"kind":"mail","action":"check_unread"}
 ///   {"kind":"reminder","title":"...","dueIn":3600}
+///   {"kind":"browser","instruction":"...","url":"https://..."}   (url optional)
+///   {"kind":"scrape","instruction":"...","url":"https://..."}    (url optional)
 enum RoutineStepPayload: Codable, Hashable, Identifiable {
     case briefing(type: String)
     case hermes(prompt: String)
     case shell(command: String)
     case mail(action: String)
     case reminder(title: String, dueIn: TimeInterval)
+    /// Read-only web automation: open `url` (or search for `instruction` when
+    /// no url is given) and report what the page says.
+    case browser(instruction: String, url: String?)
+    /// Lightweight web fetch via the Mac's Crawlee bridge: open `url` (or
+    /// search for `instruction` when no url is given) and report the text.
+    case scrape(instruction: String, url: String?)
+    /// Career-ops work on the Mac: "scan" finds and scores jobs against your
+    /// profile; "follow_ups" lists applications that went quiet.
+    case career(action: String)
+    /// Understand-Anything (interactive knowledge graph): "analyze" builds the
+    /// graph, "docs" adds an architecture report, "onboarding" walks the tour.
+    case understand(action: String)
+    /// NYU coursework: "check_deadlines" lists what's due in the next week
+    /// plus anything overdue; "sync" forces a Canvas refresh first.
+    case nyu(action: String)
 
-    private enum Kind: String, Codable { case briefing, hermes, shell, mail, reminder }
+    private enum Kind: String, Codable {
+        case briefing, hermes, shell, mail, reminder, browser, scrape, career, understand, nyu
+    }
     private enum Key: String, CodingKey {
-        case kind, type, prompt, command, action, title, dueIn
+        case kind, type, prompt, command, action, title, dueIn, instruction, url
     }
 
     init(from decoder: Decoder) throws {
@@ -40,6 +59,20 @@ enum RoutineStepPayload: Codable, Hashable, Identifiable {
             self = .reminder(
                 title: try c.decode(String.self, forKey: .title),
                 dueIn: try c.decode(TimeInterval.self, forKey: .dueIn))
+        case .browser:
+            self = .browser(
+                instruction: try c.decode(String.self, forKey: .instruction),
+                url: try c.decodeIfPresent(String.self, forKey: .url))
+        case .scrape:
+            self = .scrape(
+                instruction: try c.decode(String.self, forKey: .instruction),
+                url: try c.decodeIfPresent(String.self, forKey: .url))
+        case .career:
+            self = .career(action: try c.decode(String.self, forKey: .action))
+        case .understand:
+            self = .understand(action: try c.decode(String.self, forKey: .action))
+        case .nyu:
+            self = .nyu(action: try c.decode(String.self, forKey: .action))
         }
     }
 
@@ -62,6 +95,23 @@ enum RoutineStepPayload: Codable, Hashable, Identifiable {
             try c.encode(Kind.reminder, forKey: .kind)
             try c.encode(title, forKey: .title)
             try c.encode(dueIn, forKey: .dueIn)
+        case .browser(let instruction, let url):
+            try c.encode(Kind.browser, forKey: .kind)
+            try c.encode(instruction, forKey: .instruction)
+            try c.encodeIfPresent(url, forKey: .url)
+        case .scrape(let instruction, let url):
+            try c.encode(Kind.scrape, forKey: .kind)
+            try c.encode(instruction, forKey: .instruction)
+            try c.encodeIfPresent(url, forKey: .url)
+        case .career(let action):
+            try c.encode(Kind.career, forKey: .kind)
+            try c.encode(action, forKey: .action)
+        case .understand(let action):
+            try c.encode(Kind.understand, forKey: .kind)
+            try c.encode(action, forKey: .action)
+        case .nyu(let action):
+            try c.encode(Kind.nyu, forKey: .kind)
+            try c.encode(action, forKey: .action)
         }
     }
 
@@ -72,6 +122,11 @@ enum RoutineStepPayload: Codable, Hashable, Identifiable {
         case .shell(let command): return "shell-\(command)"
         case .mail(let action): return "mail-\(action)"
         case .reminder(let title, let dueIn): return "reminder-\(title)-\(dueIn)"
+        case .browser(let instruction, _): return "browser-\(instruction)"
+        case .scrape(let instruction, _): return "scrape-\(instruction)"
+        case .career(let action): return "career-\(action)"
+        case .understand(let action): return "understand-\(action)"
+        case .nyu(let action): return "nyu-\(action)"
         }
     }
 
@@ -86,6 +141,26 @@ enum RoutineStepPayload: Codable, Hashable, Identifiable {
             return "Mail — \(action.replacingOccurrences(of: "_", with: " "))"
         case .reminder(let title, _):
             return "Reminder — \(title)"
+        case .browser(let instruction, _):
+            return "Browse — \(instruction.prefix(40))"
+        case .scrape(let instruction, _):
+            return "Scrape — \(instruction.prefix(40))"
+        case .career(let action):
+            switch action {
+            case "follow_ups": return "Career — follow-ups"
+            default: return "Career — scan jobs"
+            }
+        case .understand(let action):
+            switch action {
+            case "docs": return "Knowledge graph — visual docs"
+            case "onboarding": return "Knowledge graph — onboarding tour"
+            default: return "Knowledge graph — analyze project"
+            }
+        case .nyu(let action):
+            switch action {
+            case "sync": return "NYU — sync Canvas"
+            default: return "NYU — check deadlines"
+            }
         }
     }
 
@@ -97,6 +172,11 @@ enum RoutineStepPayload: Codable, Hashable, Identifiable {
         case .shell: return "terminal"
         case .mail: return "envelope"
         case .reminder: return "checklist"
+        case .browser: return "globe"
+        case .scrape: return "doc.text.magnifyingglass"
+        case .career: return "briefcase"
+        case .understand: return "point.3.connected.trianglepath.dotted"
+        case .nyu: return "graduationcap.fill"
         }
     }
 }
@@ -225,7 +305,7 @@ struct RoutineSummary: Codable, Hashable, Identifiable {
 /// Mac's `RoutineTemplates` exactly — the phone sends the name and the Mac
 /// builds the routine.
 enum RoutineTemplatesPayload {
-    static let names: [String] = ["Morning Summary", "News Brief", "Evening Checklist", "Weekly Review"]
+    static let names: [String] = ["Morning Summary", "News Brief", "Evening Checklist", "Weekly Review", "Job Search Brief", "Application Follow-ups"]
 
     static func blurb(for name: String) -> String {
         switch name {
@@ -233,6 +313,8 @@ enum RoutineTemplatesPayload {
         case "News Brief": return "A round-up of what's happening, first thing."
         case "Evening Checklist": return "How today went, and the three things tomorrow needs."
         case "Weekly Review": return "A week in review, with Notes open to capture it."
+        case "Job Search Brief": return "A scan of new listings, scored against your profile."
+        case "Application Follow-ups": return "The applications that went quiet — and who to chase."
         default: return ""
         }
     }
@@ -243,6 +325,8 @@ enum RoutineTemplatesPayload {
         case "News Brief": return "newspaper"
         case "Evening Checklist": return "moon.stars"
         case "Weekly Review": return "calendar.badge.clock"
+        case "Job Search Brief": return "briefcase"
+        case "Application Follow-ups": return "paperplane"
         default: return "bolt"
         }
     }

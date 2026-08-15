@@ -147,6 +147,66 @@ struct CodeProjectPayload: Codable, Hashable, Identifiable {
     var id: String { path }
 }
 
+/// The CodeGraph state for a project, as the Mac reports it in
+/// `code.graph_index` results: a stable state string plus counts.
+struct CodeGraphStatePayload: Codable, Hashable {
+    var state: CodeGraphState
+    var fileCount: Int?
+    var symbolCount: Int?
+    var message: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case state
+        case fileCount = "file_count"
+        case symbolCount = "symbol_count"
+        case message
+    }
+
+    static func fromJSON(_ params: [String: Any]) -> CodeGraphStatePayload? {
+        guard let data = try? JSONSerialization.data(withJSONObject: params),
+              let payload = try? JSONDecoder().decode(CodeGraphStatePayload.self, from: data)
+        else { return nil }
+        return payload
+    }
+}
+
+/// The stable graph states, mirroring the Mac's `code.graph_status` wire.
+enum CodeGraphState: String, Codable, Hashable {
+    case notInstalled = "not_installed"
+    case notIndexed = "not_indexed"
+    case indexing
+    case ready
+    case failed
+
+    var isReady: Bool { self == .ready }
+    var isIndexing: Bool { self == .indexing }
+}
+
+/// The graph's status for a project, as the Mac reports it in
+/// `code.graph_status` results.
+struct CodeGraphStatusPayload: Codable, Hashable {
+    var indexed: Bool
+    var fileCount: Int
+    var symbolCount: Int
+    var available: Bool
+    var text: String
+
+    private enum CodingKeys: String, CodingKey {
+        case indexed
+        case fileCount = "file_count"
+        case symbolCount = "symbol_count"
+        case available
+        case text
+    }
+
+    static func fromJSON(_ params: [String: Any]) -> CodeGraphStatusPayload? {
+        guard let data = try? JSONSerialization.data(withJSONObject: params),
+              let payload = try? JSONDecoder().decode(CodeGraphStatusPayload.self, from: data)
+        else { return nil }
+        return payload
+    }
+}
+
 /// The coding agents a session can run. Names must match what the Mac's
 /// socket server accepts (`opencode` / `freebuff` / `prime-agent`).
 enum CodeAgentChoice: String, CaseIterable, Identifiable {
@@ -167,5 +227,218 @@ enum CodeAgentChoice: String, CaseIterable, Identifiable {
         case .opencode: return "The forked coding agent — the default."
         case .freebuff: return "The external agentic coding CLI (must be on the Mac's PATH)."
         }
+    }
+}
+
+// MARK: - Understand-Anything (interactive knowledge graph)
+//
+// The iOS half of the Understand-Anything contract. These mirror the macOS
+// wire shapes in UnderstandAnythingManager.swift / BriefingSocketServer.swift
+// exactly — the phone decodes `code.understand_status` / `code.understand_query`
+// results with these. Keep the two in lockstep.
+
+/// The knowledge graph's state for a project, as the Mac reports it in
+/// `code.understand_analyze` / status broadcasts: a stable string plus counts.
+struct UnderstandStatePayload: Codable, Hashable {
+    var state: UnderstandState
+    var nodeCount: Int?
+    var edgeCount: Int?
+    var layerCount: Int?
+    var message: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case state
+        case nodeCount = "node_count"
+        case edgeCount = "edge_count"
+        case layerCount = "layer_count"
+        case message
+    }
+
+    static func fromJSON(_ params: [String: Any]) -> UnderstandStatePayload? {
+        guard let data = try? JSONSerialization.data(withJSONObject: params),
+              let payload = try? JSONDecoder().decode(UnderstandStatePayload.self, from: data)
+        else { return nil }
+        return payload
+    }
+}
+
+/// The stable graph states, mirroring the Mac's `code.understand_status` wire.
+enum UnderstandState: String, Codable, Hashable {
+    case notInstalled = "not_installed"
+    case notAnalyzed = "not_analyzed"
+    case analyzing
+    case ready
+    case failed
+
+    var isReady: Bool { self == .ready }
+    var isAnalyzing: Bool { self == .analyzing }
+    var isFailure: Bool { self == .failed }
+}
+
+/// The graph's full status for a project, from `code.understand_status`.
+struct UnderstandStatusPayload: Codable, Hashable {
+    var state: UnderstandState
+    var available: Bool
+    var installed: Bool
+    var text: String
+
+    private enum CodingKeys: String, CodingKey {
+        case state, available, installed, text
+    }
+
+    static func fromJSON(_ params: [String: Any]) -> UnderstandStatusPayload? {
+        guard let data = try? JSONSerialization.data(withJSONObject: params),
+              let payload = try? JSONDecoder().decode(UnderstandStatusPayload.self, from: data)
+        else { return nil }
+        return payload
+    }
+}
+
+/// One node in a knowledge-graph payload — a file, function, class, …
+struct UnderstandNodePayload: Codable, Hashable, Identifiable {
+    var id: String
+    var name: String
+    var type: String
+    var filePath: String
+    var summary: String
+    var tags: [String]
+    var signature: String
+    var startLine: Int
+    var endLine: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, type, summary, tags, signature
+        case filePath = "file_path"
+        case startLine = "start_line"
+        case endLine = "end_line"
+    }
+
+    static func fromJSON(_ dict: [String: Any]) -> UnderstandNodePayload? {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
+        return try? JSONDecoder().decode(UnderstandNodePayload.self, from: data)
+    }
+}
+
+/// One edge between two nodes.
+struct UnderstandEdgePayload: Codable, Hashable, Identifiable {
+    var source: String
+    var target: String
+    var type: String
+
+    var id: String { "\(source)-\(target)-\(type)" }
+
+    static func fromJSON(_ dict: [String: Any]) -> UnderstandEdgePayload? {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
+        return try? JSONDecoder().decode(UnderstandEdgePayload.self, from: data)
+    }
+}
+
+/// A bounded subgraph (for the canvas): nodes + edges + the focused center.
+struct UnderstandGraphPayload: Codable, Hashable {
+    var nodes: [UnderstandNodePayload]
+    var edges: [UnderstandEdgePayload]
+    var center: String?
+
+    static func fromJSON(_ dict: [String: Any]) -> UnderstandGraphPayload? {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
+        return try? JSONDecoder().decode(UnderstandGraphPayload.self, from: data)
+    }
+}
+
+/// One search hit, with the Mac's relevance score.
+struct UnderstandHitPayload: Codable, Hashable, Identifiable {
+    var id: String
+    var name: String
+    var type: String
+    var filePath: String
+    var summary: String
+    var tags: [String]
+    var score: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, type, summary, tags, score
+        case filePath = "file_path"
+    }
+
+    static func fromJSON(_ dict: [String: Any]) -> UnderstandHitPayload? {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
+        return try? JSONDecoder().decode(UnderstandHitPayload.self, from: data)
+    }
+}
+
+/// One dependent found by impact analysis: how deep below the target, and the
+/// node-id chain back to it.
+struct UnderstandImpactHitPayload: Codable, Hashable, Identifiable {
+    var id: String
+    var name: String
+    var type: String
+    var filePath: String
+    var summary: String
+    var depth: Int
+    var path: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, type, summary, depth, path
+        case filePath = "file_path"
+    }
+
+    static func fromJSON(_ dict: [String: Any]) -> UnderstandImpactHitPayload? {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
+        return try? JSONDecoder().decode(UnderstandImpactHitPayload.self, from: data)
+    }
+}
+
+/// A layer summary from `code.understand_query` mode=architecture.
+struct UnderstandLayerSummaryPayload: Codable, Hashable, Identifiable {
+    var id: String
+    var name: String
+    var description: String
+    var nodeCount: Int
+    var sampleNodes: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, description
+        case nodeCount = "node_count"
+        case sampleNodes = "sample_nodes"
+    }
+
+    static func fromJSON(_ dict: [String: Any]) -> UnderstandLayerSummaryPayload? {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
+        return try? JSONDecoder().decode(UnderstandLayerSummaryPayload.self, from: data)
+    }
+}
+
+/// A node's explanation: itself, its neighbors (with edge type and direction),
+/// and the layers it belongs to.
+struct UnderstandExplainPayload: Codable, Hashable {
+    var node: UnderstandNodePayload
+    var neighbors: [UnderstandNeighborPayload]
+    var layers: [String]
+
+    struct UnderstandNeighborPayload: Codable, Hashable {
+        var direction: String
+        var type: String
+        var node: UnderstandNodePayload
+    }
+
+    static func fromJSON(_ dict: [String: Any]) -> UnderstandExplainPayload? {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
+        return try? JSONDecoder().decode(UnderstandExplainPayload.self, from: data)
+    }
+}
+
+/// A trace path: ordered node ids plus the edge types between consecutive ones.
+struct UnderstandTracePayload: Codable, Hashable {
+    var nodeIDs: [String]
+    var edgeTypes: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case nodeIDs = "node_ids"
+        case edgeTypes = "edge_types"
+    }
+
+    static func fromJSON(_ dict: [String: Any]) -> UnderstandTracePayload? {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
+        return try? JSONDecoder().decode(UnderstandTracePayload.self, from: data)
     }
 }

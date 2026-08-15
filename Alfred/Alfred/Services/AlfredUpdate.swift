@@ -32,6 +32,8 @@ struct BriefingUpdate: Codable, Equatable {
     var generatedAt: TimeInterval = 0
     var nextUpdateAt: TimeInterval = 0
     var focusedDay: String = "today"
+    /// The self-optimization card, when the Mac has learned anything to report.
+    var improvement: ImprovementCardPayload?
 
     /// Decode a briefing from a JSON-RPC `result` or `params` dictionary, as
     /// sent by the Mac's BriefingSocketServer. Tolerates the legacy wire shape
@@ -56,12 +58,14 @@ struct BriefingUpdate: Codable, Equatable {
             changes = []
         }
         guard !summary.isEmpty || !changes.isEmpty else { return nil }
+        let improvement = (params["improvement"] as? [String: Any]).flatMap(ImprovementCardPayload.fromJSON)
         return BriefingUpdate(
             summary: summary,
             changes: changes,
             generatedAt: params["generatedAt"] as? TimeInterval ?? 0,
             nextUpdateAt: params["nextUpdateAt"] as? TimeInterval ?? 0,
-            focusedDay: params["focusedDay"] as? String ?? "today")
+            focusedDay: params["focusedDay"] as? String ?? "today",
+            improvement: improvement)
     }
 }
 
@@ -77,6 +81,10 @@ enum AlfredUpdate: Equatable {
     case routineProgress(routineID: String, name: String, step: Int, total: Int, label: String)
     /// A routine finished, with its outcome.
     case routineCompleted(routineID: String, name: String, success: Bool, duration: TimeInterval, output: String)
+    /// Routine metadata changed on the Mac outside a lifecycle event (the
+    /// taste polish rewriting a created routine's name/description) — the
+    /// Routines tab refreshes its list.
+    case routinesChanged
     /// A chunk of code-session output streamed from the Mac's coding agent.
     case codeChunk(sessionID: String, text: String)
     /// A code session changed state (generating/paused/completed/error).
@@ -94,6 +102,9 @@ enum AlfredUpdate: Equatable {
     /// A full folder sweep finished on the Mac — fresh folder stats, important
     /// finds, and any "important mail in Junk" rescue candidates.
     case mailScanComplete(MailScanSummaryPayload)
+    /// The application tracker changed on the Mac (applied, status updated,
+    /// deleted) — the Jobs tab refreshes its counts without asking.
+    case careerApplicationsChanged(CareerSummaryPayload)
     case codeUpdate(code: String, language: String)
     case pushNotification(title: String, body: String)
     case error(message: String)
@@ -141,6 +152,9 @@ enum AlfredUpdateParser {
                 duration: params["duration"] as? TimeInterval ?? 0,
                 output: params["output"] as? String ?? params["result"] as? String ?? "")
 
+        case "routines.changed":
+            return .routinesChanged
+
         case "code.chunk":
             guard let text = params["text"] as? String else { return nil }
             return .codeChunk(sessionID: params["session_id"] as? String ?? "", text: text)
@@ -181,6 +195,10 @@ enum AlfredUpdateParser {
         case "mail.scan_complete":
             guard let scan = MailScanSummaryPayload.fromJSON(params) else { return nil }
             return .mailScanComplete(scan)
+
+        case "career.applications_changed":
+            guard let summary = CareerSummaryPayload.fromJSON(params) else { return nil }
+            return .careerApplicationsChanged(summary)
 
         case "push.notification":
             guard let title = params["title"] as? String else { return nil }

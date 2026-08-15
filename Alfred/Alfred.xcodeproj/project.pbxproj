@@ -407,6 +407,7 @@
 				INFOPLIST_KEY_NSCalendarsFullAccessUsageDescription = "Alfred shows your schedule in the Calendar tab. Your events stay on this phone.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Alfred hears you when you talk to him over voice — the audio goes straight to your computer, no further.";
 				INFOPLIST_KEY_NSRemindersFullAccessUsageDescription = "Alfred shows and manages your reminders in the Reminders tab. They stay on this phone.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Alfred transcribes your voice into the coding prompt when you dictate — audio is processed on this device.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -443,6 +444,7 @@
 				INFOPLIST_KEY_NSCalendarsFullAccessUsageDescription = "Alfred shows your schedule in the Calendar tab. Your events stay on this phone.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Alfred hears you when you talk to him over voice — the audio goes straight to your computer, no further.";
 				INFOPLIST_KEY_NSRemindersFullAccessUsageDescription = "Alfred shows and manages your reminders in the Reminders tab. They stay on this phone.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Alfred transcribes your voice into the coding prompt when you dictate — audio is processed on this device.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

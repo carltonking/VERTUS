@@ -89,6 +89,14 @@
         "/Users/carltonking/01 - PROJECTS/ALFRED/agent-bridge/memory_graph_mcp_server.py"
       ],
       "env": []
+    },
+    {
+      "name": "crawlee",
+      "command": "/bin/bash",
+      "args": [
+        "/Users/carltonking/01 - PROJECTS/ALFRED/agent-bridge/crawlee-mcp-wrapper.sh"
+      ],
+      "env": []
     }
   ]
 }

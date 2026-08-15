@@ -47,6 +47,9 @@ struct RoutinesView: View {
     @State private var detailRoutine: RoutineSummary?
     @State private var running: RunningState?
     @State private var resultFlash: String?
+    /// True once the Mac has answered a fetch — the empty state only shows
+    /// after a real answer, not during the first (possibly slow) connect.
+    @State private var hasLoaded = false
 
     var body: some View {
         NavigationStack {
@@ -66,7 +69,7 @@ struct RoutinesView: View {
                         Image(systemName: "plus")
                             .foregroundStyle(palette.accentBright)
                     }
-                    .disabled(!settings.isConfigured)
+                    .disabled(!linkAvailable)
                     .accessibilityLabel("New routine")
                 }
             }
@@ -84,18 +87,81 @@ struct RoutinesView: View {
         }
         .task { await reload() }
         .task { await observeRoutineEvents() }
+        .onChange(of: settings.routinesEnabled) { _, enabled in
+            // Re-enabling shows the Mac's current list, not the snapshot from
+            // whenever the tab last fetched.
+            if enabled { Task { await reload() } }
+        }
+        .onChange(of: socket.state) { _, state in
+            // The socket can land after this tab's first fetch (discovery is
+            // async), and RootView keeps tabs alive so .task won't re-run on a
+            // tab switch. Once the link is up, pull the real list.
+            if state == .connected { Task { await reload() } }
+        }
     }
 
     // MARK: - Content
 
     @ViewBuilder
     private var content: some View {
-        if !settings.isConfigured {
+        if !settings.routinesEnabled {
+            turnedOff
+        } else if !linkAvailable {
             notConnected
-        } else if routines.isEmpty && !loading {
+        } else if routines.isEmpty && !loading && hasLoaded {
             emptyState
+        } else if routines.isEmpty && !hasLoaded && socket.isConnected {
+            loadingPlaceholder
+        } else if routines.isEmpty && !hasLoaded {
+            // A socket host exists but the Mac hasn't answered — say so
+            // instead of spinning forever on a placeholder.
+            notConnected
         } else {
             routineList
+        }
+    }
+
+    // MARK: - Link state
+
+    /// These tabs talk to the Mac only over the live socket — the relay's
+    /// configured state (host + token) is irrelevant here. A socket host
+    /// (pinned or discovered) or an active connection is what matters.
+    private var linkAvailable: Bool {
+        socket.isConnected || settings.socketURL != nil
+    }
+
+    /// Brief spinner while the first fetch is in flight — distinct from the
+    /// empty state, so a slow first connect doesn't read as "no routines".
+    private var loadingPlaceholder: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+                .tint(palette.accentBright)
+            Text("Loading from your Mac…")
+                .font(.system(size: 14))
+                .foregroundStyle(palette.textSecondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Shown when the Settings toggle is off — a pointer back, not a dead end.
+    private var turnedOff: some View {
+        VStack(spacing: 0) {
+            Spacer()
+            Image(systemName: "bolt.slash")
+                .font(.system(size: 38, weight: .light))
+                .foregroundStyle(palette.textFaint)
+            Text("Routines are off")
+                .font(.system(size: 22, weight: .semibold, design: .rounded))
+                .foregroundStyle(palette.textPrimary)
+                .padding(.top, 16)
+            Text("Turn them back on in Settings and your Mac's routines will show up here.")
+                .font(.system(size: 15))
+                .foregroundStyle(palette.textSecondary)
+                .multilineTextAlignment(.center)
+                .padding(.top, 8)
+                .padding(.horizontal, 40)
+            Spacer()
+            Spacer()
         }
     }
 
@@ -329,10 +395,21 @@ struct RoutinesView: View {
         return parts.joined(separator: " · ")
     }
 
-    /// Last run outcome, when there is one: "✓ 3/5 steps · 12s ago".
+    /// Last run outcome, when there is one: "✓ 3/5 steps · 12s ago". While a run
+    /// is in flight the card shows a live spinner instead, so the row that was
+    /// told to run is the row visibly running.
     @ViewBuilder
     private func statusLine(_ routine: RoutineSummary) -> some View {
-        if let result = routine.lastResult {
+        if let running, running.id == routine.id {
+            HStack(spacing: 5) {
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(palette.accentBright)
+                Text("Running…")
+                    .font(.system(size: 12))
+                    .foregroundStyle(palette.accentBright)
+            }
+        } else if let result = routine.lastResult {
             HStack(spacing: 5) {
                 Image(systemName: result.success ? "checkmark.circle.fill" : "xmark.circle.fill")
                     .font(.system(size: 10))
@@ -341,6 +418,10 @@ struct RoutinesView: View {
                     .font(.system(size: 12))
                     .foregroundStyle(palette.textFaint)
             }
+        } else {
+            Text(routine.lastRun > 0 ? "Last run \(timeAgo(routine.lastRun))" : "Never run")
+                .font(.system(size: 12))
+                .foregroundStyle(palette.textFaint)
         }
     }
 
@@ -352,7 +433,12 @@ struct RoutinesView: View {
         // a beat anyway.
         running = RunningState(id: routine.id, text: "Starting \(routine.name)…")
         Task {
-            _ = await socket.runRoutine(id: routine.id)
+            let result = await socket.runRoutine(id: routine.id)
+            if result == nil {
+                // The Mac never accepted the run — drop the optimistic banner
+                // rather than leaving a spinner that can never resolve.
+                running = nil
+            }
             await reload()
         }
     }
@@ -367,28 +453,48 @@ struct RoutinesView: View {
     }
 
     private func reload() async {
-        guard settings.isConfigured else { return }
+        guard linkAvailable else {
+            NSLog("[routines] reload skipped — no live link (socket %@, host %@)",
+                  socket.isConnected ? "connected" : "down", settings.socketHost)
+            return
+        }
+        // Once the Mac has answered, never wipe a good list with a dead-socket
+        // [] (listRoutines returns [] on failure too) — keep showing last-known
+        // data until the link is back.
+        if hasLoaded && !socket.isConnected {
+            NSLog("[routines] socket down — keeping last-known list")
+            return
+        }
         loading = true
         defer { loading = false }
         routines = await socket.listRoutines()
+        hasLoaded = true
+        NSLog("[routines] reload — %d routines from Mac", routines.count)
     }
 
     /// Consume the pushed routine lifecycle events.
     private func observeRoutineEvents() async {
+        NSLog("[routines] observing routine lifecycle events")
         for await update in socket.updates() {
             switch update {
             case .routineStarted(let id, let name):
+                NSLog("[routines] event routine.started — %@ (%@)", name, id)
                 running = RunningState(id: UUID(uuidString: id) ?? UUID(), text: "Running \(name)…")
             case .routineProgress(let id, let name, let step, let total, _):
+                NSLog("[routines] event routine.progress — %@ step %d/%d", name, step, total)
                 running = RunningState(
                     id: UUID(uuidString: id) ?? UUID(),
                     text: "\(name): step \(step) of \(total)…")
             case .routineCompleted(let id, let name, let success, _, _):
+                NSLog("[routines] event routine.completed — %@ success=%@", name, success ? "ok" : "fail")
                 if let running, running.id.uuidString == id {
                     self.running = nil
                 }
                 resultFlash = success ? "\(name) finished ✓" : "\(name) hit a problem ✗"
                 // Pick up the refreshed lastResult.
+                await reload()
+            case .routinesChanged:
+                NSLog("[routines] event routines.changed — refreshing list")
                 await reload()
             default:
                 break

@@ -12,7 +12,7 @@
 import SwiftUI
 
 enum AlfredTab: String, CaseIterable, Identifiable, Hashable {
-    case home, chat, email, calendar, reminders, routines, code, settings
+    case home, chat, email, calendar, reminders, routines, code, courses, settings
 
     var id: String { rawValue }
 
@@ -25,6 +25,7 @@ enum AlfredTab: String, CaseIterable, Identifiable, Hashable {
         case .reminders: return "Reminders"
         case .routines: return "Routines"
         case .code: return "Code"
+        case .courses: return "Courses"
         case .settings: return "Settings"
         }
     }
@@ -38,6 +39,7 @@ enum AlfredTab: String, CaseIterable, Identifiable, Hashable {
         case .reminders: return "checklist"
         case .routines: return "bolt.fill"
         case .code: return "chevron.left.forwardslash.chevron.right"
+        case .courses: return "graduationcap.fill"
         case .settings: return "gearshape.fill"
         }
     }
@@ -58,6 +60,7 @@ struct RootView: View {
             page(.reminders) { RemindersView() }
             page(.routines) { RoutinesView() }
             page(.code) { CodeView() }
+            page(.courses) { NYUView() }
             page(.settings) { SettingsView() }
         }
         .safeAreaInset(edge: .bottom) {

@@ -392,6 +392,306 @@ final class AlfredWebSocketClient {
         }
     }
 
+    // MARK: - Career (job hunt)
+
+    /// The owner's job-hunt profile from the Mac.
+    func careerPreferences() async -> JobPreferencesPayload? {
+        do {
+            let result = try await sendCommand(name: "career.preferences", timeout: 15)
+            guard let raw = result["preferences"] as? [String: Any] else { return nil }
+            return JobPreferencesPayload.fromJSON(raw)
+        } catch {
+            logger.info("career.preferences failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Push the edited profile to the Mac. Returns the stored copy, or nil on failure.
+    func careerSetPreferences(_ preferences: JobPreferencesPayload) async -> JobPreferencesPayload? {
+        do {
+            let result = try await sendCommand(
+                name: "career.set_preferences",
+                params: ["preferences": Self.wireObject(preferences)],
+                timeout: 15)
+            guard let raw = result["preferences"] as? [String: Any] else { return nil }
+            return JobPreferencesPayload.fromJSON(raw)
+        } catch {
+            logger.info("career.set_preferences failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Scan + score: the Discover list. Strong matches come back first.
+    func careerSearch(role: String, location: String, limit: Int = 10) async -> [ScoredJobPayload] {
+        do {
+            let result = try await sendCommand(
+                name: "career.search",
+                params: ["role": role, "location": location, "limit": limit],
+                timeout: 90)
+            guard let raw = result["jobs"] as? [[String: Any]] else { return [] }
+            return raw.compactMap(ScoredJobPayload.fromJSON)
+        } catch {
+            logger.info("career.search failed: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    /// Record an application — the tracker entry, not an auto-submit.
+    func careerApply(posting: JobPostingPayload, notes: String = "") async -> JobApplicationPayload? {
+        do {
+            let result = try await sendCommand(
+                name: "career.apply",
+                params: ["posting": posting.wireDictionary, "notes": notes],
+                timeout: 60)
+            guard let raw = result["application"] as? [String: Any] else { return nil }
+            return JobApplicationPayload.fromJSON(raw)
+        } catch {
+            logger.info("career.apply failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// All tracked applications + dashboard counts.
+    func careerApplications() async -> (applications: [JobApplicationPayload], summary: CareerSummaryPayload?) {
+        do {
+            let result = try await sendCommand(name: "career.applications", timeout: 20)
+            let raw = result["applications"] as? [[String: Any]] ?? []
+            let applications = raw.compactMap(JobApplicationPayload.fromJSON)
+            let summary = (result["summary"] as? [String: Any]).flatMap(CareerSummaryPayload.fromJSON)
+            return (applications, summary)
+        } catch {
+            logger.info("career.applications failed: \(error.localizedDescription)")
+            return ([], nil)
+        }
+    }
+
+    /// Move an application to a new status (interviewed, offer, rejected…).
+    func careerUpdateStatus(id: UUID, status: ApplicationStatusPayload) async -> JobApplicationPayload? {
+        do {
+            let result = try await sendCommand(
+                name: "career.update_status",
+                params: ["application_id": id.uuidString, "status": status.rawValue],
+                timeout: 20)
+            guard let raw = result["application"] as? [String: Any] else { return nil }
+            return JobApplicationPayload.fromJSON(raw)
+        } catch {
+            logger.info("career.update_status failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func careerDeleteApplication(id: UUID) async -> Bool {
+        do {
+            let result = try await sendCommand(
+                name: "career.delete_application",
+                params: ["application_id": id.uuidString],
+                timeout: 20)
+            return result["success"] as? Bool ?? false
+        } catch {
+            logger.info("career.delete_application failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Ask the Mac to tailor the base CV to a posting. Empty on failure.
+    func careerTailorCV(posting: JobPostingPayload) async -> String {
+        await careerDocument("career.tailor_cv", posting: posting)
+    }
+
+    /// Ask the Mac for a cover letter for a posting. Empty on failure.
+    func careerCoverLetter(posting: JobPostingPayload) async -> String {
+        await careerDocument("career.cover_letter", posting: posting)
+    }
+
+    private func careerDocument(_ method: String, posting: JobPostingPayload) async -> String {
+        do {
+            let result = try await sendCommand(
+                name: method,
+                params: ["posting": posting.wireDictionary],
+                timeout: 90)
+            return (result["generated"] as? Bool ?? false)
+                ? (result["cv"] as? String ?? result["cover_letter"] as? String ?? "")
+                : ""
+        } catch {
+            logger.info("\(method) failed: \(error.localizedDescription)")
+            return ""
+        }
+    }
+
+    // MARK: - Taste (anti-slop text)
+
+    /// The Mac's taste (anti-slop) settings.
+    func tasteSettings() async -> TasteSettingsPayload? {
+        do {
+            let result = try await sendCommand(name: "taste.settings", timeout: 15)
+            guard let raw = result["settings"] as? [String: Any] else { return nil }
+            return TasteSettingsPayload.fromJSON(raw)
+        } catch {
+            logger.info("taste.settings failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Push taste settings to the Mac. Returns the stored copy, or nil on failure.
+    func tasteSetSettings(_ settings: TasteSettingsPayload) async -> TasteSettingsPayload? {
+        do {
+            let result = try await sendCommand(
+                name: "taste.set_settings",
+                params: ["settings": Self.wireObject(settings)],
+                timeout: 15)
+            guard let raw = result["settings"] as? [String: Any] else { return nil }
+            return TasteSettingsPayload.fromJSON(raw)
+        } catch {
+            logger.info("taste.set_settings failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    // MARK: - MemPalace (persistent memory)
+
+    /// The Mac's MemPalace settings (the persistent-memory configuration).
+    func memorySettings() async -> MemorySettingsPayload? {
+        do {
+            let result = try await sendCommand(name: "memory.settings", timeout: 15)
+            guard let raw = result["settings"] as? [String: Any] else { return nil }
+            return MemorySettingsPayload.fromJSON(raw)
+        } catch {
+            logger.info("memory.settings failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Push MemPalace settings to the Mac. Returns the stored copy, or nil on
+    /// failure.
+    func memorySetSettings(_ settings: MemorySettingsPayload) async -> MemorySettingsPayload? {
+        do {
+            let result = try await sendCommand(
+                name: "memory.set_settings",
+                params: ["settings": Self.wireObject(settings)],
+                timeout: 15)
+            guard let raw = result["settings"] as? [String: Any] else { return nil }
+            return MemorySettingsPayload.fromJSON(raw)
+        } catch {
+            logger.info("memory.set_settings failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    // MARK: - Homework Assistant
+
+    /// The Mac's homework settings (the submission-side skill's
+    /// configuration).
+    func homeworkSettings() async -> HomeworkSettingsPayload? {
+        do {
+            let result = try await sendCommand(name: "homework.settings", timeout: 15)
+            guard let raw = result["settings"] as? [String: Any] else { return nil }
+            return HomeworkSettingsPayload.fromJSON(raw)
+        } catch {
+            logger.info("homework.settings failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Push homework settings to the Mac. Returns the stored copy, or nil on
+    /// failure.
+    func homeworkSetSettings(_ settings: HomeworkSettingsPayload) async -> HomeworkSettingsPayload? {
+        do {
+            let result = try await sendCommand(
+                name: "homework.set_settings",
+                params: ["settings": Self.wireObject(settings)],
+                timeout: 15)
+            guard let raw = result["settings"] as? [String: Any] else { return nil }
+            return HomeworkSettingsPayload.fromJSON(raw)
+        } catch {
+            logger.info("homework.set_settings failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    // MARK: - Optimization / feedback (DSPy)
+
+    /// Record a 1–5 rating for one of Alfred's outputs. The prompt + output
+    /// ride along so the weekly compile pass has the full training example.
+    func submitFeedback(kind: String?, prompt: String, output: String,
+                        rating: Int, edited: Bool = false, context: String? = nil) async -> Bool {
+        var params: [String: Any] = [
+            "prompt": prompt,
+            "output": output,
+            "rating": rating,
+            "edited": edited,
+        ]
+        if let kind { params["kind"] = kind }
+        if let context { params["context"] = context }
+        do {
+            let result = try await sendCommand(name: "feedback.submit", params: params, timeout: 10)
+            return result["success"] as? Bool ?? false
+        } catch {
+            logger.info("feedback.submit failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// The self-optimization trend + active learned rules.
+    func optimizationReport() async -> OptimizationReportPayload? {
+        do {
+            let result = try await sendCommand(name: "optimization.report", timeout: 15)
+            return OptimizationReportPayload.fromJSON(result)
+        } catch {
+            logger.info("optimization.report failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// The loop's frequency/threshold/rollback config from the Mac.
+    func optimizationSettings() async -> OptimizationSettingsPayload? {
+        do {
+            let result = try await sendCommand(name: "optimization.settings", timeout: 15)
+            guard let raw = result["settings"] as? [String: Any] else { return nil }
+            return OptimizationSettingsPayload.fromJSON(raw)
+        } catch {
+            logger.info("optimization.settings failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Push the loop's config to the Mac. Returns the stored copy.
+    func optimizationSetSettings(_ settings: OptimizationSettingsPayload) async -> OptimizationSettingsPayload? {
+        do {
+            let result = try await sendCommand(
+                name: "optimization.set_settings",
+                params: ["settings": Self.wireObject(settings)],
+                timeout: 15)
+            guard let raw = result["settings"] as? [String: Any] else { return nil }
+            return OptimizationSettingsPayload.fromJSON(raw)
+        } catch {
+            logger.info("optimization.set_settings failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Force a compile pass now (the Manual trigger).
+    func optimizeNow() async -> OptimizationReportPayload? {
+        do {
+            let result = try await sendCommand(name: "optimization.optimize_now", timeout: 120)
+            return OptimizationReportPayload.fromJSON(result)
+        } catch {
+            logger.info("optimization.optimize_now failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Revert one domain to its previous rule set. Returns the active rules.
+    func rollbackOptimization(kind: String) async -> [String] {
+        do {
+            let result = try await sendCommand(
+                name: "optimization.rollback", params: ["kind": kind], timeout: 15)
+            return result["active_rules"] as? [String] ?? []
+        } catch {
+            logger.info("optimization.rollback failed: \(error.localizedDescription)")
+            return []
+        }
+    }
+
     // MARK: - Code sessions (AlfredCode)
 
     /// All remote coding sessions known to the Mac, newest first.
@@ -564,6 +864,168 @@ final class AlfredWebSocketClient {
         }
     }
 
+    /// The graph's state for a project (indexed?, counts, raw status text).
+    /// `nil` on any failure — the view renders an "unknown" state.
+    func codeGraphStatus(projectPath: String) async -> CodeGraphStatusPayload? {
+        do {
+            let result = try await sendCommand(
+                name: "code.graph_status", params: ["project_path": projectPath], timeout: 20)
+            return CodeGraphStatusPayload.fromJSON(result)
+        } catch {
+            logger.info("code.graph_status failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Index a project now (the picker's auto-index). Returns the new state, or
+    /// nil if the Mac didn't answer in time — a big first index can outrun the
+    /// request timeout, in which case the Mac still broadcasts code.graph_status
+    /// when it finishes, so the view recovers through the event stream.
+    func codeGraphIndex(projectPath: String) async -> CodeGraphStatePayload? {
+        do {
+            let result = try await sendCommand(
+                name: "code.graph_index", params: ["project_path": projectPath], timeout: 120)
+            guard let raw = result["state"] as? [String: Any] else { return nil }
+            return CodeGraphStatePayload.fromJSON(raw)
+        } catch HermesSocketError.timedOut {
+            // The Mac keeps indexing; the code.graph_status broadcast is the
+            // completion signal. Return the transitional state so the caller
+            // shows "indexing…" rather than an error.
+            logger.info("code.graph_index timed out — Mac is likely still indexing")
+            return CodeGraphStatePayload(state: .indexing, fileCount: nil, symbolCount: nil, message: nil)
+        } catch {
+            logger.info("code.graph_index failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Symbol search over a project's graph — the Code tab's search field.
+    /// Returns the raw result text, or nil when the graph isn't indexed.
+    func codeGraphSearch(projectPath: String, query: String) async -> String? {
+        do {
+            let result = try await sendCommand(
+                name: "code.graph_search",
+                params: ["project_path": projectPath, "query": query],
+                timeout: 20)
+            return (result["indexed"] as? Bool ?? false) ? (result["results"] as? String ?? "") : nil
+        } catch {
+            logger.info("code.graph_search failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    // MARK: - Understand-Anything (interactive knowledge graph)
+
+    /// The knowledge graph's state for a project. Nil on any failure — the
+    /// view renders an "unknown" state.
+    func codeUnderstandStatus(projectPath: String) async -> UnderstandStatusPayload? {
+        do {
+            let result = try await sendCommand(
+                name: "code.understand_status", params: ["project_path": projectPath], timeout: 20)
+            return UnderstandStatusPayload.fromJSON(result)
+        } catch {
+            logger.info("code.understand_status failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Analyze a project now (builds/refreshes its knowledge graph on the Mac
+    /// through the coding agent). Returns the new state; a long first run may
+    /// outrun the request timeout, in which case the Mac's
+    /// code.understand_status broadcast reports completion.
+    func codeUnderstandAnalyze(projectPath: String, force: Bool = false) async -> UnderstandStatePayload? {
+        do {
+            let result = try await sendCommand(
+                name: "code.understand_analyze",
+                params: ["project_path": projectPath, "force": force],
+                timeout: 120)
+            guard let raw = result["state"] as? [String: Any] else { return nil }
+            return UnderstandStatePayload.fromJSON(raw)
+        } catch HermesSocketError.timedOut {
+            logger.info("code.understand_analyze timed out — Mac is likely still analyzing")
+            return UnderstandStatePayload(state: .analyzing, nodeCount: nil, edgeCount: nil, layerCount: nil, message: nil)
+        } catch {
+            logger.info("code.understand_analyze failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Symbol search over the project's knowledge graph.
+    func codeUnderstandSearch(projectPath: String, query: String) async -> [UnderstandHitPayload] {
+        let payload = await codeUnderstandQuery(projectPath: projectPath, mode: "search", params: ["query": query])
+        let hits = payload["hits"] as? [[String: Any]] ?? []
+        return hits.compactMap(UnderstandHitPayload.fromJSON)
+    }
+
+    /// Impact analysis: what breaks if `target` changes.
+    func codeUnderstandImpact(projectPath: String, target: String) async -> [UnderstandImpactHitPayload] {
+        let payload = await codeUnderstandQuery(projectPath: projectPath, mode: "impact", params: ["target": target])
+        let hits = payload["hits"] as? [[String: Any]] ?? []
+        return hits.compactMap(UnderstandImpactHitPayload.fromJSON)
+    }
+
+    /// Explain one node: its record, neighbors and layers.
+    func codeUnderstandExplain(projectPath: String, nodeID: String) async -> UnderstandExplainPayload? {
+        let payload = await codeUnderstandQuery(projectPath: projectPath, mode: "explain", params: ["node_id": nodeID])
+        return UnderstandExplainPayload.fromJSON(payload)
+    }
+
+    /// The project's architectural layers.
+    func codeUnderstandArchitecture(projectPath: String) async -> [UnderstandLayerSummaryPayload] {
+        let payload = await codeUnderstandQuery(projectPath: projectPath, mode: "architecture", params: [:])
+        let layers = payload["layers"] as? [[String: Any]] ?? []
+        return layers.compactMap(UnderstandLayerSummaryPayload.fromJSON)
+    }
+
+    /// A path between two symbols (or backward to a root when target is nil).
+    func codeUnderstandTrace(projectPath: String, origin: String, target: String?) async -> UnderstandTracePayload? {
+        var params: [String: Any] = ["origin": origin]
+        if let target, !target.isEmpty { params["target"] = target }
+        let payload = await codeUnderstandQuery(projectPath: projectPath, mode: "trace", params: params)
+        return UnderstandTracePayload.fromJSON(payload)
+    }
+
+    /// A bounded subgraph around a symbol, for the canvas.
+    func codeUnderstandGraph(projectPath: String, center: String, depth: Int = 1, limit: Int = 60) async -> UnderstandGraphPayload? {
+        let payload = await codeUnderstandQuery(projectPath: projectPath, mode: "graph",
+                                                params: ["center": center, "depth": depth, "limit": limit])
+        return UnderstandGraphPayload.fromJSON(payload)
+    }
+
+    /// The whole project at a glance: highest-degree nodes plus their edges.
+    func codeUnderstandPreview(projectPath: String, limit: Int = 60) async -> UnderstandGraphPayload? {
+        let payload = await codeUnderstandQuery(projectPath: projectPath, mode: "preview", params: ["limit": limit])
+        return UnderstandGraphPayload.fromJSON(payload)
+    }
+
+    /// Start the interactive dashboard and return its URL (empty when it can't
+    /// start — e.g. the graph is missing or Node isn't available).
+    func codeUnderstandOpen(projectPath: String) async -> String {
+        do {
+            let result = try await sendCommand(
+                name: "code.understand_open", params: ["project_path": projectPath], timeout: 90)
+            return result["url"] as? String ?? ""
+        } catch {
+            logger.info("code.understand_open failed: \(error.localizedDescription)")
+            return ""
+        }
+    }
+
+    /// Shared plumbing for the graph queries: the Mac answers
+    /// `{mode, result}` and the mode-specific data lives under `result`.
+    private func codeUnderstandQuery(projectPath: String, mode: String, params: [String: Any]) async -> [String: Any] {
+        var body = params
+        body["project_path"] = projectPath
+        body["mode"] = mode
+        do {
+            let result = try await sendCommand(name: "code.understand_query", params: body, timeout: 30)
+            return result["result"] as? [String: Any] ?? [:]
+        } catch {
+            logger.info("code.understand_query (\(mode)) failed: \(error.localizedDescription)")
+            return [:]
+        }
+    }
+
     /// Candidate project folders for the new-session picker.
     func listCodeProjects() async -> [CodeProjectPayload] {
         do {
@@ -578,6 +1040,84 @@ final class AlfredWebSocketClient {
         } catch {
             logger.info("code.projects failed: \(error.localizedDescription)")
             return []
+        }
+    }
+
+    // MARK: - NYU coursework
+
+    /// The integration's status (settings + last-sync counts).
+    func nyuStatus() async -> NYUStatusPayload? {
+        do {
+            let result = try await sendCommand(name: "nyu.status", timeout: 20)
+            guard let raw = result["status"] as? [String: Any] else { return nil }
+            return NYUStatusPayload.fromJSON(raw)
+        } catch {
+            logger.info("nyu.status failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Replace the integration settings (token, toggles, target GPA). The
+    /// token crosses the wire once, Mac-side, to enable Sync Now.
+    @discardableResult
+    func nyuSetSettings(_ settings: NYUSettingsPayload) async -> NYUStatusPayload? {
+        do {
+            let result = try await sendCommand(
+                name: "nyu.set_settings",
+                params: ["settings": Self.wireObject(settings)], timeout: 20)
+            guard let raw = result["status"] as? [String: Any] else { return nil }
+            return NYUStatusPayload.fromJSON(raw)
+        } catch {
+            logger.info("nyu.set_settings failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Force a Canvas sync on the Mac and return its result.
+    func nyuSyncNow() async -> NYUSyncResultPayload? {
+        do {
+            let result = try await sendCommand(name: "nyu.sync_now", timeout: 90)
+            guard let raw = result["result"] as? [String: Any] else { return nil }
+            return NYUSyncResultPayload.fromJSON(raw)
+        } catch {
+            logger.info("nyu.sync_now failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func nyuAssignments() async -> [NYUAssignmentPayload] {
+        do {
+            let result = try await sendCommand(name: "nyu.assignments", timeout: 20)
+            guard let raw = result["assignments"] as? [[String: Any]] else { return [] }
+            return raw.compactMap(NYUAssignmentPayload.fromJSON)
+        } catch {
+            logger.info("nyu.assignments failed: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    func nyuGrades() async -> [NYUCoursePayload] {
+        do {
+            let result = try await sendCommand(name: "nyu.grades", timeout: 20)
+            guard let raw = result["grades"] as? [[String: Any]] else { return [] }
+            return raw.compactMap(NYUCoursePayload.fromJSON)
+        } catch {
+            logger.info("nyu.grades failed: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    /// Mark an assignment's status (e.g. submitted) on the Mac.
+    func nyuUpdateAssignment(id: Int, status: String) async -> NYUAssignmentPayload? {
+        do {
+            let result = try await sendCommand(
+                name: "nyu.update_assignment",
+                params: ["assignment_id": id, "status": status], timeout: 20)
+            guard let raw = result["assignment"] as? [String: Any] else { return nil }
+            return NYUAssignmentPayload.fromJSON(raw)
+        } catch {
+            logger.info("nyu.update_assignment failed: \(error.localizedDescription)")
+            return nil
         }
     }
 

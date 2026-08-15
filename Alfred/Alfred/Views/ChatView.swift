@@ -85,8 +85,20 @@ struct ChatView: View {
         ScrollView {
             LazyVStack(spacing: 14) {
                 ForEach(chat.messages) { message in
-                    MessageBubble(message: message) {
-                        Task { await chat.retry(message, settings: settings) }
+                    VStack(alignment: .leading, spacing: 6) {
+                        MessageBubble(message: message) {
+                            Task { await chat.retry(message, settings: settings) }
+                        }
+
+                        // Rate every reply: one tap, and the optimization loop
+                        // learns what "good" means for this user.
+                        if message.role == .alfred {
+                            FeedbackCollectionView(
+                                kind: nil,
+                                prompt: prompt(for: message),
+                                output: message.text)
+                                .padding(.horizontal, 4)
+                        }
                     }
                     .id(message.id)
                 }
@@ -98,11 +110,22 @@ struct ChatView: View {
             .padding(.horizontal, 14)
             .padding(.top, 12)
             .padding(.bottom, 8)
+            .animation(.easeOut(duration: 0.25), value: chat.messages.count)
         }
         .scrollDismissesKeyboard(.interactively)
         .defaultScrollAnchor(.bottom)
         .onChange(of: chat.messages.count) { scrollToEnd(proxy) }
         .onChange(of: chat.isThinking) { scrollToEnd(proxy) }
+    }
+
+    /// The user's message that prompted a given Alfred reply — the feedback
+    /// example pairs the prompt with the rated output.
+    private func prompt(for message: Message) -> String {
+        guard let index = chat.messages.firstIndex(of: message) else { return "" }
+        for i in stride(from: index - 1, through: 0, by: -1) {
+            if chat.messages[i].role == .user { return chat.messages[i].text }
+        }
+        return ""
     }
 
     private static let thinkingAnchor = "thinking"

@@ -53,8 +53,16 @@ import Network
 //   * mail.flag             → flag/unflag a message.
 //   * mail.trash            → move a message to the account's trash.
 //   * mail.archive          → move a message to the account's archive.
+//   * feedback.submit       → record a 1–5 rating for an AI output (prompt + output).
+//   * optimization.report   → the self-optimization trend + active learned rules.
+//   * optimization.settings → the loop's frequency/threshold/rollback config.
+//   * optimization.set_settings → update that config.
+//   * optimization.optimize_now → force a compile pass now.
+//   * optimization.rollback → revert one domain to its previous rule set.
 //   * ping                  → answered with -32601 like Hermes ACP does, which the
 //                             phone's heartbeat treats as proof of life.
+//   * chat.send              → one user turn from the macOS companion app's Chat tab;
+//                             answers with { "reply": "..." }.
 //
 // Mail lifecycle pushes (mail.sync_complete / mail.unread_count_changed) are
 // broadcast by MailManager's callbacks, wired in AppDelegate exactly like the
@@ -455,6 +463,96 @@ final class BriefingSocketServer {
                 respondCodeGitPull(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
             case "code.projects":
                 respondCodeProjects(id: id, on: client)
+            case "code.graph_status":
+                respondCodeGraphStatus(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "code.graph_index":
+                respondCodeGraphIndex(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "code.graph_search":
+                respondCodeGraphSearch(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "code.graph_context":
+                respondCodeGraphContext(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "code.understand_status":
+                respondCodeUnderstandStatus(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "code.understand_analyze":
+                respondCodeUnderstandAnalyze(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "code.understand_query":
+                respondCodeUnderstandQuery(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "code.understand_open":
+                respondCodeUnderstandOpen(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "career.preferences":
+                respondCareerPreferences(id: id, on: client)
+            case "career.set_preferences":
+                respondCareerSetPreferences(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "career.search":
+                respondCareerSearch(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "career.score":
+                respondCareerScore(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "career.tailor_cv":
+                respondCareerTailorCV(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "career.cover_letter":
+                respondCareerCoverLetter(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "career.applications":
+                respondCareerApplications(id: id, on: client)
+            case "career.apply":
+                respondCareerApply(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "career.update_status":
+                respondCareerUpdateStatus(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "career.delete_application":
+                respondCareerDeleteApplication(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "career.follow_ups_due":
+                respondCareerFollowUpsDue(id: id, on: client)
+            case "career.summary":
+                respondCareerSummary(id: id, on: client)
+            case "nyu.status":
+                respondNYUStatus(id: id, on: client)
+            case "nyu.set_settings":
+                respondNYUSetSettings(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "nyu.sync_now":
+                respondNYUSyncNow(id: id, on: client)
+            case "nyu.assignments":
+                respondNYUAssignments(id: id, on: client)
+            case "nyu.grades":
+                respondNYUGrades(id: id, on: client)
+            case "nyu.update_assignment":
+                respondNYUUpdateAssignment(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "nyu.course_info":
+                respondNYUCourseInfo(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "taste.settings":
+                respondTasteSettings(id: id, on: client)
+            case "memory.settings":
+                respondMemorySettings(id: id, on: client)
+
+            case "memory.set_settings":
+                respondMemorySetSettings(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+
+            case "taste.set_settings":
+                respondTasteSetSettings(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "tutoring.settings":
+                respondTutoringSettings(id: id, on: client)
+            case "tutoring.set_settings":
+                respondTutoringSetSettings(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "study.settings":
+                respondStudySettings(id: id, on: client)
+            case "study.set_settings":
+                respondStudySetSettings(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "study.status":
+                respondStudyStatus(id: id, on: client)
+            case "homework.settings":
+                respondHomeworkSettings(id: id, on: client)
+            case "homework.set_settings":
+                respondHomeworkSetSettings(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "feedback.submit":
+                respondFeedbackSubmit(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "optimization.report":
+                respondOptimizationReport(id: id, on: client)
+            case "optimization.settings":
+                respondOptimizationSettings(id: id, on: client)
+            case "optimization.set_settings":
+                respondOptimizationSetSettings(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "optimization.optimize_now":
+                respondOptimizationOptimizeNow(id: id, on: client)
+            case "optimization.rollback":
+                respondOptimizationRollback(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
             case "mail.accounts":
                 respondMailAccounts(id: id, on: client)
             case "mail.inbox":
@@ -509,6 +607,9 @@ final class BriefingSocketServer {
                 respondMailDraftAlternatives(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
             case "mail.draft_revise":
                 respondMailDraftRevise(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
+            case "chat.send":
+                // One user turn from the macOS companion app's Chat tab.
+                respondChatSend(id: id, params: frame["params"] as? [String: Any] ?? [:], on: client)
             case "ping":
                 // Deliberate -32601: a live ACP endpoint answers ping with
                 // "method not found", and the phone's heartbeat treats any
@@ -521,6 +622,42 @@ final class BriefingSocketServer {
         }
 
         // Notifications (no id): nothing to answer.
+    }
+
+    /// One user turn from the macOS companion app's Chat tab. Runs the shared
+    /// Hermes session exactly like the bar does (`capture: true` so the
+    /// conversation keeps its context) and answers with the full reply — the
+    /// companion renders it as a single bubble.
+    private func respondChatSend(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let text = params["text"] as? String,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            respondError(id: id, code: -32602, message: "text is required", on: client)
+            return
+        }
+        Task {
+            guard let hermes = BriefingGenerator.shared.hermes, await !hermes.isTurnActive else {
+                respondError(id: id, code: -32000,
+                             message: "Alfred is busy right now — try again in a moment.", on: client)
+                return
+            }
+            var transcript = ""
+            for await event in await hermes.prompt(text, capture: true) {
+                switch event {
+                case .text(let chunk):
+                    transcript += chunk
+                case .failed(let message):
+                    respondError(id: id, code: -32000, message: message, on: client)
+                    return
+                case .thought, .toolStarted, .toolProgress, .usage, .finished:
+                    break
+                }
+            }
+            let reply = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id, "result": ["reply": reply],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
     }
 
     private func respondBriefing(id: Any, force: Bool, on client: BriefingClient) {
@@ -579,11 +716,14 @@ final class BriefingSocketServer {
                 return
             }
             Task { @MainActor in
+                // skipPolish: template names are curated — the taste layer must
+                // not rewrite a name the owner chose by tapping a template.
                 let routine = RoutineManager.shared.createRoutine(
                     name: template.name,
                     description: template.description,
                     steps: template.steps,
-                    schedule: template.schedule)
+                    schedule: template.schedule,
+                    skipPolish: true)
                 let response: [String: Any] = [
                     "jsonrpc": "2.0", "id": id,
                     "result": ["routine": Self.routineWireDictionary(routine)],
@@ -1017,6 +1157,850 @@ final class BriefingSocketServer {
             }
         }
         return found
+    }
+
+    // MARK: - Code graph (JSON-RPC)
+
+    /// The graph's state for a project: indexed?, file/symbol counts, and the
+    /// raw status text. Never errors — a missing binary or an unindexed project
+    /// are states the phone renders.
+    private func respondCodeGraphStatus(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let projectPath = params["project_path"] as? String, !projectPath.isEmpty else {
+            respondError(id: id, code: -32602, message: "project_path is required", on: client)
+            return
+        }
+        Task { @MainActor in
+            let status = await CodeGraphManager.shared.status(projectPath: projectPath)
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": [
+                    "indexed": status.indexed,
+                    "file_count": status.fileCount,
+                    "symbol_count": status.symbolCount,
+                    "available": CodeGraphManager.shared.isAvailable,
+                    "text": status.text,
+                ],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// Index a project now (the phone's "Analyzing project…" affordance and
+    /// the picker's auto-index). `force: true` re-indexes from scratch.
+    /// Returns the resulting state so the phone can show a spinner until it
+    /// flips to ready.
+    private func respondCodeGraphIndex(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let projectPath = params["project_path"] as? String, !projectPath.isEmpty else {
+            respondError(id: id, code: -32602, message: "project_path is required", on: client)
+            return
+        }
+        let force = params["force"] as? Bool ?? false
+        Task { @MainActor in
+            let state = force
+                ? await CodeGraphManager.shared.reindex(projectPath: projectPath)
+                : await CodeGraphManager.shared.ensureIndexed(projectPath: projectPath)
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["state": Self.graphStateWire(state), "available": CodeGraphManager.shared.isAvailable],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// Symbol search over the project's graph — the Code tab's "Search
+    /// codebase…" field. Returns the raw result text plus the state, so the
+    /// phone can show "not indexed yet" distinctly from "no results".
+    private func respondCodeGraphSearch(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let projectPath = params["project_path"] as? String, !projectPath.isEmpty else {
+            respondError(id: id, code: -32602, message: "project_path is required", on: client)
+            return
+        }
+        guard let query = params["query"] as? String, !query.isEmpty else {
+            respondError(id: id, code: -32602, message: "query is required", on: client)
+            return
+        }
+        Task { @MainActor in
+            let results = await CodeGraphManager.shared.search(query: query, projectPath: projectPath)
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["results": results ?? "", "indexed": results != nil],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// The graph's context package for a task — what the agent is handed before
+    /// it starts coding. Also useful to the phone for a "what does this involve"
+    /// preview, though the session prompt is the main consumer.
+    private func respondCodeGraphContext(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let projectPath = params["project_path"] as? String, !projectPath.isEmpty else {
+            respondError(id: id, code: -32602, message: "project_path is required", on: client)
+            return
+        }
+        guard let task = params["task"] as? String, !task.isEmpty else {
+            respondError(id: id, code: -32602, message: "task is required", on: client)
+            return
+        }
+        Task { @MainActor in
+            let context = await CodeGraphManager.shared.context(for: task, projectPath: projectPath)
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["context": context ?? "", "indexed": context != nil],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// The phone-facing shape of an index state: a stable string plus counts.
+    private static func graphStateWire(_ state: CodeGraphManager.IndexState) -> [String: Any] {
+        BriefingSocketServer.graphStateWireForBroadcast(state)
+    }
+
+    /// The same wire shape, exposed for AppDelegate's broadcast hook (the
+    /// manager's onStateChange pushes `code.graph_status` notifications with
+    /// these keys).
+    static func graphStateWireForBroadcast(_ state: CodeGraphManager.IndexState) -> [String: Any] {
+        switch state {
+        case .notInstalled:
+            return ["state": "not_installed"]
+        case .notIndexed:
+            return ["state": "not_indexed"]
+        case .indexing:
+            return ["state": "indexing"]
+        case .ready(let fileCount, let symbolCount):
+            return ["state": "ready", "file_count": fileCount, "symbol_count": symbolCount]
+        case .failed(let message):
+            return ["state": "failed", "message": message]
+        }
+    }
+
+    // MARK: - Understand-Anything (JSON-RPC)
+
+    /// The knowledge graph's state for a project: analyzed?, node/edge/layer
+    /// counts, and a one-line human reading. Never errors — a missing plugin
+    /// or an unanalyzed project are states the phone renders.
+    private func respondCodeUnderstandStatus(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let projectPath = params["project_path"] as? String, !projectPath.isEmpty else {
+            respondError(id: id, code: -32602, message: "project_path is required", on: client)
+            return
+        }
+        Task { @MainActor in
+            let status = await UnderstandAnythingManager.shared.status(projectPath: projectPath)
+            var wire = Self.understandStateWire(status.state)
+            wire["available"] = status.available
+            wire["installed"] = status.installed
+            wire["text"] = status.text
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": wire,
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// Analyze a project now (the phone's "Analyze" button and the routine).
+    /// The pipeline runs in the coding agent — visible in the Code tab — and
+    /// this returns immediately with `.analyzing`; the completion broadcast
+    /// (`code.understand_status`) is the phone's recovery signal.
+    private func respondCodeUnderstandAnalyze(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let projectPath = params["project_path"] as? String, !projectPath.isEmpty else {
+            respondError(id: id, code: -32602, message: "project_path is required", on: client)
+            return
+        }
+        let force = params["force"] as? Bool ?? false
+        Task { @MainActor in
+            let state = await UnderstandAnythingManager.shared.analyze(projectPath: projectPath, force: force)
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["state": Self.understandStateWire(state),
+                            "available": UnderstandAnythingManager.shared.isAvailable],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// One query over the project's knowledge graph. `mode` selects the shape:
+    ///   search      — natural-language-ish symbol search → hits
+    ///   impact      — what breaks if `target` changes → dependents
+    ///   explain     — node detail + neighbors (`node_id`)
+    ///   architecture— the project's layers → layer summaries
+    ///   trace       — a path from `origin` to `target` (or backward to a root)
+    ///   graph       — a bounded subgraph around `center` for the canvas
+    ///   preview     — the whole project at a glance (highest-degree nodes)
+    private func respondCodeUnderstandQuery(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let projectPath = params["project_path"] as? String, !projectPath.isEmpty else {
+            respondError(id: id, code: -32602, message: "project_path is required", on: client)
+            return
+        }
+        let mode = params["mode"] as? String ?? "search"
+        Task { @MainActor in
+            let manager = UnderstandAnythingManager.shared
+            var result: [String: Any] = [:]
+            switch mode {
+            case "impact":
+                let target = params["target"] as? String ?? ""
+                let hits = await manager.impact(of: target, projectPath: projectPath)
+                result["hits"] = hits.map { hit in
+                    ["id": hit.id, "name": hit.name, "type": hit.type,
+                     "file_path": hit.filePath ?? "", "summary": hit.summary ?? "",
+                     "depth": hit.depth, "path": hit.path] as [String: Any]
+                }
+            case "explain":
+                let nodeID = params["node_id"] as? String ?? ""
+                if let explanation = await manager.explain(nodeID: nodeID, projectPath: projectPath) {
+                    result["node"] = Self.nodeWire(explanation.node)
+                    result["neighbors"] = explanation.neighbors.map { neighbor in
+                        ["direction": neighbor.direction, "type": neighbor.type,
+                         "node": Self.nodeWire(neighbor.node)] as [String: Any]
+                    }
+                    result["layers"] = explanation.layers
+                }
+            case "architecture":
+                let layers = await manager.architecture(projectPath: projectPath)
+                result["layers"] = layers.map { layer in
+                    ["id": layer.id, "name": layer.name,
+                     "description": layer.description ?? "",
+                     "node_count": layer.nodeCount,
+                     "sample_nodes": layer.sampleNodes] as [String: Any]
+                }
+            case "trace":
+                let origin = params["origin"] as? String ?? ""
+                let target = params["target"] as? String
+                if let trace = await manager.trace(from: origin, to: target, projectPath: projectPath) {
+                    result["node_ids"] = trace.nodeIDs
+                    result["edge_types"] = trace.edgeTypes
+                }
+            case "graph":
+                let center = params["center"] as? String ?? ""
+                let depth = params["depth"] as? Int ?? 1
+                let limit = params["limit"] as? Int ?? 60
+                if let subgraph = await manager.neighborhood(around: center, projectPath: projectPath,
+                                                             depth: depth, limit: limit) {
+                    result["nodes"] = subgraph.nodes.map(Self.nodeWire)
+                    result["edges"] = subgraph.edges.map(Self.edgeWire)
+                    result["center"] = center
+                }
+            case "preview":
+                let limit = params["limit"] as? Int ?? 60
+                if let subgraph = await manager.graphPreview(projectPath: projectPath, limit: limit) {
+                    result["nodes"] = subgraph.nodes.map(Self.nodeWire)
+                    result["edges"] = subgraph.edges.map(Self.edgeWire)
+                }
+            case "search":
+                fallthrough
+            default:
+                let query = params["query"] as? String ?? ""
+                let hits = await manager.search(query: query, projectPath: projectPath)
+                result["hits"] = hits.map { hit in
+                    ["id": hit.id, "name": hit.name, "type": hit.type,
+                     "file_path": hit.filePath ?? "", "summary": hit.summary ?? "",
+                     "tags": hit.tags ?? [], "score": hit.score] as [String: Any]
+                }
+            }
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["mode": mode, "result": result],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// Start the interactive dashboard (viewer + LAN proxy) and return the
+    /// URL the phone can open. Nil/empty when the graph is missing or the
+    /// viewer can't start — the phone shows the reason from status.text.
+    private func respondCodeUnderstandOpen(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let projectPath = params["project_path"] as? String, !projectPath.isEmpty else {
+            respondError(id: id, code: -32602, message: "project_path is required", on: client)
+            return
+        }
+        Task { @MainActor in
+            let url = await UnderstandAnythingManager.shared.openDashboard(projectPath: projectPath)
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["url": url ?? ""],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// The phone-facing shape of a graph state: a stable string plus counts.
+    private static func understandStateWire(_ state: UnderstandAnythingManager.GraphState) -> [String: Any] {
+        BriefingSocketServer.understandStateWireForBroadcast(state)
+    }
+
+    /// The same wire shape, exposed for the app's broadcast hook (the
+    /// manager's onStateChange pushes `code.understand_status` notifications
+    /// with these keys).
+    static func understandStateWireForBroadcast(_ state: UnderstandAnythingManager.GraphState) -> [String: Any] {
+        switch state {
+        case .notInstalled:
+            return ["state": "not_installed"]
+        case .notAnalyzed:
+            return ["state": "not_analyzed"]
+        case .analyzing:
+            return ["state": "analyzing"]
+        case .ready(let nodeCount, let edgeCount, let layerCount):
+            return ["state": "ready", "node_count": nodeCount, "edge_count": edgeCount, "layer_count": layerCount]
+        case .failed(let message):
+            return ["state": "failed", "message": message]
+        }
+    }
+
+    /// A node's wire shape (id, name, type, path, summary, tags, lines).
+    static func nodeWire(_ node: UnderstandNode) -> [String: Any] {
+        ["id": node.id, "name": node.displayName, "type": node.type,
+         "file_path": node.filePath ?? "", "summary": node.summary ?? "",
+         "tags": node.tags ?? [], "signature": node.signature ?? "",
+         "start_line": node.startLine ?? 0, "end_line": node.endLine ?? 0]
+    }
+
+    /// An edge's wire shape.
+    static func edgeWire(_ edge: UnderstandEdge) -> [String: Any] {
+        ["source": edge.source, "target": edge.target, "type": edge.type]
+    }
+
+    // MARK: - Career (JSON-RPC)
+
+    /// The owner's job-hunt profile.
+    private func respondCareerPreferences(id: Any, on client: BriefingClient) {
+        Task { @MainActor in
+            let manager = CareerOpsManager.shared
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["preferences": Self.preferencesWire(manager.preferences)],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    private func respondCareerSetPreferences(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let preferences = Self.preferences(from: params["preferences"]) else {
+            respondError(id: id, code: -32602, message: "preferences is malformed", on: client)
+            return
+        }
+        Task { @MainActor in
+            CareerOpsManager.shared.setPreferences(preferences)
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["preferences": Self.preferencesWire(CareerOpsManager.shared.preferences)],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// Scan + score in one call — the phone's Discover flow. Returns postings
+    /// at or above the apply threshold first, each with its rubric verdict.
+    private func respondCareerSearch(id: Any, params: [String: Any], on client: BriefingClient) {
+        let role = params["role"] as? String
+        let location = params["location"] as? String
+        let limit = (params["limit"] as? Int).map { min(max($0, 1), 30) } ?? 10
+        Task { @MainActor in
+            let manager = CareerOpsManager.shared
+            let postings = await manager.searchJobs(role: role, location: location, limit: limit)
+            let ranked = await manager.scoreAndRank(postings)
+            let items = ranked.map { item -> [String: Any] in
+                [
+                    "posting": Self.postingWire(item.posting),
+                    "score": Self.scoreWire(item.score),
+                ]
+            }
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["jobs": items, "threshold": manager.preferences.applyThreshold],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// Score a single posting the phone already holds.
+    private func respondCareerScore(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let posting = Self.posting(from: params["posting"]) else {
+            respondError(id: id, code: -32602, message: "posting is malformed", on: client)
+            return
+        }
+        Task { @MainActor in
+            let score = await CareerOpsManager.shared.scoreJob(posting)
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["score": Self.scoreWire(score)],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    private func respondCareerTailorCV(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let posting = Self.posting(from: params["posting"]) else {
+            respondError(id: id, code: -32602, message: "posting is malformed", on: client)
+            return
+        }
+        Task { @MainActor in
+            let manager = CareerOpsManager.shared
+            let cv = await manager.tailoredCV(for: posting)
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["cv": cv ?? "", "generated": cv != nil],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    private func respondCareerCoverLetter(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let posting = Self.posting(from: params["posting"]) else {
+            respondError(id: id, code: -32602, message: "posting is malformed", on: client)
+            return
+        }
+        Task { @MainActor in
+            let manager = CareerOpsManager.shared
+            let letter = await manager.coverLetter(for: posting)
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["cover_letter": letter ?? "", "generated": letter != nil],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// Every tracked application, newest first, plus the dashboard counts.
+    private func respondCareerApplications(id: Any, on client: BriefingClient) {
+        Task { @MainActor in
+            let manager = CareerOpsManager.shared
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": [
+                "applications": manager.listApplications().map(Self.applicationWire),
+                "summary": Self.summaryWire(manager.summary()),
+                ],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// Record an application — the human-in-the-loop version of apply. The
+    /// entry is created and the apply URL handed back; actual submission is
+    /// the owner's, exactly as career-ops ships (review before submit).
+    private func respondCareerApply(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let posting = Self.posting(from: params["posting"]) else {
+            respondError(id: id, code: -32602, message: "posting is malformed", on: client)
+            return
+        }
+        Task { @MainActor in
+            let manager = CareerOpsManager.shared
+            let score = await manager.scoreJob(posting)
+            let application = manager.recordApplication(
+                posting: posting,
+                score: score,
+                notes: params["notes"] as? String ?? "")
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["application": Self.applicationWire(application)],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    private func respondCareerUpdateStatus(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let idString = params["application_id"] as? String,
+              let applicationID = UUID(uuidString: idString),
+              let rawStatus = params["status"] as? String,
+              let status = ApplicationStatus(rawValue: rawStatus) else {
+            respondError(id: id, code: -32602,
+                         message: "application_id (a UUID) and a valid status are required", on: client)
+            return
+        }
+        Task { @MainActor in
+            let updated = CareerOpsManager.shared.updateStatus(id: applicationID, status: status)
+            guard let updated else {
+                self.respondError(id: id, code: -32602, message: "No application with that id.", on: client)
+                return
+            }
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["application": Self.applicationWire(updated)],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    private func respondCareerDeleteApplication(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let idString = params["application_id"] as? String,
+              let applicationID = UUID(uuidString: idString) else {
+            respondError(id: id, code: -32602, message: "application_id must be a UUID", on: client)
+            return
+        }
+        Task { @MainActor in
+            let deleted = CareerOpsManager.shared.deleteApplication(id: applicationID)
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id, "result": ["success": deleted],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// Applications whose follow-up window has passed.
+    private func respondCareerFollowUpsDue(id: Any, on client: BriefingClient) {
+        Task { @MainActor in
+            let manager = CareerOpsManager.shared
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["applications": manager.followUpsDue().map(Self.applicationWire)],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    private func respondCareerSummary(id: Any, on client: BriefingClient) {
+        Task { @MainActor in
+            let summary = CareerOpsManager.shared.summary()
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["summary": Self.summaryWire(summary)],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    // MARK: - NYU coursework (JSON-RPC)
+
+    /// The integration's status: settings (token presence only — the token
+    /// itself never crosses the wire) plus last-sync counts.
+    private func respondNYUStatus(id: Any, on client: BriefingClient) {
+        Task { @MainActor in
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["status": NYUIntegrationManager.statusWire()],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// Replace the integration settings from the phone (token, toggles,
+    /// target GPA). Token changes go straight through so Sync Now works.
+    private func respondNYUSetSettings(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let settings = NYUIntegrationManager.settings(from: params["settings"]) else {
+            respondError(id: id, code: -32602, message: "settings is malformed", on: client)
+            return
+        }
+        Task { @MainActor in
+            NYUIntegrationManager.shared.updateSettings { $0 = settings }
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["status": NYUIntegrationManager.statusWire()],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// Force a sync now and return its result (success or a human failure).
+    private func respondNYUSyncNow(id: Any, on client: BriefingClient) {
+        Task { @MainActor in
+            let result = await NYUIntegrationManager.shared.syncNow()
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["result": NYUIntegrationManager.syncResultWire(result)],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    private func respondNYUAssignments(id: Any, on client: BriefingClient) {
+        Task { @MainActor in
+            let rows = NYUIntegrationManager.shared.listAssignments()
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["assignments": rows.map(NYUIntegrationManager.assignmentWire)],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    private func respondNYUGrades(id: Any, on client: BriefingClient) {
+        Task { @MainActor in
+            let rows = NYUIntegrationManager.shared.listCourses()
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["grades": rows.map(NYUIntegrationManager.courseWire)],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// Mark an assignment's status from the phone (e.g. submitted).
+    private func respondNYUUpdateAssignment(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let idValue = params["assignment_id"] as? Int,
+              let rawStatus = params["status"] as? String else {
+            respondError(id: id, code: -32602,
+                         message: "assignment_id (an Int) and a status are required", on: client)
+            return
+        }
+        Task { @MainActor in
+            let updated = NYUIntegrationManager.shared.updateAssignmentStatus(id: idValue, status: rawStatus)
+            guard let updated else {
+                self.respondError(id: id, code: -32602, message: "No assignment with that id.", on: client)
+                return
+            }
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["assignment": NYUIntegrationManager.assignmentWire(updated)],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// One course's full info — syllabus, grading breakdown, schedule — the
+    /// phone's course detail and the syllabus query surface.
+    private func respondNYUCourseInfo(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let courseID = params["course_id"] as? Int else {
+            respondError(id: id, code: -32602, message: "course_id (an Int) is required", on: client)
+            return
+        }
+        Task { @MainActor in
+            guard let course = NYUIntegrationManager.shared.courseInfo(id: courseID) else {
+                self.respondError(id: id, code: -32602, message: "No course with that id.", on: client)
+                return
+            }
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": ["course": NYUIntegrationManager.courseWire(course)],
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    /// Push a NYU event (nyu.sync_complete) to every connected phone. Wired
+    /// in AppDelegate exactly like the career and briefing broadcasts.
+    func broadcastNYU(_ method: String, params: [String: Any]) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let notification: [String: Any] = [
+                "jsonrpc": "2.0", "method": method, "params": params,
+            ]
+            let json = Self.jsonString(notification)
+            for client in self.clients where client.state == .open {
+                client.connection.send(content: self.textFrame(json), completion: .contentProcessed { _ in })
+            }
+        }
+    }
+
+    // MARK: - Taste (JSON-RPC)
+
+    private func respondTasteSettings(id: Any, on client: BriefingClient) {
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": ["settings": Self.tasteSettingsWire(TasteSkillManager.shared.settings)],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    private func respondTasteSetSettings(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let settings = Self.tasteSettings(from: params["settings"]) else {
+            respondError(id: id, code: -32602, message: "settings is malformed", on: client)
+            return
+        }
+        TasteSkillManager.shared.settings = settings
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": ["settings": Self.tasteSettingsWire(TasteSkillManager.shared.settings)],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    // MARK: - Tutoring (JSON-RPC)
+
+    private func respondTutoringSettings(id: Any, on client: BriefingClient) {
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": ["settings": Self.tutorSettingsWire(PersonalTutorSkill.shared.settings)],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    private func respondTutoringSetSettings(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let settings = Self.tutorSettings(from: params["settings"]) else {
+            respondError(id: id, code: -32602, message: "settings is malformed", on: client)
+            return
+        }
+        PersonalTutorSkill.shared.settings = settings
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": ["settings": Self.tutorSettingsWire(PersonalTutorSkill.shared.settings)],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    // MARK: - Study routines (JSON-RPC)
+
+    private func respondStudySettings(id: Any, on client: BriefingClient) {
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": ["settings": StudyRoutineManager.settingsWire(StudyRoutineManager.shared.settings)],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    private func respondStudySetSettings(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let settings = StudyRoutineManager.settings(from: params["settings"]) else {
+            respondError(id: id, code: -32602, message: "settings is malformed", on: client)
+            return
+        }
+        StudyRoutineManager.shared.settings = settings
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": ["settings": StudyRoutineManager.settingsWire(StudyRoutineManager.shared.settings)],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    private func respondStudyStatus(id: Any, on client: BriefingClient) {
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": StudyRoutineManager.shared.statusWire(),
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    private func respondHomeworkSettings(id: Any, on client: BriefingClient) {
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": ["settings": HomeworkAssistantSkill.homeworkSettingsWire(HomeworkAssistantSkill.shared.settings)],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    private func respondHomeworkSetSettings(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let settings = HomeworkAssistantSkill.homeworkSettings(from: params["settings"]) else {
+            respondError(id: id, code: -32602, message: "settings is malformed", on: client)
+            return
+        }
+        // Apply only the fields the phone sent; preserve the rest, so an old
+        // client that only knows part of the surface can't clobber Mac-side
+        // fields it has never heard of.
+        let skill = HomeworkAssistantSkill.shared
+        skill.isEnabled = settings.enabled
+        skill.defaultMode = settings.defaultMode
+        skill.codeStyle = settings.codeStyle
+        skill.showSteps = settings.showSteps
+        skill.difficulty = settings.difficulty
+        skill.format = settings.format
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": ["settings": HomeworkAssistantSkill.homeworkSettingsWire(HomeworkAssistantSkill.shared.settings)],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    private func respondMemorySettings(id: Any, on client: BriefingClient) {
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": ["settings": Self.memorySettingsWire(MemPalaceManager.shared.settings)],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    private func respondMemorySetSettings(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let settings = Self.memorySettings(from: params["settings"]) else {
+            respondError(id: id, code: -32602, message: "settings is malformed", on: client)
+            return
+        }
+        MemPalaceManager.shared.updateSettings { target in
+            // Apply only the fields the phone sent; preserve the rest (so an
+            // old client that only knows part of the surface can't clobber it).
+            target.enabled = settings.enabled
+            target.learningMode = settings.learningMode
+            target.decayRate = settings.decayRate
+            target.confidenceThreshold = settings.confidenceThreshold
+            target.excludedCategories = settings.excludedCategories
+        }
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": ["settings": Self.memorySettingsWire(MemPalaceManager.shared.settings)],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    // MARK: - Optimization / feedback (JSON-RPC)
+
+    /// Record a 1–5 rating for one of Alfred's outputs. The prompt + output
+    /// ride along so the weekly compile pass has the full training example.
+    private func respondFeedbackSubmit(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let rating = params["rating"] as? Int, (1...5).contains(rating) else {
+            respondError(id: id, code: -32602, message: "rating must be an integer 1–5", on: client)
+            return
+        }
+        let prompt = params["prompt"] as? String ?? ""
+        let output = params["output"] as? String ?? ""
+        let kind = (params["kind"] as? String).flatMap(OptimizationKind.init(rawValue:))
+        DSPyOptimizer.shared.recordFeedback(
+            kind: kind,
+            prompt: prompt,
+            output: output,
+            rating: rating,
+            edited: params["edited"] as? Bool ?? false,
+            context: params["context"] as? String)
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id, "result": ["success": true],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    private func respondOptimizationReport(id: Any, on client: BriefingClient) {
+        let report = DSPyOptimizer.shared.report()
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id, "result": Self.optimizationReportWire(report),
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    private func respondOptimizationSettings(id: Any, on client: BriefingClient) {
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": ["settings": Self.optimizationSettingsWire(DSPyOptimizer.shared.settings)],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    private func respondOptimizationSetSettings(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let settings = Self.optimizationSettings(from: params["settings"]) else {
+            respondError(id: id, code: -32602, message: "settings is malformed", on: client)
+            return
+        }
+        DSPyOptimizer.shared.settings = settings
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": ["settings": Self.optimizationSettingsWire(DSPyOptimizer.shared.settings)],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
+    }
+
+    private func respondOptimizationOptimizeNow(id: Any, on client: BriefingClient) {
+        let report = Task.detached(priority: .utility) {
+            DSPyOptimizer.shared.compile()
+        }
+        Task { @MainActor in
+            let compiled = await report.value
+            let response: [String: Any] = [
+                "jsonrpc": "2.0", "id": id,
+                "result": Self.optimizationReportWire(compiled),
+            ]
+            self.send(text: Self.jsonString(response), on: client)
+        }
+    }
+
+    private func respondOptimizationRollback(id: Any, params: [String: Any], on client: BriefingClient) {
+        guard let raw = params["kind"] as? String,
+              let kind = OptimizationKind(rawValue: raw) else {
+            respondError(id: id, code: -32602, message: "kind is required", on: client)
+            return
+        }
+        let rules = DSPyOptimizer.shared.rollback(kind: kind)
+        let response: [String: Any] = [
+            "jsonrpc": "2.0", "id": id,
+            "result": [
+                "success": true,
+                "kind": kind.rawValue,
+                "active_rules": rules.map(\.directive),
+            ],
+        ]
+        self.send(text: Self.jsonString(response), on: client)
     }
 
     // MARK: - Mail (JSON-RPC)
@@ -1747,6 +2731,13 @@ final class BriefingSocketServer {
         }
     }
 
+    /// Push `routines.changed` to every connected phone — fired when routine
+    /// metadata changes outside a lifecycle event (the taste polish rewriting
+    /// a freshly created routine's name/description).
+    func broadcastRoutinesChanged() {
+        broadcastRoutine("routines.changed", params: [:])
+    }
+
     /// Push a code-session event (`code.chunk` / `code.status` /
     /// `code.test_result` / `code.git_status`) to every connected phone.
     func broadcastCode(_ method: String, params: [String: Any]) {
@@ -1766,6 +2757,230 @@ final class BriefingSocketServer {
     /// to every connected phone. Called by MailManager's callbacks, wired in
     /// AppDelegate exactly like the briefing's onGenerated.
     func broadcastMail(_ method: String, params: [String: Any]) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let notification: [String: Any] = [
+                "jsonrpc": "2.0", "method": method, "params": params,
+            ]
+            let json = Self.jsonString(notification)
+            for client in self.clients where client.state == .open {
+                client.connection.send(content: self.textFrame(json), completion: .contentProcessed { _ in })
+            }
+        }
+    }
+
+    // MARK: - Career (wire helpers)
+
+    static func memorySettingsWire(_ settings: MemPalaceSettings) -> [String: Any] {
+        [
+            "enabled": settings.enabled,
+            "learningMode": settings.learningMode.rawValue,
+            "decayRate": settings.decayRate.rawValue,
+            "confidenceThreshold": settings.confidenceThreshold,
+            "excludedCategories": settings.excludedCategories.map(\.rawValue),
+        ]
+    }
+
+    /// Decode a wire dictionary back into MemPalaceSettings (the manager's own
+    /// Codable round-trips through JSONSerialization).
+    static func memorySettings(from raw: Any?) -> MemPalaceSettings? {
+        guard let dict = raw as? [String: Any],
+              let data = try? JSONSerialization.data(withJSONObject: dict)
+        else { return nil }
+        return try? JSONDecoder().decode(MemPalaceSettings.self, from: data)
+    }
+
+    static func tasteSettingsWire(_ settings: TasteSettings) -> [String: Any] {
+        [
+            "enabled": settings.enabled,
+            "aggressiveness": settings.aggressiveness.rawValue,
+            "voice": settings.voice.rawValue,
+            "scopes": settings.scopes.map(\.rawValue),
+        ]
+    }
+
+    static func tasteSettings(from raw: Any?) -> TasteSettings? {
+        guard let dict = raw as? [String: Any],
+              let data = try? JSONSerialization.data(withJSONObject: dict)
+        else { return nil }
+        return try? JSONDecoder().decode(TasteSettings.self, from: data)
+    }
+
+    // MARK: - Tutoring (wire helpers)
+
+    static func tutorSettingsWire(_ settings: TutorSettings) -> [String: Any] {
+        [
+            "enabled": settings.enabled,
+            "mode": settings.mode.rawValue,
+            "socratic_depth": settings.socraticDepth.rawValue,
+            "explanation_length": settings.explanationLength.rawValue,
+            "practice_intensity": settings.practiceIntensity.rawValue,
+        ]
+    }
+
+    static func tutorSettings(from raw: Any?) -> TutorSettings? {
+        guard let dict = raw as? [String: Any],
+              let data = try? JSONSerialization.data(withJSONObject: dict)
+        else { return nil }
+        return try? JSONDecoder().decode(TutorSettings.self, from: data)
+    }
+
+    // MARK: - Optimization (wire helpers)
+
+    static func optimizationSettingsWire(_ settings: OptimizationSettings) -> [String: Any] {
+        [
+            "frequency": settings.frequency.rawValue,
+            "minFeedback": settings.minFeedback,
+            "confidenceThreshold": settings.confidenceThreshold,
+            "autoRollback": settings.autoRollback,
+            "lastCompiledAt": settings.lastCompiledAt ?? 0,
+        ]
+    }
+
+    static func optimizationSettings(from raw: Any?) -> OptimizationSettings? {
+        guard let dict = raw as? [String: Any],
+              let data = try? JSONSerialization.data(withJSONObject: dict)
+        else { return nil }
+        return try? JSONDecoder().decode(OptimizationSettings.self, from: data)
+    }
+
+    static func optimizationReportWire(_ report: OptimizationReport) -> [String: Any] {
+        var result: [String: Any] = [
+            "averageRating": report.averageRating,
+            "weekDelta": report.weekDelta,
+            "totalRatings": report.totalRatings,
+            "perKind": report.perKind.map { score -> [String: Any] in
+                [
+                    "kind": score.kind,
+                    "displayName": score.displayName,
+                    "current": score.current,
+                    "previous": score.previous,
+                    "samples": score.samples,
+                ]
+            },
+            "activeOptimizations": report.activeOptimizations,
+        ]
+        if let lastCompiledAt = report.lastCompiledAt {
+            result["lastCompiledAt"] = lastCompiledAt
+        }
+        if let lastRun = report.lastRun {
+            result["lastRun"] = [
+                "kind": lastRun.kind,
+                "before": lastRun.before,
+                "after": lastRun.after,
+                "examples": lastRun.examples,
+                "applied": lastRun.applied,
+                "rolledBack": lastRun.rolledBack,
+                "source": lastRun.source,
+                "createdAt": lastRun.createdAt,
+            ]
+        }
+        return result
+    }
+
+    static func improvementCardWire(_ card: ImprovementCard?) -> [String: Any]? {
+        guard let card else { return nil }
+        return [
+            "averageRating": card.averageRating,
+            "weekDelta": card.weekDelta,
+            "totalRatings": card.totalRatings,
+            "perKind": card.perKind.map { score -> [String: Any] in
+                [
+                    "kind": score.kind,
+                    "displayName": score.displayName,
+                    "current": score.current,
+                    "previous": score.previous,
+                    "samples": score.samples,
+                ]
+            },
+            "activeOptimizations": card.activeOptimizations,
+        ]
+    }
+
+    static func preferencesWire(_ preferences: JobPreferences) -> [String: Any] {
+        [
+            "roleTypes": preferences.roleTypes,
+            "locations": preferences.locations,
+            "minSalary": preferences.minSalary,
+            "desiredCompanies": preferences.desiredCompanies,
+            "keywords": preferences.keywords,
+            "followUpDays": preferences.followUpDays,
+            "applyThreshold": preferences.applyThreshold,
+        ]
+    }
+
+    static func preferences(from raw: Any?) -> JobPreferences? {
+        guard let dict = raw as? [String: Any],
+              let data = try? JSONSerialization.data(withJSONObject: dict)
+        else { return nil }
+        return try? JSONDecoder().decode(JobPreferences.self, from: data)
+    }
+
+    /// A JobPosting as the phone receives it (Codable camelCase keys — the
+    /// phone's JobPostingPayload mirrors them, so a posting round-trips
+    /// through career.apply / career.score unchanged).
+    static func postingWire(_ posting: JobPosting) -> [String: Any] {
+        guard let data = try? JSONEncoder().encode(posting),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return [:] }
+        return obj
+    }
+
+    static func posting(from raw: Any?) -> JobPosting? {
+        guard let dict = raw as? [String: Any],
+              let data = try? JSONSerialization.data(withJSONObject: dict)
+        else { return nil }
+        return try? JSONDecoder().decode(JobPosting.self, from: data)
+    }
+
+    static func scoreWire(_ score: JobScore) -> [String: Any] {
+        [
+            "score": score.score,
+            "match": score.match,
+            "northStar": score.northStar,
+            "comp": score.comp,
+            "culture": score.culture,
+            "redFlags": score.redFlags,
+            "reasoning": score.reasoning,
+            "threshold": score.threshold,
+            "shouldApply": score.shouldApply,
+            "verdictLine": score.verdictLine,
+        ]
+    }
+
+    static func applicationWire(_ application: JobApplication) -> [String: Any] {
+        [
+            "id": application.id.uuidString,
+            "jobID": application.jobID,
+            "title": application.title,
+            "company": application.company,
+            "applyURL": application.applyURL,
+            "location": application.location,
+            "score": application.score,
+            "appliedAt": application.appliedAt,
+            "status": application.status.rawValue,
+            "nextFollowUpAt": application.nextFollowUpAt ?? 0,
+            "notes": application.notes,
+            "cvPath": application.cvPath ?? "",
+        ]
+    }
+
+    static func summaryWire(_ summary: CareerSummary) -> [String: Any] {
+        [
+            "applied": summary.applied,
+            "interviews": summary.interviews,
+            "offers": summary.offers,
+            "rejected": summary.rejected,
+            "ghosted": summary.ghosted,
+            "followUpsDue": summary.followUpsDue,
+            "line": summary.line,
+        ]
+    }
+
+    /// Push a career event (career.applications_changed) to every connected
+    /// phone. Called by CareerOpsManager's onApplicationsChanged, wired in
+    /// AppDelegate exactly like the briefing's onGenerated.
+    func broadcastCareer(_ method: String, params: [String: Any]) {
         queue.async { [weak self] in
             guard let self else { return }
             let notification: [String: Any] = [
@@ -1929,13 +3144,17 @@ final class BriefingSocketServer {
                 "timestamp": change.timestamp,
             ]
         }
-        return [
+        var out: [String: Any] = [
             "summary": content.summary,
             "changes": changes,
             "generatedAt": content.generatedAt,
             "nextUpdateAt": content.nextUpdateAt,
             "focusedDay": content.focusedDay,
         ]
+        if let improvement = Self.improvementCardWire(content.improvement) {
+            out["improvement"] = improvement
+        }
+        return out
     }
 
     static func jsonString(_ object: [String: Any]) -> String {

@@ -19,16 +19,44 @@ import Foundation
 ///   {"kind":"shell","command":"..."}
 ///   {"kind":"mail","action":"check_unread"}
 ///   {"kind":"reminder","title":"...","dueIn":3600}
+///   {"kind":"browser","instruction":"...","url":"https://..."}   (url optional)
+///   {"kind":"scrape","instruction":"...","url":"https://..."}    (url optional)
 enum RoutineStep: Codable, Equatable {
     case briefing(type: String)
     case hermes(prompt: String)
     case shell(command: String)
     case mail(action: String)
     case reminder(title: String, dueIn: TimeInterval)
+    /// Read-only web automation: open `url` (or search for `instruction` when
+    /// no url is given) and report what the page says. Read-only by design —
+    /// a routine never submits forms; that is the email skill's gated job.
+    case browser(instruction: String, url: String?)
+    /// Lightweight web fetch via the Crawlee bridge: open `url` (or search
+    /// the web for `instruction` when no url is given) and report the text.
+    /// Read-only GETs — no Chrome needed, results cached per settings.
+    case scrape(instruction: String, url: String?)
+    /// Career-ops work: "scan" searches the job boards against the owner's
+    /// profile and reports the top scored listings; "follow_ups" lists
+    /// applications whose follow-up window has passed.
+    case career(action: String)
+    /// Understand-Anything (the interactive knowledge graph): "analyze" runs
+    /// the pipeline on the last-used code project, "docs" adds an architecture
+    /// report from the graph's layers, "onboarding" walks the guided tour.
+    case understand(action: String)
+    /// NYU coursework: "check_deadlines" lists assignments due in the next
+    /// week (plus overdue); "sync" forces a Canvas refresh first.
+    case nyu(action: String)
+    /// Study routines: "exam_prep" drills weak concepts for active exams,
+    /// "problem_sets" reports in-progress sets, "reading_quiz" surfaces due
+    /// readings, "lecture_review" lists today's notes, "weekly_review" writes
+    /// the Sunday progress report. See StudyRoutineManager.
+    case study(action: String)
 
-    private enum Kind: String, Codable { case briefing, hermes, shell, mail, reminder }
+    private enum Kind: String, Codable {
+        case briefing, hermes, shell, mail, reminder, browser, scrape, career, understand, nyu, study
+    }
     private enum Key: String, CodingKey {
-        case kind, type, prompt, command, action, title, dueIn
+        case kind, type, prompt, command, action, title, dueIn, instruction, url
     }
 
     init(from decoder: Decoder) throws {
@@ -42,6 +70,22 @@ enum RoutineStep: Codable, Equatable {
             self = .reminder(
                 title: try c.decode(String.self, forKey: .title),
                 dueIn: try c.decode(TimeInterval.self, forKey: .dueIn))
+        case .browser:
+            self = .browser(
+                instruction: try c.decode(String.self, forKey: .instruction),
+                url: try c.decodeIfPresent(String.self, forKey: .url))
+        case .scrape:
+            self = .scrape(
+                instruction: try c.decode(String.self, forKey: .instruction),
+                url: try c.decodeIfPresent(String.self, forKey: .url))
+        case .career:
+            self = .career(action: try c.decode(String.self, forKey: .action))
+        case .understand:
+            self = .understand(action: try c.decode(String.self, forKey: .action))
+        case .nyu:
+            self = .nyu(action: try c.decode(String.self, forKey: .action))
+        case .study:
+            self = .study(action: try c.decode(String.self, forKey: .action))
         }
     }
 
@@ -64,6 +108,26 @@ enum RoutineStep: Codable, Equatable {
             try c.encode(Kind.reminder, forKey: .kind)
             try c.encode(title, forKey: .title)
             try c.encode(dueIn, forKey: .dueIn)
+        case .browser(let instruction, let url):
+            try c.encode(Kind.browser, forKey: .kind)
+            try c.encode(instruction, forKey: .instruction)
+            try c.encodeIfPresent(url, forKey: .url)
+        case .scrape(let instruction, let url):
+            try c.encode(Kind.scrape, forKey: .kind)
+            try c.encode(instruction, forKey: .instruction)
+            try c.encodeIfPresent(url, forKey: .url)
+        case .career(let action):
+            try c.encode(Kind.career, forKey: .kind)
+            try c.encode(action, forKey: .action)
+        case .understand(let action):
+            try c.encode(Kind.understand, forKey: .kind)
+            try c.encode(action, forKey: .action)
+        case .nyu(let action):
+            try c.encode(Kind.nyu, forKey: .kind)
+            try c.encode(action, forKey: .action)
+        case .study(let action):
+            try c.encode(Kind.study, forKey: .kind)
+            try c.encode(action, forKey: .action)
         }
     }
 
@@ -78,6 +142,34 @@ enum RoutineStep: Codable, Equatable {
             return "Mail — \(action.replacingOccurrences(of: "_", with: " "))"
         case .reminder(let title, _):
             return "Reminder — \(title)"
+        case .browser(let instruction, _):
+            return "Browse — \(instruction.prefix(40))"
+        case .scrape(let instruction, _):
+            return "Scrape — \(instruction.prefix(40))"
+        case .career(let action):
+            switch action {
+            case "follow_ups": return "Career — follow-ups"
+            default: return "Career — scan jobs"
+            }
+        case .understand(let action):
+            switch action {
+            case "docs": return "Knowledge graph — visual docs"
+            case "onboarding": return "Knowledge graph — onboarding tour"
+            default: return "Knowledge graph — analyze project"
+            }
+        case .nyu(let action):
+            switch action {
+            case "sync": return "NYU — sync Canvas"
+            default: return "NYU — check deadlines"
+            }
+        case .study(let action):
+            switch action {
+            case "exam_prep": return "Study — daily exam prep"
+            case "problem_sets": return "Study — problem set check"
+            case "reading_quiz": return "Study — reading quiz"
+            case "lecture_review": return "Study — lecture notes review"
+            default: return "Study — weekly review"
+            }
         }
     }
 }
@@ -396,7 +488,32 @@ enum RoutineTemplates {
                 .shell(command: "open -a Notes"),
             ],
             schedule: .weekly(dayOfWeek: 1, hour: 18, minute: 0)),
-    ]
+        Template(
+            name: "Job Search Brief",
+            description: "A scan of new listings, scored against your profile.",
+            steps: [.career(action: "scan")],
+            schedule: .weekly(dayOfWeek: 2, hour: 8, minute: 0)),
+        Template(
+            name: "Application Follow-ups",
+            description: "The applications that went quiet — and who to chase.",
+            steps: [.career(action: "follow_ups")],
+            schedule: .daily(hour: 9, minute: 0)),
+        Template(
+            name: "Check for Upcoming Deadlines",
+            description: "The assignments due this week, and anything already overdue — from Canvas.",
+            steps: [.nyu(action: "check_deadlines")],
+            schedule: .daily(hour: 8, minute: 0)),
+        Template(
+            name: "Generate Visual Docs",
+            description: "An up-to-date architecture report and interactive graph for your latest project.",
+            steps: [.understand(action: "docs")],
+            schedule: .onDemand),
+        Template(
+            name: "Onboarding Tour",
+            description: "A guided walk through the codebase — layers first, then key files — for a new teammate.",
+            steps: [.understand(action: "onboarding")],
+            schedule: .onDemand),
+    ] + StudyRoutineTemplates.all
 }
 
 // MARK: - Manager
@@ -421,6 +538,10 @@ final class RoutineManager {
     var onRoutineStarted: ((Routine) -> Void)?
     var onRoutineProgress: ((Routine, Int, Int, String) -> Void)?   // (routine, step, total, label)
     var onRoutineCompleted: ((Routine, RoutineResult) -> Void)?
+    /// Fired whenever a routine's metadata changes outside a lifecycle event
+    /// (the taste polish rewriting a created routine's name/description) so
+    /// phones can refresh without polling.
+    var onRoutinesChanged: (() -> Void)?
 
     /// The agent that answers `hermes` steps. Handed over at launch, like the
     /// briefing generator's.
@@ -478,7 +599,8 @@ final class RoutineManager {
         description: String,
         steps: [RoutineStep],
         schedule: RoutineSchedule,
-        enabled: Bool = true
+        enabled: Bool = true,
+        skipPolish: Bool = false
     ) -> Routine {
         var routine = Routine(
             name: name.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -492,7 +614,39 @@ final class RoutineManager {
         routines.append(routine)
         save()
         NSLog("[routines] created '\(routine.name)' (\(routine.id.uuidString))")
+        // Template names ("Morning Summary", "Weekly Review") are curated by
+        // hand — never rewrite a name the user explicitly chose by tapping a
+        // template. Custom names and descriptions are the polish's target.
+        if !skipPolish {
+            polishRoutineMetadata(routine)
+        }
         return routine
+    }
+
+    /// Taste-polish a freshly created routine's name and description in the
+    /// background. Fire-and-forget: creation is never blocked on a model turn,
+    /// and a rewrite only lands when the text is genuinely generic (the
+    /// deterministic gate). The routine is updated in place and phones are
+    /// told via onRoutinesChanged.
+    private func polishRoutineMetadata(_ routine: Routine) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // The polish turn takes seconds. If the owner edited the routine in
+            // that window, never clobber the newer values — the polish was
+            // derived from the originals.
+            guard let current = self.routines.first(where: { $0.id == routine.id }),
+                  current.name == routine.name,
+                  current.description == routine.description
+            else { return }
+            let taste = TasteSkillManager.shared
+            let polishedName = await taste.polishIfNeeded(routine.name, scope: .routines)
+            let polishedDescription = await taste.polishIfNeeded(routine.description, scope: .routines)
+            guard polishedName != routine.name || polishedDescription != routine.description else {
+                return
+            }
+            self.updateRoutine(id: routine.id, name: polishedName, description: polishedDescription)
+            self.onRoutinesChanged?()
+        }
     }
 
     /// Update any subset of a routine's fields; nil leaves each untouched.
@@ -660,6 +814,18 @@ final class RoutineManager {
                 outcome = runMail(action: action)
             case .reminder(let title, let dueIn):
                 outcome = await runReminder(title: title, dueIn: dueIn)
+            case .browser(let instruction, let url):
+                outcome = await runBrowser(instruction: instruction, url: url)
+            case .scrape(let instruction, let url):
+                outcome = await runScrape(instruction: instruction, url: url)
+            case .career(let action):
+                outcome = await runCareer(action: action)
+            case .understand(let action):
+                outcome = await runUnderstand(action: action)
+            case .nyu(let action):
+                outcome = await runNYU(action: action)
+            case .study(let action):
+                outcome = await runStudy(action: action)
             }
             results.append(RoutineStepResult(
                 index: index,
@@ -682,6 +848,16 @@ final class RoutineManager {
     }
 
     private func runHermes(_ prompt: String) async -> (success: Bool, output: String) {
+        // Multi-agent routine steps run on their own team (per-role sessions),
+        // so they neither wait on nor block the shared bar session — the team
+        // does the whole pipeline and the final deliverable is the step output.
+        if MultiAgentOrchestrator.shared.enabled, let task = MultiAgentOrchestrator.route(prompt) {
+            let output = await MultiAgentOrchestrator.shared.runCollectingText(task: task)
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            let success = !trimmed.isEmpty && !trimmed.hasPrefix("Multi-agent run failed")
+            return (success, trimmed.isEmpty ? "The agent team returned an empty answer." : trimmed)
+        }
+
         guard let hermes else { return (false, "No agent session — Alfred isn't running Hermes.") }
         // Wait up to ~10s for a free session before giving up on this step; the
         // scheduler already avoids starting while a turn is active, so this only
@@ -754,6 +930,240 @@ final class RoutineManager {
         default:
             return (false, "Unknown mail action '\(action)'.")
         }
+    }
+
+    /// Read-only web automation via BrowserUseClient: open `url` and report
+    /// what the page says, or — when no url is given — search the web for the
+    /// instruction and report the top results. This is the routine-shaped
+    /// "check the price / look that up / see what the news says" step.
+    ///
+    /// Never submits anything (read-only by design) and honors the master
+    /// switch: with browser automation off the step fails with an honest
+    /// message instead of silently doing nothing. Needs Chrome running with
+    /// the browser-use daemon up — when it isn't, the harness's own error
+    /// ("open Chrome, then retry") is surfaced.
+    private func runBrowser(instruction: String, url: String?) async -> (success: Bool, output: String) {
+        let client = BrowserUseClient.shared
+        guard client.isEnabled else {
+            return (false, "Browser automation is off in Settings — no step ran.")
+        }
+
+        if let url, !url.isEmpty {
+            guard !BrowserUseClient.isBlocked(url: url) else {
+                client.logAudit("routine-blocked", url: url, detail: "refused: blocked host")
+                return (false, BrowserUseClient.refusalMessage(for: url))
+            }
+            client.logAudit("routine-page", url: url, detail: "instruction=\(instruction)")
+            let result = await client.extractText(url: url, maxChars: 2000)
+            guard result.succeeded else { return (false, result.message) }
+            let text = result.payload?["text"] as? String ?? ""
+            return (true, Self.trimmedPageText(text))
+        }
+
+        client.logAudit("routine-search", url: "", detail: "instruction=\(instruction)")
+        let result = await client.search(query: instruction, maxChars: 2000)
+        guard result.succeeded else { return (false, result.message) }
+        let text = result.payload?["text"] as? String ?? ""
+        return (true, Self.trimmedPageText(text))
+    }
+
+    /// A page's worth of scraped text down to the lines that matter for a
+    /// routine result line.
+    private static func trimmedPageText(_ text: String) -> String {
+        let lines = text.split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        return String(lines.prefix(10).joined(separator: "\n").prefix(1500))
+    }
+
+    /// Lightweight web fetch via CrawleeClient: open `url` and report what
+    /// the page says, or — when no url is given — search the web for the
+    /// instruction and report the top results. Read-only by design (GET
+    /// requests only, never a form), honors the master switch, and needs no
+    /// Chrome — the complement to the browser step when a page is simple
+    /// enough that a full browser would be wasted.
+    private func runScrape(instruction: String, url: String?) async -> (success: Bool, output: String) {
+        let client = CrawleeClient.shared
+        guard client.isEnabled else {
+            return (false, "Scraping is off in Settings — no step ran.")
+        }
+
+        if let url, !url.isEmpty {
+            client.logAudit("routine-scrape", url: url, detail: "instruction=\(instruction)")
+            let result = await client.scrape(url: url)
+            guard result.succeeded else { return (false, result.message) }
+            let title = result.title.map { "\($0)\n" } ?? ""
+            return (true, title + Self.trimmedPageText(result.text ?? ""))
+        }
+
+        client.logAudit("routine-search", url: "", detail: "instruction=\(instruction)")
+        let result = await client.search(query: instruction)
+        guard result.succeeded else { return (false, result.message) }
+        guard let results = result.payload?["results"] as? [[String: Any]], !results.isEmpty else {
+            return (false, "No search results.")
+        }
+        let lines = results.prefix(5).map { item -> String in
+            let title = item["title"] as? String ?? ""
+            let url = item["url"] as? String ?? ""
+            return "• \(title) — \(url)"
+        }
+        return (true, lines.joined(separator: "\n"))
+    }
+
+    /// Career-ops work via CareerOpsManager: "scan" searches the job boards
+    /// against the owner's profile and reports the top scored listings;
+    /// "follow_ups" lists applications whose follow-up window has passed.
+    /// Read-only — nothing here submits an application.
+    private func runCareer(action: String) async -> (success: Bool, output: String) {
+        let manager = CareerOpsManager.shared
+        switch action {
+        case "scan":
+            let postings = await manager.searchJobs(limit: 8)
+            guard !postings.isEmpty else {
+                return (false, "No listings found. Check your job preferences in Settings (role types, locations) and try again.")
+            }
+            let ranked = await manager.scoreAndRank(postings)
+            let lines = ranked.map { item -> String in
+                let mark = item.score.shouldApply ? "★" : "·"
+                return "\(mark) \(item.posting.title) — \(item.posting.company) (\(String(format: "%.1f", item.score.score)))"
+            }
+            return (true, "Top \(lines.count) jobs by fit:\n" + lines.joined(separator: "\n"))
+        case "follow_ups":
+            let due = manager.followUpsDue()
+            guard !due.isEmpty else {
+                return (true, "No follow-ups due — every application is either recent or answered.")
+            }
+            let lines = due.map { app -> String in
+                let days = Int(max(1, (Date().timeIntervalSince1970 - app.appliedAt) / 86_400))
+                return "• \(app.title) at \(app.company) — \(days)d ago, no reply yet"
+            }
+            return (true, "\(due.count) follow-up(s) due:\n" + lines.joined(separator: "\n"))
+        default:
+            return (false, "Unknown career action '\(action)'.")
+        }
+    }
+
+    /// Understand-Anything work: analyze the last-used code project and report
+    /// from its knowledge graph. "analyze" runs (or refreshes) the pipeline;
+    /// "docs" adds an architecture report from the graph's layers; "onboarding"
+    /// walks the guided tour. Needs a project to act on — routines carry no
+    /// path, so the step uses the project most recently used in the Code tab.
+    private func runUnderstand(action: String) async -> (success: Bool, output: String) {
+        guard let projectPath = AlfredCodeManager.shared.lastKnownProjectPath() else {
+            return (false, "No project to analyze — pick a project folder in the Code tab first.")
+        }
+        let manager = UnderstandAnythingManager.shared
+        guard manager.isEnabled else {
+            return (false, "Understand-Anything is off in Settings — no step ran.")
+        }
+        guard manager.isInstalled else {
+            return (false, "Understand-Anything isn't installed on the Mac. Install it with: curl -fsSL https://raw.githubusercontent.com/Egonex-AI/Understand-Anything/main/install.sh | bash")
+        }
+
+        // Make sure there's a graph; analyze is idempotent when one exists.
+        var state = await manager.ensureAnalyzed(projectPath: projectPath)
+        if !state.isReady {
+            state = await manager.analyze(projectPath: projectPath)
+        }
+        guard case .ready(let nodes, let edges, let layers) = state else {
+            return (false, "The knowledge graph isn't ready (\(stateDescription(state))).")
+        }
+
+        let header = "\(projectPath) — \(nodes) nodes, \(edges) edges, \(layers) layer\(layers == 1 ? "" : "s")"
+        switch action {
+        case "docs":
+            let summaries = await manager.architecture(projectPath: projectPath)
+            guard !summaries.isEmpty else { return (false, header + "\nNo architecture to report.") }
+            let lines = summaries.map { layer -> String in
+                var line = "\n■ \(layer.name) — \(layer.nodeCount) node\(layer.nodeCount == 1 ? "" : "s")"
+                if let description = layer.description, !description.isEmpty {
+                    line += "\n  \(description)"
+                }
+                if !layer.sampleNodes.isEmpty {
+                    line += "\n  e.g. \(layer.sampleNodes.prefix(4).joined(separator: ", "))"
+                }
+                return line
+            }
+            return (true, header + lines.joined(separator: "\n"))
+        case "onboarding":
+            guard let graph = await manager.graph(projectPath: projectPath),
+                  let tour = graph.tour, !tour.isEmpty else {
+                return (true, header + "\nNo guided tour in this graph (the pipeline builds one with the full /understand run).")
+            }
+            let steps = tour.sorted { $0.order < $1.order }.prefix(8).map { step -> String in
+                var line = "\n\(step.order). \(step.title)"
+                if let description = step.description, !description.isEmpty {
+                    line += "\n  \(description)"
+                }
+                if !step.nodeIds.isEmpty {
+                    let names = step.nodeIds.prefix(4).compactMap { id in
+                        graph.nodes.first(where: { $0.id == id })?.displayName
+                    }
+                    if !names.isEmpty { line += "\n  → \(names.joined(separator: ", "))" }
+                }
+                return line
+            }
+            return (true, header + steps.joined(separator: "\n"))
+        default:
+            return (true, header + "\nThe graph is ready to explore — open it from the Code tab's Knowledge Graph sheet.")
+        }
+    }
+
+    private func stateDescription(_ state: UnderstandAnythingManager.GraphState) -> String {
+        switch state {
+        case .notInstalled: return "plugin not installed"
+        case .notAnalyzed: return "not analyzed"
+        case .analyzing: return "still analyzing"
+        case .ready: return "ready"
+        case .failed(let message): return message
+        }
+    }
+
+    /// NYU coursework via NYUIntegrationManager: "check_deadlines" reports
+    /// what's due in the next week plus anything overdue; "sync" forces a
+    /// Canvas refresh first and reports its outcome. Needs the integration
+    /// configured — the step says so plainly when it isn't.
+    private func runNYU(action: String) async -> (success: Bool, output: String) {        let manager = NYUIntegrationManager.shared
+        guard manager.isConfigured else {
+            return (false, "The NYU integration isn't configured — add a Canvas token in Settings (NYU) and turn it on, then run again.")
+        }
+        switch action {
+        case "sync":
+            let result = await manager.syncNow()
+            return (result.success, result.message)
+        case "check_deadlines":
+            let upcoming = manager.dueWithin(days: 7)
+            let overdue = manager.overdue()
+            guard !upcoming.isEmpty || !overdue.isEmpty else {
+                return (true, "Nothing due in the next 7 days, and nothing overdue. Enjoy the breathing room — sync when you want a fresh look.")
+            }
+            var lines: [String] = []
+            if !upcoming.isEmpty {
+                lines.append("\(upcoming.count) assignment\(upcoming.count == 1 ? "" : "s") due in the next 7 days:")
+                lines.append(contentsOf: upcoming.prefix(10).map { row -> String in
+                    let when = row.dueAt.map {
+                        Date(timeIntervalSince1970: $0).formatted(date: .abbreviated, time: .omitted)
+                    } ?? "no due date"
+                    return "• \(row.name) — \(row.courseName) (due \(when))"
+                })
+            }
+            if !overdue.isEmpty {
+                lines.append("\(overdue.count) overdue — submit or mark them:")
+                lines.append(contentsOf: overdue.prefix(5).map { row in
+                    "• \(row.name) — \(row.courseName) (overdue \(row.daysUntil.map { "\(abs($0))d" } ?? ""))"
+                })
+            }
+            return (true, lines.joined(separator: "\n"))
+        default:
+            return (false, "Unknown nyu action '\(action)'.")
+        }
+    }
+
+    /// Study-routine work via StudyRoutineManager: exam prep, problem sets,
+    /// reading quizzes, lecture review and the weekly report. The manager
+    /// adapts each step to the tutor's live mastery + learning style.
+    private func runStudy(action: String) async -> (success: Bool, output: String) {
+        await StudyRoutineManager.shared.runStep(action: action)
     }
 
     /// Set a reminder due `dueIn` seconds from now, in the user's real Reminders

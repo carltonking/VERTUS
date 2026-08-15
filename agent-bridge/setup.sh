@@ -90,6 +90,24 @@ setup_browser_use() {
 }
 
 # ---------------------------------------------------------------------------
+# crawlee: our own Node bridge around the crawlee npm library (one-shot CLI for
+# Alfred's orchestration + MCP server for Hermes). npm install in the bridge
+# dir; Chromium mode additionally needs playwright (installed on demand).
+# ---------------------------------------------------------------------------
+setup_crawlee() {
+  local dir="$BRIDGE_ROOT/agent-bridge/crawlee"
+  if [ ! -d "$dir/node_modules" ]; then
+    warn "crawlee bridge not installed — running npm install (this takes a minute)"
+    (cd "$dir" && npm install --no-audit --no-fund 2>&1 | tail -2)
+  fi
+  if [ -d "$dir/node_modules" ]; then
+    ok "crawlee bridge ready (npm)"
+  else
+    warn "crawlee install incomplete — run: cd $dir && npm install"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # agentmemory: hermes plugin + pi extension + MCP server
 # ---------------------------------------------------------------------------
 setup_agentmemory() {
@@ -318,6 +336,7 @@ status() {
   ok "prime-agent: $(command -v prime-agent || echo "not installed") $(prime-agent --version 2>/dev/null | head -1 || true)"
   ok "hermes: $HOME/.hermes/hermes-agent/venv/bin/hermes (agentmemory plugin: $([ -d "$HOME/.hermes/plugins/agentmemory" ] && echo yes || echo no))"
   ok "browser-use MCP: $([ -x "$(cd "$(dirname "$0")" && pwd)/.venvs/browser-use/bin/browser-use" ] && echo ready || echo 'not installed')"
+  ok "crawlee MCP: $([ -d "$(cd "$(dirname "$0")" && pwd)/crawlee/node_modules" ] && echo ready || echo 'not installed — run ./setup.sh')"
   ok "graphiti: $([ -x "$REPOS/graphiti/mcp_server/.venv/bin/python" ] && echo ready || echo 'not installed')"
   # grep -c (not -q): under `set -o pipefail`, grep -q exits on the first match and
   # SIGPIPEs launchctl, whose rc 141 then fails the pipeline — false "not loaded".
@@ -347,5 +366,5 @@ run_smoke_test() {
 MODE="${1:---install}"
 case "$MODE" in
   --status) status; run_smoke_test ;;
-  *) write_config; setup_openswarm; setup_browser_use; setup_agentmemory; setup_agentmemory_service; setup_prime_agent; setup_graphiti; setup_falkordb; setup_vault; status ;;
+  *) write_config; setup_openswarm; setup_browser_use; setup_crawlee; setup_agentmemory; setup_agentmemory_service; setup_prime_agent; setup_graphiti; setup_falkordb; setup_vault; status ;;
 esac

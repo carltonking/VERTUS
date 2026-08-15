@@ -246,12 +246,19 @@ final class MailAIService {
         - Match the owner's voice: \(style.isEmpty ? "professional but warm" : style)
         \(signature.isEmpty ? "" : "- The owner's signature is: \n\(signature)")
         """
-        guard let obj = await runJSON(instruction, text: parts.text),
+        guard let obj = await runJSON(instruction, text: parts.text, compresses: false),
               let body = obj["body"] as? String, !body.isEmpty
         else { return nil }
         let subject = obj["subject"] as? String
             ?? (parts.subject.hasPrefix("Re:") ? parts.subject : "Re: " + parts.subject)
-        return MailDraft(subject: subject, body: Self.withSignature(body, signature: signature))
+        // Taste pass: when the draft reads generic, rewrite it with specificity
+        // and the owner's voice (tied to the email's subject). Gated on a
+        // deterministic boringness check, so a good draft skips the extra turn.
+        // The turn is bounded tighter (30s) because the draft already waited on
+        // its own model turn — the phone shouldn't sit through two full waits.
+        let polished = await TasteSkillManager.shared.polishIfNeeded(
+            body, scope: .emails, context: parts.subject, turnTimeoutOverride: 30)
+        return MailDraft(subject: subject, body: Self.withSignature(polished, signature: signature))
     }
 
     /// Three replies in different tones for the review screen's "Show
@@ -269,15 +276,19 @@ final class MailAIService {
         - Match the owner's voice: \(style.isEmpty ? "professional but warm" : style)
         \(signature.isEmpty ? "" : "- The owner's signature is: \n\(signature)")
         """
-        guard let obj = await runJSON(instruction, text: parts.text),
+        guard let obj = await runJSON(instruction, text: parts.text, compresses: false),
               let raw = obj["alternatives"] as? [[String: Any]]
         else { return [] }
-        return raw.compactMap { dict -> MailDraft? in
-            guard let body = dict["body"] as? String, !body.isEmpty else { return nil }
+        var drafts: [MailDraft] = []
+        for dict in raw {
+            guard let body = dict["body"] as? String, !body.isEmpty else { continue }
             let subject = dict["subject"] as? String
                 ?? (parts.subject.hasPrefix("Re:") ? parts.subject : "Re: " + parts.subject)
-            return MailDraft(subject: subject, body: Self.withSignature(body, signature: signature))
+            let polished = await TasteSkillManager.shared.polishIfNeeded(
+                body, scope: .emails, context: parts.subject, turnTimeoutOverride: 30)
+            drafts.append(MailDraft(subject: subject, body: Self.withSignature(polished, signature: signature)))
         }
+        return drafts
     }
 
     /// Revise a draft in place from a natural-language instruction ("make it
@@ -306,7 +317,7 @@ final class MailAIService {
         Subject: \(currentSubject)
         \(currentBody)
         """
-        guard let obj = await runJSON(rules, text: material),
+        guard let obj = await runJSON(rules, text: material, compresses: false),
               let body = obj["body"] as? String, !body.isEmpty
         else { return nil }
         let subject = obj["subject"] as? String ?? currentSubject
@@ -388,10 +399,20 @@ final class MailAIService {
     /// `isTurnActive` is checked *at run time*, just before prompting — two asks
     /// could both pass a single early check before either turn starts (TOCTOU),
     /// and a user turn that began while this ask sat in the queue must win.
-    private func runJSON(_ instruction: String, text: String) async -> [String: Any]? {
+    /// One tool-free model turn answered in a single JSON object. `compresses`
+    /// routes long bodies through Headroom before they enter the prompt: the
+    /// model sees the same content in fewer tokens (the mail copilot's calls
+    /// are cached analysis — classification, summaries, tasks). Drafting paths
+    /// pass `false` because the model must reproduce the sender's exact
+    /// wording there, and compression is lossy-by-design.
+    private func runJSON(_ instruction: String, text: String, compresses: Bool = true)
+        async -> [String: Any]? {
         guard let session = hermes else { return nil }
         let room = 4000
-        let trimmed = String(text.prefix(room))
+        var trimmed = String(text.prefix(room))
+        if compresses {
+            trimmed = await HeadroomMCPClient.shared.compressForContext(trimmed)
+        }
         let prompt = instruction + "\n\nEmail:\n" + trimmed
         return await turnGate.enqueue {
             // Re-check immediately before prompting. If the owner started a turn

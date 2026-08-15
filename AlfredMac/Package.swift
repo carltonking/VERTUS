@@ -24,6 +24,13 @@ let package = Package(
             name: "alfred-mcp",
             path: "AlfredMCP"
         ),
+        // The windowed companion app: a native macOS surface that mirrors the
+        // iOS app's tab layout. A separate executable so it coexists with
+        // the menu-bar Alfred target (which keeps its own @main entry).
+        .executableTarget(
+            name: "AlfredMacApp",
+            path: "AlfredMacApp"
+        ),
         .testTarget(
             name: "AlfredTests",
             dependencies: ["Alfred"],

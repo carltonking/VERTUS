@@ -95,7 +95,7 @@ final class MemoryReflectionService {
         Extract durable facts a human would want Alfred to remember.
 
         Respond with EXACTLY ONE JSON object, nothing else, no markdown fences:
-        {"facts":[{"category":"projects|goals|topics|keyelements","title":"short","body":"one-ish sentence, no quotes"}],"personal_memories":[{"kind":"person|communicationStyle|routine|classInfo|interest|passion|preference|project|goal|habit|lifeContext","title":"short stable name","summary":"one concrete sentence","keywords":["short"],"confidence":0.0,"importance":1,"source_observation_id":"id from OBSERVATIONS or empty","evidence_excerpt":"short supporting text"}],"summary":"one line summarizing the window"}
+        {"facts":[{"category":"projects|goals|topics|keyelements","title":"short","body":"one-ish sentence, no quotes"}],"personal_memories":[{"kind":"person|communicationStyle|routine|classInfo|interest|passion|preference|project|goal|habit|lifeContext","title":"short stable name","summary":"one concrete sentence","keywords":["short"],"confidence":0.0,"importance":1,"source_observation_id":"id from OBSERVATIONS or empty","evidence_excerpt":"short supporting text"}],"preferences":[{"category":"preference|project_pattern|person|goal|learning|constraint","content":"one concise sentence","confidence":0.0}],"summary":"one line summarizing the window"}
 
         Rules:
         - category: projects = active build work; goals = ambitions, target habits; topics = concepts/tech the user is learning; keyelements = values/preferences, recurring patterns.
@@ -171,6 +171,23 @@ final class MemoryReflectionService {
         if let summary = obj["summary"] as? String {
             store.logActivity(summary, source: "hermes-reflection", importance: 3)
             NSLog("[hermes] reflection summary: %@", summary)
+        }
+
+        // Durable learned preferences → MemPalaceManager (the confidence/decay
+        // vault). The same quiet pass feeds both stores: facts and personal
+        // memories are the graph, preferences are the long-lived "what I know
+        // about the user" layer that grounds every future session.
+        if let preferences = obj["preferences"] as? [[String: Any]] {
+            for preference in preferences {
+                guard let content = preference["content"] as? String,
+                      !content.isEmpty else { continue }
+                let category = (preference["category"] as? String)
+                    .flatMap(MemoryCategory.init(rawValue:)) ?? .preference
+                let confidence = preference["confidence"] as? Double ?? 0.5
+                MemPalaceManager.shared.remember(content: content, category: category,
+                                                 source: "reflection",
+                                                 confidence: confidence)
+            }
         }
 
         if let memories = obj["personal_memories"] as? [[String: Any]] {
