@@ -1592,8 +1592,10 @@ extension HermesSession {
     ///   fragments across chunks and are concatenated per index; each advanced
     ///   call is emitted as `.toolCallDelta`.
     /// * When the stream ends with `finish_reason: tool_calls`, the completed
-    ///   calls are handed to `executeToolCall` and the results are fed back as
-    ///   a follow-up turn, which streams through the same path.
+    ///   calls are executed inline against the registered `tools` (via each
+    ///   `LLMTool.execute(arguments:)`), the results are fed back as a second
+    ///   `/v1/chat/completions` POST, and that follow-up streams through the
+    ///   same path.
     /// * Exactly one `.done` event is emitted when the final turn finishes
     ///   cleanly.
     private static func runHermesSSE(
@@ -1665,18 +1667,30 @@ extension HermesSession {
             }
         }
 
-        // Tool-calling turn: hand the completed calls to the executor, feed
-        // the results back, and stream the follow-up answer.
+        // Tool-calling turn: execute the completed calls against the
+        // registered tools, feed the results back, and stream the follow-up
+        // answer. No throw — an unknown tool or a failing execute() becomes a
+        // tool-result error message the model can read and react to.
         let calls = accumulator.completedCalls
         if sawToolCall, finishedWithToolCalls, !calls.isEmpty {
-            guard let executeToolCall else { throw LLMError.toolCallDetected(calls) }
             var turn = messages
             turn.append(.assistant(toolCalls: calls))
             for call in calls {
-                let result = await executeToolCall(call.function.name, call.function.arguments)
+                let result: String
+                if let tool = tools?.first(where: { $0.name == call.function.name }) {
+                    do {
+                        result = try await tool.execute(arguments: call.function.arguments)
+                    } catch {
+                        result = "Error: \(error.localizedDescription)"
+                    }
+                } else {
+                    result = "Error: unknown tool '\(call.function.name)' — not registered in this turn's tool set."
+                }
                 turn.append(.toolResult(result, toolCallID: call.id))
             }
-            // Follow-up without tools; the answer streams through the same path.
+            // Second POST: original messages + assistant tool_calls + tool
+            // results. Its .contentDelta events stream through the same path;
+            // .done is emitted only when this final turn finishes.
             return try await runHermesSSE(baseURL: baseURL, messages: turn, system: system,
                                           tools: nil, executeToolCall: nil,
                                           onToken: onToken, onEvent: onEvent)

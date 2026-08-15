@@ -43,7 +43,7 @@ def _default_port() -> int:
 PORT = _default_port()
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 # Any requested model id is served by this local Ollama model.
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:4b")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:1.5b")
 
 app = FastAPI(title="Alfred Local Server (Ollama bridge)")
 app.add_middleware(

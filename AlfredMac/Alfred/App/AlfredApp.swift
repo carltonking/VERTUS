@@ -637,13 +637,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let popover = NSPopover()
         popover.behavior = .transient   // click away to dismiss
         popover.delegate = self
-        popover.contentViewController = NSHostingController(
-            rootView: SettingsPopoverView(
-                onRelaunch: { [weak self] in self?.relaunchApp() },
-                onQuit: { NSApp.terminate(nil) }
-            )
-        )
+        popover.contentViewController = NSHostingController(rootView: popoverRootView())
         return popover
+    }
+
+    /// The popover's SwiftUI root. Rebuilt on every open (see
+    /// toggleSettingsPopover) so @State re-seeds from persisted values — a
+    /// transient popover keeps its hosting controller, and with it stale
+    /// state, between shows otherwise.
+    private func popoverRootView() -> SettingsPopoverView {
+        SettingsPopoverView(
+            onRelaunch: { [weak self] in self?.relaunchApp() },
+            onQuit: { NSApp.terminate(nil) },
+            onApplyModelMode: { [weak self] mode in self?.applyModelMode(mode) }
+        )
+    }
+
+    /// Flip the assistant between cloud and local models: persist the choice,
+    /// write Hermes' config, and respawn the session so the next turn runs
+    /// under the new world. No-op when the mode didn't actually change — the
+    /// picker re-seeds from persisted state on every open, so re-confirming
+    /// the same mode is the common case.
+    private func applyModelMode(_ mode: ModelMode) {
+        guard ProviderKeyRing.persistedModelMode() != mode else { return }
+        ProviderKeyRing.persistModelMode(mode)
+        NSLog("[model] mode → %@", mode.rawValue)
+
+        // Hermes reads its config at spawn; rewrite it now so the running
+        // session and any lazy spawn pick the new world.
+        Task.detached { ProviderKeyRing.shared.applyModelMode(mode) }
+        if mode == .local {
+            // Keep the local brain resident so the first turn in local mode
+            // answers fast instead of paying a cold Ollama load.
+            Task.detached { await LocalWarmup.runForever() }
+        }
+        Task { @MainActor in
+            // Only respawn an existing session; a cold cloud install spawns
+            // lazily and reads the new config on its own.
+            guard await self.hermes.hasAttemptedStart else { return }
+            try? await self.hermes.restart()
+        }
     }
 
     /// Relaunch: quit this instance immediately, and let a detached shell
@@ -669,6 +702,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.performClose(nil)
             return
         }
+        // Rebuild the root view so the model-mode picker re-seeds from the
+        // persisted choice (a transient popover keeps its hosting controller
+        // between shows, taking stale @State with it).
+        popover.contentViewController = NSHostingController(rootView: popoverRootView())
         // A transient popover is dismissed by the mouse-down on the status item
         // *before* this action runs, so without this the click that closed it
         // would immediately reopen it and the popover would look stuck open.

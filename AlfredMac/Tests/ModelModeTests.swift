@@ -31,4 +31,20 @@ final class ModelModeTests: XCTestCase {
         // The default must stay today's behavior: cloud.
         XCTAssertEqual(ModelMode.allCases.first, .cloud)
     }
+
+    func testPersistModelModeRoundTrips() {
+        // Defaults must not leak between runs of the suite.
+        let saved = UserDefaults.standard.string(forKey: ProviderKeyRing.modelModeKey)
+        defer {
+            if let saved {
+                UserDefaults.standard.set(saved, forKey: ProviderKeyRing.modelModeKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: ProviderKeyRing.modelModeKey)
+            }
+        }
+        ProviderKeyRing.persistModelMode(.local)
+        XCTAssertEqual(ProviderKeyRing.persistedModelMode(), .local)
+        ProviderKeyRing.persistModelMode(.cloud)
+        XCTAssertEqual(ProviderKeyRing.persistedModelMode(), .cloud)
+    }
 }

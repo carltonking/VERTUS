@@ -153,19 +153,20 @@ enum LocalModels {
     /// `custom` provider reaches the local server.
     static let ollamaBaseURL = "http://127.0.0.1:11434/v1"
 
-    /// The default local brain: qwen3 4B (Q4 ~2.5 GB), native function calling.
-    /// Pulled via `ollama pull`.
-    static let brain = "qwen3:4b"
-    static let coder = "alfred-coder:latest"
+    /// Local-first routing:
+    /// - agentic/coding/files = alfred-coder-32k (1.5B, 32K, tools) - 3x faster than qwen3:4b, purpose-built for Alfred
+    /// - vision/screen = alfred-vision (3.8B VL) - only vision-capable model
+    /// - reasoning/complex chat = qwen3:4b - best quality when you need it
+    static let brain = "alfred-coder-32k:latest"
+    static let coder = "alfred-coder-32k:latest"
     static let vision = "alfred-vision:latest"
     static let small = "qwen2.5-coder:1.5b"
+    static let reasoning = "qwen3:4b"
 
-    /// Every model the user has, for the provider entry Hermes writes.
-    static let all: [String] = [brain, coder, vision, small]
+    /// Every model Hermes sees - brain is default, others selectable via `hermes model`
+    static let all: [String] = [brain, vision, reasoning, small]
 
-    /// How much context Hermes is allowed to build against the local model.
-    /// qwen3's native window is far larger; 32,768 is Hermes' hard minimum
-    /// and leaves room for the KV cache, so a small window wins here.
+    /// Hermes' hard minimum - matches alfred-coder-32k's 32K window
     static let contextLength = 32_768
 }
 
@@ -198,10 +199,22 @@ enum LocalWarmup {
         }
     }
 
+    private static let startLock = NSLock()
+    private static var runStarted = false
+
     /// Refresh the keep-alive timer until the mode leaves local or the app
     /// stops. Errors are swallowed — the model loads lazily on first use
-    /// anyway, so a failed prewarm only costs a few seconds once.
+    /// anyway, so a failed prewarm only costs a few seconds once. A once-guard
+    /// keeps a duplicate loop from stacking when the user flips to local
+    /// twice (launch already starts one in local mode).
     static func runForever() async {
+        startLock.lock()
+        if runStarted {
+            startLock.unlock()
+            return
+        }
+        runStarted = true
+        startLock.unlock()
         while !Task.isCancelled {
             await ping()
             try? await Task.sleep(nanoseconds: UInt64((keepAliveMinutes - 5)) * 60_000_000_000)
@@ -408,6 +421,13 @@ final class ProviderKeyRing: ObservableObject {
         import json, sys
         from hermes_cli.config import load_config, save_config
         cfg = load_config()
+        # A fresh ~/.hermes (config.yaml deleted or never created) loads
+        # DEFAULT_CONFIG with model: "" — a bare string, not a dict. Coerce it
+        # or the writes below crash ("string indices must be integers") and
+        # config.yaml is never created. The app must be able to bootstrap a
+        # config from scratch, not just edit an existing one.
+        if not isinstance(cfg.get("model"), dict):
+            cfg["model"] = {}
         chain = json.loads(sys.argv[1])
         primary = json.loads(sys.argv[2])
         cfg["model"]["provider"] = primary["provider"]
@@ -459,6 +479,14 @@ final class ProviderKeyRing: ObservableObject {
         return raw.flatMap(ModelMode.init(rawValue:)) ?? .cloud
     }
 
+    /// Record the cloud/local choice in UserDefaults so both the menu-bar app
+    /// and the companion (which shares the key) agree on the current mode.
+    /// The menu-bar app owns *applying* it to Hermes' config — this just
+    /// persists the intent.
+    static func persistModelMode(_ mode: ModelMode) {
+        UserDefaults.standard.set(mode.rawValue, forKey: modelModeKey)
+    }
+
     /// Point Hermes at the selected model world. The caller restarts the
     /// session afterwards so the next turn picks it up.
     func applyModelMode(_ mode: ModelMode, completion: ((Bool) -> Void)? = nil) {
@@ -494,6 +522,10 @@ final class ProviderKeyRing: ObservableObject {
         import json, sys
         from hermes_cli.config import load_config, save_config
         cfg = load_config()
+        # Same fresh-config guard as syncHermesFallbackChain: DEFAULT_CONFIG
+        # leaves model as a bare string until something writes a dict.
+        if not isinstance(cfg.get("model"), dict):
+            cfg["model"] = {}
         cfg["model"]["provider"] = "custom"
         cfg["model"]["default"] = sys.argv[1]
         cfg["model"]["base_url"] = sys.argv[2]
