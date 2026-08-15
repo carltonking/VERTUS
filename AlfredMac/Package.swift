@@ -9,9 +9,17 @@ let package = Package(
     platforms: [
         .macOS(.v14),
     ],
+    dependencies: [
+        // AlfredCore: the platform-agnostic core shared with the iOS app — LLM
+        // provider protocol/router, markdown-vault memory, Keychain store.
+        .package(path: "../AlfredCore"),
+    ],
     targets: [
         .executableTarget(
             name: "Alfred",
+            dependencies: [
+                .product(name: "AlfredCore", package: "AlfredCore"),
+            ],
             path: "Alfred",
             resources: [
                 .process("Resources"),

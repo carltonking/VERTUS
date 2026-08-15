@@ -1,5 +1,6 @@
 import Foundation
 import SQLite3
+import AlfredCore
 
 // SQLITE_TRANSIENT is a C macro, invisible to Swift; -1 tells SQLite to copy the
 // bound string before the statement is finalized.

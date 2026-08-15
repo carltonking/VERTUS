@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import AlfredCore
 
 // MARK: - Events
 //
@@ -188,6 +189,11 @@ actor HermesSession {
 
     private let workingDirectory: String
 
+    /// Base URL of the local Hermes server (AlfredMac/Server/server.py,
+    /// OpenAI-compatible /v1/chat/completions) used by the ToolCallingProvider
+    /// conformance. Override with ALFRED_HERMES_URL; defaults to localhost:8080.
+    nonisolated let providerBaseURL: URL
+
     // MARK: Process
 
     private var process: Process?
@@ -212,10 +218,13 @@ actor HermesSession {
     /// turning a genuinely dead bridge into an honest, recoverable error.
     static let handshakeDeadline: TimeInterval = 120
 
-    /// Bound for `session/new` once initialize has answered. Nothing slow
-    /// happens after the bridges are up, so this can be tighter than the
-    /// initialize deadline.
-    static let sessionNewDeadline: TimeInterval = 60
+    /// Bound for `session/new` once initialize has answered. session/new
+    /// spawns every stdio MCP bridge in agent-servers.json (odysseus x4,
+    /// browser-use, crawlee, graphiti, agentmemory via npx) and waits for each
+    /// to finish its own handshake before answering — on a machine with a
+    /// dozen bridges that measured ~59s cold, so a 60s cap failed
+    /// intermittently on load. Same headroom as initialize.
+    static let sessionNewDeadline: TimeInterval = 120
 
     /// This session's own deadline. Defaults to `turnDeadline`; the remote code
     /// manager raises it for coding sessions, where a generation can legitimately
@@ -269,13 +278,15 @@ actor HermesSession {
          workingDirectory: String = NSHomeDirectory(),
          autoApprovePermissions: Bool = true,
          turnDeadline: TimeInterval? = nil,
-         extraMCPServers: [[String: Any]] = []) {
+         extraMCPServers: [[String: Any]] = [],
+         baseURL: String = ProcessInfo.processInfo.environment["ALFRED_HERMES_URL"] ?? "http://localhost:8080") {
         self.engine = engine
         self.posture = posture
         self.workingDirectory = workingDirectory
         self.autoApprovePermissions = autoApprovePermissions
         self.turnDeadline = turnDeadline ?? Self.turnDeadline
         self.extraMCPServers = extraMCPServers
+        self.providerBaseURL = URL(string: baseURL) ?? URL(string: "http://localhost:8080")!
     }
 
     // MARK: - Binary resolution
@@ -391,7 +402,7 @@ actor HermesSession {
             // which is more honest than refusing to spawn. Log it: a silent
             // launch without provider/model is the first thing to suspect
             // when prime answers with a 401 out of the blue.
-            NSLog("[hermes] prime-agent launching with no ringed provider it can serve — add a gemini/groq key")
+            AlfredLog.provider.warning("[hermes] prime-agent launching with no ringed provider it can serve — add a gemini/groq key")
             return (binary, ["--mode", "acp", "--offline"])
         }
         return (binary, ["--mode", "acp", "--offline", "--provider", provider, "--model", modelID])
@@ -784,7 +795,7 @@ actor HermesSession {
             guard !data.isEmpty,
                   let line = String(data: data, encoding: .utf8) else { return }
             if line.contains("ERROR") || line.contains("Traceback") || line.contains("CRITICAL") {
-                NSLog("[hermes] %@", line.trimmingCharacters(in: .whitespacesAndNewlines))
+                AlfredLog.session.error("[hermes] \(line.trimmingCharacters(in: .whitespacesAndNewlines), privacy: .public)")
             }
         }
 
@@ -854,11 +865,11 @@ actor HermesSession {
             // help. Surface it as handshakeTimedOut so the bar says what is
             // actually wrong (a stuck startup), and the keepalive retries the
             // spawn itself.
-            NSLog("[hermes] session handshake timed out after \(Int(Self.handshakeDeadline))s — tearing down")
+            AlfredLog.session.error("[hermes] session handshake timed out after \(Int(Self.handshakeDeadline))s — tearing down")
             shutdown()
             throw HermesError.handshakeTimedOut
         } catch {
-            NSLog("[hermes] session handshake failed — tearing down: %@", error.localizedDescription)
+            AlfredLog.session.error("[hermes] session handshake failed — tearing down: \(error.localizedDescription, privacy: .public)")
             shutdown()
             throw error
         }
@@ -890,7 +901,7 @@ actor HermesSession {
                     .appendingPathComponent("alfred-mcp").path,
               FileManager.default.isExecutableFile(atPath: shim)
         else {
-            NSLog("[hermes] alfred-mcp not found in bundle — macOS tools unavailable this session")
+            AlfredLog.session.warning("[hermes] alfred-mcp not found in bundle — macOS tools unavailable this session")
             return nil
         }
         return ["name": "alfred", "command": shim, "args": [], "env": []]
@@ -1116,6 +1127,7 @@ actor HermesSession {
         do {
             sid = try await activeSessionID()
         } catch {
+            AlfredLog.provider.error("[provider] turn failed before request: \(error.localizedDescription, privacy: .public)")
             continuation.yield(.failed(error.localizedDescription))
             continuation.finish()
             return
@@ -1168,7 +1180,7 @@ actor HermesSession {
                     "prompt": blocks,
                 ], timeout: turnDeadline)
             } catch let error as HermesError where Self.isRecoverableTurnFailure(error) {
-                NSLog("[hermes] recoverable session fault — \(Self.recoveryLabel(error)) — rebuilding and retrying once")
+                AlfredLog.session.error("[hermes] recoverable session fault — \(Self.recoveryLabel(error)) — rebuilding and retrying once")
                 let freshSID = try await rebuildSession()
                 result = try await request("session/prompt", [
                     "sessionId": freshSID,
@@ -1178,6 +1190,11 @@ actor HermesSession {
             let stop = result["stopReason"] as? String ?? "end_turn"
             continuation.yield(.finished(stopReason: stop))
         } catch {
+            // Provider request/response errors land here: quota (402/429), rate
+            // limits, upstream timeouts and model errors Hermes surfaces as a
+            // failed turn. Logged with real os_log so the unified log can be
+            // filtered to provider faults without attaching a debugger.
+            AlfredLog.provider.error("[provider] turn failed: \(error.localizedDescription, privacy: .public)")
             continuation.yield(.failed(error.localizedDescription))
         }
 
@@ -1512,6 +1529,159 @@ actor HermesSession {
         guard let content = update["content"] as? [String: Any],
               let text = content["text"] as? String,
               !text.isEmpty else { return nil }
+        return text
+    }
+}
+
+// MARK: - ToolCallingProvider (AlfredCore)
+
+/// The local Hermes server (AlfredMac/Server/server.py — an OpenAI-compatible
+/// `/v1/chat/completions` at localhost:8080) as an LLM provider. Conforming to
+/// AlfredCore's `ToolCallingProvider` means this session can be dropped into a
+/// `ProviderRouter` beside any other provider, and tool-calling turns flow
+/// through the same SSE path as plain streaming ones.
+extension HermesSession: ToolCallingProvider {
+
+    nonisolated var id: String { "hermes" }
+    nonisolated var displayName: String { "Hermes (local)" }
+
+    /// Model id sent to the local server; it only echoes it back (it serves
+    /// its own MODEL_NAME), so this is informational.
+    nonisolated var model: String {
+        get { "hermes-local" }
+        set {}
+    }
+
+    nonisolated func complete(messages: [LLMMessage], system: String) async throws -> String {
+        try await Self.runHermesSSE(baseURL: providerBaseURL, messages: messages, system: system,
+                                    tools: nil, executeToolCall: nil, onToken: nil, onEvent: nil)
+    }
+
+    nonisolated func stream(
+        messages: [LLMMessage],
+        system: String,
+        onToken: @escaping @Sendable (String) -> Void
+    ) async throws -> String {
+        try await Self.runHermesSSE(baseURL: providerBaseURL, messages: messages, system: system,
+                                    tools: nil, executeToolCall: nil, onToken: onToken, onEvent: nil)
+    }
+
+    nonisolated func streamWithTools(
+        messages: [LLMMessage],
+        system: String,
+        tools: [any LLMTool]?,
+        executeToolCall: ((String, String) async -> String)?,
+        onEvent: @escaping @Sendable (LLMStreamEvent) -> Void
+    ) async throws -> String {
+        try await Self.runHermesSSE(baseURL: providerBaseURL, messages: messages, system: system,
+                                    tools: tools, executeToolCall: executeToolCall, onToken: nil, onEvent: onEvent)
+    }
+}
+
+extension HermesSession {
+
+    /// Run one OpenAI-compatible streaming turn against the local Hermes
+    /// server (`{base}/v1/chat/completions`, SSE).
+    ///
+    /// * `data:` lines only; non-data lines are ignored; `data: [DONE]` ends
+    ///   the stream.
+    /// * `delta.content` fragments are accumulated and delivered via `onToken`
+    ///   (plain streaming) or as `.contentDelta` events (tool-calling).
+    /// * Partial `delta.tool_calls` fragments are accumulated per index via
+    ///   AlfredCore's `ToolCallAccumulator` — arguments arrive as JSON string
+    ///   fragments across chunks and are concatenated per index; each advanced
+    ///   call is emitted as `.toolCallDelta`.
+    /// * When the stream ends with `finish_reason: tool_calls`, the completed
+    ///   calls are handed to `executeToolCall` and the results are fed back as
+    ///   a follow-up turn, which streams through the same path.
+    /// * Exactly one `.done` event is emitted when the final turn finishes
+    ///   cleanly.
+    private static func runHermesSSE(
+        baseURL: URL,
+        messages: [LLMMessage],
+        system: String,
+        tools: [any LLMTool]?,
+        executeToolCall: ((String, String) async -> String)?,
+        onToken: (@Sendable (String) -> Void)?,
+        onEvent: (@Sendable (LLMStreamEvent) -> Void)?
+    ) async throws -> String {
+        let url = baseURL.appendingPathComponent("v1/chat/completions")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 300
+
+        var payloadMessages: [[String: Any]] = []
+        if !system.isEmpty { payloadMessages.append(["role": "system", "content": system]) }
+        for message in messages {
+            payloadMessages.append(["role": message.role, "content": message.content])
+        }
+        var body: [String: Any] = ["model": "hermes-local", "messages": payloadMessages, "stream": true]
+        if let tools, !tools.isEmpty {
+            body["tools"] = tools.map { $0.definition.payload }
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else { throw LLMError.networkError("no HTTP response") }
+        guard http.statusCode == 200 else {
+            if http.statusCode == 429 { throw LLMError.rateLimited() }
+            throw LLMError.inferenceFailed("HTTP \(http.statusCode)")
+        }
+
+        var text = ""
+        var sawToolCall = false
+        var finishedWithToolCalls = false
+        var accumulator = ToolCallAccumulator()
+
+        for try await line in bytes.lines {
+            guard line.hasPrefix("data: ") else { continue }
+            let payload = String(line.dropFirst(6))
+            if payload == "[DONE]" { break }
+
+            guard let data = payload.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let choices = json["choices"] as? [[String: Any]],
+                  let choice = choices.first,
+                  let delta = choice["delta"] as? [String: Any]
+            else { continue }
+
+            if let piece = delta["content"] as? String, !piece.isEmpty {
+                text += piece
+                onToken?(piece)
+                if let onEvent { onEvent(.contentDelta(piece)) }
+            }
+
+            if let deltas = delta["tool_calls"] as? [[String: Any]] {
+                sawToolCall = true
+                for call in accumulator.accumulate(deltas: deltas) {
+                    if let onEvent { onEvent(.toolCallDelta(call)) }
+                }
+            }
+
+            if let finish = choice["finish_reason"] as? String, finish == "tool_calls" {
+                finishedWithToolCalls = true
+                break
+            }
+        }
+
+        // Tool-calling turn: hand the completed calls to the executor, feed
+        // the results back, and stream the follow-up answer.
+        let calls = accumulator.completedCalls
+        if sawToolCall, finishedWithToolCalls, !calls.isEmpty {
+            guard let executeToolCall else { throw LLMError.toolCallDetected(calls) }
+            var turn = messages
+            turn.append(.assistant(toolCalls: calls))
+            for call in calls {
+                let result = await executeToolCall(call.function.name, call.function.arguments)
+                turn.append(.toolResult(result, toolCallID: call.id))
+            }
+            // Follow-up without tools; the answer streams through the same path.
+            return try await runHermesSSE(baseURL: baseURL, messages: turn, system: system,
+                                          tools: nil, executeToolCall: nil,
+                                          onToken: onToken, onEvent: onEvent)
+        }
+        if let onEvent { onEvent(.done) }
         return text
     }
 }

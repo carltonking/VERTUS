@@ -5,9 +5,11 @@ import Foundation
 /// Where Alfred's memory lives. Read from `~/.alfred/obsidian.json`
 /// (`{"vaultPath": "/path/to/vault"}`); without a config, Alfred keeps an
 /// Obsidian-shaped vault at `~/.alfred/vault` so memory always has a home.
-enum AlfredConfig {
+/// Foundation-only, so it runs on macOS and iOS (iOS resolves the sandbox
+/// home; callers can point `vaultPath` anywhere via the JSON config).
+public enum AlfredConfig {
 
-    static func vaultPath() -> String {
+    public static func vaultPath() -> String {
         let configPath = "\(NSHomeDirectory())/.alfred/obsidian.json"
         if let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -24,9 +26,9 @@ enum AlfredConfig {
 /// conventions: daily notes nest under `Journal/YYYY/MM/`, concept notes stay
 /// flat in `My Life/Projects|Goals|Topics|Key Elements/`, everything links
 /// with `[[wikilinks]]`.
-struct Vault {
+public struct Vault {
 
-    enum Concept: String, CaseIterable {
+    public enum Concept: String, CaseIterable, Sendable {
         case projects = "Projects"
         case goals = "Goals"
         case habits = "Habits"
@@ -34,22 +36,22 @@ struct Vault {
         case keyElements = "Key Elements"
     }
 
-    let root: URL
+    public let root: URL
 
-    init(path: String) {
+    public init(path: String) {
         root = URL(fileURLWithPath: path, isDirectory: true)
     }
 
     // MARK: Paths
 
-    func journalDir(for date: Date = Date()) -> URL {
+    public func journalDir(for date: Date = Date()) -> URL {
         let cal = Calendar.current
         let y = cal.component(.year, from: date)
         let m = String(format: "%02d", cal.component(.month, from: date))
         return root.appendingPathComponent("Journal/\(y)/\(m)", isDirectory: true)
     }
 
-    func conceptDir(_ concept: Concept) -> URL {
+    public func conceptDir(_ concept: Concept) -> URL {
         root.appendingPathComponent("My Life/\(concept.rawValue)", isDirectory: true)
     }
 
@@ -58,7 +60,7 @@ struct Vault {
     /// If a note for the day already exists (Penn's or ours), we use it —
     /// one file per day, sections appended.
     /// Returns nil when the vault root doesn't exist (not configured yet).
-    func dailyNote(for date: Date = Date()) -> URL? {
+    public func dailyNote(for date: Date = Date()) -> URL? {
         guard FileManager.default.fileExists(atPath: root.path) else { return nil }
         let dir = journalDir(for: date)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -88,7 +90,7 @@ struct Vault {
 
     /// Append a bullet to today's journal note (creates it if missing).
     @discardableResult
-    mutating func appendJournal(_ text: String, date: Date = Date()) -> URL? {
+    public mutating func appendJournal(_ text: String, date: Date = Date()) -> URL? {
         guard let url = dailyNote(for: date) else { return nil }
         var body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if body.isEmpty { return url }
@@ -102,7 +104,7 @@ struct Vault {
     /// Create or update a concept note in `My Life/<Concept>/`. Returns the
     /// note URL. Existing notes are updated only when `append` is true.
     @discardableResult
-    func writeConceptNote(_ category: Concept, title: String, body: String, append: Bool = false) -> URL? {
+    public func writeConceptNote(_ category: Concept, title: String, body: String, append: Bool = false) -> URL? {
         guard FileManager.default.fileExists(atPath: root.path) else { return nil }
         let dir = conceptDir(category)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -120,7 +122,7 @@ struct Vault {
     // MARK: Reading
 
     /// All markdown files under the vault, recursively.
-    func allNotes() -> [URL] {
+    public func allNotes() -> [URL] {
         guard let urls = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)?
             .compactMap({ $0 as? URL }) else { return [] }
         return urls.filter { url in

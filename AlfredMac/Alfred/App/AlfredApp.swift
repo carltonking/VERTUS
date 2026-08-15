@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import SwiftUI
 import UserNotifications
+import AlfredCore
 
 // Alfred is a client for Hermes Agent, not an assistant.
 //
@@ -117,9 +118,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var barWindow: BarWindow?
     private var hotkeyListener: HotkeyListener?
     private var statusItem: NSStatusItem?
-    /// The settings window hanging off the menu-bar icon, and its state.
+    /// The popover hanging off the menu-bar icon, and its state.
     private var settingsPopover: NSPopover?
-    private var settingsModel: SettingsModel?
     private var settingsPopoverClosedAt: Date?
     private var escapeMonitor: Any?
     /// The turn currently streaming, so a new query supersedes it.
@@ -615,10 +615,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Status item
 
-    /// Clicking the menu-bar icon opens a settings popover rather than an NSMenu:
-    /// a menu can't hold a text field, and the provider API key has to be typed
-    /// somewhere. The menu's items (show the bar, computer control, quit) moved
-    /// into the popover, so nothing was lost.
+    /// Clicking the menu-bar icon opens a small popover with two actions:
+    /// relaunch and quit. Settings deliberately live nowhere in the menu bar —
+    /// every capability is on by design and stays on.
     private func setupStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let url = Bundle.module.url(forResource: "alfred-menubar", withExtension: "png"),
@@ -634,23 +633,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = item
     }
 
-    /// Built lazily so the keychain isn't read at launch — that read is what can
-    /// raise the "Alfred wants to use your keychain" prompt, and it belongs at the
-    /// moment the user opens settings, not during startup.
     private func makeSettingsPopover() -> NSPopover {
-        let model = SettingsModel()
-        settingsModel = model
-
         let popover = NSPopover()
         popover.behavior = .transient   // click away to dismiss
         popover.delegate = self
         popover.contentViewController = NSHostingController(
             rootView: SettingsPopoverView(
-                model: model,
-                onShowBar: { [weak self] in
-                    self?.settingsPopover?.performClose(nil)
-                    self?.showBar()
-                },
                 onRelaunch: { [weak self] in self?.relaunchApp() },
                 onQuit: { NSApp.terminate(nil) }
             )
@@ -756,41 +744,52 @@ private func enforceRetry(_ text: String, _ attachment: FileAttachment?, agent: 
     /// The direct:turn implementation used by the query entry and the retry
     /// path. `handleQuery` is the UI entry (it owns barState bookkeeping).
     private func handleQueryAsync(text: String, attachment: FileAttachment?, agent: HermesSession) async {
-        var streamed = ""
         var failure: String?
         // The turn consumes quota on whichever provider is active right now.
         if let provider = providerKeys.activeKey?.provider {
             UsageTracker.shared.record(provider: provider)
         }
-        for await event in await agent.prompt(text, attachment: attachment) {
-            switch event {
-            case .text(let chunk):
-                if barState.presenceState == .thinking { barState.presenceState = .responding }
-                barState.responseText += chunk
 
-            case .thought:
-                break
-
-            case .toolStarted, .toolProgress, .finished:
-                break
-
-            case .toolStarted, .toolProgress, .finished:
-                break
-
-            case .usage(let used, let size):
-                // hermes' daily usage counter for the provider that served
-                // this turn (the ring's active key).
-                UsageTracker.shared.recordHermesUsage(used: used, size: size)
-
-            case .failed(let message):
-                failure = message
-                // A hard quota/rate-limit answer caps that key at 0% on the
-                // meter until the vendor window resets.
-                let lower = message.lowercased()
-                let markers = ["429", "rate limit", "quota", "usage limit",
-                               "billing", "402", "no usage left", "insufficient_funds"]
-                guard markers.contains(where: { lower.contains($0) }) else { break }
-                UsageTracker.shared.recordQuotaHit(message: message)
+        // The bar talks to the local Hermes server (AlfredMac/Server/server.py,
+        // OpenAI-compatible /v1/chat/completions) directly over SSE through
+        // HermesSession's ToolCallingProvider conformance — no hermes acp
+        // subprocess, no Ollama config indirection. A per-turn session is cheap:
+        // streamWithTools never touches the ACP process machinery. The tool set
+        // is AlfredCore's: FileReadTool reads vault-contained files.
+        let session = HermesSession(baseURL: ProcessInfo.processInfo.environment["ALFRED_HERMES_URL"] ?? "http://localhost:8080")
+        let tools: [any LLMTool] = [FileReadTool()]
+        do {
+            _ = try await session.streamWithTools(
+                prompt: text,
+                tools: tools,
+                onEvent: { event in
+                    switch event {
+                    case .contentDelta(let piece):
+                        // Append to the bar's response area (ExpandedPresenceView,
+                        // capped at ~5 lines then scrolls) on the main actor.
+                        DispatchQueue.main.async {
+                            if self.barState.presenceState == .thinking { self.barState.presenceState = .responding }
+                            self.barState.responseText += piece
+                        }
+                    case .toolCallDelta(let call):
+                        DispatchQueue.main.async {
+                            self.barState.responseText += "\n[Tool: \(call.function.name)]\n"
+                        }
+                    case .done:
+                        break
+                    }
+                }
+            )
+        } catch {
+            failure = error.localizedDescription
+            AlfredLog.provider.error("[provider] \(error.localizedDescription, privacy: .public)")
+            // A hard quota/rate-limit answer caps that key at 0% on the
+            // meter until the vendor window resets.
+            let lower = (failure ?? "").lowercased()
+            let markers = ["429", "rate limit", "quota", "usage limit",
+                           "billing", "402", "no usage left", "insufficient_funds"]
+            if markers.contains(where: { lower.contains($0) }) {
+                UsageTracker.shared.recordQuotaHit(message: failure ?? "")
             }
         }
 

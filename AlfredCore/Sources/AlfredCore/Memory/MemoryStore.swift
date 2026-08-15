@@ -4,16 +4,26 @@ import Foundation
 
 /// One Alfred memory. First-class citizens of the vault are markdown notes —
 /// this is just the in-memory index over them.
-struct MemoryNote {
-    let id: String
-    let title: String
-    let body: String
-    let category: String      // journal | activity | projects | goals | habits | topics | keyelements | documents
-    let importance: Int       // 1...5
-    let date: Date
-    let url: URL?
+public struct MemoryNote: Sendable {
+    public let id: String
+    public let title: String
+    public let body: String
+    public let category: String      // journal | activity | projects | goals | habits | topics | keyelements | documents
+    public let importance: Int       // 1...5
+    public let date: Date
+    public let url: URL?
 
-    var text: String { "\(title)\n\(body)" }
+    public var text: String { "\(title)\n\(body)" }
+
+    public init(id: String, title: String, body: String, category: String, importance: Int, date: Date, url: URL?) {
+        self.id = id
+        self.title = title
+        self.body = body
+        self.category = category
+        self.importance = importance
+        self.date = date
+        self.url = url
+    }
 }
 
 // MARK: - Store
@@ -24,18 +34,20 @@ struct MemoryNote {
 /// vault, serves keyword search, and hands concepts/journals to the vault
 /// writer. The vault is the single source of truth — the index here is only
 /// for fast lookups and is rebuilt on refresh.
-final class MemoryStore {
+public final class MemoryStore {
 
-    static let shared = MemoryStore()
+    public static let shared = MemoryStore()
 
     private var notes: [MemoryNote] = []
     private let queue = DispatchQueue(label: "alfred.memory")
 
     private lazy var vault: Vault = Vault(path: AlfredConfig.vaultPath())
 
+    public init() {}
+
     // MARK: Category mapping — vault folders → memory categories
 
-    static func category(forFolder folder: String) -> String {
+    public static func category(forFolder folder: String) -> String {
         switch folder {
         case "Projects":     return "projects"
         case "Goals":        return "goals"
@@ -51,7 +63,7 @@ final class MemoryStore {
     /// Rebuild the index from the vault. Safe to call repeatedly; used at
     /// launch and on a refresh timer so notes the user adds in Obsidian
     /// become visible without an Alfred restart.
-    func refresh() {
+    public func refresh() {
         let urls = vault.allNotes()
         var found: [MemoryNote] = []
         let formatter = DateFormatter()
@@ -97,13 +109,13 @@ final class MemoryStore {
     /// The full indexed note list, newest first. Read-only snapshot — the
     /// unified layer's vault mirror is rebuilt from this on launch
     /// (MigrationManager).
-    func allNotes() -> [MemoryNote] {
+    public func allNotes() -> [MemoryNote] {
         queue.sync { notes }
     }
 
     /// Search the vault by keywords. Notes matching the most terms rank first;
     /// importance breaks ties. Pass a category to narrow.
-    func search(_ query: String, category: String? = nil, limit: Int = 6) -> [MemoryNote] {
+    public func search(_ query: String, category: String? = nil, limit: Int = 6) -> [MemoryNote] {
         let terms = query.lowercased()
             .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
             .map(String.init)
@@ -127,7 +139,7 @@ final class MemoryStore {
     }
 
     /// Most recent notes, optionally within one category.
-    func recent(category: String? = nil, limit: Int = 10) -> [MemoryNote] {
+    public func recent(category: String? = nil, limit: Int = 10) -> [MemoryNote] {
         queue.sync {
             let filtered = category.map { c in notes.filter { $0.category == c } } ?? notes
             return Array(filtered.prefix(limit))
@@ -136,7 +148,7 @@ final class MemoryStore {
 
     /// A compact single-line rendering of the top matches, ready to drop into
     /// a prompt. Empty string when nothing matched.
-    func groundingText(for query: String, limit: Int = 4) -> String {
+    public func groundingText(for query: String, limit: Int = 4) -> String {
         let matches = search(query, limit: limit)
         guard !matches.isEmpty else { return "" }
         return matches.enumerated().map { i, n in
@@ -149,8 +161,8 @@ final class MemoryStore {
 
     /// Log a line into today's journal note (activity/inbox) and index it.
     @discardableResult
-    func logActivity(_ text: String, source: String = "screen", importance: Int = 2,
-                     date: Date = Date()) -> MemoryNote? {
+    public func logActivity(_ text: String, source: String = "screen", importance: Int = 2,
+                            date: Date = Date()) -> MemoryNote? {
         guard !text.isEmpty else { return nil }
         var vault = self.vault
         guard let url = vault.appendJournal(text, date: date) else { return nil }
@@ -170,8 +182,8 @@ final class MemoryStore {
     /// clobbers an existing note; when the note exists and `append` is true, a
     /// dated bullet is appended instead.
     @discardableResult
-    func noteConcept(_ concept: Vault.Concept, title: String, body: String,
-                     append: Bool = false) -> MemoryNote? {
+    public func noteConcept(_ concept: Vault.Concept, title: String, body: String,
+                            append: Bool = false) -> MemoryNote? {
         guard let url = vault.writeConceptNote(concept, title: title, body: body, append: append) else { return nil }
         let note = MemoryNote(
             id: UUID().uuidString,

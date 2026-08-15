@@ -1,4 +1,5 @@
 import Foundation
+import AlfredCore
 
 extension Notification.Name {
     /// Posted when the *active* key was removed — the agent must respawn on
@@ -192,9 +193,8 @@ enum LocalWarmup {
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         let (data, response) = (try? await URLSession.shared.data(for: request)) ?? (Data(), nil)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            NSLog("[model] warmup ping failed: HTTP %d %@",
-                  http.statusCode,
-                  String(data: data, encoding: .utf8) ?? "?")
+            let body = String(data: data, encoding: .utf8) ?? "?"
+            AlfredLog.provider.error("[provider] warmup ping failed: HTTP \(http.statusCode, privacy: .public) \(body, privacy: .public)")
         }
     }
 
@@ -209,9 +209,9 @@ enum LocalWarmup {
     }
 }
 
-/// One provider API key, as saved by the user in Settings. Keys live in
-/// `~/.alfred/gemini-keys.json` (0600) so the plaintext never lands in
-/// Alfred's logs, vault, or anywhere else readable.
+/// One provider API key, as saved by the user in Settings. Keys live in the
+/// macOS Keychain (via AlfredCore's KeychainStore) so the plaintext never
+/// lands in UserDefaults, Alfred's logs, or anywhere else readable.
 struct ProviderKey: Codable, Identifiable, Equatable {
     var id = UUID()
     var provider: LLMProvider
@@ -252,7 +252,10 @@ final class ProviderKeyRing: ObservableObject {
     @Published private(set) var keys: [ProviderKey] = []
     @Published private(set) var activeKeyID: UUID?
 
-    private static let storeURL = "\(NSHomeDirectory())/.alfred/gemini-keys.json"
+    /// Keychain account holding the encoded ring (keys + active id). The ring
+    /// is a thin wrapper over AlfredCore's KeychainStore — no file, no
+    /// UserDefaults, no persistence logic of its own.
+    private static let keychainAccount = "providerRing"
 
     /// The venv python hermes uses; drives the fallback-chain sync.
     static let hermesPython = "\(NSHomeDirectory())/.hermes/hermes-agent/venv/bin/python3"
@@ -534,7 +537,7 @@ final class ProviderKeyRing: ObservableObject {
     // MARK: - Persistence
 
     private func load() {
-        guard let data = FileManager.default.contents(atPath: Self.storeURL),
+        guard let data = KeychainStore.load(account: Self.keychainAccount),
               let decoded = try? JSONDecoder().decode(StoredRing.self, from: data)
         else { return }
         keys = decoded.keys
@@ -551,14 +554,9 @@ final class ProviderKeyRing: ObservableObject {
     private func save() {
         let payload = StoredRing(keys: keys, activeKeyID: activeKeyID)
         guard let data = try? JSONEncoder().encode(payload) else { return }
-        do {
-            try data.write(to: URL(fileURLWithPath: Self.storeURL), options: .atomic)
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: Self.storeURL
-            )
-        } catch {
-            NSLog("[keys] failed to save key ring: \(error.localizedDescription)")
+        guard KeychainStore.save(account: Self.keychainAccount, data: data) else {
+            NSLog("[keys] failed to save key ring to Keychain")
+            return
         }
     }
 }
