@@ -15,9 +15,13 @@ import SwiftUI
 // MARK: - The palette a view draws with
 
 struct Palette: Equatable {
-    // Ground — strict OLED deep black
+    // Ground — neutral gray
     let backgroundTop: Color
     let backgroundBottom: Color
+
+    // The side panel's own ground, one step below the page background so the
+    // rail reads as a distinct column. RGB(10, 10, 10).
+    let sidebarBackground: Color
 
     // Raised surfaces (Alfred's bubbles, cards, the composer)
     let surface: Color
@@ -28,9 +32,9 @@ struct Palette: Equatable {
     // framed boxes — one hairline, then whitespace.
     let hairline: Color
 
-    // The single energetic accent — orange. Active buttons, focus
-    // states, highlights, the send control, and the selected tab pill all draw
-    // with this family and nothing else.
+    // The accent family — neutral grays, never a colour. Active buttons,
+    // focus states, highlights, the send control, and the selected sidebar row
+    // all draw with this family and nothing else.
     let accent: Color
     let accentDeep: Color
     let accentBright: Color
@@ -72,27 +76,28 @@ struct Palette: Equatable {
 // MARK: - The one palette
 
 extension Palette {
-    /// Alfred's single theme: OLED black ground, one orange accent, and
-    /// warm-tinted state colours. The surface tint is a hair lighter and bluer
-    /// than pure black so cards lift off the ground without a hard line.
+    /// Alfred's single theme: a dark gray ground, neutral gray accents, and no
+    /// coloured states. Sidebar/tab chrome is RGB(10, 10, 10); every page
+    /// background is solid RGB(30, 30, 30); text is white; radii are sharp (0).
     static let mono = Palette(
-        backgroundTop: Color(hex: 0x000000),
-        backgroundBottom: Color(hex: 0x07070C),
-        surface: Color(hex: 0x14141A),
-        surfaceBorder: Color(hex: 0x2A2A36),
-        hairline: Color.white.opacity(0.07),
-        accent: Color(hex: 0xFF7A3D),
-        accentDeep: Color(hex: 0xE06020),
-        accentBright: Color(hex: 0xFFB380),
-        accentSoft: Color(hex: 0xFFE8D6),
-        textPrimary: Color(hex: 0xF4F4F7),
-        textSecondary: Color(hex: 0x9D9DA8),
-        textFaint: Color(hex: 0x6F6F7B),
-        danger: Color(hex: 0xFF6B6B),
-        success: Color(hex: 0x42D982),
-        cardRadius: 16,
-        bubbleRadius: 20,
-        composerRadius: 28
+        backgroundTop: Color(red: 30/255, green: 30/255, blue: 30/255),
+        backgroundBottom: Color(red: 30/255, green: 30/255, blue: 30/255),
+        sidebarBackground: Color(red: 10/255, green: 10/255, blue: 10/255),
+        surface: Color(white: 0.08),
+        surfaceBorder: Color(white: 0.12),
+        hairline: Color.white.opacity(0.06),
+        accent: Color(white: 0.3),
+        accentDeep: Color(white: 0.2),
+        accentBright: Color(white: 0.5),
+        accentSoft: Color(white: 0.7),
+        textPrimary: .white,
+        textSecondary: Color.white.opacity(0.7),
+        textFaint: Color.white.opacity(0.45),
+        danger: Color(white: 0.5),
+        success: Color(white: 0.5),
+        cardRadius: 0,
+        bubbleRadius: 0,
+        composerRadius: 0
     )
 }
 

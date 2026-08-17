@@ -3,6 +3,7 @@ import Combine
 import SwiftUI
 import UserNotifications
 import AlfredCore
+import AlfredMacApp
 
 // Alfred is a client for Hermes Agent, not an assistant.
 //
@@ -78,9 +79,21 @@ private struct BarContainer: View {
 struct AlfredApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
+    @State private var settings = AppSettings()
+    @State private var chat = ChatStore()
+
     var body: some Scene {
-        // No windows: Alfred is menu-bar resident and the bar is an NSPanel the
-        // delegate owns. Settings is required for a valid Scene graph.
+        // One Alfred: the windowed surface (side panel, tabs) hosts the
+        // macOSRootView from the AlfredMacApp library, and the delegate keeps
+        // the menu-bar icon + ⌘⇧J notch bar. Settings is required for a valid
+        // Scene graph.
+        WindowGroup("Alfred") {
+            macOSRootView()
+                .environment(settings)
+                .environment(chat)
+                .frame(minWidth: 720, minHeight: 520)
+        }
+        .defaultSize(width: 980, height: 720)
         Settings { EmptyView() }
     }
 }
@@ -138,8 +151,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSLog("[boot] applicationDidFinishLaunching begin / pid \(ProcessInfo.processInfo.processIdentifier)")
         Self.shared = self
 
-        // Menu-bar resident: no Dock icon, no window in the app switcher.
-        NSApp.setActivationPolicy(.accessory)
+        // A foreground app: window + Dock icon + menu bar. The window hosts
+        // the windowed surface (macOSRootView); the menu bar keeps the status
+        // item and the ⌘⇧J notch bar.
+        NSApp.setActivationPolicy(.regular)
 
         setupBarWindow()
         setupStatusItem()
@@ -367,25 +382,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         startRelayIfConfigured()
 
-        // Apply the persisted model mode. Local mode is re-asserted every
-        // launch — the flag lives in Hermes' config, and a manual edit or a
-        // hermes update can drift it back to cloud. Cloud mode mirrors the
-        // stored provider keys into hermes' fallback chain so a quota-limited
+        // Always use cloud mode (NOUS portal models). Mirror the stored
+        // provider keys into hermes' fallback chain so a quota-limited
         // primary provider auto-falls through to a free tier.
-        switch ProviderKeyRing.persistedModelMode() {
-        case .local:
-            Task.detached { ProviderKeyRing.shared.applyModelMode(.local) }
-            // Local-mode latency budget: prewarm the model (keeps alfred's
-            // brain resident in Ollama) and spawn the agent session now, so
-            // the first prompt answers in ~a second instead of paying a cold
-            // model load + MCP startup. Failed spawns are caught — prompts
-            // still start it lazily.
-            Task.detached { await LocalWarmup.runForever() }
-            Task { try? await hermes.start() }
-        case .cloud:
-            if !providerKeys.keys.isEmpty {
-                Task.detached { ProviderKeyRing.shared.syncHermesFallbackChain() }
-            }
+        if !providerKeys.keys.isEmpty {
+            Task.detached { ProviderKeyRing.shared.syncHermesFallbackChain() }
         }
 
         // Keep the agent alive. A prompt respawns a dead session lazily, but an
@@ -648,35 +649,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func popoverRootView() -> SettingsPopoverView {
         SettingsPopoverView(
             onRelaunch: { [weak self] in self?.relaunchApp() },
-            onQuit: { NSApp.terminate(nil) },
-            onApplyModelMode: { [weak self] mode in self?.applyModelMode(mode) }
+            onQuit: { NSApp.terminate(nil) }
         )
-    }
-
-    /// Flip the assistant between cloud and local models: persist the choice,
-    /// write Hermes' config, and respawn the session so the next turn runs
-    /// under the new world. No-op when the mode didn't actually change — the
-    /// picker re-seeds from persisted state on every open, so re-confirming
-    /// the same mode is the common case.
-    private func applyModelMode(_ mode: ModelMode) {
-        guard ProviderKeyRing.persistedModelMode() != mode else { return }
-        ProviderKeyRing.persistModelMode(mode)
-        NSLog("[model] mode → %@", mode.rawValue)
-
-        // Hermes reads its config at spawn; rewrite it now so the running
-        // session and any lazy spawn pick the new world.
-        Task.detached { ProviderKeyRing.shared.applyModelMode(mode) }
-        if mode == .local {
-            // Keep the local brain resident so the first turn in local mode
-            // answers fast instead of paying a cold Ollama load.
-            Task.detached { await LocalWarmup.runForever() }
-        }
-        Task { @MainActor in
-            // Only respawn an existing session; a cold cloud install spawns
-            // lazily and reads the new config on its own.
-            guard await self.hermes.hasAttemptedStart else { return }
-            try? await self.hermes.restart()
-        }
     }
 
     /// Relaunch: quit this instance immediately, and let a detached shell
@@ -702,9 +676,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.performClose(nil)
             return
         }
-        // Rebuild the root view so the model-mode picker re-seeds from the
-        // persisted choice (a transient popover keeps its hosting controller
-        // between shows, taking stale @State with it).
+        // Rebuild the root view so @State re-seeds from persisted values
+        // (a transient popover keeps its hosting controller between shows,
+        // taking stale @State with it).
         popover.contentViewController = NSHostingController(rootView: popoverRootView())
         // A transient popover is dismissed by the mouse-down on the status item
         // *before* this action runs, so without this the click that closed it

@@ -2,14 +2,15 @@
 //  RootView.swift
 //  AlfredMacApp
 //
-//  The windowed companion's root: the same tab layout as the iOS app.
-//  Ported from Alfred/Alfred/Views/RootView.swift — same AlfredTab enum, same
-//  page-switching pattern (each page keeps its own view identity, hidden pages
-//  don't swallow taps), same floating tab bar via safeAreaInset.
+//  The windowed surface's root: a monochrome side panel (SidebarView) on the
+//  left rail, the six pages in a ZStack on the right. Each page keeps its own
+//  view identity, so switching tabs doesn't reset a half-typed message or a
+//  scroll position — hidden pages don't swallow taps and don't contribute
+//  toolbar items to the shared window toolbar.
 //
 //  Deviation from iOS: the iOS RootView's `.task` blocks connect the phone to
 //  the Mac (push registration, the live socket, the mail store). The menu-bar
-//  Alfred app already owns those connections, so the companion's root is pure
+//  Alfred app already owns those connections, so the root is pure
 //  presentation — the socket/mail wiring belongs to the views the other
 //  sessions drop in.
 //
@@ -17,20 +18,18 @@
 import SwiftUI
 
 enum AlfredTab: String, CaseIterable, Identifiable, Hashable {
-    case home, chat, email, calendar, reminders, routines, code, courses, settings
+    case home, email, calendar, reminders, routines, sessions, settings
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .home: return "Home"
-        case .chat: return "Chat"
         case .email: return "Email"
         case .calendar: return "Calendar"
         case .reminders: return "Reminders"
         case .routines: return "Routines"
-        case .code: return "Code"
-        case .courses: return "Courses"
+        case .sessions: return "Sessions"
         case .settings: return "Settings"
         }
     }
@@ -38,20 +37,18 @@ enum AlfredTab: String, CaseIterable, Identifiable, Hashable {
     var icon: String {
         switch self {
         case .home: return "house.fill"
-        case .chat: return "bubble.left.and.bubble.right.fill"
         case .email: return "envelope.fill"
         case .calendar: return "calendar"
         case .reminders: return "checklist"
         case .routines: return "bolt.fill"
-        case .code: return "chevron.left.forwardslash.chevron.right"
-        case .courses: return "graduationcap.fill"
+        case .sessions: return "briefcase.fill"
         case .settings: return "gearshape.fill"
         }
     }
 }
 
 /// Whether this page is the currently selected tab. The windowed root keeps
-/// every page alive in a ZStack (so tab switches don't reset a half-typed
+/// every page alive in a ZStack (so tab switches doesn't reset a half-typed
 /// message or a scroll position), and macOS merges the toolbar items of every
 /// mounted NavigationStack into the one window toolbar — so without this, the
 /// Calendar/Routines/Reminders "+" buttons would all appear on whatever tab
@@ -89,38 +86,51 @@ struct TabToolbar<Items: ToolbarContent>: ViewModifier {
     }
 }
 
-struct macOSRootView: View {
+public struct macOSRootView: View {
     @Environment(AppSettings.self) private var settings
     @State private var selection: AlfredTab = .home
+    @State private var sidebarCollapsed: Bool = false
 
-    var body: some View {
-        ZStack {
-            // Each page keeps its own view identity, so switching tabs doesn't reset a half-typed
-            // message or a scroll position the way rebuilding a single view would.
-            page(.home) { HomeView(selection: $selection) }
-            page(.chat) { ChatView(goBackHome: { selection = .home }) }
-            page(.email) { EmailView() }
-            page(.calendar) { CalendarView() }
-            page(.reminders) { RemindersView() }
-            page(.routines) { RoutinesView() }
-            page(.code) { CodeView() }
-            page(.courses) { NYUView() }
-            page(.settings) { SettingsView() }
+    public init() {}
+
+    public var body: some View {
+        HStack(spacing: 0) {
+            // The collapse toggle, moved out of the sidebar rail and pinned to
+            // the very top-left of the window, right under the traffic-light
+            // controls. A slim 24pt strip keeps it a permanent handle beside
+            // the rail without overlapping the first tab.
+            VStack(alignment: .leading, spacing: 0) {
+                SidebarCollapseButton(collapsed: $sidebarCollapsed)
+                    .padding(.leading, 4)
+                    .padding(.top, 8)
+                Spacer(minLength: 0)
+            }
+            .frame(width: 24)
+            .background(Palette.mono.sidebarBackground)
+
+            // The side panel: the content tabs + the settings gear pinned to
+            // the bottom-left. Sits on its own RGB(10, 10, 10) ground so it
+            // reads as a distinct rail beside the page.
+            SidebarView(selection: $selection, collapsed: $sidebarCollapsed)
+
+            ZStack {
+                // Each page keeps its own view identity, so switching tabs doesn't reset a half-typed
+                // message or a scroll position the way rebuilding a single view would.
+                page(.home) { HomeView(selection: $selection) }
+                page(.email) { EmailView() }
+                page(.calendar) { CalendarView() }
+                page(.reminders) { RemindersView() }
+                page(.routines) { RoutinesView() }
+                page(.sessions) { SessionsView() }
+                // Settings is reachable only through the gear at the bottom of
+                // the side panel — it is deliberately not a sidebar row.
+                page(.settings) { SettingsView() }
+            }
         }
         .safeAreaInset(edge: .bottom) {
-            VStack(spacing: 0) {
-                // Chat owns the whole screen while it's open: the composer sits
-                // over the inset every other tab gives the bar, so the bar would
-                // bury it. Full-screen chat, navigable back to Home via its
-                // leading button.
-                if selection != .chat {
-                    AlfredTabBar(selection: $selection)
-                }
-
-                // The statusbar stays under everything — including chat — like
-                // Hermes' statusbar: the live link to the Mac is always legible.
-                StatusBarView()
-            }
+            // The statusbar stays under everything — including sessions — like
+            // Hermes' statusbar: the live link to the Mac is always legible.
+            StatusBarView()
         }
         .environment(\.palette, .mono)
         .tint(Palette.mono.accentBright)
@@ -136,5 +146,32 @@ struct macOSRootView: View {
             .accessibilityHidden(selection != tab)
             // Hidden pages must not contribute items to the shared window toolbar.
             .environment(\.isTabActive, selection == tab)
+    }
+}
+
+/// The sidebar collapse toggle. A small arrow-only button that lives at the
+/// window's top-left, under the traffic-light controls: chevron-left to
+/// collapse, chevron-right to expand.
+private struct SidebarCollapseButton: View {
+    @Environment(\.palette) private var palette
+
+    @Binding var collapsed: Bool
+
+    var body: some View {
+        Button {
+            withAnimation(.snappy(duration: 0.2)) {
+                collapsed.toggle()
+            }
+        } label: {
+            Image(systemName: collapsed ? "chevron.right" : "chevron.left")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(palette.textFaint)
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(collapsed ? "Expand sidebar" : "Collapse sidebar")
+        .accessibilityLabel(collapsed ? "Expand sidebar" : "Collapse sidebar")
+        .accessibilityIdentifier("sidebar.toggle")
     }
 }

@@ -15,7 +15,7 @@ import Observation
 
 @MainActor
 @Observable
-final class ChatStore {
+public final class ChatStore {
 
     /// The single conversation — Home, Chat and the shell share it.
     static let shared = ChatStore()
@@ -29,7 +29,7 @@ final class ChatStore {
     private var socket: AlfredWebSocketClient { .shared }
     private let fileURL: URL
 
-    init() {
+    public init() {
         // Scoped to an "Alfred Companion" folder so the transcript never lands
         // next to the Mac brain's own files in the shared Application Support.
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]

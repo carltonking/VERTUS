@@ -9,6 +9,16 @@ let package = Package(
     platforms: [
         .macOS(.v14),
     ],
+    products: [
+        // The windowed surface (side panel, tabs, mail, calendar, routines). A
+        // library — the menu-bar Alfred executable links it and presents its
+        // macOSRootView in a WindowGroup, so there is one Alfred.app carrying
+        // both the window and the menu bar.
+        .library(
+            name: "AlfredMacApp",
+            targets: ["AlfredMacApp"]
+        ),
+    ],
     dependencies: [
         // AlfredCore: the platform-agnostic core shared with the iOS app — LLM
         // provider protocol/router, markdown-vault memory, Keychain store.
@@ -19,6 +29,7 @@ let package = Package(
             name: "Alfred",
             dependencies: [
                 .product(name: "AlfredCore", package: "AlfredCore"),
+                "AlfredMacApp",
             ],
             path: "Alfred",
             resources: [
@@ -32,16 +43,13 @@ let package = Package(
             name: "alfred-mcp",
             path: "AlfredMCP"
         ),
-        // The windowed companion app: a native macOS surface that mirrors the
-        // iOS app's tab layout. A separate executable so it coexists with
-        // the menu-bar Alfred target (which keeps its own @main entry).
-        .executableTarget(
+        .target(
             name: "AlfredMacApp",
             path: "AlfredMacApp"
         ),
         .testTarget(
             name: "AlfredTests",
-            dependencies: ["Alfred"],
+            dependencies: ["Alfred", "AlfredMacApp"],
             path: "Tests"
         ),
     ]

@@ -50,7 +50,7 @@ private let defaultSocketPort = 8766
 
 @MainActor
 @Observable
-final class AppSettings {
+public final class AppSettings {
 
     /// What the user typed — a hostname or full URL, kept verbatim so the settings field
     /// shows them back what they entered rather than a normalised form they didn't write.
@@ -182,7 +182,7 @@ final class AppSettings {
         return URL(string: "ws://\(raw):\(port)")
     }
 
-    init() {
+    public init() {
         host = UserDefaults.standard.string(forKey: SettingsKeys.host) ?? ""
         token = UserDefaults.standard.string(forKey: SettingsKeys.token) ?? ""
         voiceHost = UserDefaults.standard.string(forKey: SettingsKeys.voiceHost) ?? ""

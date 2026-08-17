@@ -28,9 +28,6 @@ struct SettingsView: View {
     @State private var testState: TestState = .idle
     @State private var socketTestState: SocketTestState = .idle
 
-    /// Cloud vs local, seeded from the Mac's persisted choice.
-    @State private var modelMode = ProviderKeyRing.persistedModelMode()
-
     /// The add-key editor.
     @State private var newProvider: LLMProvider = .gemini
     @State private var newKey = ""
@@ -132,21 +129,6 @@ struct SettingsView: View {
                         Text("Mac address (direct link)")
                     } footer: {
                         Text("The live link to your Mac — streaming chat, briefings and updates without a cloud relay. Left blank, Alfred finds the Mac automatically over mDNS or Tailscale. The link is plain ws:// (the Mac's server has no TLS), so a pasted wss:// address is downgraded. Leave the port empty for the default (\\(AlfredWebSocketClient.defaultPort)).")
-                    }
-
-                    Section {
-                        Picker("Model mode", selection: $modelMode) {
-                            ForEach(ModelMode.allCases) { mode in
-                                Text(mode.displayName).tag(mode)
-                            }
-                        }
-                        .onChange(of: modelMode) { _, mode in
-                            ProviderKeyRing.persistModelMode(mode)
-                        }
-                    } header: {
-                        Text("Model")
-                    } footer: {
-                        Text("Cloud uses the provider keys below (with Hermes' fallback chain); Local drives Alfred with the Ollama models on this Mac. The menu-bar app applies the choice to Hermes' config — it takes effect on the next turn.")
                     }
 
                     Section {
