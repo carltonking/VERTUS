@@ -119,6 +119,6 @@ until then).
 
 ## Next steps
 
-1. Rebuild the bar: `cd alfred/apps/alfred-bar && swiftc -o AlfredBar AlfredQuickBarApp.swift QuickBarRootView.swift QuickBarViewModel.swift` (typechecks clean, 0 errors).
+1. Rebuild the bar: `cd alfred/apps/alfred-bar && swiftc -o AlfredBar AlfredQuickBarApp.swift QuickBarRootView.swift QuickBarViewModel.swift MathEval.swift` (typechecks clean, 0 errors).
 2. Launch: `cd alfred/apps/alfred-bar && ./AlfredBar` (background it; long-lived GUI processes don't survive this sandbox's shell timeouts, so launch from your own terminal or via `launchctl`).
 3. Start Milestone 5: native iOS app scaffolding under `alfred/apps/AlfredPhone/`.

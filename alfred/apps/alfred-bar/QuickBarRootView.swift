@@ -99,6 +99,15 @@ enum NotchPanelMetrics {
     static let windowWidth: CGFloat = 331
 }
 
+// MARK: - Calculator panel metrics
+
+/// The live calculator chip (shown while the prompt parses as math).
+/// Fixed output-window height: room for the dimmed expression row, the
+/// big result, and breathing room around the chip.
+enum MathPreviewMetrics {
+    static let windowHeight: CGFloat = 88
+}
+
 // MARK: - The panel shape
 
 /// Shape of the notch widget. `progress` morphs it from a notch-sized nub
@@ -182,8 +191,52 @@ struct NotchPanelContent: View {
     var onPickFile: () -> Void
     var onSend: (String) -> Void
     var onNewSession: () -> Void
+    /// The prompt has started parsing as a live math expression → the bar
+    /// needs room for the calculator output window (and vice versa).
+    var onMathChange: (Bool) -> Void
 
     @State private var prompt = ""
+
+    /// When the whole prompt parses as math, this is its live result —
+    /// recomputed from scratch on every keystroke so the answer appears
+    /// with no Enter needed. Nil for normal chat text.
+    private var mathPreview: MathEvaluator.Result? {
+        MathEvaluator.evaluate(prompt)
+    }
+
+    /// The output window is needed when there's a live math result, a math
+    /// expression in progress, or an existing conversation; idle+plain-text
+    /// = no window.
+    private var showOutputWindow: Bool {
+        mathPreview != nil || isMathInProgress || !model.transcript.isEmpty
+    }
+
+    /// The prompt is shaping up into a math expression but doesn't fully
+    /// parse yet ("9+", "sqrt(9") — the calculator is engaged.
+    private var isMathInProgress: Bool {
+        MathEvaluator.isMathInProgress(prompt)
+    }
+
+    // Chat auto-follow: while pinned at the bottom, new streamed text
+    // keeps the view scrolled to the latest line. ANY upward scroll by
+    // the user switches this off instantly (the programmatic follow
+    // scroll only ever moves down, so upward motion is always the user
+    // reading), and scrolling back to the very bottom switches it on
+    // again. That way ALFRED's answer can be read while it's still
+    // typing.
+    @State private var followLatest = true
+    /// Last measured chat content-top offset (named-space y of the
+    /// transcript's top edge; 0 at the top, negative as you scroll down).
+    @State private var lastTopOffset: CGFloat = 0
+    /// Cumulative upward scroll distance since the last downward motion —
+    /// a slow drag only unpins once it has really moved this far.
+    @State private var upwardMotion: CGFloat = 0
+    /// Back within this many points of the true bottom → follow again.
+    private let reFollowZone: CGFloat = 8
+    /// Cumulative upward motion (points) that counts as "the user scrolled
+    /// up to read" and disables the follow.
+    private let unpinThreshold: CGFloat = 6
+    private static let scrollSpaceName = "chatScroll"
 
     /// Horizontal center of the logo (ZStack coords): centered between the
     /// window's left end and the notch, so it sits in the left shoulder.
@@ -239,6 +292,11 @@ struct NotchPanelContent: View {
         .frame(width: NotchPanelMetrics.topWidth, height: widgetHeight)
         .mask(NotchPanelShape(progress: progress, expandedHeight: widgetHeight))
         .clipped()
+        .onChange(of: prompt) { _ in
+            // Live calculator: growing/shrinking the output window as the
+            // prompt enters/leaves "math mode" (Enter is not involved).
+            onMathChange(mathPreview != nil || isMathInProgress)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .alfredAppendPrompt)) { note in
             guard let path = note.object as? String else { return }
             appendPath(path)
@@ -295,7 +353,11 @@ struct NotchPanelContent: View {
 
     private var outputPane: some View {
         Group {
-            if !model.transcript.isEmpty {
+            if let math = mathPreview {
+                mathPane(math)          // live calculator chip wins
+            } else if isMathInProgress {
+                pendingMathPane         // mid-expression: keep the window
+            } else if !model.transcript.isEmpty {
                 chatPane
             } else {
                 Color.clear
@@ -309,8 +371,62 @@ struct NotchPanelContent: View {
         // The window starts right underneath the (measured) notch, so
         // scrolling never sends text up into the icons/notch area.
         .offset(x: NotchPanelMetrics.chamferInset, y: NotchPanelMetrics.topBandHeight)
-        .opacity(!model.transcript.isEmpty && outputHeight > 0 ? contentReveal : 0)
-        .allowsHitTesting(!model.transcript.isEmpty && outputHeight > 0 && contentReveal > 0.5)
+        .opacity(showOutputWindow && outputHeight > 0 ? contentReveal : 0)
+        .allowsHitTesting(showOutputWindow && outputHeight > 0 && contentReveal > 0.5)
+    }
+
+    /// Dimmed echo of the raw prompt while the user is mid-expression and
+    /// no complete result exists yet — keeps the output window put instead
+    /// of shutting it between keystrokes.
+    private var pendingMathPane: some View {
+        ZStack {
+            Color.clear
+            Text(prompt.trimmingCharacters(in: .whitespacesAndNewlines))
+                .font(.system(size: 13, weight: .regular))
+                .italic()
+                .foregroundStyle(.white.opacity(0.45))
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color(white: 0.12))
+                )
+        }
+    }
+
+    /// Calculator display: the answer, centered in the chat window. A dimmed
+    /// normalized form of the expression sits above the big result; a lone
+    /// number just shows the number itself.
+    private func mathPane(_ result: MathEvaluator.Result) -> some View {
+        let formatted = MathEvaluator.format(result.value)
+        let raw = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let showExpression = formatted != raw
+        return ZStack {
+            Color.clear
+            VStack(spacing: 6) {
+                if showExpression {
+                    Text(result.rendered)
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundStyle(.white.opacity(0.55))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                }
+                Text(formatted)
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.5)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color(white: 0.16))
+            )
+        }
     }
 
     /// Scrollable chat: one bubble per transcript entry; the newest text is
@@ -321,7 +437,7 @@ struct NotchPanelContent: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(model.transcript) { entry in
-                        chatBubble(for: entry).id(entry.id)
+                        TranscriptBubbleView(entry: entry).id(entry.id)
                     }
                     if model.isThinking {
                         thinkingBubble.id("thinking")
@@ -330,8 +446,16 @@ struct NotchPanelContent: View {
                 .padding(.horizontal, 14)
                 .padding(.top, NotchPanelMetrics.chatTopPad)
                 .padding(.bottom, NotchPanelMetrics.outputBottomInset)
+                .background(scrollMeasurer)
+            }
+            .coordinateSpace(name: Self.scrollSpaceName)
+            .onPreferenceChange(ChatScrollMetricsKey.self) { metrics in
+                trackScroll(metrics)
             }
             .onChange(of: model.transcriptText) { _ in
+                // Only follow while the user is still pinned to the bottom —
+                // if they've scrolled up to read, leave their place alone.
+                guard followLatest else { return }
                 withAnimation(.easeOut(duration: 0.15)) {
                     proxy.scrollTo(scrollAnchor(), anchor: .bottom)
                 }
@@ -346,6 +470,50 @@ struct NotchPanelContent: View {
         }
     }
 
+    /// Zero-size geometry reader pinned behind the whole transcript: it
+    /// reports the content's top offset inside the scroll view and its
+    /// total (padded) height, re-evaluated on every scroll frame and on
+    /// every layout change — that's what `trackScroll` decides from.
+    private var scrollMeasurer: some View {
+        GeometryReader { geo in
+            Color.clear.preference(
+                key: ChatScrollMetricsKey.self,
+                value: ChatScrollMetrics(
+                    topOffset: geo.frame(in: .named(Self.scrollSpaceName)).minY,
+                    contentHeight: geo.size.height
+                )
+            )
+        }
+    }
+
+    /// Receives the chat's scroll/layout metrics on every change and
+    /// maintains the follow-the-latest flag:
+    /// - while following, any real upward motion disables it instantly —
+    ///   the programmatic follow scroll only ever moves down, so upward
+    ///   motion is always the user scrolling away to read;
+    /// - while not following, arriving back within `reFollowZone` of the
+    ///   true bottom re-enables it, so the view tracks the newest text
+    ///   again once the user returns to the live edge.
+    private func trackScroll(_ metrics: ChatScrollMetrics) {
+        let maxOffset = max(0, metrics.contentHeight - outputHeight)
+        let delta = metrics.topOffset - lastTopOffset
+        lastTopOffset = metrics.topOffset
+        if delta > 0 {
+            upwardMotion += delta
+        } else {
+            upwardMotion = 0
+        }
+        if followLatest {
+            if upwardMotion > unpinThreshold {
+                followLatest = false
+                alfredTrace("chat follow disabled — user scrolled up")
+            }
+        } else if metrics.topOffset + maxOffset <= reFollowZone {
+            followLatest = true
+            alfredTrace("chat follow enabled — back at the bottom")
+        }
+    }
+
     /// Which bubble to keep pinned at the bottom while chatting: the thinking
     /// bubble while waiting, otherwise the newest message entry (stable id).
     private func scrollAnchor() -> AnyHashable {
@@ -356,32 +524,6 @@ struct NotchPanelContent: View {
             return last.id
         }
         return ""
-    }
-
-    /// One chat message in a rounded bubble — white with black text for
-    /// your prompts (right side, classic messenger style), dark gray with
-    /// white text for ALFRED's replies (left side).
-    @ViewBuilder
-    private func chatBubble(for entry: TranscriptEntry) -> some View {
-        let isYou = entry.role == "you"
-        Group {
-            if isYou {
-                Text(entry.text)
-                    .foregroundStyle(.black)
-            } else {
-                renderedMarkdown(entry.text)
-                    .foregroundStyle(.white)
-            }
-        }
-        .font(.system(size: 13))
-        .textSelection(.enabled)
-        .padding(.horizontal, 11)
-        .padding(.vertical, 7)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isYou ? Color.white : Color(white: 0.22))
-        )
-        .frame(maxWidth: .infinity, alignment: isYou ? .trailing : .leading)
     }
 
     /// "thinking" with three animated dots while the reply is still coming.
@@ -446,6 +588,9 @@ struct NotchPanelContent: View {
         guard !text.isEmpty else { return }
         alfredTrace("submit: '\(text)'")
         prompt = ""
+        // Sending a new message returns to the live bottom — the message
+        // and the reply stream follow from there.
+        followLatest = true
         onSend(text)
     }
 
@@ -470,16 +615,6 @@ struct NotchPanelContent: View {
             }
         }
     }
-
-    private func renderedMarkdown(_ text: String) -> Text {
-        let attributed = (try? AttributedString(
-            markdown: text,
-            options: AttributedString.MarkdownParsingOptions(
-                interpretedSyntax: .inlineOnlyPreservingWhitespace
-            )
-        )) ?? AttributedString(text)
-        return Text(attributed)
-    }
 }
 
 // MARK: - Root view
@@ -490,6 +625,9 @@ struct QuickBarRootView: View {
     @ObservedObject var expansionState: ExpansionState
 
     @StateObject private var model = QuickBarViewModel()
+    /// True while the prompt currently parses as a live math expression —
+    /// the bar shows the result chip instead of (or dimming) the chat.
+    @State private var mathActive = false
 
     var body: some View {
         NotchPanelContent(
@@ -507,6 +645,12 @@ struct QuickBarRootView: View {
             onNewSession: {
                 alfredTrace("new session via toolbar icon")
                 model.newSession()
+            },
+            onMathChange: { active in
+                if mathActive != active {
+                    mathActive = active
+                    refreshWidgetHeight()
+                }
             }
         )
         .frame(
@@ -519,6 +663,7 @@ struct QuickBarRootView: View {
         .onChange(of: model.sentAtLeastOnce) { _ in refreshWidgetHeight() }
         .onChange(of: model.isStreaming) { _ in refreshWidgetHeight() }
         .onChange(of: model.transcript.count) { _ in refreshWidgetHeight() }
+        .onChange(of: model.transcriptText) { _ in refreshWidgetHeight() }
         .onChange(of: model.promptLines) { _ in refreshWidgetHeight() }
         .onAppear {
             let args = CommandLine.arguments
@@ -537,20 +682,24 @@ struct QuickBarRootView: View {
     /// lines. Cleared by a new session.
     ///
     /// The size SNAPS — never animates — so the bar can't visibly drift or
-    /// jitter on screen. Sizes change only once per turn (at send, and again
-    /// at done); while ALFRED is streaming with output the size stays frozen,
-    /// so per-chunk text updates can't churn the layout.
+    /// jitter on screen.
+    ///
+    /// While ALFRED is streaming with output on screen the widget only ever
+    /// GROWS: every new chunk of answer text raises the target, so the bar
+    /// reaches its full (ten-line) size as the answer arrives — no toggle
+    /// off/on needed. A mid-stream SHRINK is ignored (that per-chunk churn
+    /// was the jitter); the shrink is applied the moment the turn ends.
     private func refreshWidgetHeight() {
-        let active = !model.transcript.isEmpty
+        let active = mathActive || !model.transcript.isEmpty
         let lines = model.promptLines
         let target = active
             ? NotchPanelMetrics.height(promptLines: lines) + desiredOutputHeight()
             : NotchPanelMetrics.idleHeight(promptLines: lines)
         alfredTrace("refreshWidgetHeight active=\(active) current=\(expansionState.widgetHeight) target=\(target)")
         guard expansionState.widgetHeight != target else { return }
-        // Freeze while the answer streams in: the pane resizes at send and
-        // at done, never mid-stream (that per-chunk churn was the jitter).
-        guard !model.isStreaming || !model.hasOutput else { return }
+        // Mid-stream the widget only grows; shrinking waits for the turn to
+        // end (isStreaming flips false) so chunk updates can't churn layout.
+        if model.isStreaming && model.hasOutput, target < expansionState.widgetHeight { return }
         expansionState.widgetHeight = target
     }
 
@@ -559,6 +708,8 @@ struct QuickBarRootView: View {
     /// metrics the bubbles render with — capped at ten visible lines;
     /// anything larger scrolls inside the fixed-size window.
     private func desiredOutputHeight() -> CGFloat {
+        // Live calculator: a fixed window sized for the centered chip.
+        if mathActive { return MathPreviewMetrics.windowHeight }
         var content: CGFloat = 0
         for (index, entry) in model.transcript.enumerated() {
             if index > 0 { content += 8 }              // gap between bubbles
@@ -639,6 +790,112 @@ struct TranscriptEntry: Identifiable {
     let id = UUID()
     let role: String
     var text: String
+}
+
+// MARK: - Chat scroll metrics
+
+/// Where the chat content sits inside its scroll view: `topOffset` is the
+/// distance from the viewport's top edge to the content's top edge (0 at
+/// the top, negative as you scroll toward the bottom) and `contentHeight`
+/// is the full (padded) height of the transcript. Fed to the follow-the-
+/// latest scroll behavior via `ChatScrollMetricsKey`.
+private struct ChatScrollMetrics: Equatable {
+    var topOffset: CGFloat = 0
+    var contentHeight: CGFloat = 0
+}
+
+private struct ChatScrollMetricsKey: PreferenceKey {
+    static var defaultValue = ChatScrollMetrics()
+    static func reduce(value: inout ChatScrollMetrics, nextValue: () -> ChatScrollMetrics) {
+        value = nextValue()
+    }
+}
+
+// MARK: - Chat bubble
+
+/// One transcript message as a rounded bubble — white with black text for
+/// your prompts (right side, classic messenger style), dark gray with white
+/// text for ALFRED's replies (left side). ALFRED's replies carry a small
+/// always-present copy button (brighter on hover) that puts the reply's
+/// text on the pasteboard and briefly flashes a checkmark; the text itself
+/// also stays selectable for the usual Cmd+C path.
+struct TranscriptBubbleView: View {
+    var entry: TranscriptEntry
+
+    @State private var hovering = false
+    @State private var justCopied = false
+
+    private var isYou: Bool { entry.role == "you" }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            bubble
+            if !isYou {
+                copyButton
+            }
+        }
+        .onHover { hovering = $0 }
+    }
+
+    /// The message bubble itself: hugging text in a rounded rect, full-row
+    /// frame so prompts sit right-aligned and replies left-aligned.
+    private var bubble: some View {
+        Group {
+            if isYou {
+                Text(entry.text)
+                    .foregroundStyle(.black)
+            } else {
+                renderedMarkdown(entry.text)
+                    .foregroundStyle(.white)
+            }
+        }
+        .font(.system(size: 13))
+        .textSelection(.enabled)
+        .padding(.horizontal, 11)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(isYou ? Color.white : Color(white: 0.22))
+        )
+        .frame(maxWidth: .infinity, alignment: isYou ? .trailing : .leading)
+    }
+
+    /// Small copy button pinned to the right of each reply; copies the
+    /// reply's text to the pasteboard and flashes a checkmark. Always
+    /// visible at low opacity so the affordance is discoverable, brighter
+    /// on hover, and it needs no menu bar — it works on tap, period.
+    private var copyButton: some View {
+        Button {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(entry.text, forType: .string)
+            justCopied = true
+            Task {
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                justCopied = false
+            }
+        } label: {
+            Image(systemName: justCopied ? "checkmark" : "doc.on.doc")
+                .font(.system(size: 11, weight: .regular))
+                .symbolRenderingMode(.monochrome)
+                .foregroundStyle(.white.opacity(hovering ? 0.9 : 0.4))
+        }
+        .buttonStyle(.plain)
+        .help("Copy reply")
+        .padding(.top, 7)
+        .animation(.easeOut(duration: 0.15), value: justCopied)
+    }
+
+    /// Markdown-rendered Text for ALFRED's replies (inline syntax only,
+    /// whitespace preserved — same rendering as before).
+    private func renderedMarkdown(_ text: String) -> Text {
+        Text((try? AttributedString(
+            markdown: text,
+            options: AttributedString.MarkdownParsingOptions(
+                interpretedSyntax: .inlineOnlyPreservingWhitespace
+            )
+        )) ?? AttributedString(text))
+    }
 }
 
 // MARK: - Prompt editor

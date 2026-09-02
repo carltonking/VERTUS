@@ -36,6 +36,15 @@ struct AlfredQuickBarApp: App {
 
 final class KeyablePanel: NSPanel {
     override var canBecomeKey: Bool { true }
+
+    /// AppKit constrains window frames so the top edge stays on screen —
+    /// and for auto-resized windows it can push the whole panel DOWN below
+    /// the menu bar (the bar visibly detaching from the top while typing).
+    /// This panel must sit flush with the screen top at ALL times: return
+    /// the requested frame untouched, never shifted downward.
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        return frameRect
+    }
 }
 
 // MARK: - Global hotkey (Carbon; no Input Monitoring TCC permission needed)
@@ -156,6 +165,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             expansionState: expansionState
         ))
         host.wantsLayer = true
+        // The hosting view must NEVER resize the window on its own: its
+        // content-size tracking grows the window bottom-anchored (AppKit
+        // keeps the window origin), which is exactly what pushed the bar
+        // down off the top of the screen when the prompt strip grew. The
+        // window frame is owned by the height observer + showPanel, which
+        // always keep the top edge flush.
+        if #available(macOS 13.0, *) {
+            host.sizingOptions = []
+        }
 
         self.host = host
         self.panel = panel
@@ -180,13 +198,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     panel.setFrame(frame, display: true)
                 }
             }
+        // The SwiftUI content can resize while the panel is hidden (typing in
+        // the prompt grew the strip, a background turn finished, …). AppKit
+        // frames anchor at the bottom-left, so the next show would keep the
+        // stale top edge and push the bar DOWN off the top of the screen.
+        // Re-sync on every order-front instead: showPanel recomputes the
+        // frame from the widget height, so the top edge is always flush.
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification,
+            object: panel,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, let panel = self.panel else { return }
+            guard panel.occlusionState.contains(.visible) else { return }
+            panel.setFrame(
+                self.restingFrame(on: panel.screen ?? NSScreen.main ?? NSScreen.screens.first ?? .init()),
+                display: false
+            )
+        }
+        // Keep the top edge flush when displays change (resolution, plugged/
+        // unplugged monitor): the frame must be recomputed for the new screen.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, let panel = self.panel, panel.isVisible else { return }
+            self.currentWidgetHeight = self.expansionState.widgetHeight
+            panel.setFrame(
+                self.restingFrame(on: panel.screen ?? NSScreen.main ?? NSScreen.screens.first ?? .init()),
+                display: true
+            )
+        }
     }
 
     /// The window's top edge is flush with the top of the screen (y = 0),
     /// horizontally centered — the panel then sits exactly where the notch is.
+    /// The height always comes from `expansionState.widgetHeight` (the view's
+    /// own published size), never from a cached value — if the SwiftUI content
+    /// resized without a height-observer tick, this still pins the top edge
+    /// correctly so the bar can never detach from the top of the screen.
     private func restingFrame(on screen: NSScreen) -> NSRect {
         let f = screen.frame
-        let h = currentWidgetHeight
+        let h = expansionState.widgetHeight
         return NSRect(
             x: f.midX - NotchPanelMetrics.windowWidth / 2,
             y: f.maxY - h,

@@ -115,7 +115,7 @@ and a scrollable transcript capped below the notch and above the prompt bar.
 
 ```bash
 cd alfred/apps/alfred-bar
-swiftc -o AlfredBar AlfredQuickBarApp.swift QuickBarRootView.swift QuickBarViewModel.swift
+swiftc -o AlfredBar AlfredQuickBarApp.swift QuickBarRootView.swift QuickBarViewModel.swift MathEval.swift
 ./AlfredBar          # or launch via the plist in disabled-launchagents/
 ```
 
