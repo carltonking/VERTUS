@@ -1,484 +1,268 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>archiveVersion</key>
-	<string>1</string>
-	<key>classes</key>
-	<dict/>
-	<key>objectVersion</key>
-	<string>77</string>
-	<key>objects</key>
-	<dict>
-		<key>A1FE000000001000</key>
-		<dict>
-			<key>isa</key>
-			<string>PBXFileReference</string>
-			<key>lastKnownFileType</key>
-			<string>text.script.swift</string>
-			<key>path</key>
-			<string>AlfredPhoneApp.swift</string>
-			<key>sourceTree</key>
-			<string>&lt;group&gt;</string>
-		</dict>
-		<key>A1FE000000001001</key>
-		<dict>
-			<key>isa</key>
-			<string>PBXFileReference</string>
-			<key>lastKnownFileType</key>
-			<string>text.script.swift</string>
-			<key>path</key>
-			<string>AlfredClient.swift</string>
-			<key>sourceTree</key>
-			<string>&lt;group&gt;</string>
-		</dict>
-		<key>A1FE000000001002</key>
-		<dict>
-			<key>isa</key>
-			<string>PBXFileReference</string>
-			<key>lastKnownFileType</key>
-			<string>text.script.swift</string>
-			<key>path</key>
-			<string>ChatView.swift</string>
-			<key>sourceTree</key>
-			<string>&lt;group&gt;</string>
-		</dict>
-		<key>A1FE000000001003</key>
-		<dict>
-			<key>isa</key>
-			<string>PBXFileReference</string>
-			<key>lastKnownFileType</key>
-			<string>text.script.swift</string>
-			<key>path</key>
-			<string>KeychainStore.swift</string>
-			<key>sourceTree</key>
-			<string>&lt;group&gt;</string>
-		</dict>
-		<key>A1FE000000001004</key>
-		<dict>
-			<key>isa</key>
-			<string>PBXFileReference</string>
-			<key>lastKnownFileType</key>
-			<string>text.plist.xml</string>
-			<key>path</key>
-			<string>Info.plist</string>
-			<key>sourceTree</key>
-			<string>&lt;group&gt;</string>
-		</dict>
-		<key>A1FE000000001005</key>
-		<dict>
-			<key>explicitFileType</key>
-			<string>wrapper.application</string>
-			<key>includeInIndex</key>
-			<integer>0</integer>
-			<key>isa</key>
-			<string>PBXFileReference</string>
-			<key>path</key>
-			<string>ALFRED.app</string>
-			<key>sourceTree</key>
-			<string>BUILT_PRODUCTS_DIR</string>
-		</dict>
-		<key>A1FE000000001006</key>
-		<dict>
-			<key>children</key>
-			<array>
-				<string>A1FE000000001000</string>
-				<string>A1FE000000001001</string>
-				<string>A1FE000000001002</string>
-				<string>A1FE000000001003</string>
-				<string>A1FE000000001004</string>
-			</array>
-			<key>isa</key>
-			<string>PBXGroup</string>
-			<key>path</key>
-			<string>AlfredPhone</string>
-			<key>sourceTree</key>
-			<string>&lt;group&gt;</string>
-		</dict>
-		<key>A1FE000000001007</key>
-		<dict>
-			<key>children</key>
-			<array>
-				<string>A1FE000000001005</string>
-			</array>
-			<key>isa</key>
-			<string>PBXGroup</string>
-			<key>name</key>
-			<string>Products</string>
-			<key>sourceTree</key>
-			<string>&lt;group&gt;</string>
-		</dict>
-		<key>A1FE000000001008</key>
-		<dict>
-			<key>buildActionMask</key>
-			<integer>2147483647</integer>
-			<key>files</key>
-			<array>
-				<string>A1FE000000001018</string>
-				<string>A1FE000000001019</string>
-				<string>A1FE00000000101A</string>
-				<string>A1FE00000000101B</string>
-			</array>
-			<key>isa</key>
-			<string>PBXSourcesBuildPhase</string>
-			<key>runOnlyForDeploymentPostprocessing</key>
-			<integer>0</integer>
-		</dict>
-		<key>A1FE000000001009</key>
-		<dict>
-			<key>buildActionMask</key>
-			<integer>2147483647</integer>
-			<key>files</key>
-			<array/>
-			<key>isa</key>
-			<string>PBXResourcesBuildPhase</string>
-			<key>runOnlyForDeploymentPostprocessing</key>
-			<integer>0</integer>
-		</dict>
-		<key>A1FE00000000100A</key>
-		<dict>
-			<key>buildActionMask</key>
-			<integer>2147483647</integer>
-			<key>files</key>
-			<array/>
-			<key>isa</key>
-			<string>PBXFrameworksBuildPhase</string>
-			<key>runOnlyForDeploymentPostprocessing</key>
-			<integer>0</integer>
-		</dict>
-		<key>A1FE00000000100B</key>
-		<dict>
-			<key>buildConfigurationList</key>
-			<string>A1FE00000000100D</string>
-			<key>buildPhases</key>
-			<array>
-				<string>A1FE000000001008</string>
-				<string>A1FE00000000100A</string>
-				<string>A1FE000000001009</string>
-			</array>
-			<key>buildRules</key>
-			<array/>
-			<key>dependencies</key>
-			<array/>
-			<key>isa</key>
-			<string>PBXNativeTarget</string>
-			<key>name</key>
-			<string>AlfredPhone</string>
-			<key>productName</key>
-			<string>AlfredPhone</string>
-			<key>productReference</key>
-			<string>A1FE000000001005</string>
-			<key>productType</key>
-			<string>com.apple.product-type.application</string>
-		</dict>
-		<key>A1FE00000000100C</key>
-		<dict>
-			<key>attributes</key>
-			<dict>
-				<key>BuildIndependentTargetsInParallel</key>
-				<integer>1</integer>
-				<key>LastSwiftUpdateCheck</key>
-				<integer>1500</integer>
-				<key>LastUpgradeCheck</key>
-				<integer>1500</integer>
-				<key>TargetAttributes</key>
-				<dict>
-					<key>A1FE00000000100B</key>
-					<dict>
-						<key>CreatedOnToolsVersion</key>
-						<string>15.0</string>
-					</dict>
-				</dict>
-			</dict>
-			<key>buildConfigurationList</key>
-			<string>A1FE00000000100E</string>
-			<key>compatibilityVersion</key>
-			<string>Xcode 14.0</string>
-			<key>developmentRegion</key>
-			<string>en</string>
-			<key>hasScannedForEncodings</key>
-			<integer>0</integer>
-			<key>isa</key>
-			<string>PBXProject</string>
-			<key>knownRegions</key>
-			<array>
-				<string>en</string>
-				<string>Base</string>
-			</array>
-			<key>mainGroup</key>
-			<string>A1FE000000001013</string>
-			<key>productRefGroup</key>
-			<string>A1FE000000001007</string>
-			<key>projectDirPath</key>
-			<string></string>
-			<key>projectRoot</key>
-			<string></string>
-			<key>targets</key>
-			<array>
-				<string>A1FE00000000100B</string>
-			</array>
-		</dict>
-		<key>A1FE00000000100D</key>
-		<dict>
-			<key>buildConfigurations</key>
-			<array>
-				<string>A1FE00000000100F</string>
-				<string>A1FE000000001010</string>
-			</array>
-			<key>defaultConfigurationIsVisible</key>
-			<integer>0</integer>
-			<key>defaultConfigurationName</key>
-			<string>Release</string>
-			<key>isa</key>
-			<string>XCConfigurationList</string>
-		</dict>
-		<key>A1FE00000000100E</key>
-		<dict>
-			<key>buildConfigurations</key>
-			<array>
-				<string>A1FE000000001011</string>
-				<string>A1FE000000001012</string>
-			</array>
-			<key>defaultConfigurationIsVisible</key>
-			<integer>0</integer>
-			<key>defaultConfigurationName</key>
-			<string>Release</string>
-			<key>isa</key>
-			<string>XCConfigurationList</string>
-		</dict>
-		<key>A1FE00000000100F</key>
-		<dict>
-			<key>buildSettings</key>
-			<dict>
-				<key>CODE_SIGN_STYLE</key>
-				<string>Automatic</string>
-				<key>CURRENT_PROJECT_VERSION</key>
-				<string>1</string>
-				<key>DEBUG_INFORMATION_FORMAT</key>
-				<string>dwarf</string>
-				<key>ENABLE_TESTABILITY</key>
-				<string>YES</string>
-				<key>GENERATE_INFOPLIST_FILE</key>
-				<string>NO</string>
-				<key>INFOPLIST_FILE</key>
-				<string>AlfredPhone/Info.plist</string>
-				<key>IPHONEOS_DEPLOYMENT_TARGET</key>
-				<string>16.0</string>
-				<key>LD_RUNPATH_SEARCH_PATHS</key>
-				<array>
-					<string>$(inherited)</string>
-					<string>@executable_path/Frameworks</string>
-				</array>
-				<key>MARKETING_VERSION</key>
-				<string>0.1.0</string>
-				<key>ONLY_ACTIVE_ARCH</key>
-				<string>YES</string>
-				<key>PRODUCT_BUNDLE_IDENTIFIER</key>
-				<string>com.alfred.phone</string>
-				<key>PRODUCT_NAME</key>
-				<string>ALFRED</string>
-				<key>SDKROOT</key>
-				<string>iphoneos</string>
-				<key>SWIFT_EMIT_LOC_STRINGS</key>
-				<string>YES</string>
-				<key>SWIFT_OPTIMIZATION_LEVEL</key>
-				<string>-Onone</string>
-				<key>SWIFT_VERSION</key>
-				<string>5.0</string>
-				<key>TARGETED_DEVICE_FAMILY</key>
-				<string>1,2</string>
-			</dict>
-			<key>isa</key>
-			<string>XCBuildConfiguration</string>
-			<key>name</key>
-			<string>Debug</string>
-		</dict>
-		<key>A1FE000000001010</key>
-		<dict>
-			<key>buildSettings</key>
-			<dict>
-				<key>CODE_SIGN_STYLE</key>
-				<string>Automatic</string>
-				<key>CURRENT_PROJECT_VERSION</key>
-				<string>1</string>
-				<key>DEBUG_INFORMATION_FORMAT</key>
-				<string>dwarf-with-dsym</string>
-				<key>ENABLE_NS_ASSERTIONS</key>
-				<string>NO</string>
-				<key>GENERATE_INFOPLIST_FILE</key>
-				<string>NO</string>
-				<key>INFOPLIST_FILE</key>
-				<string>AlfredPhone/Info.plist</string>
-				<key>IPHONEOS_DEPLOYMENT_TARGET</key>
-				<string>16.0</string>
-				<key>LD_RUNPATH_SEARCH_PATHS</key>
-				<array>
-					<string>$(inherited)</string>
-					<string>@executable_path/Frameworks</string>
-				</array>
-				<key>MARKETING_VERSION</key>
-				<string>0.1.0</string>
-				<key>PRODUCT_BUNDLE_IDENTIFIER</key>
-				<string>com.alfred.phone</string>
-				<key>PRODUCT_NAME</key>
-				<string>ALFRED</string>
-				<key>SDKROOT</key>
-				<string>iphoneos</string>
-				<key>SWIFT_COMPILATION_MODE</key>
-				<string>wholemodule</string>
-				<key>SWIFT_EMIT_LOC_STRINGS</key>
-				<string>YES</string>
-				<key>SWIFT_VERSION</key>
-				<string>5.0</string>
-				<key>TARGETED_DEVICE_FAMILY</key>
-				<string>1,2</string>
-			</dict>
-			<key>isa</key>
-			<string>XCBuildConfiguration</string>
-			<key>name</key>
-			<string>Release</string>
-		</dict>
-		<key>A1FE000000001011</key>
-		<dict>
-			<key>buildSettings</key>
-			<dict>
-				<key>CODE_SIGN_STYLE</key>
-				<string>Automatic</string>
-				<key>CURRENT_PROJECT_VERSION</key>
-				<string>1</string>
-				<key>DEBUG_INFORMATION_FORMAT</key>
-				<string>dwarf</string>
-				<key>ENABLE_TESTABILITY</key>
-				<string>YES</string>
-				<key>GENERATE_INFOPLIST_FILE</key>
-				<string>NO</string>
-				<key>INFOPLIST_FILE</key>
-				<string>AlfredPhone/Info.plist</string>
-				<key>IPHONEOS_DEPLOYMENT_TARGET</key>
-				<string>16.0</string>
-				<key>LD_RUNPATH_SEARCH_PATHS</key>
-				<array>
-					<string>$(inherited)</string>
-					<string>@executable_path/Frameworks</string>
-				</array>
-				<key>MARKETING_VERSION</key>
-				<string>0.1.0</string>
-				<key>ONLY_ACTIVE_ARCH</key>
-				<string>YES</string>
-				<key>PRODUCT_BUNDLE_IDENTIFIER</key>
-				<string>com.alfred.phone</string>
-				<key>PRODUCT_NAME</key>
-				<string>ALFRED</string>
-				<key>SDKROOT</key>
-				<string>iphoneos</string>
-				<key>SWIFT_EMIT_LOC_STRINGS</key>
-				<string>YES</string>
-				<key>SWIFT_OPTIMIZATION_LEVEL</key>
-				<string>-Onone</string>
-				<key>SWIFT_VERSION</key>
-				<string>5.0</string>
-				<key>TARGETED_DEVICE_FAMILY</key>
-				<string>1,2</string>
-			</dict>
-			<key>isa</key>
-			<string>XCBuildConfiguration</string>
-			<key>name</key>
-			<string>Debug</string>
-		</dict>
-		<key>A1FE000000001012</key>
-		<dict>
-			<key>buildSettings</key>
-			<dict>
-				<key>CODE_SIGN_STYLE</key>
-				<string>Automatic</string>
-				<key>CURRENT_PROJECT_VERSION</key>
-				<string>1</string>
-				<key>DEBUG_INFORMATION_FORMAT</key>
-				<string>dwarf-with-dsym</string>
-				<key>ENABLE_NS_ASSERTIONS</key>
-				<string>NO</string>
-				<key>GENERATE_INFOPLIST_FILE</key>
-				<string>NO</string>
-				<key>INFOPLIST_FILE</key>
-				<string>AlfredPhone/Info.plist</string>
-				<key>IPHONEOS_DEPLOYMENT_TARGET</key>
-				<string>16.0</string>
-				<key>LD_RUNPATH_SEARCH_PATHS</key>
-				<array>
-					<string>$(inherited)</string>
-					<string>@executable_path/Frameworks</string>
-				</array>
-				<key>MARKETING_VERSION</key>
-				<string>0.1.0</string>
-				<key>PRODUCT_BUNDLE_IDENTIFIER</key>
-				<string>com.alfred.phone</string>
-				<key>PRODUCT_NAME</key>
-				<string>ALFRED</string>
-				<key>SDKROOT</key>
-				<string>iphoneos</string>
-				<key>SWIFT_COMPILATION_MODE</key>
-				<string>wholemodule</string>
-				<key>SWIFT_EMIT_LOC_STRINGS</key>
-				<string>YES</string>
-				<key>SWIFT_VERSION</key>
-				<string>5.0</string>
-				<key>TARGETED_DEVICE_FAMILY</key>
-				<string>1,2</string>
-			</dict>
-			<key>isa</key>
-			<string>XCBuildConfiguration</string>
-			<key>name</key>
-			<string>Release</string>
-		</dict>
-		<key>A1FE000000001013</key>
-		<dict>
-			<key>children</key>
-			<array>
-				<string>A1FE000000001006</string>
-				<string>A1FE000000001007</string>
-			</array>
-			<key>isa</key>
-			<string>PBXGroup</string>
-			<key>sourceTree</key>
-			<string>&lt;group&gt;</string>
-		</dict>
-		<key>A1FE000000001018</key>
-		<dict>
-			<key>fileRef</key>
-			<string>A1FE000000001000</string>
-			<key>isa</key>
-			<string>PBXBuildFile</string>
-		</dict>
-		<key>A1FE000000001019</key>
-		<dict>
-			<key>fileRef</key>
-			<string>A1FE000000001001</string>
-			<key>isa</key>
-			<string>PBXBuildFile</string>
-		</dict>
-		<key>A1FE00000000101A</key>
-		<dict>
-			<key>fileRef</key>
-			<string>A1FE000000001002</string>
-			<key>isa</key>
-			<string>PBXBuildFile</string>
-		</dict>
-		<key>A1FE00000000101B</key>
-		<dict>
-			<key>fileRef</key>
-			<string>A1FE000000001003</string>
-			<key>isa</key>
-			<string>PBXBuildFile</string>
-		</dict>
-		<key>A1FE00000000101C</key>
-		<dict>
-			<key>fileRef</key>
-			<string>A1FE000000001004</string>
-			<key>isa</key>
-			<string>PBXBuildFile</string>
-		</dict>
-	</dict>
-	<key>rootObject</key>
-	<string>A1FE00000000100C</string>
-</dict>
-</plist>
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A1FE000000001018 /* AlfredPhoneApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001000 /* AlfredPhoneApp.swift */; };
+		A1FE000000001019 /* AlfredClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001001 /* AlfredClient.swift */; };
+		A1FE00000000101A /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001002 /* ChatView.swift */; };
+		A1FE00000000101B /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001003 /* KeychainStore.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A1FE000000001000 /* AlfredPhoneApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlfredPhoneApp.swift; sourceTree = "<group>"; };
+		A1FE000000001001 /* AlfredClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlfredClient.swift; sourceTree = "<group>"; };
+		A1FE000000001002 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
+		A1FE000000001003 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
+		A1FE000000001004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A1FE000000001005 /* ALFRED.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ALFRED.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A1FE00000000100A /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A1FE000000001006 /* AlfredPhone */ = {
+			isa = PBXGroup;
+			children = (
+				A1FE000000001000 /* AlfredPhoneApp.swift */,
+				A1FE000000001001 /* AlfredClient.swift */,
+				A1FE000000001002 /* ChatView.swift */,
+				A1FE000000001003 /* KeychainStore.swift */,
+				A1FE000000001004 /* Info.plist */,
+			);
+			path = AlfredPhone;
+			sourceTree = "<group>";
+		};
+		A1FE000000001007 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A1FE000000001005 /* ALFRED.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A1FE000000001013 /* Main group */ = {
+			isa = PBXGroup;
+			children = (
+				A1FE000000001006 /* AlfredPhone */,
+				A1FE000000001007 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A1FE00000000100B /* AlfredPhone */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A1FE00000000100D /* Build configuration list for PBXNativeTarget "AlfredPhone" */;
+			buildPhases = (
+				A1FE000000001008 /* Sources */,
+				A1FE00000000100A /* Frameworks */,
+				A1FE000000001009 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = AlfredPhone;
+			productName = AlfredPhone;
+			productReference = A1FE000000001005 /* ALFRED.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A1FE00000000100C /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 9999;
+				LastUpgradeCheck = 9999;
+				TargetAttributes = {
+					A1FE00000000100B = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = A1FE00000000100E /* Build configuration list for PBXProject "AlfredPhone" */;
+			compatibilityVersion = "Xcode 16.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A1FE000000001013;
+			productRefGroup = A1FE000000001007 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A1FE00000000100B /* AlfredPhone */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A1FE000000001009 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A1FE000000001008 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1FE000000001018 /* AlfredPhoneApp.swift in Sources */,
+				A1FE000000001019 /* AlfredClient.swift in Sources */,
+				A1FE00000000101A /* ChatView.swift in Sources */,
+				A1FE00000000101B /* KeychainStore.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A1FE00000000100F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = AlfredPhone/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.alfred.phone;
+				PRODUCT_NAME = ALFRED;
+				SDKROOT = iphoneos;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A1FE000000001010 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = AlfredPhone/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.alfred.phone;
+				PRODUCT_NAME = ALFRED;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		A1FE000000001011 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = AlfredPhone/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.alfred.phone;
+				PRODUCT_NAME = ALFRED;
+				SDKROOT = iphoneos;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A1FE000000001012 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = AlfredPhone/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.alfred.phone;
+				PRODUCT_NAME = ALFRED;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A1FE00000000100D /* Build configuration list for PBXNativeTarget "AlfredPhone" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A1FE00000000100F /* Debug */,
+				A1FE000000001010 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A1FE00000000100E /* Build configuration list for PBXProject "AlfredPhone" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A1FE000000001011 /* Debug */,
+				A1FE000000001012 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A1FE00000000100C /* Project object */;
+}
