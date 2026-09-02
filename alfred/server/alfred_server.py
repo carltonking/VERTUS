@@ -132,6 +132,11 @@ class AgentBridge:
 
     def _run_worker(self) -> None:
         self._create_session = self._load_pi()
+        # Prewarm: spawn the engine gateway and create the session NOW, at
+        # server start, so the first real prompt doesn't pay the ~50s cold-
+        # start (venv python import + hermes session init). Failure here is
+        # non-fatal — the lazy path in _run_prompt_with_respawn retries.
+        self._prewarm()
         while True:
             item = self._queue.get()
             if item is None:
@@ -142,6 +147,18 @@ class AgentBridge:
                 self._emit({"type": "error", "message": "agent SDK not available"})
                 continue
             self._run_prompt_with_respawn(text)
+
+    def _prewarm(self) -> None:
+        """Create the agent session at startup; never raises."""
+        if self._create_session is None:
+            return
+        try:
+            result = self._create_session()
+            self._session = result["session"]
+            self._session.subscribe(self._on_pi_event)
+            print("[alfred] agent session prewarmed", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[alfred] prewarm failed (will retry on first prompt): {exc}", file=sys.stderr)
 
     def _run_prompt_with_respawn(self, text: str) -> None:
         """Run one prompt, restarting a dead agent gateway once in-line.

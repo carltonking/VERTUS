@@ -34,6 +34,16 @@ struct ChatView: View {
                     }
                     .padding(.horizontal, 16).padding(.vertical, 6)
                 }
+                if let connectionNote {
+                    HStack {
+                        Image(systemName: "wifi.exclamationmark")
+                        Text(connectionNote).font(.footnote)
+                        Spacer()
+                    }
+                    .foregroundStyle(Color(white: 0.85))
+                    .padding(.horizontal, 16).padding(.vertical, 6)
+                    .background(Color(white: 0.16))
+                }
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 12) {
@@ -69,6 +79,7 @@ struct ChatView: View {
                     Button(action: send) {
                         Image(systemName: "arrow.up.circle.fill")
                             .font(.system(size: 26))
+                            .foregroundStyle(.white)
                     }
                     .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         || streaming || !client.isConfigured)
@@ -77,6 +88,9 @@ struct ChatView: View {
             }
             .navigationTitle("ALFRED")
             .navigationBarTitleDisplayMode(.inline)
+            // ALFRED theme: dark, strictly monochrome — no accent colors.
+            .tint(.white)
+            .preferredColorScheme(.dark)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -105,8 +119,9 @@ struct ChatView: View {
                 Spacer()
             }
             .font(.footnote)
+            .foregroundStyle(Color(white: 0.85))
             .padding(10)
-            .background(Color.yellow.opacity(0.15))
+            .background(Color(white: 0.16))
         }
         .buttonStyle(.plain)
     }
@@ -125,12 +140,14 @@ struct ChatView: View {
 
     private func bubble(for msg: ChatMessage) -> some View {
         let isUser = msg.role == "you"
+        // Monochrome scheme: your messages are light-gray bubbles with black
+        // text; ALFRED's are dark-gray bubbles with white text.
         return HStack {
             if isUser { Spacer(minLength: 48) }
             Text(msg.text)
                 .padding(.horizontal, 12).padding(.vertical, 8)
-                .background(isUser ? Color.accentColor.opacity(0.85) : Color(.systemGray5))
-                .foregroundStyle(isUser ? .white : .primary)
+                .background(isUser ? Color(white: 0.85) : Color(white: 0.22))
+                .foregroundStyle(isUser ? Color(white: 0.05) : Color(white: 0.95))
                 .clipShape(RoundedRectangle(cornerRadius: 14))
             if !isUser { Spacer(minLength: 48) }
         }
@@ -161,9 +178,9 @@ struct ChatView: View {
                     activity = nil
                     if case .error(let message) = event {
                         if messages.last?.role == "alfred", messages.last?.text.isEmpty == true {
-                            messages[messages.count - 1].text = "⚠️ \(message)"
+                            messages[messages.count - 1].text = "Error: \(message)"
                         } else {
-                            messages.append(ChatMessage(role: "alfred", text: "⚠️ \(message)"))
+                            messages.append(ChatMessage(role: "alfred", text: "Error: \(message)"))
                         }
                     }
                 }
