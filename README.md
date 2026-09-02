@@ -127,6 +127,30 @@ Native iOS client (SwiftUI) over Tailscale: streaming chat against the hub,
 token stored in Keychain. Status: **scaffold only** — chat view and client are
 in place; remote approvals and polish are pending.
 
+## Identity, persona, and shared memory
+
+All three surfaces (terminal, QuickBar, phone) share **one brain and one
+memory** — this is what makes ALFRED feel like the same assistant everywhere:
+
+- **Persona:** `~/.hermes/SOUL.md` — the identity the hermes engine injects
+  into every session on every surface. It defines who ALFRED is (butler for
+  Carlton, addressed as "sir"), the operating rules (execute locally, confirm
+  destructive remote actions), and the capability summary. Editing this file
+  re-personalizes every surface at once.
+- **Memory:** `~/.alfred/memory/` — the shared store ALFRED is instructed to
+  read at session start and update when it learns durable facts:
+  - `profile.md` — stable facts about Carlton (machines, projects, preferences)
+  - `notes/` — dated task notes (`YYYY-MM-DD-topic.md`)
+  - `index.json` — topic → note map
+- The hermes-side fact file `~/.hermes/memories/USER.md` is kept aligned but
+  the `~/.alfred/memory/` store is the source of truth.
+
+The pi-era skill files (`alfred/extensions/alfred-persona`,
+`alfred-memory`, `memory-skill`) describe the same contract for the legacy
+pi engine path (`ALFRED_ENGINE=pi`); hermes loads the persona from SOUL.md
+and the memory instructions live there too, so no per-surface configuration
+is needed.
+
 ## Configuration knobs
 
 | Env var | Meaning |
