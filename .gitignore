@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Codebuff / tool state (never publish)
+.freebuff/
+
+# Logs
+*.log
+
+# Build artifacts
+build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.tsbuildinfo
+
+# Dependencies
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Stray editor/backup files
+*.bak-*

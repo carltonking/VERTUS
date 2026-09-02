@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.alfred.falkordb</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/carltonking/01 - PROJECTS/ALFRED/agent-bridge/falkordb-launchd.sh</string>
+    </array>
+    <!-- Same PATH fix as agentmemory: docker lives in /usr/local/bin, which is not
+         on launchd's default PATH — the wrapper could never find it. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>/Users/carltonking</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/carltonking/.alfred/logs/falkordb.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/carltonking/.alfred/logs/falkordb.err</string>
+</dict>
+</plist>
