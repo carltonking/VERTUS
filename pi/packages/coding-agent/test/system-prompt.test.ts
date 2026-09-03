@@ -60,7 +60,7 @@ describe("buildSystemPrompt", () => {
 			expect(prompt).toContain(expected);
 		});
 
-		test("instructs models to resolve alfred docs and examples under absolute base paths", () => {
+		test("instructs models to resolve vertus docs and examples under absolute base paths", () => {
 			const prompt = buildSystemPrompt({
 				contextFiles: [],
 				skills: [],
@@ -68,7 +68,7 @@ describe("buildSystemPrompt", () => {
 			});
 
 			expect(prompt).toContain(
-				"- When reading ALFRED docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory",
+				"- When reading VERTUS docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory",
 			);
 			expect(prompt).toContain("environment variables (docs/environment-variables.md)");
 		});

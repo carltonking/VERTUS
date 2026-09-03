@@ -1,16 +1,16 @@
 /**
  * HermesSession — pi-UI-compatible session driven by the forked hermes engine.
  *
- * ALFRED fork. The pi interactive TUI is fused to `AgentSession`; this class
+ * VERTUS fork. The pi interactive TUI is fused to `AgentSession`; this class
  * subclasses it and swaps ONLY the agent turn machinery: instead of running
  * the pi agent loop, each prompt is executed by the local hermes gateway
  * (see ./hermes-gateway.ts) while every event the UI renders — message
  * start/update/end, turn start/end, tool execution, agent end — is
  * synthesized through the real AgentSession event pipeline, so session
- * persistence, extensions (including the ALFRED header/theme), footer stats,
+ * persistence, extensions (including the VERTUS header/theme), footer stats,
  * and all rendering behave exactly as before.
  *
- * Opt in with ALFRED_ENGINE=hermes (see sdk.ts) — the pi engine is the default.
+ * Opt in with VERTUS_ENGINE=hermes (see sdk.ts) — the pi engine is the default.
  */
 
 import { contentText } from "@earendil-works/pi-ai";

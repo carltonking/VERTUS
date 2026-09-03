@@ -338,24 +338,24 @@ Examples:
 			console.log(`${chalk.bold("Usage:")}
   ${getPackageCommandUsage("update")}
 
-Update alfred, installed packages, or model catalogs.
+Update vertus, installed packages, or model catalogs.
 
 Options:
-  --self                  Update alfred only (default when no target is given)
+  --self                  Update vertus only (default when no target is given)
   --extensions            Update installed packages only
   --models                Refresh model catalogs only
-  --all                   Update alfred and installed packages
+  --all                   Update vertus and installed packages
   --extension <source>    Update one package only
   -a, --approve           Trust project-local files for this command
   -na, --no-approve       Ignore project-local files for this command
-  --force                 Reinstall alfred even if the current version is latest
+  --force                 Reinstall vertus even if the current version is latest
 
 Short forms:
-  ${APP_NAME} update                Update alfred only
-  ${APP_NAME} update --all          Update alfred and all extensions
+  ${APP_NAME} update                Update vertus only
+  ${APP_NAME} update --all          Update vertus and all extensions
   ${APP_NAME} update --models       Refresh model catalogs only
   ${APP_NAME} update <source>       Update one package
-  ${APP_NAME} update pi             Update alfred only (self works as alias to pi)
+  ${APP_NAME} update pi             Update vertus only (self works as alias to pi)
 `);
 			return;
 

@@ -51,7 +51,7 @@ describe("issue #2791 fs.watch error event crashes process", () => {
 			`
 import { setTheme, stopThemeWatcher } from "${themeModulePath}";
 
-process.env.ALFRED_CODING_AGENT_DIR = "${agentDir}";
+process.env.VERTUS_CODING_AGENT_DIR = "${agentDir}";
 
 setTheme("custom-test", true);
 

@@ -1,0 +1,268 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A1FE000000001018 /* VertusPhoneApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001000 /* VertusPhoneApp.swift */; };
+		A1FE000000001019 /* VertusClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001001 /* VertusClient.swift */; };
+		A1FE00000000101A /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001002 /* ChatView.swift */; };
+		A1FE00000000101B /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001003 /* KeychainStore.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A1FE000000001000 /* VertusPhoneApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VertusPhoneApp.swift; sourceTree = "<group>"; };
+		A1FE000000001001 /* VertusClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VertusClient.swift; sourceTree = "<group>"; };
+		A1FE000000001002 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
+		A1FE000000001003 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
+		A1FE000000001004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A1FE000000001005 /* VERTUS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VERTUS.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A1FE00000000100A /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A1FE000000001006 /* VertusPhone */ = {
+			isa = PBXGroup;
+			children = (
+				A1FE000000001000 /* VertusPhoneApp.swift */,
+				A1FE000000001001 /* VertusClient.swift */,
+				A1FE000000001002 /* ChatView.swift */,
+				A1FE000000001003 /* KeychainStore.swift */,
+				A1FE000000001004 /* Info.plist */,
+			);
+			path = VertusPhone;
+			sourceTree = "<group>";
+		};
+		A1FE000000001007 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A1FE000000001005 /* VERTUS.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A1FE000000001013 /* Main group */ = {
+			isa = PBXGroup;
+			children = (
+				A1FE000000001006 /* VertusPhone */,
+				A1FE000000001007 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A1FE00000000100B /* VertusPhone */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A1FE00000000100D /* Build configuration list for PBXNativeTarget "VertusPhone" */;
+			buildPhases = (
+				A1FE000000001008 /* Sources */,
+				A1FE00000000100A /* Frameworks */,
+				A1FE000000001009 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = VertusPhone;
+			productName = VertusPhone;
+			productReference = A1FE000000001005 /* VERTUS.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A1FE00000000100C /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 9999;
+				LastUpgradeCheck = 9999;
+				TargetAttributes = {
+					A1FE00000000100B = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = A1FE00000000100E /* Build configuration list for PBXProject "VertusPhone" */;
+			compatibilityVersion = "Xcode 16.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A1FE000000001013;
+			productRefGroup = A1FE000000001007 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A1FE00000000100B /* VertusPhone */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A1FE000000001009 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A1FE000000001008 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1FE000000001018 /* VertusPhoneApp.swift in Sources */,
+				A1FE000000001019 /* VertusClient.swift in Sources */,
+				A1FE00000000101A /* ChatView.swift in Sources */,
+				A1FE00000000101B /* KeychainStore.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A1FE00000000100F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = VertusPhone/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vertus.phone;
+				PRODUCT_NAME = VERTUS;
+				SDKROOT = iphoneos;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A1FE000000001010 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = VertusPhone/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vertus.phone;
+				PRODUCT_NAME = VERTUS;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		A1FE000000001011 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = VertusPhone/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vertus.phone;
+				PRODUCT_NAME = VERTUS;
+				SDKROOT = iphoneos;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A1FE000000001012 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = VertusPhone/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vertus.phone;
+				PRODUCT_NAME = VERTUS;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A1FE00000000100D /* Build configuration list for PBXNativeTarget "VertusPhone" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A1FE00000000100F /* Debug */,
+				A1FE000000001010 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A1FE00000000100E /* Build configuration list for PBXProject "VertusPhone" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A1FE000000001011 /* Debug */,
+				A1FE000000001012 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A1FE00000000100C /* Project object */;
+}

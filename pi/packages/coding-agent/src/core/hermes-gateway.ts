@@ -5,7 +5,7 @@
  * speaks newline-framed JSON-RPC 2.0 (the documented TUI-gateway protocol,
  * see website/docs/developer-guide/programmatic-integration.md in the fork).
  *
- * This is the engine side of the ALFRED hermes bridge: the pi UI keeps its
+ * This is the engine side of the VERTUS hermes bridge: the pi UI keeps its
  * session machinery (events, transcript, extensions, themes) and ONLY the
  * agent turn itself is executed by hermes.
  */
@@ -16,11 +16,11 @@ import { appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-/** ALFRED_GW_DEBUG=1 → append raw gateway wire traffic to /tmp/alfred-gw-debug.log */
+/** VERTUS_GW_DEBUG=1 → append raw gateway wire traffic to /tmp/vertus-gw-debug.log */
 export function gwDebug(msg: string): void {
-	if (process.env.ALFRED_GW_DEBUG !== "1") return;
+	if (process.env.VERTUS_GW_DEBUG !== "1") return;
 	try {
-		appendFileSync("/tmp/alfred-gw-debug.log", `${new Date().toISOString()} ${msg}\n`);
+		appendFileSync("/tmp/vertus-gw-debug.log", `${new Date().toISOString()} ${msg}\n`);
 	} catch {
 		// diagnostics only
 	}
@@ -70,14 +70,14 @@ export interface HermesPromptHandlers {
 
 export function hermesRepoPath(): string {
 	return (
-		process.env.ALFRED_HERMES_REPO ??
+		process.env.VERTUS_HERMES_REPO ??
 		join(homedir(), ".hermes", "hermes-agent")
 	);
 }
 
 export function hermesPythonPath(): string {
 	return (
-		process.env.ALFRED_HERMES_PYTHON ??
+		process.env.VERTUS_HERMES_PYTHON ??
 		join(hermesRepoPath(), "venv", "bin", "python")
 	);
 }

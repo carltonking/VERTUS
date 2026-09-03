@@ -497,16 +497,17 @@ const piConfigName: string | undefined = pkg.piConfig?.name;
 export const PACKAGE_NAME: string = pkg.name || "@earendil-works/pi-coding-agent";
 export const APP_NAME: string = piConfigName || "pi";
 export const APP_TITLE: string = piConfigName ? APP_NAME : "π";
-/** Display title and version for the ALFRED rebrand (independent of the upstream pi package version). */
-export const BRAND_TITLE: string = "ALFRED";
+/** Display title and version for the VERTUS rebrand (independent of the upstream pi package version). */
+export const BRAND_TITLE: string = "VERTUS";
 export const BRAND_VERSION: string = "0.01.0";
 /** ASCII art banner rendered in the interactive CLI header. */
-export const BRAND_LOGO: string = `█████╗ ██╗     ███████╗██████╗ ███████╗██████╗ 
-██╔══██╗██║     ██╔════╝██╔══██╗██╔════╝██╔══██╗
-███████║██║     █████╗  ██████╔╝█████╗  ██║  ██║
-██╔══██║██║     ██╔══╝  ██╔══██╗██╔══╝  ██║  ██║
-██║  ██║███████╗██║     ██║  ██║███████╗██████╔╝
-╚═╝  ╚═╝╚══════╝╚═╝     ╚═╝  ╚═╝╚══════╝╚═════╝`;
+export const BRAND_LOGO: string = 
+`██╗   ██╗███████╗██████╗ ████████╗██╗   ██╗███████╗
+ ██║   ██║██╔════╝██╔══██╗╚══██╔══╝██║   ██║██╔════╝
+ ██║   ██║█████╗  ██████╔╝   ██║   ██║   ██║███████╗
+ ╚██╗ ██╔╝██╔══╝  ██╔══██╗   ██║   ██║   ██║╚════██║
+  ╚████╔╝ ███████╗██║  ██║   ██║   ╚██████╔╝███████║
+   ╚═══╝  ╚══════╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚══════╝`;
 export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".pi";
 export const VERSION: string = pkg.version || "0.0.0";
 

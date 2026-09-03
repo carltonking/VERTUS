@@ -4,11 +4,11 @@
 	"description": "Coding agent CLI with read, bash, edit, write tools and session management",
 	"type": "module",
 	"piConfig": {
-		"name": "alfred",
-		"configDir": ".alfred"
+		"name": "vertus",
+		"configDir": ".vertus"
 	},
 	"bin": {
-		"alfred": "dist/bundle/cli.js"
+		"vertus": "dist/bundle/cli.js"
 	},
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",

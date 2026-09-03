@@ -44,20 +44,20 @@ function getDefaultAttributionHeaders(
 	if (isOpenRouterModel(model)) {
 		return {
 			"HTTP-Referer": "https://pi.dev",
-			"X-OpenRouter-Title": "alfred",
+			"X-OpenRouter-Title": "vertus",
 			"X-OpenRouter-Categories": "cli-agent",
 		};
 	}
 
 	if (isNvidiaNimModel(model)) {
 		return {
-			"X-BILLING-INVOKE-ORIGIN": "ALFRED",
+			"X-BILLING-INVOKE-ORIGIN": "VERTUS",
 		};
 	}
 
 	if (isCloudflareModel(model)) {
 		return {
-			"User-Agent": "alfred-coding-agent",
+			"User-Agent": "vertus-coding-agent",
 		};
 	}
 
@@ -73,7 +73,7 @@ function getSessionHeaders(model: Model<Api>, sessionId: string | undefined): Re
 	) {
 		return undefined;
 	}
-	return { "x-opencode-session": sessionId, "x-opencode-client": "alfred" };
+	return { "x-opencode-session": sessionId, "x-opencode-client": "vertus" };
 }
 
 export function mergeProviderAttributionHeaders(

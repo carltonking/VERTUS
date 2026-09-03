@@ -366,7 +366,7 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 		writeFileSync(noHeaderFile, originalContent);
 
 		expect(() => SessionManager.open(noHeaderFile, tempDir)).toThrow(
-			`Session file is not a valid alfred session: ${noHeaderFile}`,
+			`Session file is not a valid vertus session: ${noHeaderFile}`,
 		);
 		expect(readFileSync(noHeaderFile, "utf-8")).toBe(originalContent);
 	});
@@ -377,7 +377,7 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 		writeFileSync(nonSessionFile, originalContent);
 
 		expect(() => SessionManager.open(nonSessionFile, tempDir)).toThrow(
-			`Session file is not a valid alfred session: ${nonSessionFile}`,
+			`Session file is not a valid vertus session: ${nonSessionFile}`,
 		);
 		expect(readFileSync(nonSessionFile, "utf-8")).toBe(originalContent);
 	});

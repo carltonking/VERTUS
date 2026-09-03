@@ -1,0 +1,10 @@
+{
+	"name": "vertus-icloud",
+	"private": true,
+	"version": "0.1.0",
+	"type": "module",
+	"description": "VERTUS Calendar (EventKit) + Email (Mail.app) tools for the user's iCloud/Exchange accounts.",
+	"pi": {
+		"extensions": ["./index.ts"]
+	}
+}

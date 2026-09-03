@@ -2,11 +2,11 @@ import { describe, expect, it } from "vitest";
 import { getPiUserAgent } from "../src/utils/pi-user-agent.ts";
 
 describe("getPiUserAgent", () => {
-	it("formats the alfred user agent", () => {
+	it("formats the vertus user agent", () => {
 		const runtime = process.versions.bun ? `bun/${process.versions.bun}` : `node/${process.version}`;
 		const userAgent = getPiUserAgent("1.2.3");
 
-		expect(userAgent).toBe(`alfred/1.2.3 (${process.platform}; ${runtime}; ${process.arch})`);
-		expect(userAgent).toMatch(/^alfred\/[^\s()]+ \([^;()]+;\s*[^;()]+;\s*[^()]+\)$/);
+		expect(userAgent).toBe(`vertus/1.2.3 (${process.platform}; ${runtime}; ${process.arch})`);
+		expect(userAgent).toMatch(/^vertus\/[^\s()]+ \([^;()]+;\s*[^;()]+;\s*[^()]+\)$/);
 	});
 });

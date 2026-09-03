@@ -147,7 +147,7 @@ describe("createAgentSession provider attribution headers", () => {
 		const headers = await captureHeaders(createModel("openrouter", "https://openrouter.ai/api/v1"));
 
 		expect(headers?.["HTTP-Referer"]).toBe("https://pi.dev");
-		expect(headers?.["X-OpenRouter-Title"]).toBe("alfred");
+		expect(headers?.["X-OpenRouter-Title"]).toBe("vertus");
 		expect(headers?.["X-OpenRouter-Categories"]).toBe("cli-agent");
 	});
 
@@ -165,7 +165,7 @@ describe("createAgentSession provider attribution headers", () => {
 		const headers = await captureHeaders(createModel("custom-openrouter", "https://openrouter.ai/api/v1"));
 
 		expect(headers?.["HTTP-Referer"]).toBe("https://pi.dev");
-		expect(headers?.["X-OpenRouter-Title"]).toBe("alfred");
+		expect(headers?.["X-OpenRouter-Title"]).toBe("vertus");
 		expect(headers?.["X-OpenRouter-Categories"]).toBe("cli-agent");
 	});
 
@@ -173,7 +173,7 @@ describe("createAgentSession provider attribution headers", () => {
 		const headers = await captureHeaders(createModel("custom-openrouter", "not-a-url-openrouter.ai"));
 
 		expect(headers?.["HTTP-Referer"]).toBe("https://pi.dev");
-		expect(headers?.["X-OpenRouter-Title"]).toBe("alfred");
+		expect(headers?.["X-OpenRouter-Title"]).toBe("vertus");
 		expect(headers?.["X-OpenRouter-Categories"]).toBe("cli-agent");
 	});
 
@@ -196,13 +196,13 @@ describe("createAgentSession provider attribution headers", () => {
 	it("adds default attribution headers for direct NVIDIA NIM endpoints", async () => {
 		const headers = await captureHeaders(createModel("custom-nim", "https://integrate.api.nvidia.com/v1"));
 
-		expect(headers?.["X-BILLING-INVOKE-ORIGIN"]).toBe("ALFRED");
+		expect(headers?.["X-BILLING-INVOKE-ORIGIN"]).toBe("VERTUS");
 	});
 
 	it("adds default attribution headers for the NVIDIA provider", async () => {
 		const headers = await captureHeaders(createModel("nvidia", "https://example.test/v1"));
 
-		expect(headers?.["X-BILLING-INVOKE-ORIGIN"]).toBe("ALFRED");
+		expect(headers?.["X-BILLING-INVOKE-ORIGIN"]).toBe("VERTUS");
 	});
 
 	it("does not add NVIDIA NIM attribution headers when telemetry is disabled", async () => {
@@ -249,7 +249,7 @@ describe("createAgentSession provider attribution headers", () => {
 		});
 
 		expect(headers?.["x-opencode-session"]).toBe("opencode-session");
-		expect(headers?.["x-opencode-client"]).toBe("alfred");
+		expect(headers?.["x-opencode-client"]).toBe("vertus");
 	});
 
 	it("lets configured OpenCode headers override the defaults", async () => {

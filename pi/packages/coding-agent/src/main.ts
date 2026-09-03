@@ -27,7 +27,7 @@ import {
 	validateAuthCommandArgs,
 } from "./cli/auth-command.ts";
 import { resolveCredentialForPrint } from "./cli/credential-print.ts";
-import { tryRunViaAlfredServer } from "./alfred-server-client.ts";
+import { tryRunViaVertusServer } from "./vertus-server-client.ts";
 import { processFileArguments } from "./cli/file-processor.ts";
 import { buildInitialMessage } from "./cli/initial-message.ts";
 import { listModels } from "./cli/list-models.ts";
@@ -611,7 +611,7 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 	}
 	time("parseArgs");
-	// ALFRED hub proxy (one-shot only): run the prompt through the hub
+	// VERTUS hub proxy (one-shot only): run the prompt through the hub
 	// session so the CLI shares the transcript with the quick bar and the
 	// phone — before any local session, model discovery, or extension
 	// startup. Falls back to the normal local path when the hub is down.
@@ -622,7 +622,7 @@ export async function main(args: string[], options?: MainOptions) {
 		&& !parsed.help
 		&& parsed.listModels === undefined
 	) {
-		const proxied = await tryRunViaAlfredServer({ messages: parsed.messages });
+		const proxied = await tryRunViaVertusServer({ messages: parsed.messages });
 		if (proxied) {
 			process.exit(0);
 		}

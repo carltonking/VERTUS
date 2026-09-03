@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vertusbar.dev</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/carltonking/01 - PROJECTS/VERTUS/vertus/apps/vertus-bar/VertusBar</string>
+    </array>
+    <!-- Start the bar at login so the toggle always works. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- KeepAlive: always relaunch, even after a clean Quit, so VERTUS
+         Bar is always resident. Relaunches run WITHOUT --show, so the
+         bar comes back hidden and only appears when summoned via ⇧⌘J
+         or the menubar icon. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/carltonking/.vertus/logs/vertusbar.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/carltonking/.vertus/logs/vertusbar.err</string>
+</dict>
+</plist>

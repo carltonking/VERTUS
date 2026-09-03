@@ -1002,7 +1002,7 @@ export class InteractiveMode {
 			);
 			const onboarding = theme.fg(
 				"dim",
-				`alfred can explain its own features and look up its docs. Ask it how to use or extend alfred.`,
+				`vertus can explain its own features and look up its docs. Ask it how to use or extend vertus.`,
 			);
 			this.builtInHeader = new ExpandableText(
 				() => `${logo}\n${compactInstructions}\n${compactOnboarding}\n\n${onboarding}`,
@@ -1097,7 +1097,7 @@ export class InteractiveMode {
 		}
 
 		// Start version check asynchronously (official pi distribution only — the
-		// ALFRED fork does not self-update via the pi release channel).
+		// VERTUS fork does not self-update via the pi release channel).
 		if (APP_NAME === "pi") {
 			checkForNewPiVersion(this.version).then((newRelease) => {
 				if (newRelease) {
@@ -3888,7 +3888,7 @@ export class InteractiveMode {
 			new Text(
 				theme.fg(
 					"warning",
-					`This project is not trusted. Project ${CONFIG_DIR_NAME} resources and packages are ignored. Use /trust to save a trust decision, then restart alfred.`,
+					`This project is not trusted. Project ${CONFIG_DIR_NAME} resources and packages are ignored. Use /trust to save a trust decision, then restart vertus.`,
 				),
 				1,
 				0,

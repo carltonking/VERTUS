@@ -448,7 +448,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 
 			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stdout).toContain("Usage:");
-			expect(stdout).toContain("alfred install <source> [-l]");
+			expect(stdout).toContain("vertus install <source> [-l]");
 			expect(errorSpy).not.toHaveBeenCalled();
 			expect(process.exitCode).toBeUndefined();
 		} finally {
@@ -533,7 +533,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 
 			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stderr).toContain('Unknown option --unknown for "install".');
-			expect(stderr).toContain('Use "alfred --help" or "alfred install <source> [-l] [--approve|--no-approve]".');
+			expect(stderr).toContain('Use "vertus --help" or "vertus install <source> [-l] [--approve|--no-approve]".');
 			expect(process.exitCode).toBe(1);
 		} finally {
 			errorSpy.mockRestore();
@@ -548,7 +548,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 
 			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stderr).toContain("Missing install source.");
-			expect(stderr).toContain("Usage: alfred install <source> [-l]");
+			expect(stderr).toContain("Usage: vertus install <source> [-l]");
 			expect(stderr).not.toContain("at ");
 			expect(process.exitCode).toBe(1);
 		} finally {
@@ -569,7 +569,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 
 			expect(fetchMock).toHaveBeenCalledOnce();
 			expect(logSpy.mock.calls.map(([message]) => String(message)).join("\n")).toContain(
-				`alfred is already up to date (v${BRAND_VERSION})`,
+				`vertus is already up to date (v${BRAND_VERSION})`,
 			);
 			expect(errorSpy).not.toHaveBeenCalled();
 			expect(process.exitCode).toBeUndefined();
@@ -629,7 +629,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 			expect.arrayContaining(["ci", "--ignore-scripts"]),
 		);
 		expect(logSpy.mock.calls.map(([message]) => String(message)).join("\n")).toContain(
-			`Updated alfred from ${BRAND_VERSION} to ${targetVersion}`,
+			`Updated vertus from ${BRAND_VERSION} to ${targetVersion}`,
 		);
 		expect(errorSpy).not.toHaveBeenCalled();
 		expect(process.exitCode).toBeUndefined();
@@ -670,7 +670,7 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		expect(fetchMock).not.toHaveBeenCalled();
 		expect(existsSync(npmRecordPath)).toBe(false);
 		expect(errorSpy.mock.calls.map(([message]) => String(message)).join("\n")).toContain(
-			"Managed alfred installations do not support --force",
+			"Managed vertus installations do not support --force",
 		);
 		expect(process.exitCode).toBe(1);
 	});
@@ -745,7 +745,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 			expect(recordedArgs).toContain(`${PACKAGE_NAME}@${VERSION}`);
 			expect(recordedArgs).not.toContain(PACKAGE_NAME);
 			expect(recordedArgs).not.toContain(projectPrefix);
-			expect(stdout).toContain(`Updated alfred from ${BRAND_VERSION} to ${VERSION}`);
+			expect(stdout).toContain(`Updated vertus from ${BRAND_VERSION} to ${VERSION}`);
 		} finally {
 			logSpy.mockRestore();
 			errorSpy.mockRestore();
@@ -791,7 +791,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 			const recordedArgs = JSON.parse(readFileSync(recordPath, "utf-8")) as string[];
 			expect(recordedArgs).toContain(`${PACKAGE_NAME}@${targetVersion}`);
 			expect(recordedArgs).not.toContain(PACKAGE_NAME);
-			expect(stdout).toContain(`Updated alfred from ${BRAND_VERSION} to ${targetVersion}`);
+			expect(stdout).toContain(`Updated vertus from ${BRAND_VERSION} to ${targetVersion}`);
 		} finally {
 			logSpy.mockRestore();
 			errorSpy.mockRestore();
@@ -886,7 +886,7 @@ else {
 			expect(stdout).not.toContain("Updated pi");
 			expect(stderr).toContain("exited with code 23");
 			expect(stderr).toContain("If pnpm reports missing package versions");
-			expect(stderr).toContain("Run `pnpm store prune` and retry `alfred update --self`.");
+			expect(stderr).toContain("Run `pnpm store prune` and retry `vertus update --self`.");
 		} finally {
 			logSpy.mockRestore();
 			errorSpy.mockRestore();

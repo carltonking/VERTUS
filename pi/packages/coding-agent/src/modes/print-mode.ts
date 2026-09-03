@@ -139,6 +139,9 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		if (mode === "text") {
 			const state = session.state;
 			const lastMessage = state.messages[state.messages.length - 1];
+			if (process.env.VERTUS_DEBUG_PRINT) {
+				console.error(`[print-debug] messages=${state.messages.length} lastRole=${lastMessage?.role} stopReason=${(lastMessage as AssistantMessage | undefined)?.stopReason} contentTypes=${JSON.stringify((lastMessage as AssistantMessage | undefined)?.content?.map((c) => c.type))}`);
+			}
 
 			if (lastMessage?.role === "assistant") {
 				const assistantMsg = lastMessage as AssistantMessage;
