@@ -1,6 +1,7 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentSession } from "../../../core/agent-session.ts";
+import type { Usage } from "@earendil-works/pi-ai/compat";
 import { areExperimentalFeaturesEnabled } from "../../../core/experimental.ts";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.ts";
 import { addUsageToTotals, createUsageTotals } from "../../../core/usage-totals.ts";
@@ -90,12 +91,17 @@ export class FooterComponent implements Component {
 
 		for (const entry of this.session.sessionManager.getEntries()) {
 			if (entry.type === "message" && entry.message.role === "assistant") {
-				addUsageToTotals(usageTotals, entry.message.usage);
+				// Error/interrupted turns can persist assistant messages without a
+				// usable usage object; dereferencing it here would throw during
+				// render and kill the TUI's render loop (frozen screen). Guard it.
+				const usage = entry.message.usage as Partial<Usage> | null | undefined;
+				if (!usage || typeof usage.input !== "number") continue;
+				const cacheRead = usage.cacheRead ?? 0;
+				const cacheWrite = usage.cacheWrite ?? 0;
+				addUsageToTotals(usageTotals, usage as Usage);
 
-				const latestPromptTokens =
-					entry.message.usage.input + entry.message.usage.cacheRead + entry.message.usage.cacheWrite;
-				latestCacheHitRate =
-					latestPromptTokens > 0 ? (entry.message.usage.cacheRead / latestPromptTokens) * 100 : undefined;
+				const latestPromptTokens = usage.input + cacheRead + cacheWrite;
+				latestCacheHitRate = latestPromptTokens > 0 ? (cacheRead / latestPromptTokens) * 100 : undefined;
 			} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
 				addUsageToTotals(usageTotals, entry.message.usage);
 			} else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {

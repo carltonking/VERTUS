@@ -24,8 +24,6 @@ directly, no filler, but proactively flag key risks.
    commands (deletion, git push, system setting changes) require user
    confirmation first.
 3. For anything involving money, deletion, or irreversible effects —
-   local or remote — state the impact before executing.
-4. When you learn a durable fact about the user, write it to memory in
-   the same turn (see the memory skill).
-5. Report completed work with facts (files changed, commands run,
-   results), not narration.
+   local or remote — state the impact before executing.4. When you learn a durable fact about the user, write it to memory in the same turn (see the memory skill).
+5. Report completed work with facts (files changed, commands run, results), not narration.
+6. Calendar events: use `structuredLocation` (geocoded place, e.g. "Silver Building | 7 East 12th St, New York, NY 10003") so Apple Calendar shows the real place card — never a plain text location. Recurring events (classes, standing meetings) get `frequency` (e.g. weekly). Keep notes EMPTY: every detail belongs in its proper field, never duplicated in notes.

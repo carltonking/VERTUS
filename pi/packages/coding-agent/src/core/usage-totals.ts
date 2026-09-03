@@ -20,11 +20,15 @@ export function createUsageTotals(): UsageTotals {
 }
 
 export function addUsageToTotals(totals: UsageTotals, usage: Usage): void {
-	totals.input += usage.input;
-	totals.output += usage.output;
-	totals.cacheRead += usage.cacheRead;
-	totals.cacheWrite += usage.cacheWrite;
-	totals.cost += usage.cost.total;
+	// Defensive: malformed or missing usage (e.g. error turns persisted by
+	// bridge engines) must never throw inside a render path.
+	if (!usage || typeof usage !== "object") return;
+	const num = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+	totals.input += num(usage.input);
+	totals.output += num(usage.output);
+	totals.cacheRead += num(usage.cacheRead);
+	totals.cacheWrite += num(usage.cacheWrite);
+	totals.cost += num(usage.cost?.total);
 }
 
 export interface UsageCostBreakdownEntry {

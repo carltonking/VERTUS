@@ -20,8 +20,105 @@ final class QuickBarViewModel: ObservableObject {
     private var streamTask: Task<Void, Never>?
     private var config: ServerConfig
 
+    // MARK: Slash commands (skills)
+
+    /// Slash-command catalog from the hub (GET /api/skills): every registry
+    /// command plus every installed skill — the same list the alfred CLI's
+    /// '/' menu shows.
+    @Published var slashCommands: [SlashCommand] = []
+    /// Live suggestion list for the current '/'-prefixed prompt text.
+    @Published var slashSuggestions: [SlashCommand] = []
+    private var catalogLoaded = false
+    private var catalogRetry = false
+
     init(config: ServerConfig = ServerConfig.load()) {
         self.config = config
+    }
+
+    /// Kick off a one-time catalog fetch; safe to call on every keystroke.
+    /// On failure it arms a single retry so a hub that was still starting up
+    /// (or temporarily down) doesn't leave the menu permanently empty.
+    func ensureSlashCatalog() {
+        guard !catalogLoaded else { return }
+        catalogLoaded = true
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                guard let url = URL(string: "\(self.config.baseURL)/api/skills") else { return }
+                var req = URLRequest(url: url)
+                req.setValue("Bearer \(self.config.token)", forHTTPHeaderField: "Authorization")
+                req.timeoutInterval = 10
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    throw URLError(.badServerResponse)
+                }
+                let raw = obj["commands"] as? [[String: Any]] ?? []
+                let cmds = raw.compactMap { entry -> SlashCommand? in
+                    guard let name = entry["name"] as? String else { return nil }
+                    return SlashCommand(
+                        name: name,
+                        description: entry["description"] as? String ?? ""
+                    )
+                }
+                await MainActor.run { self.slashCommands = cmds.sorted { $0.name < $1.name } }
+            } catch {
+                // Autocomplete is best-effort; sending plain text still works.
+                // Allow one retry on the next keystroke (e.g. the hub was
+                // mid-restart when the bar first opened).
+                await MainActor.run {
+                    if !self.catalogRetry {
+                        self.catalogRetry = true
+                        self.catalogLoaded = false
+                    }
+                }
+            }
+        }
+    }
+
+    /// Recompute suggestions while the user types. Active whenever the
+    /// prompt is a single leading /token (no space yet) — exactly like the
+    /// CLI's '/' menu.
+    func updateSlashSuggestions(for prompt: String) {
+        let trimmed = prompt.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix("/"), !prompt.contains(" ") else {
+            if !slashSuggestions.isEmpty { slashSuggestions = [] }
+            return
+        }
+        let query = String(trimmed.dropFirst()).lowercased()
+        let matches = slashCommands.filter { cmd in
+            let bare = cmd.name.dropFirst().lowercased()
+            return query.isEmpty || bare.hasPrefix(query) || bare.contains(query)
+        }
+        // No cap: the dropdown is a 4-row scrollable window, so every match
+        // stays reachable by scrolling.
+        if matches.map(\.name) != slashSuggestions.map(\.name) {
+            slashSuggestions = matches
+        }
+        ensureSlashCatalog()
+    }
+
+    /// Complete the prompt with the picked command (keeps the '/' form); the
+    /// user then types their arguments after it and hits send.
+    func completeSlash(_ command: SlashCommand) -> String {
+        slashSuggestions = []
+        return command.name + " "
+    }
+
+    /// Geometry shared by the view layer: the dropdown shows at most 4 rows.
+    static let slashVisibleRows = 4
+    static let slashRowHeight: CGFloat = 22
+
+    /// One dropdown row's fixed height.
+    var slashRowHeight: CGFloat { Self.slashRowHeight }
+
+    /// Reserved space below the prompt strip while the dropdown is open:
+    /// 4 rows + internal padding + breathing room. Zero when closed. The
+    /// widget grows by exactly this much and the strip floats above it.
+    var slashMenuSpace: CGFloat {
+        slashSuggestions.isEmpty
+            ? 0
+            : CGFloat(min(slashSuggestions.count, Self.slashVisibleRows)) * Self.slashRowHeight + 16
     }
 
     func send(_ text: String) {
@@ -220,6 +317,15 @@ extension QuickBarViewModel {
     var transcriptText: String {
         transcript.map(\.text).joined()
     }
+}
+
+// MARK: - Slash commands
+
+/// One entry in the '/' autocomplete menu: "/name" plus a short description.
+struct SlashCommand: Identifiable, Equatable {
+    let name: String
+    let description: String
+    var id: String { name }
 }
 
 // MARK: - Server config

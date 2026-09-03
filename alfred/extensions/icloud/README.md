@@ -10,7 +10,7 @@ or tokens are stored; macOS handles authorization per account.
 |---|---|
 | `list_calendars` | List all calendars (iCloud, Exchange, …) — read-only |
 | `read_calendar_events` | Events in a date range with id/title/start/end/location/notes |
-| `create_calendar_event` | Create an event **only** in the dedicated `ALFRED` calendar (+ default 10 min reminder) |
+| `create_calendar_event` | Create an event **only** in the dedicated `ALFRED` calendar (+ default 10 min reminder). Supports geocoded **structured locations** (Apple Calendar place card), **recurrence** (daily/weekly/monthly/yearly), and alarms |
 | `cancel_calendar_event` | Cancel an event **only** from the `ALFRED` calendar (by id) |
 | `list_emails` | Recent email from a mailbox (default INBOX) — read-only |
 | `search_emails` | Search subject/sender/body — read-only |
@@ -28,6 +28,19 @@ or tokens are stored; macOS handles authorization per account.
 - **Email sending requires your confirmation** — ALFRED is instructed to use
   `compose_email` by default; `send_draft`/`send_email` only with explicit
   consent. Nothing is sent automatically.
+
+## Event formatting rules (how ALFRED formats events)
+
+- **Locations are geocoded.** Pass `structuredLocation` as
+  `Place Title | street address, city, state zip` (or just an address). The
+  helper geocodes it and attaches an `EKStructuredLocation` with a coordinate —
+  Apple Calendar then shows the real **place card** (map, weather,
+  "Alert when I need to leave"), exactly as if you had picked the suggestion in
+  Calendar's location bar. Plain `location` remains display-only text.
+- **Notes stay empty.** Course, instructor, room, and location belong in their
+  proper fields; ALFRED never duplicates them into notes.
+- **Recurring events use recurrence.** `frequency` (daily/weekly/monthly/yearly)
+  plus optional `interval` and `until` — e.g. a weekly class is `weekly`.
 
 ## First-time setup (one time, ~30 seconds)
 

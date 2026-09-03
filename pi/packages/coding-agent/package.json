@@ -5,7 +5,7 @@
 	"type": "module",
 	"piConfig": {
 		"name": "alfred",
-		"configDir": ".pi"
+		"configDir": ".alfred"
 	},
 	"bin": {
 		"alfred": "dist/bundle/cli.js"

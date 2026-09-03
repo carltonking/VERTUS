@@ -160,6 +160,52 @@ class AgentBridge:
         except Exception as exc:  # noqa: BLE001
             print(f"[alfred] prewarm failed (will retry on first prompt): {exc}", file=sys.stderr)
 
+    def _expand_slash_text(self, text: str) -> str | None:
+        """Expand a leading /command before it reaches the agent.
+
+        Skills, bundles, /learn, /init, quick commands, and aliases are
+        resolved through the gateway's command.dispatch — the same server-side
+        expansion the hermes CLI's '/' menu uses. Clients send plain text, so
+        every surface (bar, phone, CLI one-shot) gets identical slash behavior.
+
+        Returns the text to submit, or None when the command already produced
+        its own output (an exec-style command); the caller then stops.
+        """
+        stripped = text.strip()
+        if not stripped.startswith("/"):
+            return text
+        expand = getattr(self._session, "expand_slash", None)
+        if expand is None:  # pi fallback bridge has no slash dispatch
+            return text
+        head, _, arg = stripped.partition(" ")
+        try:
+            result = expand(head.lstrip("/"), arg.strip())
+        except Exception as exc:  # noqa: BLE001
+            self._emit({"type": "activity", "text": f"slash dispatch failed: {exc}"})
+            return text
+        if result is None:
+            # Not a resolvable /command — submit as an ordinary prompt.
+            return text
+        rtype = result.get("type")
+        if rtype in ("send", "skill"):
+            msg = result.get("message")
+            if isinstance(msg, str) and msg:
+                return msg
+            return text
+        if rtype == "alias":
+            target = str(result.get("target") or "").lstrip("/")
+            if target and target != head.lstrip("/"):
+                return self._expand_slash_text(f"/{target} {arg}".strip())
+            return text
+        # exec / plugin / anything else: output was produced server-side.
+        out = str(result.get("output") or result.get("notice") or result.get("display") or "")
+        if out:
+            self._emit({"type": "text", "text": out})
+        else:
+            self._emit({"type": "activity", "text": f"ran {head}"})
+        self._emit({"type": "done"})
+        return None
+
     def _run_prompt_with_respawn(self, text: str) -> None:
         """Run one prompt, restarting a dead agent gateway once in-line.
 
@@ -188,6 +234,10 @@ class AgentBridge:
                         continue
                     self._emit({"type": "error", "message": f"agent start failed: {exc}"})
                     return
+            expanded = self._expand_slash_text(text)
+            if expanded is None:
+                return
+            text = expanded
             try:
                 self._session.prompt(text)
                 # prompt() returning means the agent turn finished; the
@@ -272,6 +322,16 @@ class AgentBridge:
         except Exception:
             pass
 
+    def slash_catalog(self) -> dict:
+        """Slash-command + skill catalog for client autocomplete menus."""
+        catalog = getattr(self._session, "slash_catalog", None)
+        if catalog is None:  # pi fallback bridge
+            return {"commands": [], "skillCount": 0}
+        try:
+            return catalog()
+        except Exception as exc:  # noqa: BLE001
+            return {"commands": [], "skillCount": 0, "error": str(exc)[:200]}
+
     def prompt(self, text: str, remote: bool) -> None:
         self._queue.put((text, remote))
 
@@ -299,6 +359,8 @@ class AlfredHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/health":
             self._json(200, {"status": "ok", "time": int(time.time())})
+        elif self.path == "/api/skills":
+            self._json(200, self.bridge.slash_catalog())
         elif self.path == "/api/events":
             self._sse()
         else:

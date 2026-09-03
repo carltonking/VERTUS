@@ -4380,7 +4380,12 @@ export class InteractiveMode {
 		if (allQueued.length === 0) {
 			this.updatePendingMessagesDisplay();
 			if (options?.abort) {
-				this.agent.abort();
+				// Engine-aware abort: AgentSession.abort() aborts the inner pi
+				// agent; the hermes-engine override (HermesSession.abort)
+				// additionally interrupts the in-flight hermes turn via the
+				// gateway. agent.abort() alone is a no-op during hermes turns
+				// (no inner activeRun), which made ESC silently do nothing.
+				void this.session.abort();
 			}
 			return 0;
 		}
@@ -4390,7 +4395,12 @@ export class InteractiveMode {
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
 		if (options?.abort) {
-			this.agent.abort();
+			// Engine-aware abort: AgentSession.abort() aborts the inner pi
+			// agent; the hermes-engine override (HermesSession.abort)
+			// additionally interrupts the in-flight hermes turn via the
+			// gateway. agent.abort() alone is a no-op during hermes turns
+			// (no inner activeRun), which made ESC silently do nothing.
+			void this.session.abort();
 		}
 		return allQueued.length;
 	}

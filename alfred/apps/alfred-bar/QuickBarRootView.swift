@@ -266,9 +266,12 @@ struct NotchPanelContent: View {
         min(1, max(0, (progress - 0.55) / 0.25))
     }
 
-    /// Height of the output pane above the bar (0 while idle).
+    /// Height of the output pane above the bar (0 while idle). The slash
+    /// dropdown's reserved bottom space is excluded, so the extra room the
+    /// widget gains when the menu opens stays BELOW the prompt strip instead
+    /// of being absorbed into the chat pane.
     private var outputHeight: CGFloat {
-        max(0, widgetHeight - NotchPanelMetrics.height(promptLines: model.promptLines))
+        max(0, widgetHeight - NotchPanelMetrics.height(promptLines: model.promptLines) - model.slashMenuSpace)
     }
 
     /// Empty band below the notch: a clear empty row when idle, a small gap
@@ -288,6 +291,7 @@ struct NotchPanelContent: View {
             topBar
             divider
             inputRow
+            slashSuggestionsOverlay
         }
         .frame(width: NotchPanelMetrics.topWidth, height: widgetHeight)
         .mask(NotchPanelShape(progress: progress, expandedHeight: widgetHeight))
@@ -296,6 +300,9 @@ struct NotchPanelContent: View {
             // Live calculator: growing/shrinking the output window as the
             // prompt enters/leaves "math mode" (Enter is not involved).
             onMathChange(mathPreview != nil || isMathInProgress)
+            // '/'-command autocomplete: suggest while the text is a bare
+            // /token, exactly like the alfred CLI's slash menu.
+            model.updateSlashSuggestions(for: prompt)
         }
         .onReceive(NotificationCenter.default.publisher(for: .alfredAppendPrompt)) { note in
             guard let path = note.object as? String else { return }
@@ -552,6 +559,93 @@ struct NotchPanelContent: View {
             .offset(x: NotchPanelMetrics.chamferInset, y: dividerY)
     }
 
+    // MARK: Slash suggestions — compact menu floating just below the prompt
+    // strip while the prompt is a bare '/token' (or '/'). Click to complete;
+    // it hides itself once a space or non-slash text is typed.
+
+    private var slashSuggestionsOverlay: some View {
+        Group {
+            if !model.slashSuggestions.isEmpty {
+                // Fixed 4-row scrollable dropdown directly below the prompt
+                // bar: all matches stay reachable while the menu itself never
+                // exceeds four rows. Auto-scrolls back to the top whenever
+                // the match list changes (typing re-filters it).
+                ScrollViewReader { proxy in
+                    ScrollView([.vertical]) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(model.slashSuggestions) { cmd in
+                                Button {
+                                    prompt = model.completeSlash(cmd)
+                                } label: {
+                                    HStack(spacing: 6) {
+                                        Text(cmd.name)
+                                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                            .foregroundStyle(.white)
+                                        Text(":")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.white.opacity(0.35))
+                                        Text(cmd.description)
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.white.opacity(0.55))
+                                            .lineLimit(1)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 4)
+                                    .frame(height: slashRowHeight, alignment: .center)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .id(cmd.name)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                    .frame(width: 300, height: slashMenuWindowHeight)
+                    .onChange(of: model.slashSuggestions) { _ in
+                        // Typing re-filters the list — reset to the top so
+                        // the best (first) match is always the one showing.
+                        if let first = model.slashSuggestions.first {
+                            proxy.scrollTo(first.name, anchor: .top)
+                        }
+                    }
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color(white: 0.13, opacity: 0.98))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.08))
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                // Below the prompt strip, inside the widget's reserved
+                // bottom space (see slashMenuSpace / outputHeight).
+                .offset(x: 12, y: slashMenuTopY)
+                .transition(.opacity)
+                .allowsHitTesting(true)
+            }
+        }
+    }
+
+    /// Top edge for the suggestion menu: anchored to the widget's bottom
+    /// edge (6pt margin), inside the reserved band below the prompt strip.
+    /// Bottom-anchoring makes the placement immune to divider/gap math: the
+    /// widget reserves exactly `slashMenuSpace` under the strip, and the menu
+    /// fills the top of that band — so it is ALWAYS below the prompt bar.
+    private var slashMenuTopY: CGFloat {
+        widgetHeight - 6 - slashMenuWindowHeight
+    }
+
+    /// One dropdown row's fixed height (shared with the widget sizing).
+    private var slashRowHeight: CGFloat { model.slashRowHeight }
+
+    /// The scrollable dropdown window: exactly 4 rows plus vertical padding —
+    /// never taller, regardless of how many skills match.
+    private var slashMenuWindowHeight: CGFloat {
+        min(CGFloat(model.slashSuggestions.count), 4) * slashRowHeight + 8
+    }
+
     // MARK: Input row — multi-line prompt editor (3 visible lines, scrolls
     // beyond), no send button; Return sends, Shift+Return inserts a newline.
 
@@ -665,6 +759,7 @@ struct QuickBarRootView: View {
         .onChange(of: model.transcript.count) { _ in refreshWidgetHeight() }
         .onChange(of: model.transcriptText) { _ in refreshWidgetHeight() }
         .onChange(of: model.promptLines) { _ in refreshWidgetHeight() }
+        .onChange(of: model.slashSuggestions) { _ in refreshWidgetHeight() }
         .onAppear {
             let args = CommandLine.arguments
             if args.contains("--verify-output") || args.contains("--demo-output") {
@@ -690,11 +785,16 @@ struct QuickBarRootView: View {
     /// off/on needed. A mid-stream SHRINK is ignored (that per-chunk churn
     /// was the jitter); the shrink is applied the moment the turn ends.
     private func refreshWidgetHeight() {
+        // The slash dropdown lives BELOW the prompt strip: the widget adds a
+        // reserved band under the strip (menu height + breathing room) in
+        // both idle and chatting states, so the strip floats above the
+        // dropdown instead of the menu being clipped by the panel edge.
+        let menuExtra = model.slashMenuSpace
         let active = mathActive || !model.transcript.isEmpty
         let lines = model.promptLines
-        let target = active
+        let target = (active
             ? NotchPanelMetrics.height(promptLines: lines) + desiredOutputHeight()
-            : NotchPanelMetrics.idleHeight(promptLines: lines)
+            : NotchPanelMetrics.idleHeight(promptLines: lines)) + menuExtra
         alfredTrace("refreshWidgetHeight active=\(active) current=\(expansionState.widgetHeight) target=\(target)")
         guard expansionState.widgetHeight != target else { return }
         // Mid-stream the widget only grows; shrinking waits for the turn to

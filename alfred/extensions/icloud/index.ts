@@ -451,7 +451,7 @@ export default function (pi: ExtensionAPI) {
 			if (params.to) args.push("--to", params.to);
 			if (params.calendar) args.push("--calendar", params.calendar);
 			if (params.max) args.push("--max", String(Math.floor(params.max)));
-			const r = await runHelper(false, args);
+			const r = await runHelper(args);
 			if (!r.ok) throw new Error(r.error);
 			const events = (r.data.events as Array<Record<string, unknown>>) ?? [];
 			if (events.length === 0) {
@@ -471,33 +471,49 @@ export default function (pi: ExtensionAPI) {
 	const calendarMutationsGuideline =
 		"Calendar mutations (create/cancel) are sandboxed to the dedicated 'ALFRED' calendar and enforced in native code — never create or cancel events in the user's real calendars.";
 
+	const eventFormattingGuidelines = [
+		"ALWAYS pass structuredLocation (format 'Place Title | street address, city, state zip' or just an address) instead of plain location — it geocodes the place so Apple Calendar shows the real place card with map, exactly like picking a suggestion in Calendar's location bar. Plain location is display text only.",
+		"NEVER put event details (course, instructor, location, URLs…) into notes — every fact belongs in its proper field (title, structuredLocation, recurrence). The user keeps notes empty.",
+		"For recurring events (classes, standing meetings) set frequency (daily|weekly|monthly|yearly), optionally interval and until (yyyy-MM-dd) — e.g. a weekly class is frequency 'weekly'.",
+	];
+
 	pi.registerTool({
 		...makeRender("+event", "title"),
 		name: "create_calendar_event",
 		label: "Create Calendar Event",
 		description:
-			`Create an event in the dedicated '${loadConfig().calendarName}' calendar (auto-created on first use) with a default 10-minute reminder. Use for scheduling, reminders, and follow-ups the user asks for. Never creates events in real calendars.`,
+			`Create an event in the dedicated '${loadConfig().calendarName}' calendar (auto-created on first use) with a default 10-minute reminder. Supports geocoded structured locations (Apple Calendar place card), recurrence, and alarms. Never creates events in real calendars.`,
 		promptSnippet:
-			`Create an event (with default reminder) in the sandboxed '${loadConfig().calendarName}' calendar.`,
-		promptGuidelines: [calendarMutationsGuideline, "If the user asks to change or remove an event from a real calendar, tell them it must be done in the Calendar app."],
+			`Create an event (geocoded place, recurrence, reminder) in the sandboxed '${loadConfig().calendarName}' calendar.`,
+		promptGuidelines: [calendarMutationsGuideline, ...eventFormattingGuidelines],
 		parameters: Type.Object({
 			title: Type.String({ description: "Event summary/title." }),
 			start: Type.String({ description: 'Start: "yyyy-MM-dd" for all-day, or "yyyy-MM-ddTHH:mm" / ISO datetime.' }),
 			end: Type.String({ description: 'End: same format as start (must be after start).' }),
-			location: Type.Optional(Type.String({ description: "Optional location string." })),
-			notes: Type.Optional(Type.String({ description: "Optional notes/description." })),
+			structuredLocation: Type.Optional(Type.String({ description: "Preferred over location. Geocoded place: 'Place Title | street address, city, state zip' (or just an address). Shows the real place card in Apple Calendar." })),
+			location: Type.Optional(Type.String({ description: "Plain location text (display only — no place card). Use structuredLocation instead." })),
+			frequency: Type.Optional(Type.String({ description: "Recurrence frequency: daily, weekly, monthly, or yearly. Set for recurring events like classes." })),
+			interval: Type.Optional(Type.Number({ description: "Recurrence interval (default 1 = every week for weekly)." })),
+			until: Type.Optional(Type.String({ description: 'Recurrence end date, "yyyy-MM-dd" (optional; repeats forever if omitted).' })),
+			notes: Type.Optional(Type.String({ description: "Optional notes. Keep empty — the user does not want event details duplicated here." })),
 			alarmMinutes: Type.Optional(Type.Number({ description: "Reminder minutes before start (default 10, 0 = none)." })),
 		}),
 		async execute(_id, params) {
 			const cfg = loadConfig();
 			const args = ["create-event", "--calendar", cfg.calendarName, "--title", params.title, "--start", params.start, "--end", params.end];
+			if (params.structuredLocation) args.push("--structured-location", params.structuredLocation);
 			if (params.location) args.push("--location", params.location);
+			if (params.frequency) args.push("--frequency", params.frequency);
+			if (params.interval !== undefined) args.push("--interval", String(Math.floor(params.interval)));
+			if (params.until) args.push("--until", params.until);
 			if (params.notes) args.push("--notes", params.notes);
 			if (params.alarmMinutes !== undefined) args.push("--alarm-minutes", String(Math.floor(params.alarmMinutes)));
-			const r = await runHelper(false, args);
+			const r = await runHelper(args);
 			if (!r.ok) throw new Error(r.error);
+			const sl = typeof r.data.structuredLocation === "string" && r.data.structuredLocation ? ` @ ${r.data.structuredLocation} (place card)` : "";
+			const rec = typeof r.data.recurrence === "string" && r.data.recurrence ? `, repeats ${r.data.recurrence}` : "";
 			return textResult(
-				`Created in "${r.data.calendar}": **${r.data.title}** (${r.data.start} → ${r.data.end})${r.data.allDay ? " [all-day]" : ""}, reminder ${r.data.alarmMinutes} min before. id: \`${r.data.id}\``,
+				`Created in "${r.data.calendar}": **${r.data.title}** (${r.data.start} → ${r.data.end})${r.data.allDay ? " [all-day]" : ""}${sl}${rec}, reminder ${r.data.alarmMinutes} min before. id: \`${r.data.id}\``,
 				{ event: r.data },
 			);
 		},

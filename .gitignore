@@ -1,5 +1,6 @@
 # macOS
 .DS_Store
+Context/
 
 # Codebuff / tool state (never publish)
 .freebuff/

@@ -6,6 +6,7 @@
 //
 // Build: swiftc -O -o alfred-events alfred-events.swift
 
+import CoreLocation
 import EventKit
 import Foundation
 
@@ -66,23 +67,37 @@ final class Args {
 // ── EventKit plumbing ─────────────────────────────────────────────────────────
 let store = EKEventStore()
 
-func authorize() -> Bool {
+func authorize(writeOnly: Bool = false) -> Bool {
     switch EKEventStore.authorizationStatus(for: .event) {
     case .fullAccess:
+        return true
+    case .writeOnly:
+        if !writeOnly { return false } // reads need full access
+        // "Add Only" is enough for writes, but it hides real calendars and
+        // cannot create the dedicated ALFRED calendar. Opportunistically ask
+        // for the Full Access upgrade (single prompt); if the user declines,
+        // keep working with what we have.
+        if #available(macOS 14.0, *) {
+            let sem = DispatchSemaphore(value: 0)
+            store.requestFullAccessToEvents { _, _ in sem.signal() }
+            _ = sem.wait(timeout: .now() + 60)
+        }
         return true
     case .notDetermined:
         let sem = DispatchSemaphore(value: 0)
         var granted = false
         if #available(macOS 14.0, *) {
-            store.requestFullAccessToEvents { g, _ in granted = g; sem.signal() }
+            if writeOnly {
+                store.requestWriteOnlyAccessToEvents { g, _ in granted = g; sem.signal() }
+            } else {
+                store.requestFullAccessToEvents { g, _ in granted = g; sem.signal() }
+            }
         } else {
             store.requestAccess(to: .event) { g, _ in granted = g; sem.signal() }
         }
         _ = sem.wait(timeout: .now() + 60)
         return granted
     case .denied, .restricted:
-        return false
-    case .writeOnly:
         return false
     @unknown default:
         return false
@@ -91,7 +106,17 @@ func authorize() -> Bool {
 
 func requireAccess() {
     guard authorize() else {
-        fail("Calendar access denied or not yet granted.\n\nOn first use macOS shows a prompt — click Allow (System Settings → Privacy & Security → Calendar).\nIf there is no prompt, launch:\n  open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars'\nand enable access for the app that runs the terminal (Terminal/iTerm).")
+        let writeOnlyHint = EKEventStore.authorizationStatus(for: .event) == .writeOnly
+            ? "\n\nCalendar access for this app is currently set to \"Add Only\" — reading needs \"Full Access\".\nFix: System Settings → Privacy & Security → Calendar → set this app to Full Access."
+            : ""
+        fail("Calendar access denied or not yet granted.\n\nOn first use macOS shows a prompt — click Allow (System Settings → Privacy & Security → Calendar).\nIf there is no prompt, launch:\n  open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars'\nand enable access for the app that runs the terminal (Terminal/iTerm).\(writeOnlyHint)")
+    }
+}
+
+/// Mutations only need write access — full access is only for reading.
+func requireWriteAccess() {
+    guard authorize(writeOnly: true) else {
+        fail("Calendar write access denied or not yet granted.\n\nOn first use macOS shows a prompt — click Allow (System Settings → Privacy & Security → Calendar).\nIf there is no prompt, launch:\n  open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars'\nand enable access for the app that runs the terminal (Terminal/iTerm).")
     }
 }
 
@@ -171,12 +196,21 @@ func findCalendar(_ title: String) -> EKCalendar? {
     }
 }
 
-func calendarSource() -> EKSource? {
-    // Prefer an account source (iCloud/CalDAV); fall back to the default for new events.
+func calendarSourceCandidates() -> [EKSource] {
     let sources = store.sources
-    if let def = store.defaultCalendarForNewEvents?.source { return def }
-    for s in sources where s.sourceType == .calDAV && s.title.lowercased().contains("icloud") { return s }
-    return sources.first { $0.sourceType == .calDAV } ?? sources.first
+    var candidates: [EKSource] = []
+    // iCloud first (accepts new calendars, syncs to the user's devices),
+    // then any other CalDAV account, then Subscribed/Local as last resorts.
+    // The default-calendar source is intentionally LAST: it is often the
+    // school Exchange account, which refuses calendar creation.
+    candidates.append(contentsOf: sources.filter { $0.sourceType == .calDAV && $0.title.lowercased().contains("icloud") })
+    candidates.append(contentsOf: sources.filter { $0.sourceType == .calDAV && !$0.title.lowercased().contains("icloud") })
+    candidates.append(contentsOf: sources.filter { $0.sourceType == .subscribed })
+    candidates.append(contentsOf: sources.filter { $0.sourceType == .local })
+    if let def = store.defaultCalendarForNewEvents?.source, !candidates.contains(def) {
+        candidates.append(def)
+    }
+    return candidates
 }
 
 func ensureCalendar(_ title: String) -> (calendar: EKCalendar, created: Bool) {
@@ -186,20 +220,56 @@ func ensureCalendar(_ title: String) -> (calendar: EKCalendar, created: Bool) {
     let calendar = EKCalendar(for: .event, eventStore: store)
     calendar.title = title
     calendar.cgColor = CGColor(red: 0.15, green: 0.55, blue: 0.95, alpha: 1.0)
-    if let source = calendarSource() {
+    // Try each candidate source; some accounts (e.g. school Exchange) refuse
+    // calendar creation, so the first that accepts wins.
+    var lastError: Error?
+    for source in calendarSourceCandidates() {
         calendar.source = source
+        do {
+            try store.saveCalendar(calendar, commit: true)
+            return (calendar, true)
+        } catch {
+            lastError = error
+        }
     }
-    do {
-        try store.saveCalendar(calendar, commit: true)
-        return (calendar, true)
-    } catch {
-        fail("Could not create calendar '\(title)': \(error.localizedDescription)")
-    }
+    fail("Could not create calendar '\(title)': \(lastError?.localizedDescription ?? "no writable account source found")\n\nIf Calendar access is set to \"Add Only\", the system hides real accounts and refuses calendar creation.\nFix: System Settings → Privacy & Security → Calendar → set this app to Full Access.")
 }
 
 /// All events a calendar contributes across store.calendars(for: .event).
 func calendarSet() -> [EKCalendar] {
     store.calendars(for: .event)
+}
+
+// ── Location resolution (Apple Calendar's "selected place") ──────────────────
+/// Plain `event.location` stores display text only; Calendar shows a real place
+/// card (with map + "Alert when I need to leave") only when the event carries an
+/// `EKStructuredLocation` with a geocoded coordinate. This geocodes the address
+/// the same way Calendar's location bar does when you pick a suggestion.
+/// Format: "Place Title | street address, city, state zip" — or just an address.
+func resolveStructuredLocation(_ raw: String) -> (title: String, address: String, latitude: Double, longitude: Double)? {
+    let parts = raw.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+    let placeTitle = parts.count > 1 ? parts[0] : ""
+    let address = (parts.count > 1 ? parts[1] : parts[0])
+    guard !address.isEmpty else { return nil }
+
+    // CLGeocoder is callback-based; bridge to sync with a semaphore (one-shot CLI).
+    let sem = DispatchSemaphore(value: 0)
+    var resolved: (title: String, address: String, latitude: Double, longitude: Double)?
+    let geocoder = CLGeocoder()
+    geocoder.geocodeAddressString(address) { placemarks, _ in
+        if let p = placemarks?.first, let loc = p.location {
+            // Calendar renders the selected place as title (bold) + address (subtitle).
+            let title = placeTitle.isEmpty ? (p.name ?? address) : placeTitle
+            let subtitle = [p.thoroughfare, p.subThoroughfare, p.locality, p.administrativeArea, p.postalCode]
+                .compactMap { $0 }.joined(separator: " ")
+            resolved = (title: title, address: subtitle.isEmpty ? address : subtitle,
+                        latitude: loc.coordinate.latitude, longitude: loc.coordinate.longitude)
+        }
+        sem.signal()
+    }
+    _ = sem.wait(timeout: .now() + 8.0)
+    geocoder.cancelGeocode()
+    return resolved
 }
 
 // ── Subcommands ───────────────────────────────────────────────────────────────
@@ -253,6 +323,14 @@ func cmdEvents(_ args: Args) throws -> Never {
             "allDay": ev.isAllDay,
         ]
         if let loc = ev.location, !loc.isEmpty { dict["location"] = loc }
+        if let sl = ev.structuredLocation {
+            var slDict: [String: Any] = ["title": sl.title ?? ""]
+            if let geo = sl.geoLocation {
+                slDict["latitude"] = geo.coordinate.latitude
+                slDict["longitude"] = geo.coordinate.longitude
+            }
+            dict["structuredLocation"] = slDict
+        }
         if let notes = ev.notes, !notes.isEmpty { dict["notes"] = notes }
         if let url = ev.url { dict["url"] = url.absoluteString }
         if let occ = ev.occurrenceDate { dict["occurrence"] = isoFormatter.string(from: occ) }
@@ -263,14 +341,14 @@ func cmdEvents(_ args: Args) throws -> Never {
 
 func cmdEnsureCalendar(_ args: Args) throws -> Never {
     let allowed = guardWritableCalendar(try args.str("name"))
-    requireAccess()
+    requireWriteAccess()
     let (_, created) = ensureCalendar(allowed)
     emit(["calendar": allowed, "created": created])
 }
 
 func cmdCreateEvent(_ args: Args) throws -> Never {
     let allowed = guardWritableCalendar(try args.str("calendar"))
-    requireAccess()
+    requireWriteAccess()
     let title = try args.str("title")
     let startRaw = try args.str("start")
     let endRaw = try args.str("end")
@@ -287,10 +365,53 @@ func cmdCreateEvent(_ args: Args) throws -> Never {
     event.endDate = end
     event.isAllDay = isAllDay
     if let loc = args.opt("location") { event.location = loc }
+    // Apple Calendar "selected place": geocode the address and attach it as a
+    // structured location with a coordinate, so Calendar shows the place card
+    // with map, weather, and "Alert when I need to leave" — exactly as if the
+    // address had been typed and a suggestion picked in the location bar.
+    var resolvedTitle: String?
+    if let raw = args.opt("structured-location") {
+        if let sl = resolveStructuredLocation(raw) {
+            let structured = EKStructuredLocation(title: sl.title)
+            structured.geoLocation = CLLocation(latitude: sl.latitude, longitude: sl.longitude)
+            event.structuredLocation = structured
+            resolvedTitle = sl.title
+            if args.opt("location") == nil { event.location = sl.address }
+        } else {
+            // Never fail the whole event for a geocode miss — fall back to text.
+            if args.opt("location") == nil { event.location = raw.components(separatedBy: "|").last?.trimmingCharacters(in: .whitespaces) ?? raw }
+        }
+    }
     if let notes = args.opt("notes") { event.notes = notes }
     let minutes = try args.int("alarm-minutes", default: 10)
     if minutes > 0 {
         event.addAlarm(EKAlarm(relativeOffset: -Double(minutes) * 60))
+    }
+    // Recurrence: --frequency daily|weekly|monthly|yearly [--interval N] [--until yyyy-MM-dd]
+    var recurrenceDesc: String?
+    if let freqRaw = args.opt("frequency") {
+        let freq: EKRecurrenceFrequency
+        switch freqRaw.lowercased() {
+        case "daily": freq = .daily
+        case "weekly": freq = .weekly
+        case "monthly": freq = .monthly
+        case "yearly": freq = .yearly
+        default: throw CLIError(message: "unknown --frequency '\(freqRaw)' (daily|weekly|monthly|yearly)")
+        }
+        let interval = try args.int("interval", default: 1)
+        guard interval >= 1 else { throw CLIError(message: "--interval must be >= 1") }
+        var end: EKRecurrenceEnd?
+        var untilRaw: String?
+        if let u = args.opt("until") {
+            guard let until = dayFormatter.date(from: u) else {
+                throw CLIError(message: "could not parse --until (use yyyy-MM-dd)")
+            }
+            end = EKRecurrenceEnd(end: until)
+            untilRaw = u
+        }
+        let rule = EKRecurrenceRule(recurrenceWith: freq, interval: interval, end: end)
+        event.recurrenceRules = [rule]
+        recurrenceDesc = "\(freqRaw.lowercased())" + (interval > 1 ? " x\(interval)" : "") + (untilRaw != nil ? " until \(untilRaw!)" : "")
     }
     do {
         try store.save(event, span: .thisEvent, commit: true)
@@ -305,12 +426,15 @@ func cmdCreateEvent(_ args: Args) throws -> Never {
         "end": fmtDate(end, allDay: isAllDay),
         "allDay": isAllDay,
         "alarmMinutes": minutes,
+        "location": event.location ?? "",
+        "recurrence": recurrenceDesc ?? "",
+        "structuredLocation": resolvedTitle ?? "",
     ])
 }
 
 func cmdCancelEvent(_ args: Args) throws -> Never {
     let allowed = guardWritableCalendar(try args.str("calendar"))
-    requireAccess()
+    requireWriteAccess()
     let eventId = try args.str("id")
     guard let event = store.event(withIdentifier: eventId) else {
         throw CLIError(message: "no event found with id \(eventId)")
@@ -337,7 +461,10 @@ func cmdAuthStatus() -> Never {
     case .restricted: status = "restricted"
     @unknown default: status = "unknown"
     }
-    emit(["status": status, "granted": status == "fullAccess", "allowedCalendar": allowedCalendarName()])
+    emit(["status": status, "granted": status == "fullAccess", "allowedCalendar": allowedCalendarName(),
+          "hint": status == "writeOnly"
+              ? "Calendar access is 'Add Only': events can be created but not read, and the dedicated ALFRED calendar cannot be managed. Set Full Access in System Settings → Privacy & Security → Calendar."
+              : ""])
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────

@@ -400,17 +400,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
 	};
-	// ALFRED fork: hermes executes agent turns by default. The session type
-	// stays AgentSession — HermesSession subclasses it and keeps every
-	// UI/framework contract. Opt out with ALFRED_ENGINE=pi (rollback). The
-	// default lives in code, not the shell wrapper, so stale shells and
-	// hashed PATHs cannot silently revert to the pi engine.
+	// ALFRED fork: the pi engine executes agent turns by default (native
+	// pi agent loop — no Python gateway subprocess, no hermes dependency).
+	// The session type stays AgentSession either way; opt back into the
+	// hermes brain with ALFRED_ENGINE=hermes. The default lives in code,
+	// not the shell wrapper, so stale shells and hashed PATHs cannot
+	// silently revert.
 	const session =
-		process.env.ALFRED_ENGINE === "pi"
-			? new AgentSession(sessionConfig)
-			: // ALFRED fork: the hermes engine is loaded lazily so the rollback
-			  // path stays untouched (bundle splits it into its own chunk).
-			  new (await import("./hermes-session.ts")).HermesSession(sessionConfig);
+		process.env.ALFRED_ENGINE === "hermes"
+			? // hermes path stays lazily imported so the default bundle
+			  // never loads it (bundle splits it into its own chunk).
+			  new (await import("./hermes-session.ts")).HermesSession(sessionConfig)
+			: new AgentSession(sessionConfig);
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {

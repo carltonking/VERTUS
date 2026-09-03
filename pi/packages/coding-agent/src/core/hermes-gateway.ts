@@ -12,8 +12,19 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
+import { appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+/** ALFRED_GW_DEBUG=1 → append raw gateway wire traffic to /tmp/alfred-gw-debug.log */
+export function gwDebug(msg: string): void {
+	if (process.env.ALFRED_GW_DEBUG !== "1") return;
+	try {
+		appendFileSync("/tmp/alfred-gw-debug.log", `${new Date().toISOString()} ${msg}\n`);
+	} catch {
+		// diagnostics only
+	}
+}
 
 export interface HermesToolStart {
 	toolCallId: string;
@@ -32,6 +43,8 @@ export interface HermesToolEnd {
 }
 
 export interface HermesTurnResult {
+	/** Full reasoning text when the engine only reports it on message.complete (non-streaming path). */
+	reasoning?: string;
 	status: "complete" | "interrupted" | "error";
 	error?: string;
 	usage?: unknown;
@@ -39,6 +52,18 @@ export interface HermesTurnResult {
 
 export interface HermesPromptHandlers {
 	onDelta?: (delta: string) => void | Promise<void>;
+	/**
+	 * Real model reasoning tokens (hermes reasoning.delta → reasoning_callback).
+	 * Streamed per-delta during generation; render as the thinking block.
+	 */
+	onReasoningDelta?: (delta: string) => void | Promise<void>;
+	/**
+	 * KawaiiSpinner status text (hermes thinking.delta → thinking_callback,
+	 * e.g. "(◔_◔) reflecting..."). NOT model reasoning — the engine only
+	 * emits it in quiet mode as an API-call indicator. Surfaces must not
+	 * render it as thinking content.
+	 */
+	onThinkingStatus?: (text: string) => void | Promise<void>;
 	onToolStart?: (tool: HermesToolStart) => void | Promise<void>;
 	onToolEnd?: (tool: HermesToolEnd) => void | Promise<void>;
 }
@@ -137,6 +162,7 @@ export class HermesGateway {
 				resolveTurn(result);
 			};
 			this.rpc("prompt.submit", { session_id: this.sessionId, text })
+				.then(() => gwDebug(`prompt.submit acked session=${this.sessionId} chars=${text.length}`))
 				.catch((error: unknown) => {
 					this.turn = undefined;
 					clearTimeout(timer);
@@ -185,11 +211,19 @@ export class HermesGateway {
 		const proc = spawn(hermesPythonPath(), ["-u", "-m", "tui_gateway.entry"], {
 			cwd: hermesRepoPath(),
 			env: gatewayEnv(),
-			stdio: ["pipe", "pipe", "inherit"],
+			// stderr must NOT be inherited: the hermes engine logs diagnostics
+			// there (e.g. the "Copilot token exchange degraded to RAW token"
+			// warning when its token exchange is unreachable), and inherited
+			// stderr prints those straight into the pi TUI as stray lines that
+			// get wiped on the next redraw. Pipe it instead and drain it — the
+			// engine keeps its own on-disk logs (agent.log / crash log).
+			stdio: ["pipe", "pipe", "pipe"],
 		});
 		if (!proc.stdout || !proc.stdin) {
 			throw new Error("hermes gateway failed to spawn (no stdio)");
 		}
+		// Consume the child's stderr so it never blocks on a full pipe.
+		proc.stderr?.resume();
 		const rl = createInterface({ input: proc.stdout, crlfDelay: Infinity });
 		return [proc, rl];
 	}
@@ -269,11 +303,13 @@ export class HermesGateway {
 		}
 		if (msg.method === "event") {
 			const params = msg.params ?? {};
+			gwDebug(`event ${params.type} ${JSON.stringify(params.payload ?? {}).slice(0, 300)}`);
 			this.handleEvent(params.type, params.payload ?? {});
 			return;
 		}
 		if (msg.error) {
 			const message = String(msg.error.message ?? "rpc error");
+			gwDebug(`rpc-error id=${msg.id} ${message}`);
 			const holder = msg.id !== undefined ? this.pendingRpc.get(String(msg.id)) : undefined;
 			if (holder) {
 				this.pendingRpc.delete(String(msg.id));
@@ -298,6 +334,21 @@ export class HermesGateway {
 				this.ready = true;
 				for (const waiter of this.readyWaiters.splice(0)) waiter();
 				break;
+			case "thinking.delta": {
+				// KawaiiSpinner status text, not reasoning (see onThinkingStatus).
+				const text = firstText(payload?.text) ?? "";
+				if (text && this.turn) {
+					void this.turn.handlers.onThinkingStatus?.(text);
+				}
+				break;
+			}
+			case "reasoning.delta": {
+				const text = firstText(payload?.text) ?? "";
+				if (text && this.turn) {
+					void this.turn.handlers.onReasoningDelta?.(text);
+				}
+				break;
+			}
 			case "message.delta": {
 				const text = firstText(payload?.text) ?? payload?.rendered ?? "";
 				if (text && this.turn) {
@@ -339,6 +390,7 @@ export class HermesGateway {
 					status: status === "error" ? "error" : status === "interrupted" ? "interrupted" : "complete",
 					error: payload?.error ?? (status === "error" ? payload?.text : undefined),
 					usage: payload?.usage,
+					reasoning: typeof payload?.reasoning === "string" ? payload.reasoning : undefined,
 				});
 				break;
 			}

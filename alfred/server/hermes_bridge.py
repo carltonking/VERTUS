@@ -99,6 +99,51 @@ class _HermesSession:
         if errors:
             raise AgentSessionError(errors[-1])
 
+    def slash_catalog(self) -> dict:
+        """Fetch the slash-command + skill catalog (registry + skills + quick
+        commands), shaped for clients: {"commands": [{name, description}]}.
+        Mirrors what the hermes CLI's '/' menu shows."""
+        resp = self._rpccall("commands.catalog", {}, timeout=30)
+        pairs = resp.get("pairs") or []
+        commands = []
+        for pair in pairs:
+            if isinstance(pair, (list, tuple)) and pair:
+                commands.append(
+                    {
+                        "name": str(pair[0]),
+                        "description": str(pair[1]) if len(pair) > 1 else "",
+                    }
+                )
+            elif isinstance(pair, str) and pair:
+                commands.append({"name": pair, "description": ""})
+        return {"commands": commands, "skillCount": int(resp.get("skill_count") or 0)}
+
+    def expand_slash(self, name: str, arg: str) -> dict | None:
+        """Resolve a /command through the gateway's command.dispatch — the
+        same server-side expansion the hermes CLI uses for skills, bundles,
+        /learn, /init, quick commands, and aliases.
+
+        Returns the dispatch result dict ("type": send/exec/alias/skill/…)
+        or None when the gateway reports the name isn't a resolvable command
+        (the caller then submits the raw text as an ordinary prompt).
+        """
+        try:
+            resp = self._rpccall(
+                "command.dispatch",
+                {"name": name, "arg": arg, "session_id": self._session_id or ""},
+                timeout=30,
+            )
+        except AgentSessionError as exc:
+            # Not a resolvable slash command → submit the raw text as an
+            # ordinary prompt (dispatch errors with "unknown command" for
+            # registry misses and "not a quick/plugin/bundle/skill command"
+            # when nothing claimed the name).
+            lowered = str(exc).lower()
+            if "unknown command" in lowered or "not a quick" in lowered:
+                return None
+            raise
+        return resp if isinstance(resp, dict) and resp.get("type") else None
+
     def interrupt(self) -> None:
         """Abort the in-flight turn (best-effort; hub has no abort endpoint yet)."""
         with self._lock:
@@ -294,11 +339,31 @@ def create_agent_session(log=print):
         [str(VENV_PYTHON), "-u", "-c", _GATEWAY_BOOT],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
         cwd=str(FORK_REPO),
         env={**os.environ},
     )
+
+    # The hermes engine writes diagnostics to stderr (e.g. the Copilot
+    # token-exchange "degraded to RAW token" warning at session create).
+    # Never let that leak onto a client's terminal/UI: pipe it and drain it
+    # into the hub's own log instead. The engine persists its diagnostics
+    # on disk too (agent.log / crash log), so nothing is lost if the hub
+    # discards log output.
+    def _drain_gateway_stderr() -> None:
+        try:
+            if proc.stderr is None:
+                return
+            for raw in proc.stderr:
+                line = raw.rstrip()
+                if line:
+                    log(line)
+        except Exception:
+            pass
+
+    threading.Thread(target=_drain_gateway_stderr, daemon=True).start()
     session = _HermesSession(proc, log)
     if not session._ready.wait(READY_TIMEOUT_S):
         proc.kill()

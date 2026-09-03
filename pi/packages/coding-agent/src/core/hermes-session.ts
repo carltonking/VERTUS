@@ -10,13 +10,13 @@
  * persistence, extensions (including the ALFRED header/theme), footer stats,
  * and all rendering behave exactly as before.
  *
- * Enabled with ALFRED_ENGINE=hermes (see sdk.ts).
+ * Opt in with ALFRED_ENGINE=hermes (see sdk.ts) — the pi engine is the default.
  */
 
 import { contentText } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { AgentSession, type AgentSessionConfig } from "./agent-session.ts";
-import { HermesGateway, type HermesTurnResult } from "./hermes-gateway.ts";
+import { HermesGateway, gwDebug, type HermesTurnResult } from "./hermes-gateway.ts";
 
 type StreamingAssistantMessage = Omit<AgentMessage, "content"> & {
 	role: "assistant";
@@ -36,17 +36,33 @@ function tryContentText(content: any): string {
 }
 
 function mapUsage(usage: any): any {
-	const input = Number(usage?.input ?? usage?.prompt_tokens ?? 0) || 0;
-	const output = Number(usage?.output ?? usage?.completion_tokens ?? 0) || 0;
+	const input = Number(usage?.input ?? usage?.prompt ?? usage?.prompt_tokens ?? 0) || 0;
+	const output = Number(usage?.output ?? usage?.completion ?? usage?.completion_tokens ?? 0) || 0;
 	const cacheRead = Number(usage?.cacheRead ?? usage?.cache_read ?? usage?.cached_tokens ?? 0) || 0;
 	const cacheWrite = Number(usage?.cacheWrite ?? usage?.cache_write ?? 0) || 0;
+	// pi's Usage type needs cost as {input,output,cacheRead,cacheWrite,total};
+	// hermes reports a flat cost number (or none at all).
+	const cost = Number(usage?.cost?.total ?? usage?.cost ?? usage?.total_cost ?? 0) || 0;
 	return {
 		input,
 		output,
 		cacheRead,
 		cacheWrite,
-		total: Number(usage?.total ?? input + output) || 0,
-		cost: Number(usage?.cost ?? usage?.total_cost ?? 0) || 0,
+		totalTokens: Number(usage?.totalTokens ?? usage?.total ?? input + output) || 0,
+		cost: { input: cost, output: cost, cacheRead: 0, cacheWrite: 0, total: cost },
+	};
+}
+
+/** Complete zeroed Usage — attached to error turns so the footer/usage
+ *  accounting never dereferences a missing usage object. */
+function zeroUsage(): any {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 }
 
@@ -96,7 +112,10 @@ export class HermesSession extends AgentSession {
 	override async abort(): Promise<void> {
 		this.abortRetry();
 		try {
-			await this.gatewaySafe().interrupt();
+			// Optional chaining: abort must never SPAWN a gateway (the
+			// gatewaySafe() getter lazily creates one). No gateway = nothing
+			// to interrupt.
+			await this.gateway?.interrupt();
 		} catch {
 			// best-effort
 		}
@@ -179,10 +198,12 @@ export class HermesSession extends AgentSession {
 					type: "agent_end",
 					messages: this.agent.state.messages.slice(),
 				});
+				gwDebug("bridge agent_end emitted");
 			} catch {
 				// best-effort
 			}
 			await anyThis._emitAgentSettled();
+			gwDebug("bridge agent_settled emitted");
 		}
 	}
 
@@ -215,10 +236,17 @@ export class HermesSession extends AgentSession {
 		await anyThis._handleAgentEvent({ type: "message_start", message: assistant as unknown as AgentMessage });
 
 		let accumulated = "";
+		// Real model reasoning streams into the thinking content block so the
+		// TUI renders it like native pi thinking (collapsible, italic).
+		let reasoningAccumulated = "";
+		// KawaiiSpinner status text ("(◔_◔) reflecting...") is NOT reasoning —
+		// never render it as content. Keep the latest string for debug only.
+		let thinkingStatus = "";
 		let result: HermesTurnResult;
 		try {
 			result = await this.gatewaySafe().prompt(originalText, {
 					onDelta: async (delta) => {
+						gwDebug(`bridge onDelta +${delta.length} total=${accumulated.length + delta.length}`);
 						accumulated += delta;
 						assistant.content = [{ type: "text", text: accumulated }];
 						await anyThis._handleAgentEvent({
@@ -227,6 +255,22 @@ export class HermesSession extends AgentSession {
 							assistantMessageEvent: { type: "text_delta", delta, isReasoning: false },
 							timestamp: Date.now(),
 						});
+					},
+					onReasoningDelta: async (delta) => {
+						gwDebug(`bridge onReasoningDelta +${delta.length} total=${reasoningAccumulated.length + delta.length}`);
+						reasoningAccumulated += delta;
+						assistant.content = [{ type: "thinking", thinking: reasoningAccumulated }, { type: "text", text: accumulated }];
+						await anyThis._handleAgentEvent({
+							type: "message_update",
+							message: assistant as unknown as AgentMessage,
+							assistantMessageEvent: { type: "thinking_delta", delta, contentIndex: 0 },
+							timestamp: Date.now(),
+						});
+					},
+					onThinkingStatus: async (text) => {
+						// KawaiiSpinner status text is never rendered as content.
+						thinkingStatus = text;
+						gwDebug(`bridge thinkingStatus ${JSON.stringify(text)}`);
 					},
 					onToolStart: async (tool) => {
 						assistant.content = [...assistant.content, {
@@ -293,15 +337,27 @@ export class HermesSession extends AgentSession {
 		if (result.error) {
 			assistant.errorMessage = result.error;
 		}
-		if (result.usage) {
-			assistant.usage = mapUsage(result.usage);
+		// Always attach a complete Usage object: pi's footer and stats sum
+		// assistant message usage, and an absent object crashes the TUI render
+		// loop (frozen "Working..." screen after an error turn).
+		assistant.usage = mapUsage(result.usage ?? {});
+		// Non-streaming providers only report reasoning on the terminal frame:
+		// if the stream delivered none, adopt the message.complete reasoning so
+		// the thinking block still renders. KawaiiSpinner status text is never
+		// persisted as thinking content.
+		const finalReasoning = reasoningAccumulated || (result.reasoning ?? "");
+		if (finalReasoning) {
+			assistant.content = [{ type: "thinking", thinking: finalReasoning }, ...assistant.content.filter((p: any) => p.type !== "thinking")];
 		}
+		gwDebug(`bridge turn settled status=${result.status} textLen=${accumulated.length} reasoningLen=${reasoningAccumulated.length} finalReasoningLen=${finalReasoning.length} spinnerStatus=${JSON.stringify(thinkingStatus)}`);
 		await anyThis._handleAgentEvent({ type: "message_end", message: assistant as unknown as AgentMessage });
+		gwDebug("bridge message_end emitted");
 		await anyThis._handleAgentEvent({
 			type: "turn_end",
 			message: assistant as unknown as AgentMessage,
 			toolResults: [],
 		});
+		gwDebug("bridge turn_end emitted");
 	}
 }
 
