@@ -21,6 +21,20 @@ Properties:
     manager-level lock anywhere near the prompt path.
   - No hermes/gateway knowledge: the factory callable builds the bridge for
     an agent id (the hub passes AgentBridge; tests pass fakes).
+  - Introspection without side effects: ``status(agent_id)`` reports the
+    bridge's live state (or a never-built idle payload) WITHOUT creating a
+    bridge — the hub's GET /api/agents/<id>/status endpoint never
+    instantiates an engine as a side effect.
+  - Deletion support: ``drop(agent_id)`` pops + closes a live bridge so a
+    hub DELETE can tear an agent down without racing the worker.
+
+Lock discipline (Step C) — this module participates in a documented global
+order; see the module docstring of vertus_server.py for the full rules.
+In short: the ONLY nested acquisition in the system is
+SessionManager._lock → AgentRegistry._lock (inside get_or_create_session's
+factory), and AgentRegistry never takes this lock, so no cycle exists.
+Engine calls (bridge close/spawn/prompt) never happen while the map lock is
+held — drop() pops under the lock, then closes outside it.
 
 No network calls, no secrets. Prompt 3 will point each session's tools at
 the agent's sandbox/ directory; this module only isolates sessions.
@@ -75,14 +89,53 @@ class SessionManager:
         with self._lock:
             bridge = self._sessions.get(agent_id)
             if bridge is None:  # re-check: another thread may have won
+                # Re-validate UNDER the map lock. A concurrent hub DELETE
+                # removes the registry entry and THEN drops the map entry;
+                # without this second check a prompt that validated just
+                # before the delete could resurrect a zombie bridge for an
+                # agent that no longer exists.
+                self.registry.get_agent(agent_id)
                 bridge = self._factory(agent_id)
                 self._sessions[agent_id] = bridge
             return bridge
 
     def has_session(self, agent_id: str) -> bool:
         """True when a bridge already exists for this agent (no creation)."""
+        agent_id = str(agent_id or DEFAULT_AGENT_ID).strip() or DEFAULT_AGENT_ID
         with self._lock:
             return agent_id in self._sessions
+
+    def status(self, agent_id: str) -> dict:
+        """Live turn state for an agent WITHOUT creating a bridge.
+
+        An agent that has never been prompted/streamed has no bridge; it
+        reports the canonical idle payload so callers (the hub's DELETE
+        guard, GET /status) never instantiate an engine as a side effect.
+        """
+        agent_id = str(agent_id or DEFAULT_AGENT_ID).strip() or DEFAULT_AGENT_ID
+        with self._lock:
+            bridge = self._sessions.get(agent_id)
+        if bridge is None:
+            return {
+                "state": "idle",
+                "queue_depth": 0,
+                "turn_started_at": None,
+                "gateway_alive": False,
+            }
+        return bridge.status()
+
+    def drop(self, agent_id: str) -> bool:
+        """Close and forget an agent's live bridge, if any.
+
+        Pops the bridge under the map lock, then closes it OUTSIDE the lock
+        (closing talks to the engine). Returns True when a bridge existed.
+        """
+        agent_id = str(agent_id or DEFAULT_AGENT_ID).strip() or DEFAULT_AGENT_ID
+        with self._lock:
+            bridge = self._sessions.pop(agent_id, None)
+        if bridge is not None:
+            bridge.close()  # engine call; never under the map lock
+        return bridge is not None
 
     def live_ids(self) -> list[str]:
         """Agent ids that currently hold a session (primary always included)."""

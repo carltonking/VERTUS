@@ -42,6 +42,18 @@ deleted (ValueError). Deleting the primary agent reassigns primary status to
 the oldest remaining agent (by created_at, then id) rather than recreating a
 fresh empty "primary" while other agents still exist.
 
+Deletion is destructive by default (``delete_agent``); the hub's DELETE
+endpoint passes ``archive=True``, which MOVES the agent directory to
+``<root>/.trash/<id>-<timestamp>/`` instead of destroying it (a tombstone
+with profile.json intact). The trash root is excluded from every scan.
+
+Agent creation accepts the full v2 editable field set (see
+``create_agent(name, **fields)``); validation of those fields is shared with
+``update_agent`` via ``_validate_fields``. ``create_agent``'s id scheme:
+``_slugify(name)`` (lowercase [a-z0-9-]) with a deterministic short uuid
+suffix only when the slug is already taken — never a random id on first
+try, so "create Scout" yields "scout" unless "scout" exists.
+
 No network calls, no secrets of its own: this is local, on-disk state. The
 storage root defaults to ~/.vertus/agents and can be overridden with the
 VERTUS_AGENTS_DIR environment variable (used by tests and smoke runs).
@@ -182,15 +194,23 @@ class AgentRegistry:
         with self._lock:
             return self._ensure_primary_locked()
 
-    def create_agent(self, name: str) -> dict:
-        """Create an agent (profile + sandbox + engine home + memory) and return it."""
+    def create_agent(self, name: str, **fields) -> dict:
+        """Create an agent (profile + sandbox + engine home + memory) and return it.
+
+        ``fields`` are optional v2 editable profile fields (title,
+        description, persona, model, provider, color, emoji, autonomy) —
+        validated exactly like ``update_agent``'s (unknown key → TypeError,
+        bad autonomy → ValueError), applied before the derived home tree is
+        materialized so config.yaml/SOUL.md reflect them from the start.
+        """
         name = str(name).strip()
         if not name:
             raise ValueError("agent name must be non-empty")
+        self._validate_fields(fields)
         with self._lock:
             self.root.mkdir(parents=True, exist_ok=True)
             agent_id = self._fresh_id(_slugify(name))
-            return self._create_locked(agent_id, name)
+            return self._create_locked(agent_id, name, fields)
 
     def list_agents(self) -> list[dict]:
         """All agents sorted oldest-first, each dict carrying is_primary."""
@@ -219,26 +239,36 @@ class AgentRegistry:
 
         Only fields in EDITABLE_FIELDS are accepted (TypeError otherwise, so a
         typo'd field can never silently no-op). ``autonomy`` is validated.
-        ``model``/``provider`` set to None mean "inherit the fleet default".
+        ``model``/``provider``/``color``/``emoji`` set to None mean "unset"
+        (model/provider → inherit the fleet default); None on the free-form
+        text fields (title/description/persona) clears them to "".
         """
-        unknown = set(fields) - set(EDITABLE_FIELDS)
-        if unknown:
-            raise TypeError(f"unknown profile field(s): {', '.join(sorted(unknown))}")
-        if "autonomy" in fields and fields["autonomy"] not in AUTONOMY_VALUES:
-            raise ValueError(f"autonomy must be one of {AUTONOMY_VALUES}")
+        self._validate_fields(fields)
         with self._lock:
             agent_id = self._validated_id(agent_id)
             agent = self._load(agent_id)
             for key, value in fields.items():
-                if value is None and key in ("model", "provider", "color", "emoji"):
-                    agent[key] = None
+                if value is None:
+                    # null clears: identity fields → None, text fields → ""
+                    agent[key] = None if key in ("model", "provider", "color", "emoji") else ""
+                elif key in ("model", "provider"):
+                    agent[key] = value
                 else:
-                    agent[key] = str(value) if key != "model" and key != "provider" else value
+                    agent[key] = str(value)
             agent["updated_at"] = _utc_now_iso()
             self._write_profile(agent_id, agent)
             self._materialize_home_locked(agent_id, agent)
         agent["is_primary"] = agent_id == self._read_marker()
         return agent
+
+    @staticmethod
+    def _validate_fields(fields: dict) -> None:
+        """Shared schema guard for create_agent/update_agent field dicts."""
+        unknown = set(fields) - set(EDITABLE_FIELDS)
+        if unknown:
+            raise TypeError(f"unknown profile field(s): {', '.join(sorted(unknown))}")
+        if "autonomy" in fields and fields["autonomy"] not in AUTONOMY_VALUES:
+            raise ValueError(f"autonomy must be one of {AUTONOMY_VALUES}")
 
     def rename_agent(self, agent_id: str, name: str) -> dict:
         """Update the display name; id, directory, sandbox, and home are kept."""
@@ -254,12 +284,16 @@ class AgentRegistry:
         agent["is_primary"] = agent_id == self._read_marker()
         return agent
 
-    def delete_agent(self, agent_id: str) -> None:
-        """Delete an agent directory (profile + sandbox + home + memory).
+    def delete_agent(self, agent_id: str, *, archive: bool = False) -> str | None:
+        """Delete an agent directory; returns the trash path when archiving.
 
         Refuses to delete the last remaining agent (ValueError). Deleting
         the primary reassigns primary status to the oldest remaining agent
-        (see module docstring for the policy rationale).
+        (see module docstring for the policy rationale). With
+        ``archive=True`` the directory is MOVED (not destroyed) to
+        ``<root>/.trash/<id>-<timestamp>/`` — the hub's DELETE endpoint uses
+        this so nothing is ever lost; the registry then no longer lists the
+        agent and ``get_agent`` raises KeyError for it.
         """
         with self._lock:
             agent_id = self._validated_id(agent_id)
@@ -268,12 +302,26 @@ class AgentRegistry:
                 raise KeyError(agent_id)
             if len(ids) <= 1:
                 raise ValueError("cannot delete the last remaining agent")
-            shutil.rmtree(self.root / agent_id)
+            if archive:
+                trash_root = self.root / ".trash"
+                trash_root.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                dest = trash_root / f"{agent_id}-{stamp}"
+                suffix = 1
+                while dest.exists():  # two deletes of the same id in one second
+                    dest = trash_root / f"{agent_id}-{stamp}-{suffix}"
+                    suffix += 1
+                shutil.move(str(self.root / agent_id), str(dest))
+                archived = str(dest)
+            else:
+                shutil.rmtree(self.root / agent_id)
+                archived = None
             if self._read_marker() == agent_id:
                 oldest = sorted(
                     (self._load(aid)["created_at"], aid) for aid in ids if aid != agent_id
                 )[0][1]
                 self._write_marker(oldest)
+            return archived
 
     def agent_home(self, agent_id: str) -> Path:
         """The agent's engine config root (HERMES_HOME for its gateway)."""
@@ -403,7 +451,8 @@ class AgentRegistry:
         agent["is_primary"] = True
         return agent
 
-    def _create_locked(self, agent_id: str, name: str) -> dict:
+    def _create_locked(self, agent_id: str, name: str, fields: dict | None = None) -> dict:
+        fields = fields or {}
         agent_dir = self.root / agent_id
         sandbox = agent_dir / "sandbox"
         sandbox.mkdir(parents=True, exist_ok=True)
@@ -424,6 +473,16 @@ class AgentRegistry:
             "home_path": str(agent_dir / "home"),
             "schema_version": SCHEMA_VERSION,
         }
+        # Overlay validated create fields onto the defaults BEFORE the first
+        # materialization so the derived tree is born correct. Null text
+        # fields keep their defaults (title falls back to the name).
+        for key, value in fields.items():
+            if value is None:
+                continue
+            if key in ("model", "provider"):
+                profile[key] = value
+            else:
+                profile[key] = str(value)
         self._write_profile(agent_id, profile)
         self._materialize_home_locked(agent_id, profile)
         self.agent_memory_dir(agent_id).mkdir(parents=True, exist_ok=True)

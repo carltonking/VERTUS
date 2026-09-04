@@ -6,6 +6,28 @@ a bearer token from ~/.vertus/token.
 
 Run:  python vertus/server/vertus_server.py serve
       VERTUS_HOST=100.x.y.z VERTUS_PORT=8787 python vertus/server/vertus_server.py serve
+
+Lock discipline (Step C)
+------------------------
+Three lock domains exist: SessionManager._lock (the agent→bridge map),
+AgentRegistry._lock (profiles + the on-disk tree), and each bridge's
+AgentBridge._status_lock (pure in-memory turn state). Rules:
+
+  1. No code path ever holds two domains at once EXCEPT the documented
+     SessionManager._lock → AgentRegistry._lock nesting inside
+     get_or_create_session (its factory resolves cwds/identity from the
+     registry). AgentRegistry never takes the manager lock and bridges never
+     take either, so this nesting cannot deadlock.
+  2. Never call into a bridge or engine session (prompt/close/spawn/status)
+     while holding the manager or registry lock. Bridge locks guard only
+     in-memory flags; engine calls happen on the worker thread or after the
+     manager lock is released (SessionManager.drop).
+  3. Never do filesystem work while holding the manager lock. All profile /
+     home / trash mutation happens under the registry lock, inside registry
+     methods, and never while another lock is held.
+  4. Handlers that touch both stores (PATCH / DELETE below) acquire them
+     SEQUENTIALLY — registry first, manager second — so a concurrent
+     PATCH/DELETE/prompt can never deadlock and never observes a torn state.
 """
 
 from __future__ import annotations
@@ -32,15 +54,24 @@ from urllib.parse import parse_qs, urlsplit
 # Script-dir import (python3 vertus/server/vertus_server.py) keeps this plain;
 # fall back to a package-relative import for `python -m vertus.server.vertus_server`.
 try:
-    from agent_registry import AgentRegistry  # type: ignore
+    from agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
     from session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 except ImportError:  # pragma: no cover - only hit under package invocation
-    from .agent_registry import AgentRegistry  # type: ignore
+    from .agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
     from .session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 
 VERTUS_DIR = Path.home() / ".vertus"
 TOKEN_FILE = VERTUS_DIR / "token"
 DEFAULT_PORT = 8787
+
+# HTTP/API policy limits (the registry itself stays permissive; these are
+# request-body guards). One persona is typically 1–2k characters; 20k is
+# generous headroom while bounding what a client can stuff into SOUL.md.
+PERSONA_MAX_CHARS = 20_000
+
+# Free-form text fields treat null as "clear to empty" on PATCH; identity
+# fields (model/provider/color/emoji) treat null as "unset → inherit".
+_TEXT_FIELDS = ("title", "description", "persona")
 
 
 def ensure_token() -> str:
@@ -115,6 +146,14 @@ class AgentBridge:
         self._queue: Queue = Queue()
         self._create_session = create_session_factory
         self._session = None
+        # Step A: in-flight turn introspection. _status_lock guards ONLY these
+        # in-memory flags (never engine calls, never other locks — see the
+        # module docstring's lock discipline).
+        self._status_lock = threading.Lock()
+        self._running = False
+        self._turn_started_at: float | None = None
+        self._stale = False      # a profile PATCH happened; respawn on next turn
+        self._closed = False     # close() called; no new turns may start
         self._worker = Thread(target=self._run_worker, daemon=True)
         self._worker.start()
 
@@ -178,7 +217,23 @@ class AgentBridge:
             if self._create_session is None:
                 self._emit({"type": "error", "message": "agent SDK not available"})
                 continue
-            self._run_prompt_with_respawn(text, remote=remote)
+            # Stale profile config (a PATCH happened since the last turn) is
+            # consumed BETWEEN turns: the old gateway finishes any in-flight
+            # turn undisturbed; the NEXT spawn uses the new kwargs. The
+            # running marker wraps the whole turn INCLUDING the respawn retry
+            # path — a turn being retried is still "running".
+            self._consume_stale()
+            with self._status_lock:
+                if self._closed:
+                    break
+                self._running = True
+                self._turn_started_at = time.monotonic()
+            try:
+                self._run_prompt_with_respawn(text, remote=remote)
+            finally:
+                with self._status_lock:
+                    self._running = False
+                    self._turn_started_at = None
 
     def _spawn_session(self, remote: bool):
         """Create one engine session with this agent's identity + spawn-mode env.
@@ -216,7 +271,8 @@ class AgentBridge:
             # starts in $HOME or the repo root and no re-creation happens on
             # first prompt. Prewarm is always local-mode (approvals default).
             result = self._spawn_session(remote=False)
-            self._session = result["session"]
+            if not self._adopt_session(result["session"]):
+                return  # closed mid-spawn; the session was shut down
             self._session.subscribe(self._on_pi_event)
             print(
                 f"[vertus] agent {self.agent_id} session prewarmed (cwd: {self.cwd})",
@@ -304,7 +360,8 @@ class AgentBridge:
             if self._session is None:
                 try:
                     result = self._spawn_session(remote)
-                    self._session = result["session"]
+                    if not self._adopt_session(result["session"]):
+                        return  # bridge was closed while spawning (DELETE)
                     self._session.subscribe(self._on_pi_event)
                 except Exception as exc:
                     if _attempt == 0 and (
@@ -417,7 +474,115 @@ class AgentBridge:
             return {"commands": [], "skillCount": 0, "error": str(exc)[:200]}
 
     def prompt(self, text: str, remote: bool) -> None:
+        """Queue one turn. Raises RuntimeError after close() (hub → 409)."""
+        with self._status_lock:
+            if self._closed:
+                raise RuntimeError(f"agent {self.agent_id} is closed")
         self._queue.put((text, remote))
+
+    # ------------------------------------------------------------------
+    # Step A: turn introspection + lifecycle (reconfigure / close)
+    # ------------------------------------------------------------------
+
+    def status(self) -> dict:
+        """Live turn state: idle | running | queued, plus queue/gateway health.
+
+        ``gateway_alive`` is False when no engine session exists yet (agent
+        never prompted, or the last spawn failed) or the current session
+        reports itself dead. Pure read — no engine call, no side effect.
+        """
+        with self._status_lock:
+            running = self._running
+            started = self._turn_started_at
+            closed = self._closed
+        session = self._session
+        gateway_alive = (
+            not closed
+            and session is not None
+            and not bool(getattr(session, "is_dead", False))
+        )
+        depth = self._queue.qsize()
+        state = "running" if running else ("queued" if depth else "idle")
+        return {
+            "state": state,
+            "queue_depth": depth,
+            "turn_started_at": started,
+            "gateway_alive": gateway_alive,
+        }
+
+    def reconfigure(self, session_kwargs: dict) -> None:
+        """Apply new identity kwargs after a profile PATCH.
+
+        Marks the bridge stale so the NEXT turn closes the current gateway
+        and respawns with the new config; an in-flight turn keeps running on
+        the old gateway to completion. Two PATCHes before the next turn
+        coalesce into a single respawn (stale is a boolean).
+        """
+        with self._status_lock:
+            if self._closed:
+                return
+            self._session_kwargs = dict(session_kwargs or {})
+            self._stale = True
+
+    def close(self) -> None:
+        """Stop the bridge: drain queued turns, close the engine session, exit.
+
+        Safe on an idle bridge (the hub DELETE path — a running bridge is
+        refused with 409 upstream). Engine close happens outside the status
+        lock; the worker exits on the None sentinel.
+        """
+        with self._status_lock:
+            if self._closed:
+                return
+            self._closed = True
+        # Drain anything queued so no turn runs after close (DELETE refused
+        # busy bridges, but a prompt can race in between the check and here).
+        while True:
+            try:
+                self._queue.get_nowait()
+            except Empty:
+                break
+        session = self._session
+        self._session = None
+        if session is not None:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001 — close is best-effort
+                pass
+        self._queue.put(None)
+
+    def _consume_stale(self) -> None:
+        """Drop the current engine session when a PATCH marked it stale."""
+        with self._status_lock:
+            stale = self._stale
+            if stale:
+                self._stale = False
+        if not stale:
+            return
+        session = self._session
+        self._session = None
+        if session is not None:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001 — close is best-effort
+                pass
+
+    def _adopt_session(self, session) -> bool:
+        """Store a freshly spawned engine session unless the bridge was closed
+        in the meantime (a DELETE raced the spawn) — then close it instead."""
+        with self._status_lock:
+            if self._closed:
+                closed = True
+            else:
+                self._session = session
+                closed = False
+        if closed:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+        return True
 
 
 class VertusHandler(BaseHTTPRequestHandler):
@@ -452,7 +617,13 @@ class VertusHandler(BaseHTTPRequestHandler):
         elif path == "/api/agents":
             self._handle_agents_list()
         elif path.startswith("/api/agents/"):
-            self._handle_agent_get(path[len("/api/agents/"):].strip("/"))
+            rest = path[len("/api/agents/"):].strip("/")
+            if not rest:
+                self._json(404, {"error": "not found"})
+            elif rest.endswith("/status"):
+                self._handle_agent_status(rest[: -len("/status")])
+            else:
+                self._handle_agent_get(rest)
         elif path == "/api/events":
             self._sse(self._query_param("agent_id"))
         else:
@@ -462,11 +633,8 @@ class VertusHandler(BaseHTTPRequestHandler):
         if not self._authed():
             self._json(401, {"error": "unauthorized"})
             return
-        length = int(self.headers.get("Content-Length", 0))
-        try:
-            payload = json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
-            self._json(400, {"error": "invalid json"})
+        payload = self._read_body()
+        if payload is None:
             return
         route = urlsplit(self.path).path
         if route == "/api/prompt":
@@ -481,6 +649,9 @@ class VertusHandler(BaseHTTPRequestHandler):
             except KeyError:
                 self._json(404, {"error": f"agent not found: {agent_id}"})
                 return
+            except RuntimeError as exc:  # bridge closed mid-DELETE
+                self._json(409, {"error": str(exc)[:200]})
+                return
             sandbox_path = ""
             try:
                 sandbox_path = resolve_sandbox_cwd(self.registry, agent_id)
@@ -488,16 +659,134 @@ class VertusHandler(BaseHTTPRequestHandler):
                 pass
             self._json(202, {"accepted": True, "agent_id": agent_id, "sandbox_path": sandbox_path})
         elif route == "/api/agents":
-            name = str(payload.get("name", "")).strip()
-            if not name:
-                self._json(400, {"error": "name required"})
+            raw_name = payload.get("name")
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                self._json(400, {"error": "name required (non-empty string)"})
                 return
             try:
-                self._json(201, self.registry.create_agent(name))
-            except Exception as exc:  # noqa: BLE001
-                self._json(500, {"error": str(exc)[:200]})
+                fields = _validate_profile_payload(payload, allow_name=True)
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
+                return
+            try:
+                self._json(201, self.registry.create_agent(raw_name.strip(), **fields))
+            except (TypeError, ValueError) as exc:  # registry backstop
+                self._json(400, {"error": str(exc)[:200]})
         else:
             self._json(404, {"error": "not found"})
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        """PATCH /api/agents/<id> — partial profile update (v2 editable fields)."""
+        if not self._authed():
+            self._json(401, {"error": "unauthorized"})
+            return
+        agent_id = self._agent_route_id()
+        if agent_id is None:
+            self._json(404, {"error": "not found"})
+            return
+        payload = self._read_body()
+        if payload is None:
+            return
+        if "name" in payload:
+            self._json(
+                400,
+                {"error": f"name is not editable via PATCH; allowed: {', '.join(EDITABLE_FIELDS)}"},
+            )
+            return
+        try:
+            fields = _validate_profile_payload(payload, allow_name=False)
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        if not fields:
+            # PATCH {} — a no-op read of current state; nothing is respawned.
+            try:
+                updated = self.registry.get_agent(agent_id)
+            except KeyError:
+                self._json(404, {"error": f"agent not found: {agent_id}"})
+                return
+            self._json(200, {**updated, "respawn_pending": False})
+            return
+        try:
+            updated = self.registry.update_agent(agent_id, **fields)
+        except KeyError:
+            self._json(404, {"error": f"agent not found: {agent_id}"})
+            return
+        except (TypeError, ValueError) as exc:  # registry backstop
+            self._json(400, {"error": str(exc)[:200]})
+            return
+        # A live bridge must respawn with the new config on its NEXT turn; an
+        # in-flight turn keeps running on the old gateway to completion. The
+        # update is deferred, never blocked — reconfigure() only flags state.
+        respawn_pending = False
+        if self.sessions.has_session(agent_id):
+            try:
+                bridge = self.sessions.get_or_create_session(agent_id)  # exists: no creation
+                bridge.reconfigure(resolve_session_kwargs(self.registry, agent_id))
+                respawn_pending = True
+            except KeyError:
+                respawn_pending = False  # agent deleted concurrently — nothing to respawn
+        self._json(200, {**updated, "respawn_pending": respawn_pending})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        """DELETE /api/agents/<id> — archive + tear down, or 409 when busy."""
+        if not self._authed():
+            self._json(401, {"error": "unauthorized"})
+            return
+        agent_id = self._agent_route_id()
+        if agent_id is None:
+            self._json(404, {"error": "not found"})
+            return
+        try:
+            agent = self.registry.get_agent(agent_id)
+        except KeyError:
+            self._json(404, {"error": f"agent not found: {agent_id}"})
+            return
+        if agent.get("is_primary"):
+            self._json(409, {"error": "cannot delete the primary agent"})
+            return
+        st = self.sessions.status(agent_id)
+        if st["state"] == "running" or st["queue_depth"] > 0:
+            self._json(
+                409,
+                {"error": f"agent {agent_id} is busy (state={st['state']}, "
+                          f"queue_depth={st['queue_depth']})"},
+            )
+            return
+        try:
+            archived = self.registry.delete_agent(agent_id, archive=True)
+        except ValueError as exc:  # last remaining agent (shouldn't happen: primary guard)
+            self._json(409, {"error": str(exc)[:200]})
+            return
+        # Drop AFTER the registry delete so no racing prompt can resurrect a
+        # bridge for a registry entry that no longer exists (see
+        # SessionManager.get_or_create_session's re-validation).
+        self.sessions.drop(agent_id)
+        self._json(200, {"deleted": agent_id, "archived_to": archived})
+
+    def _agent_route_id(self) -> str | None:
+        """The <id> from /api/agents/<id>; None when the path isn't exactly that."""
+        prefix = "/api/agents/"
+        path = urlsplit(self.path).path
+        if not path.startswith(prefix):
+            return None
+        agent_id = path[len(prefix):].strip("/")
+        if not agent_id or "/" in agent_id:  # sub-resources (e.g. .../status) excluded
+            return None
+        return agent_id
+
+    def _read_body(self) -> dict | None:
+        """Parse the request body as a JSON object; 400 + None on failure."""
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            self._json(400, {"error": "invalid json"})
+            return None
+        if not isinstance(payload, dict):
+            self._json(400, {"error": "body must be a JSON object"})
+            return None
+        return payload
 
     def _query_param(self, name: str) -> str:
         return (parse_qs(urlsplit(self.path).query).get(name) or [""])[0]
@@ -522,6 +811,22 @@ class VertusHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             self._json(500, {"error": str(exc)[:200]})
 
+    def _handle_agent_status(self, agent_id: str) -> None:
+        """GET /api/agents/<id>/status — live turn state.
+
+        Deliberately no bridge side effect: existence is gated through the
+        registry and turn state comes from SessionManager.status(), which
+        reports the idle payload for agents that have never run.
+        """
+        if not agent_id:
+            self._json(404, {"error": "not found"})
+            return
+        try:
+            self.registry.get_agent(agent_id)  # KeyError → 404
+        except KeyError:
+            self._json(404, {"error": "agent not found"})
+            return
+        self._json(200, self.sessions.status(agent_id))
     def _sse(self, agent_id: str = DEFAULT_AGENT_ID) -> None:
         try:
             bridge = self.sessions.get_or_create_session(agent_id or DEFAULT_AGENT_ID)
@@ -551,6 +856,44 @@ class VertusHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args) -> None:
         pass
+
+
+def _validate_profile_payload(payload: dict, *, allow_name: bool) -> dict:
+    """Validate a POST/PATCH agent body against the v2 editable schema.
+
+    Returns the registry field dict (``name`` is handled by the caller).
+    Raises ValueError with a client-facing message for any 400 condition:
+    unknown keys, non-string values, bad autonomy, persona over the
+    PERSONA_MAX_CHARS cap. The registry itself stays permissive — this is
+    the HTTP guard, the only path clients can reach.
+    """
+    allowed = set(EDITABLE_FIELDS) | ({"name"} if allow_name else set())
+    unknown = set(payload) - allowed
+    if unknown:
+        raise ValueError(f"unknown field(s): {', '.join(sorted(unknown))}")
+    fields: dict = {}
+    for key in EDITABLE_FIELDS:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if key == "autonomy":
+            if value not in AUTONOMY_VALUES:
+                raise ValueError(f"autonomy must be one of {AUTONOMY_VALUES}")
+            fields[key] = value
+            continue
+        if isinstance(value, bool) or (value is not None and not isinstance(value, str)):
+            raise ValueError(f"{key} must be a string or null")
+        if value is None:
+            # null clears: text fields → "", identity fields → None (inherit)
+            fields[key] = "" if key in _TEXT_FIELDS else None
+        elif key in ("model", "provider") and value == "":
+            fields[key] = None  # empty string means "no override", like null
+        else:
+            fields[key] = value
+    persona = fields.get("persona")
+    if isinstance(persona, str) and len(persona) > PERSONA_MAX_CHARS:
+        raise ValueError(f"persona exceeds {PERSONA_MAX_CHARS} characters")
+    return fields
 
 
 def resolve_sandbox_cwd(registry: AgentRegistry, agent_id: str) -> str:
