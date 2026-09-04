@@ -331,10 +331,25 @@ class _HermesSession:
                 pass
 
 
-def create_agent_session(log=print):
-    """Start the hermes stdio gateway and wait until a session is ready."""
+def create_agent_session(log=print, cwd: str | None = None):
+    """Start the hermes stdio gateway and wait until a session is ready.
+
+    ``cwd`` sets the session workspace the hermes agent runs its tools in
+    (shell cwd, file tools, git probe). It is sent as the explicit ``cwd``
+    param of the gateway's ``session.create`` RPC — the gateway validates it
+    and persists it as the session's workspace. When omitted, the gateway
+    falls back to config ``terminal.cwd`` → ``TERMINAL_CWD`` → process cwd.
+
+    VERTUS hub invariant: each agent's session is created with that agent's
+    sandbox directory as cwd, never ``$HOME`` or the repo root (the hub
+    resolves and creates the directory before calling this).
+    """
     if not VENV_PYTHON.exists():
         raise AgentSessionError(f"hermes venv python not found: {VENV_PYTHON}")
+    if cwd:
+        c = Path(cwd).expanduser()
+        c.mkdir(parents=True, exist_ok=True)
+        cwd = str(c.resolve())
     proc = subprocess.Popen(
         [str(VENV_PYTHON), "-u", "-c", _GATEWAY_BOOT],
         stdin=subprocess.PIPE,
@@ -369,8 +384,11 @@ def create_agent_session(log=print):
         proc.kill()
         raise AgentSessionError("hermes gateway did not become ready in time")
     # Create one persistent session cwd-bound to the VERTUS working dir so
-    # the agent has real workspace context (mirrors the pi in-memory default).
-    cwd = os.environ.get("VERTUS_CWD") or os.getcwd()
+    # the agent has real workspace context. Each agent gets its own sandbox
+    # directory here — the gateway treats an explicit cwd as the session
+    # workspace and validates it, so this is the isolation point (see
+    # module docstring). Mirrors the pi in-memory default.
+    cwd = cwd or os.environ.get("VERTUS_CWD") or os.getcwd()
     try:
         session._session_id = session._create_session(cwd)
     except Exception as exc:

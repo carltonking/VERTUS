@@ -963,7 +963,17 @@ export class InteractiveMode {
 
 		// Add header with keybindings from config (unless silenced)
 		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
-			const logo = theme.fg("accent", BRAND_LOGO) + theme.fg("dim", `\nv${BRAND_VERSION}`);
+			// Monochrome top→bottom fade for the VERTUS block logo.
+			const logoFade = ["#E6E6E6", "#C3C3C3", "#A0A0A0", "#7D7D7D", "#5A5A5A", "#373737"];
+			const logo = BRAND_LOGO.split("\n")
+				.map((line, i) => {
+					const hex = logoFade[Math.min(i, logoFade.length - 1)];
+					const r = Number.parseInt(hex.slice(1, 3), 16);
+					const g = Number.parseInt(hex.slice(3, 5), 16);
+					const b = Number.parseInt(hex.slice(5, 7), 16);
+					return `\x1b[38;2;${r};${g};${b}m${line}\x1b[39m`;
+				})
+				.join("\n") + theme.fg("dim", `\nv${BRAND_VERSION}`);
 
 			// Build startup instructions using keybinding hint helpers
 			const hint = (keybinding: AppKeybinding, description: string) => keyHint(keybinding, description);

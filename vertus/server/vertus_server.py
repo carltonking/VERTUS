@@ -27,6 +27,16 @@ from pathlib import Path
 from queue import Queue, Empty
 import threading
 from threading import Thread
+from urllib.parse import parse_qs, urlsplit
+
+# Script-dir import (python3 vertus/server/vertus_server.py) keeps this plain;
+# fall back to a package-relative import for `python -m vertus.server.vertus_server`.
+try:
+    from agent_registry import AgentRegistry  # type: ignore
+    from session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
+except ImportError:  # pragma: no cover - only hit under package invocation
+    from .agent_registry import AgentRegistry  # type: ignore
+    from .session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 
 VERTUS_DIR = Path.home() / ".vertus"
 TOKEN_FILE = VERTUS_DIR / "token"
@@ -79,12 +89,22 @@ def _tailnet_ip_cli() -> str | None:
 
 
 class AgentBridge:
-    """Owns the pi agent session and serializes prompts through a queue."""
+    """Owns the pi agent session and serializes prompts through a queue.
 
-    def __init__(self) -> None:
+    Each agent gets its own bridge (own queue + worker thread + engine
+    session); the SessionManager builds one per agent id, so two agents can
+    be mid-prompt at the same time. The class itself is unchanged in spirit:
+    prompts are serialized per-agent, and events fan out to that agent's
+    subscribers only.
+    """
+
+    def __init__(self, agent_id: str = DEFAULT_AGENT_ID, create_session_factory=None, cwd: str | None = None) -> None:
+        self.agent_id = agent_id
+        # Session workspace: the agent's sandbox dir (never $HOME / repo root).
+        self.cwd = cwd
         self.subscribers: list[Queue] = []
         self._queue: Queue = Queue()
-        self._create_session = None
+        self._create_session = create_session_factory
         self._session = None
         self._worker = Thread(target=self._run_worker, daemon=True)
         self._worker.start()
@@ -131,7 +151,8 @@ class AgentBridge:
             return None
 
     def _run_worker(self) -> None:
-        self._create_session = self._load_pi()
+        if self._create_session is None:
+            self._create_session = self._load_pi()
         # Prewarm: spawn the engine gateway and create the session NOW, at
         # server start, so the first real prompt doesn't pay the ~50s cold-
         # start (venv python import + hermes session init). Failure here is
@@ -153,10 +174,16 @@ class AgentBridge:
         if self._create_session is None:
             return
         try:
-            result = self._create_session()
+            # Prewarm with the agent's sandbox cwd — same binding the lazy
+            # path uses, so the prewarmed session never starts in $HOME or
+            # the repo root and no re-creation happens on first prompt.
+            result = self._create_session(cwd=self.cwd)
             self._session = result["session"]
             self._session.subscribe(self._on_pi_event)
-            print("[vertus] agent session prewarmed", file=sys.stderr)
+            print(
+                f"[vertus] agent {self.agent_id} session prewarmed (cwd: {self.cwd})",
+                file=sys.stderr,
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"[vertus] prewarm failed (will retry on first prompt): {exc}", file=sys.stderr)
 
@@ -219,7 +246,7 @@ class AgentBridge:
         for _attempt in range(2):
             if self._session is None:
                 try:
-                    result = self._create_session()
+                    result = self._create_session(cwd=self.cwd)
                     self._session = result["session"]
                     self._session.subscribe(self._on_pi_event)
                 except Exception as exc:
@@ -337,9 +364,10 @@ class AgentBridge:
 
 
 class VertusHandler(BaseHTTPRequestHandler):
-    server_version = "VertusServer/1.0"
-    bridge: AgentBridge = None  # type: ignore[assignment]
+    server_version = "VertusServer/1.1"
+    sessions: SessionManager = None  # type: ignore[assignment]
     token: str = ""
+    registry: AgentRegistry = None  # type: ignore[assignment]
 
     def _authed(self) -> bool:
         header = self.headers.get("Authorization", "")
@@ -357,12 +385,19 @@ class VertusHandler(BaseHTTPRequestHandler):
         if not self._authed():
             self._json(401, {"error": "unauthorized"})
             return
-        if self.path == "/api/health":
+        # Route on the path only; agent_id etc. arrive as query params.
+        path = urlsplit(self.path).path
+        if path == "/api/health":
             self._json(200, {"status": "ok", "time": int(time.time())})
-        elif self.path == "/api/skills":
-            self._json(200, self.bridge.slash_catalog())
-        elif self.path == "/api/events":
-            self._sse()
+        elif path == "/api/skills":
+            agent_id = self._query_param("agent_id")
+            self._json(200, self.sessions.get_or_create_session(agent_id).slash_catalog())
+        elif path == "/api/agents":
+            self._handle_agents_list()
+        elif path.startswith("/api/agents/"):
+            self._handle_agent_get(path[len("/api/agents/"):].strip("/"))
+        elif path == "/api/events":
+            self._sse(self._query_param("agent_id"))
         else:
             self._json(404, {"error": "not found"})
 
@@ -376,23 +411,71 @@ class VertusHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self._json(400, {"error": "invalid json"})
             return
-        if self.path == "/api/prompt":
-            text = str(payload.get("text", "")).strip()
+        route = urlsplit(self.path).path
+        if route == "/api/prompt":
+            text = str(payload.get("text", payload.get("prompt", ""))).strip()
             if not text:
                 self._json(400, {"error": "text required"})
                 return
             remote = self.headers.get("X-Vertus-Client", "local").lower() != "local"
-            self.bridge.prompt(text, remote=remote)
-            self._json(202, {"accepted": True})
+            agent_id = str(payload.get("agent_id") or DEFAULT_AGENT_ID)
+            try:
+                self.sessions.get_or_create_session(agent_id).prompt(text, remote=remote)
+            except KeyError:
+                self._json(404, {"error": f"agent not found: {agent_id}"})
+                return
+            sandbox_path = ""
+            try:
+                sandbox_path = resolve_sandbox_cwd(self.registry, agent_id)
+            except Exception:  # noqa: BLE001  # report path best-effort only
+                pass
+            self._json(202, {"accepted": True, "agent_id": agent_id, "sandbox_path": sandbox_path})
+        elif route == "/api/agents":
+            name = str(payload.get("name", "")).strip()
+            if not name:
+                self._json(400, {"error": "name required"})
+                return
+            try:
+                self._json(201, self.registry.create_agent(name))
+            except Exception as exc:  # noqa: BLE001
+                self._json(500, {"error": str(exc)[:200]})
         else:
             self._json(404, {"error": "not found"})
 
-    def _sse(self) -> None:
+    def _query_param(self, name: str) -> str:
+        return (parse_qs(urlsplit(self.path).query).get(name) or [""])[0]
+
+    def _handle_agents_list(self) -> None:
+        """GET /api/agents — self-heals the registry (primary) then lists."""
+        try:
+            self.registry.ensure_primary()
+            self._json(200, {"agents": self.registry.list_agents()})
+        except Exception as exc:  # noqa: BLE001
+            self._json(500, {"error": str(exc)[:200]})
+
+    def _handle_agent_get(self, agent_id: str) -> None:
+        """GET /api/agents/<id> — one agent, 404 when unknown."""
+        if not agent_id:
+            self._json(404, {"error": "not found"})
+            return
+        try:
+            self._json(200, self.registry.get_agent(agent_id))
+        except KeyError:
+            self._json(404, {"error": "agent not found"})
+        except Exception as exc:  # noqa: BLE001
+            self._json(500, {"error": str(exc)[:200]})
+
+    def _sse(self, agent_id: str = DEFAULT_AGENT_ID) -> None:
+        try:
+            bridge = self.sessions.get_or_create_session(agent_id or DEFAULT_AGENT_ID)
+        except KeyError:
+            self._json(404, {"error": f"agent not found: {agent_id}"})
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        q = self.bridge.subscribe()
+        q = bridge.subscribe()
         try:
             while True:
                 try:
@@ -407,10 +490,46 @@ class VertusHandler(BaseHTTPRequestHandler):
         except (ConnectionAbortedError, BrokenPipeError, OSError):
             pass
         finally:
-            self.bridge.unsubscribe(q)
+            bridge.unsubscribe(q)
 
     def log_message(self, fmt: str, *args) -> None:
         pass
+
+
+def resolve_sandbox_cwd(registry: AgentRegistry, agent_id: str) -> str:
+    """Validate the agent and return its sandbox dir, re-ensured on disk.
+
+    Every per-agent session is cwd-bound here — this is the hub's sandbox
+    isolation point. The registry's get_agent() is also the unknown-agent
+    gate (KeyError → 404). Falls back to <registry.root>/<id>/sandbox if the
+    profile predates the sandbox_path field; the directory is (re-)created
+    if it vanished.
+    """
+    agent = registry.get_agent(agent_id)  # KeyError for unknown agents
+    sandbox = agent.get("sandbox_path") or str(registry.root / agent_id / "sandbox")
+    Path(sandbox).expanduser().mkdir(parents=True, exist_ok=True)
+    return str(Path(sandbox).expanduser().resolve())
+
+
+def build_session_manager(registry: AgentRegistry, factory=None) -> SessionManager:
+    """One SessionManager for the hub: primary prewarmed, others lazy.
+
+    Each bridge is created with its agent's sandbox dir as the session cwd
+    (see resolve_sandbox_cwd). ``factory`` defaults to building real
+    AgentBridges (hermes engine); tests inject fakes so no engine subprocess
+    is ever spawned — fakes that accept ``cwd=`` still exercise the sandbox
+    resolution path.
+    """
+    if factory is None:
+        def factory(agent_id: str):
+            return AgentBridge(
+                agent_id=agent_id, cwd=resolve_sandbox_cwd(registry, agent_id)
+            )
+    return SessionManager(
+        registry,
+        factory=factory,
+        seed_agent_id=DEFAULT_AGENT_ID,
+    )
 
 
 def serve(host: str | None, port: int) -> None:
@@ -424,9 +543,23 @@ def serve(host: str | None, port: int) -> None:
         ip = tailnet_ip()
         if ip and ip not in bind_hosts:
             bind_hosts.append(ip)
-    bridge = AgentBridge()
-    VertusHandler.bridge = bridge
+    registry = AgentRegistry()
+    VertusHandler.registry = registry
     VertusHandler.token = token
+    # ensure_primary() MUST run before the session manager seeds the primary
+    # bridge: on a fresh store the seed factory resolves the sandbox via
+    # get_agent("primary"), which raises KeyError until the agent exists.
+    try:
+        primary = registry.ensure_primary()
+        print(f"[vertus] agents root: {registry.root} (primary: {primary['id']})")
+        sessions = build_session_manager(registry)
+        VertusHandler.sessions = sessions
+        print("[vertus] agent session prewarm starting (primary)…", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
+        # A hub with no usable registry cannot serve any agent; fail loudly
+        # rather than come up half-broken.
+        print(f"[vertus] agent registry/session init failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
     servers: list[ThreadingHTTPServer] = []
     for h in bind_hosts:
         try:

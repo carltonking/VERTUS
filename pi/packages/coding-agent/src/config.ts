@@ -501,13 +501,13 @@ export const APP_TITLE: string = piConfigName ? APP_NAME : "π";
 export const BRAND_TITLE: string = "VERTUS";
 export const BRAND_VERSION: string = "0.01.0";
 /** ASCII art banner rendered in the interactive CLI header. */
-export const BRAND_LOGO: string = 
+export const BRAND_LOGO: string =
 `██╗   ██╗███████╗██████╗ ████████╗██╗   ██╗███████╗
- ██║   ██║██╔════╝██╔══██╗╚══██╔══╝██║   ██║██╔════╝
- ██║   ██║█████╗  ██████╔╝   ██║   ██║   ██║███████╗
- ╚██╗ ██╔╝██╔══╝  ██╔══██╗   ██║   ██║   ██║╚════██║
-  ╚████╔╝ ███████╗██║  ██║   ██║   ╚██████╔╝███████║
-   ╚═══╝  ╚══════╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚══════╝`;
+██║   ██║██╔════╝██╔══██╗╚══██╔══╝██║   ██║██╔════╝
+██║   ██║█████╗  ██████╔╝   ██║   ██║   ██║███████╗
+╚██╗ ██╔╝██╔══╝  ██╔══██╗   ██║   ██║   ██║╚════██║
+ ╚████╔╝ ███████╗██║  ██║   ██║   ╚██████╔╝███████║
+  ╚═══╝  ╚══════╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚══════╝`;
 export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".pi";
 export const VERSION: string = pkg.version || "0.0.0";
 

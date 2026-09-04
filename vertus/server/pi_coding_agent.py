@@ -117,15 +117,33 @@ class _AgentSession:
             self._ready.set()  # unblock create_agent_session if bridge dies early
 
 
-def create_agent_session(log=print):
-    """Start the bun bridge and wait until its pi session is ready."""
+def create_agent_session(log=print, cwd: str | None = None):
+    """Start the bun bridge and wait until its pi session is ready.
+
+    ``cwd`` sets the agent workspace: exported as ``VERTUS_CWD`` to the
+    bridge child (pi_bridge.mjs passes it to pi's createAgentSession) and
+    used as the bridge child's spawn cwd. When omitted, the bridge falls
+    back to its own process cwd.
+
+    VERTUS hub invariant: each agent's session is created with that agent's
+    sandbox directory as cwd, never ``$HOME`` or the repo root (the hub
+    resolves and creates the directory before calling this).
+    """
+    child_env = {**os.environ}
+    if cwd:
+        c = Path(cwd).expanduser()
+        c.mkdir(parents=True, exist_ok=True)
+        c = c.resolve()
+        child_env["VERTUS_CWD"] = str(c)
+        cwd = str(c)
     proc = subprocess.Popen(
         [BUN, str(BRIDGE)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
         bufsize=1,
-        env={**os.environ},
+        env=child_env,
+        cwd=str(cwd) if cwd else None,
     )
     session = _AgentSession(proc, log)
     if not session._ready.wait(BRIDGE_READY_TIMEOUT_S):

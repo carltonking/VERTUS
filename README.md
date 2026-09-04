@@ -29,6 +29,10 @@ The terminal UI is a fork of [earendil-works/pi](https://github.com/earendil-wor
 │   │   └── VertusPhone/              # native iOS client (scaffold)
 │   ├── server/
 │   │   ├── vertus_server.py          # hub: HTTP + SSE, auth, bridges
+│   │   ├── agent_registry.py         # durable multi-agent registry (~/.vertus/agents)
+│   │   ├── session_manager.py        # per-agent session map (keyed, lazy, thread-safe)
+│   │   ├── test_agent_registry.py    # registry unit tests (pytest)
+│   │   ├── test_session_manager.py   # session/HTTP/concurrency tests (pytest)
 │   │   ├── hermes_bridge.py          # engine bridge → hermes TUI gateway (default)
 │   │   ├── pi_bridge.mjs             # legacy bridge → pi agent (VERTUS_BRIDGE=pi)
 │   │   └── pi_coding_agent.py        # legacy pi python facade
@@ -100,12 +104,101 @@ python3 vertus/server/vertus_server.py serve \
 ```
 
 - **Auth:** bearer token, expected at `~/.vertus/token` (`Authorization: Bearer …`).
-- **Endpoints:** `GET /api/health`, `GET /api/events` (SSE), `POST /api/prompt`.
+- **Endpoints:** `GET /api/health`, `GET /api/events` (SSE), `POST /api/prompt`,
+  plus the WIP multi-agent endpoints below.
 - **Wire events:** `text`, `activity`, `done`, `error`.
 - **Engine bridge:** `hermes_bridge.py` by default; `VERTUS_BRIDGE=pi` forces
   the legacy `pi_bridge.mjs` path.
 - **Keepalive:** copy `disabled-launchagents/com.vertus.server.plist` into
   `~/Library/LaunchAgents/` and `launchctl load` it.
+
+## Multi-agent (WIP)
+
+The hub carries a durable registry of agents, and each agent now gets its own
+**live session**: one bridge (own queue + worker thread + engine session) per
+agent id, so two agents can be prompted concurrently without blocking each
+other. Defaults preserve the old single-session behavior — omit `agent_id`
+everywhere and you're talking to `primary` exactly as before.
+
+On-disk layout (per agent, under `~/.vertus/agents/`):
+
+```
+~/.vertus/agents/
+├── _primary                  # marker file: id of the primary agent
+└── <agent_id>/
+    ├── profile.json          # {"id", "name", "created_at", "sandbox_path"}
+    └── sandbox/              # the agent's default working directory (cwd)
+```
+
+- `agent_id` is the directory name and never changes (lowercase slug,
+  deduped with a short suffix on collision); `name` is display-only.
+- `ensure_primary()` runs at hub startup: if no agents exist it creates
+  `primary` / "Primary", and the hub prewarms that session exactly like the
+  old single-session hub. Every other agent's session is lazy — its engine
+  gateway spawns on that agent's first prompt or event stream.
+- Deleting the last remaining agent is refused; deleting the primary
+  reassigns primary to the oldest remaining agent.
+- Sessions are keyed in a thread-safe `SessionManager`; an unknown agent id
+  on any endpoint is a 404 (validated through the registry).
+- **Sandbox isolation (Prompt 3):** each agent's session starts with its
+  `sandbox/` as the working computer — never `$HOME` or the VERTUS repo root.
+  Enforcement per engine:
+  - **hermes (default):** the hub sends the sandbox as the explicit `cwd`
+    param of the gateway's `session.create` RPC. The gateway treats an
+    explicit cwd as the session workspace and registers it as the
+    terminal-tool's env override, so shell/file tools start there. (Keys
+    involved: `session.create.cwd` → session `cwd` → tools.terminal-tool
+    `cwd` override; config `terminal.cwd` / env `TERMINAL_CWD` are only
+    fallbacks when no explicit cwd is sent — the hub always sends one.)
+  - **pi fallback (`VERTUS_BRIDGE=pi`):** the hub exports `VERTUS_CWD` to
+    the `pi_bridge.mjs` child and spawns the child in the sandbox;
+    `pi_bridge.mjs` passes it to pi's `createAgentSession({ cwd })`.
+  - The hub re-ensures the sandbox dir on every session creation (a
+    deleted `sandbox/` is recreated before the session starts).
+- **Remaining escape hatches (honest list):** the sandbox is a *default*
+  working directory, not a jail. The engine can still read/write absolute
+  paths anywhere the hub user can, its gateway child inherits the hub's
+  env, hermes' `session.cwd.set` RPC could move a session out (the hub
+  never calls it), and memory/persona extensions still read `~/.hermes`.
+  OS-level confinement (per-agent containers / seatbelt profiles) is the
+  Prompt 4 boundary; computer-use locking stays out of scope here.
+
+Hub endpoints (same bearer token as everything else):
+
+| Endpoint | Meaning |
+|---|---|
+| `GET /api/agents` | list agents (ensures primary exists first) |
+| `POST /api/agents` `{"name": "…"}` | create an agent, returns its profile |
+| `GET /api/agents/<id>` | one agent's profile, 404 when unknown |
+| `POST /api/prompt` `{"text"\|"prompt": "…", "agent_id": "…"?}` | queue a turn for that agent (default `primary`); 202 with `{"accepted": true, "agent_id": …, "sandbox_path": …}` |
+| `GET /api/events?agent_id=…` | SSE stream for that agent only (default `primary`) |
+| `GET /api/skills?agent_id=…` | slash/skill catalog from that agent's session |
+
+Concurrency notes:
+
+- Each bridge owns its queue; nothing crosses agents. Prompting two agents
+  simultaneously keeps both turns in flight (proven by a test with fake
+  sessions measuring peak in-flight turns ≥ 2 and wall-clock ≈ one turn,
+  not two).
+- Within one agent, prompts still serialize in submission order (same as
+  the old behavior for a single client).
+
+Tests (no engine subprocess is ever spawned; the bridge class is swapped
+for a recording fake, but the production default factory — including the
+per-agent sandbox cwd resolution — still runs):
+
+```bash
+python3 -m pytest vertus/server/test_agent_registry.py vertus/server/test_session_manager.py -v
+```
+
+The sandbox test (`test_default_factory_binds_each_agents_sandbox`) proves
+agent A's bridge gets A's `sandbox/` and agent B's gets B's, and that both
+dirs exist before any session starts. To verify against the real hub:
+
+```bash
+python3 vertus/server/vertus_server.py serve --host 127.0.0.1 --port 8791
+curl -s -H "Bearer $(cat ~/.vertus/token)" localhost:8791/api/agents/scout | jq .sandbox_path
+```
 
 ## QuickBar
 
@@ -185,5 +278,6 @@ State lives in `~/.pi/` (pi sessions, settings, extensions), `~/.hermes/`
 | Hub server + SSE + auth | ✅ |
 | QuickBar under the notch | ✅ |
 | One-shot CLI through the hub | ✅ |
+| Multi-agent registry, parallel sessions, per-agent sandbox cwd | ✅ (default-cwd isolation; OS-level confinement pending) |
 | VertusPhone scaffold | ⬜ scaffold only |
 | hermes fork on GitHub, remote approvals, polish | ⬜ pending |
