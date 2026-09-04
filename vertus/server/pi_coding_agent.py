@@ -117,7 +117,14 @@ class _AgentSession:
             self._ready.set()  # unblock create_agent_session if bridge dies early
 
 
-def create_agent_session(log=print, cwd: str | None = None):
+def create_agent_session(
+    log=print,
+    cwd: str | None = None,
+    agent_home: str | None = None,
+    extra_env: dict | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+):
     """Start the bun bridge and wait until its pi session is ready.
 
     ``cwd`` sets the agent workspace: exported as ``VERTUS_CWD`` to the
@@ -125,11 +132,33 @@ def create_agent_session(log=print, cwd: str | None = None):
     used as the bridge child's spawn cwd. When omitted, the bridge falls
     back to its own process cwd.
 
-    VERTUS hub invariant: each agent's session is created with that agent's
-    sandbox directory as cwd, never ``$HOME`` or the repo root (the hub
-    resolves and creates the directory before calling this).
+    Per-agent identity kwargs (agent_home / model / provider / extra_env)
+    are accepted for hub-signature parity with the hermes bridge but are
+    NOT implemented on the pi fallback path — the pi engine has no HERMES_HOME
+    equivalent, and model selection is pi's own settings-based resolver.
+    VERTUS_BRIDGE=pi therefore runs every agent on the shared pi identity.
+
+    The child env is explicitly constructed from a narrow allowlist (Step 3
+    applies to the fallback too): no wholesale ``{**os.environ}`` — pi vars,
+    per-agent context, or hub-internal state cannot leak across bots.
     """
-    child_env = {**os.environ}
+    child_env: dict[str, str] = {}
+    for key in (
+        "PATH", "HOME", "USER", "SHELL", "TMPDIR", "LANG", "LC_ALL",
+        "TERM", "TERMINFO", "SSL_CERT_FILE", "SSL_CERT_DIR",
+        "VERTUS_BUN",        # bun binary selection is hub-level policy
+    ):  # deliberate, reviewed allowlist — keep in sync with hermes_bridge
+        value = os.environ.get(key)
+        if value is not None:
+            child_env[key] = value
+    if extra_env:
+        child_env.update({str(k): str(v) for k, v in extra_env.items()})
+    if cwd:
+        c = Path(cwd).expanduser()
+        c.mkdir(parents=True, exist_ok=True)
+        c = c.resolve()
+        child_env["VERTUS_CWD"] = str(c)
+        cwd = str(c)
     if cwd:
         c = Path(cwd).expanduser()
         c.mkdir(parents=True, exist_ok=True)

@@ -59,17 +59,20 @@ class FakeSession:
 class FakeBridge(vs.AgentBridge):
     """AgentBridge with the real queue/worker but a FakeSession engine.
 
-    Records the cwd kwarg (the sandbox binding under test) via super().
+    Records the cwd kwarg (the sandbox binding under test) and the identity
+    kwargs (per-agent HERMES_HOME / model / provider) via super().
     """
 
-    def __init__(self, agent_id: str, cwd: str | None = None):
+    def __init__(self, agent_id: str, cwd: str | None = None, session_kwargs: dict | None = None):
         # Assign before super().__init__: the worker prewarms immediately and
         # _make appends to self.sessions from that thread.
         self.sessions: list[FakeSession] = []
-        super().__init__(agent_id=agent_id, create_session_factory=self._make, cwd=cwd)
+        self.session_kwargs = dict(session_kwargs or {})
+        super().__init__(agent_id=agent_id, create_session_factory=self._make, cwd=cwd, session_kwargs=session_kwargs)
 
-    def _make(self, cwd=None):
+    def _make(self, cwd=None, **kwargs):
         self.last_cwd = cwd
+        self.last_spawn_kwargs = kwargs
         s = FakeSession(self)
         self.sessions.append(s)
         return {"session": s}
@@ -306,7 +309,10 @@ def test_default_factory_binds_each_agents_sandbox(monkeypatch, tmp_path):
     registry.ensure_primary()
     registry.create_agent("Scout")
     # Swap the real bridge class for the recording fake; build_session_manager
-    # builds it through the production default factory incl. sandbox resolution.
+    # builds it through the production default factory incl. sandbox + identity
+    # resolution. (The swap is REQUIRED: without it the real AgentBridge would
+    # attempt a live engine prewarm in the test process.)
+    monkeypatch.setattr(vs, "AgentBridge", FakeBridge)
     mgr = vs.build_session_manager(registry)
     p = mgr.get_or_create_session("primary")
     s = mgr.get_or_create_session("scout")
@@ -411,3 +417,221 @@ def test_same_agent_still_serializes(monkeypatch, tmp_path):
     # prompt list order on the single session).
     assert len(p.sessions) == 1, "one live session per bridge; no churn"
     assert p.sessions[0].prompts == ["first", "second"], "order must be preserved"
+
+
+# ----------------------------------------------------------------------
+# Step 1/2: schema v2 identity + derived engine home + memory dirs
+# ----------------------------------------------------------------------
+
+
+def test_v2_profile_fields_and_home_exist(monkeypatch, tmp_path):
+    """New agents get the full v2 schema and a materialized engine home."""
+    monkeypatch.setenv("VERTUS_AGENTS_DIR", str(tmp_path / "agents"))
+    monkeypatch.setenv("VERTUS_FLEET_HERMES_HOME", str(tmp_path / "fleet-hermes"))
+    registry = vs.AgentRegistry()
+    agent = registry.create_agent("Scout")
+    assert agent["schema_version"] == 2
+    assert agent["title"] == "Scout"
+    assert agent["autonomy"] == "ask"
+    home = Path(agent["home_path"])
+    assert home == tmp_path / "agents" / agent["id"] / "home"
+    assert (home / "config.yaml").is_file(), "engine home must carry config.yaml"
+    assert (home / "memories").is_dir(), "engine home must carry memories/"
+    assert (home / "skills" / "vertus-memory" / "SKILL.md").is_file(), (
+        "memory skill must be materialized into the agent home"
+    )
+
+
+def test_update_agent_materializes_soul_and_memory_dirs(monkeypatch, tmp_path):
+    """persona/model updates rewrite home/ (derived state) immediately."""
+    monkeypatch.setenv("VERTUS_AGENTS_DIR", str(tmp_path / "agents"))
+    monkeypatch.setenv("VERTUS_FLEET_HERMES_HOME", str(tmp_path / "fleet-hermes"))
+    registry = vs.AgentRegistry()
+    agent = registry.create_agent("Scout")
+    agent_mem, shared = registry.ensure_memory_dirs(agent["id"])
+    updated = registry.update_agent(
+        agent["id"],
+        persona="You are SCOUT, the recon butler.",
+        model="nemotron-3-ultra-free",
+        provider="opencode-zen",
+        emoji="🛰️",
+        autonomy="trusted",
+    )
+    home = Path(updated["home_path"])
+    assert (home / "SOUL.md").read_text().startswith("You are SCOUT")
+    cfg_text = (home / "config.yaml").read_text()
+    assert "nemotron-3-ultra-free" in cfg_text
+    assert "opencode-zen" in cfg_text
+    assert Path(updated["sandbox_path"]).is_dir()
+    assert agent_mem.is_dir() and shared.is_dir()
+    # profile.json on disk carries the update.
+    on_disk = json.loads((registry.root / agent["id"] / "profile.json").read_text())
+    assert on_disk["model"] == "nemotron-3-ultra-free"
+    assert on_disk["schema_version"] == 2
+
+
+def test_v1_profile_migration_is_idempotent_and_lossless(monkeypatch, tmp_path):
+    """A v1 fixture upgrades in place: backfills, keeps unknown keys, no data loss."""
+    monkeypatch.setenv("VERTUS_AGENTS_DIR", str(tmp_path / "agents"))
+    monkeypatch.setenv("VERTUS_FLEET_HERMES_HOME", str(tmp_path / "fleet-hermes"))
+    fleet = tmp_path / "fleet-hermes"
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / "SOUL.md").write_text("You are VERTUS, the user's personal butler.")
+    registry = vs.AgentRegistry()
+    registry.ensure_primary()
+    # Hand-craft a v1 profile on disk, exactly as the pre-fleet hub wrote it.
+    v1 = {
+        "id": "primary",
+        "name": "Primary",
+        "created_at": "2026-09-01T10:00:00+00:00",
+        "sandbox_path": str(tmp_path / "agents" / "primary" / "sandbox"),
+        "custom_future_key": {"keep": True},  # unknown-key preservation
+    }
+    (tmp_path / "agents" / "primary").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "agents" / "primary" / "profile.json").write_text(json.dumps(v1))
+
+    first = registry.get_agent("primary")
+    assert first["schema_version"] == 2
+    assert first["title"] == "Primary", "title backfilled from name"
+    assert first["persona"].startswith("You are VERTUS"), (
+        "persona backfilled from the fleet SOUL.md fixture"
+    )
+    assert first["custom_future_key"] == {"keep": True}, "unknown keys must survive"
+    assert first["created_at"] == v1["created_at"], "v1 timestamps kept"
+    on_disk = json.loads((tmp_path / "agents" / "primary" / "profile.json").read_text())
+    assert on_disk["schema_version"] == 2
+    assert on_disk["custom_future_key"] == {"keep": True}
+
+    # Idempotent: reloading never changes values again.
+    before = json.loads((tmp_path / "agents" / "primary" / "profile.json").read_text())
+    again = registry.get_agent("primary")
+    after = json.loads((tmp_path / "agents" / "primary" / "profile.json").read_text())
+    assert before == after, "migration must not rewrite an already-v2 profile"
+    assert again["title"] == "Primary"
+
+
+def test_skills_materialized_with_injected_paths(monkeypatch, tmp_path):
+    """Skill templates must carry the agent's real memory paths, not placeholders."""
+    monkeypatch.setenv("VERTUS_AGENTS_DIR", str(tmp_path / "agents"))
+    monkeypatch.setenv("VERTUS_FLEET_HERMES_HOME", str(tmp_path / "fleet-hermes"))
+    registry = vs.AgentRegistry()
+    agent = registry.create_agent("Scout")
+    agent_mem, shared = registry.ensure_memory_dirs(agent["id"])
+    skill = (Path(agent["home_path"]) / "skills" / "vertus-memory" / "SKILL.md").read_text()
+    assert "{{AGENT_MEMORY_DIR}}" not in skill, "template markers must be substituted"
+    assert str(agent_mem) in skill and str(shared) in skill
+
+
+# ----------------------------------------------------------------------
+# Step 3: per-agent identity reaches the spawn (HERMES_HOME + model)
+# ----------------------------------------------------------------------
+
+
+def test_spawn_carries_per_agent_home_and_model(monkeypatch, tmp_path):
+    """The default factory must wire agent_home/model/provider into the bridge."""
+    monkeypatch.setenv("VERTUS_AGENTS_DIR", str(tmp_path / "agents"))
+    monkeypatch.setenv("VERTUS_FLEET_HERMES_HOME", str(tmp_path / "fleet-hermes"))
+    registry = vs.AgentRegistry()
+    registry.ensure_primary()
+    registry.update_agent("primary", model="model-a", provider="prov-a")
+    registry.create_agent("Scout")
+    scout_id = registry.list_agents()[-1]["id"]
+    registry.update_agent(scout_id, model="model-b", provider="prov-b")
+    # FakeBridge keeps the production factory path (resolve_sandbox_cwd +
+    # resolve_session_kwargs both run for real); only the engine spawn is fake.
+    monkeypatch.setattr(vs, "AgentBridge", FakeBridge)
+    mgr = vs.build_session_manager(registry)
+    p = mgr.get_or_create_session("primary")
+    s = mgr.get_or_create_session(scout_id)
+    # Spawn synchronously (deterministic; no engine subprocess either way).
+    p._spawn_session(remote=False)
+    s._spawn_session(remote=False)
+    assert p.session_kwargs.get("agent_home", "").endswith("primary/home")
+    assert s.session_kwargs.get("agent_home", "").endswith("scout/home")
+    assert p.session_kwargs["model"] == "model-a"
+    assert s.session_kwargs["model"] == "model-b"
+    assert p.session_kwargs["extra_env"]["HERMES_MODEL"] == "model-a"
+    assert s.session_kwargs["extra_env"]["HERMES_INFERENCE_PROVIDER"] == "prov-b"
+    # And the spawn call itself received the identity kwargs:
+    assert p.last_spawn_kwargs.get("model") == "model-a"
+    assert s.last_spawn_kwargs.get("agent_home", "").endswith("scout/home")
+    assert p.cwd.endswith("primary/sandbox") and s.cwd.endswith("scout/sandbox")
+
+
+def test_resolve_session_kwargs_unknown_agent_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("VERTUS_AGENTS_DIR", str(tmp_path / "agents"))
+    registry = vs.AgentRegistry()
+    registry.ensure_primary()
+    with pytest.raises(KeyError):
+        vs.resolve_session_kwargs(registry, "ghost")
+
+
+# ----------------------------------------------------------------------
+# Step 3: gateway env is explicitly constructed, never inherited
+# ----------------------------------------------------------------------
+
+
+def test_gateway_env_allowlist(monkeypatch):
+    """build_gateway_env passes only allowlisted vars + provider keys + HERMES_HOME."""
+    import hermes_bridge as hb
+
+    monkeypatch.setenv("VERTUS_TOP_SECRET_BOT_FLAG", "leak-me")
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    env = hb.build_gateway_env(agent_home="/tmp/agent-home")
+    assert env["HERMES_HOME"] == "/tmp/agent-home"
+    assert env["HERMES_YOLO_MODE"] == "1"
+    assert env["OPENAI_API_KEY"] == "sk-test"
+    assert "VERTUS_TOP_SECRET_BOT_FLAG" not in env, "non-allowlisted env must not leak"
+    assert len(env) <= len(hb._ENGINE_ENV_ALLOWLIST) + len(hb.PROVIDER_KEY_VARS)
+
+
+def test_gateway_env_drops_hermes_home_when_unset(monkeypatch):
+    """No agent_home and no HERMES_HOME → the child falls back to the fleet default."""
+    import hermes_bridge as hb
+
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    env = hb.build_gateway_env()
+    assert "HERMES_HOME" not in env
+
+
+# ----------------------------------------------------------------------
+# Step 4: no process-global state carries per-turn / per-agent context
+# ----------------------------------------------------------------------
+
+
+def test_no_vertus_remote_env_mutation(monkeypatch, tmp_path):
+    """remote=True must NOT write any process env — it rides the queue item."""
+    import os
+
+    mgr, _ = make_manager(monkeypatch, tmp_path)
+    p = mgr.get_or_create_session("primary")
+    before = dict(os.environ)
+    p.prompt("hello from the phone", remote=True)
+    deadline = time.time() + 5
+    while time.time() < deadline and not p.sessions[-1].prompts:
+        time.sleep(0.02)
+    assert os.environ == before, "prompt handling must not mutate os.environ"
+    assert p.sessions[-1].prompts == ["hello from the phone"]
+
+
+def test_remote_flag_is_sticky_and_not_global(monkeypatch, tmp_path):
+    """_remote_seen flips only on the prompting bridge, never on other agents."""
+    mgr, _ = make_manager(monkeypatch, tmp_path)
+    p = mgr.get_or_create_session("primary")
+    s = mgr.get_or_create_session("scout")
+    p.prompt("remote turn", remote=True)
+    deadline = time.time() + 5
+    while time.time() < deadline and not p.sessions[-1].prompts:
+        time.sleep(0.02)
+    assert p._remote_seen is True
+    assert s._remote_seen is False, "one agent's remote flag must not leak to another"
+    # And the sticky respawn env reaches the spawn call on the NEXT session.
+    p.prompt("second remote turn", remote=False)
+    deadline = time.time() + 5
+    while time.time() < deadline and len(p.sessions) < 2:
+        time.sleep(0.02)
+        if p.sessions:
+            time.sleep(0.05)
+    assert p._remote_seen is True

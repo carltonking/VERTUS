@@ -126,9 +126,23 @@ On-disk layout (per agent, under `~/.vertus/agents/`):
 ~/.vertus/agents/
 ├── _primary                  # marker file: id of the primary agent
 └── <agent_id>/
-    ├── profile.json          # {"id", "name", "created_at", "sandbox_path"}
-    └── sandbox/              # the agent's default working directory (cwd)
+    ├── profile.json          # schema v2: identity + persona + model (source of truth)
+    ├── sandbox/              # the agent's default working directory (cwd)
+    ├── memory/               # this bot's own notes (skill-injected path)
+    └── home/                 # per-agent ENGINE config root (HERMES_HOME)
+        ├── config.yaml       #   derived from profile.model/provider
+        ├── SOUL.md           #   derived from profile.persona
+        ├── memories/         #   engine-side memory (USER.md / MEMORY.md)
+        ├── auth.json / .env  #   seeded once from the fleet home (~/.hermes)
+        └── skills/           #   templated VERTUS skills (injected paths)
+
+~/.vertus/memory/shared/     # fleet-wide notes every bot reads/writes
 ```
+
+`home/` is **derived state** — profile.json is authoritative and the tree is
+re-materialized on every profile update. Schema v1 profiles migrate in place
+on load (idempotent, unknown keys preserved, persona backfilled from
+`~/.hermes/SOUL.md`).
 
 - `agent_id` is the directory name and never changes (lowercase slug,
   deduped with a short suffix on collision); `name` is display-only.
@@ -140,6 +154,18 @@ On-disk layout (per agent, under `~/.vertus/agents/`):
   reassigns primary to the oldest remaining agent.
 - Sessions are keyed in a thread-safe `SessionManager`; an unknown agent id
   on any endpoint is a 404 (validated through the registry).
+- **Identity isolation (fleet phase):** each agent's gateway is spawned with
+  its `home/` dir as `HERMES_HOME` (the fork's per-process config-root
+  override), so config.yaml (model/provider), SOUL.md (persona), memories/,
+  auth.json, and .env all resolve per-bot. The child env is an explicit
+  allowlist — the hub never hands the gateway its whole environment, so no
+  bot's context can leak into another's engine.
+- **Remote mode is spawn-time, not per-turn:** the old process-global
+  `VERTUS_REMOTE` env flag (a race across concurrently-running agents) is
+  gone; `remote` rides the prompt queue item, and once an agent sees a
+  remote prompt its gateways keep approval prompts on (`HERMES_YOLO_MODE=0`)
+  — `prompt.submit` has no per-turn context field in the fork's RPC, so the
+  stricter mode is sticky per gateway lifetime.
 - **Sandbox isolation (Prompt 3):** each agent's session starts with its
   `sandbox/` as the working computer — never `$HOME` or the VERTUS repo root.
   Enforcement per engine:

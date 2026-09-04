@@ -98,10 +98,19 @@ class AgentBridge:
     subscribers only.
     """
 
-    def __init__(self, agent_id: str = DEFAULT_AGENT_ID, create_session_factory=None, cwd: str | None = None) -> None:
+    def __init__(self, agent_id: str = DEFAULT_AGENT_ID, create_session_factory=None, cwd: str | None = None, session_kwargs: dict | None = None) -> None:
         self.agent_id = agent_id
         # Session workspace: the agent's sandbox dir (never $HOME / repo root).
         self.cwd = cwd
+        # Identity kwargs forwarded to every engine session this bridge creates
+        # (per-agent HERMES_HOME / model / provider). Captured at bridge build
+        # time and refreshed by reconfigure() on a profile PATCH — a live
+        # gateway keeps its identity until the next turn respawns it.
+        self._session_kwargs: dict = dict(session_kwargs or {})
+        # Step 4: remote/local is enforced at SPAWN time (HERMES_YOLO_MODE=0),
+        # because prompt.submit has no per-turn context field. Sticky: once a
+        # remote prompt is seen, this agent's gateways keep approvals on.
+        self._remote_seen = False
         self.subscribers: list[Queue] = []
         self._queue: Queue = Queue()
         self._create_session = create_session_factory
@@ -162,22 +171,51 @@ class AgentBridge:
             item = self._queue.get()
             if item is None:
                 break
+            # ``remote`` is carried explicitly on the item (Step 4: the old
+            # os.environ["VERTUS_REMOTE"] write was process-global — two
+            # agents running concurrently overwrote each other's flag).
             text, remote = item
-            os.environ["VERTUS_REMOTE"] = "1" if remote else "0"
             if self._create_session is None:
                 self._emit({"type": "error", "message": "agent SDK not available"})
                 continue
-            self._run_prompt_with_respawn(text)
+            self._run_prompt_with_respawn(text, remote=remote)
+
+    def _spawn_session(self, remote: bool):
+        """Create one engine session with this agent's identity + spawn-mode env.
+
+        Single funnel for prewarm and the lazy prompt path so both always
+        bind the same cwd, identity kwargs, and remote-mode env. No
+        process-global state is touched (Step 4).
+        """
+        if remote:
+            self._remote_seen = True
+        kwargs = dict(self._session_kwargs)
+        extra = dict(kwargs.pop("extra_env", None) or {})
+        if self._remote_seen:
+            # Sticky safety: once any remote prompt has been seen for this
+            # agent, every future gateway for it keeps the engine's approval
+            # prompts ON (HERMES_YOLO_MODE=0), even if the fleet default
+            # would bypass them. prompt.submit has no per-turn field
+            # (Step 0(d)), so mode is fixed per gateway lifetime.
+            extra["HERMES_YOLO_MODE"] = "0"
+            # pi fallback: its approval guard extension reads VERTUS_REMOTE in
+            # the bridge child; spawn-time injection replaces the old
+            # process-global hub write (inert for the hermes engine).
+            extra["VERTUS_REMOTE"] = "1"
+        if extra:
+            kwargs["extra_env"] = extra
+        return self._create_session(cwd=self.cwd, **kwargs)
 
     def _prewarm(self) -> None:
         """Create the agent session at startup; never raises."""
         if self._create_session is None:
             return
         try:
-            # Prewarm with the agent's sandbox cwd — same binding the lazy
-            # path uses, so the prewarmed session never starts in $HOME or
-            # the repo root and no re-creation happens on first prompt.
-            result = self._create_session(cwd=self.cwd)
+            # Prewarm with the agent's sandbox cwd + identity kwargs — same
+            # binding the lazy path uses, so the prewarmed session never
+            # starts in $HOME or the repo root and no re-creation happens on
+            # first prompt. Prewarm is always local-mode (approvals default).
+            result = self._spawn_session(remote=False)
             self._session = result["session"]
             self._session.subscribe(self._on_pi_event)
             print(
@@ -233,7 +271,7 @@ class AgentBridge:
         self._emit({"type": "done"})
         return None
 
-    def _run_prompt_with_respawn(self, text: str) -> None:
+    def _run_prompt_with_respawn(self, text: str, remote: bool = False) -> None:
         """Run one prompt, restarting a dead agent gateway once in-line.
 
         The hermes gateway runs as a child process that can be killed
@@ -242,11 +280,30 @@ class AgentBridge:
         pipe". On gateway death we drop the session and respawn it so the
         same prompt still goes through; genuine agent errors are surfaced
         immediately.
+
+        ``remote`` rides on this call instead of a process-global env var
+        (Step 4). Ground truth from the fork's RPC: prompt.submit carries no
+        per-turn context field, and the approval guard is a pi-engine
+        extension — so remote/local is enforced at SPAWN time via
+        HERMES_YOLO_MODE and cannot vary between turns within one gateway
+        lifetime (see _spawn_session for the sticky-mode trade-off).
         """
+        if remote and not self._remote_seen and self._session is not None:
+            # First remote prompt on a locally-spawned gateway: the running
+            # gateway may have approvals bypassed (fleet HERMES_YOLO_MODE=1).
+            # Drop it so this turn — and every later one — runs on a gateway
+            # spawned with approvals enforced. One-time cold-start cost.
+            try:
+                close = getattr(self._session, "close", None)
+                if close:
+                    close()
+            except Exception:
+                pass
+            self._session = None
         for _attempt in range(2):
             if self._session is None:
                 try:
-                    result = self._create_session(cwd=self.cwd)
+                    result = self._spawn_session(remote)
                     self._session = result["session"]
                     self._session.subscribe(self._on_pi_event)
                 except Exception as exc:
@@ -511,19 +568,58 @@ def resolve_sandbox_cwd(registry: AgentRegistry, agent_id: str) -> str:
     return str(Path(sandbox).expanduser().resolve())
 
 
+def resolve_session_kwargs(registry: AgentRegistry, agent_id: str) -> dict:
+    """Per-agent identity kwargs for engine session creation (Step 3).
+
+    Returns {} when the agent carries no per-agent identity (legacy profiles
+    or the pi fallback bridge), and otherwise forwards exactly what the
+    hermes bridge's create_agent_session() accepts:
+
+      agent_home  — the agent's derived engine config root, injected into
+                    the gateway as HERMES_HOME so config.yaml, SOUL.md,
+                    memories/, auth.json, and .env all resolve per-bot.
+      model/provider — forwarded as the per-session model override param.
+      extra_env   — HERMES_MODEL / HERMES_INFERENCE_PROVIDER fallbacks so
+                    the override holds even for engines that ignore the
+                    session.create model param (belt and suspenders).
+    """
+    agent = registry.get_agent(agent_id)
+    kwargs: dict = {}
+    home = agent.get("home_path") or str(registry.agent_home(agent_id))
+    if home and Path(home).is_dir():
+        kwargs["agent_home"] = home
+    model = agent.get("model")
+    provider = agent.get("provider")
+    if model:
+        kwargs["model"] = str(model)
+    if provider:
+        kwargs["provider"] = str(provider)
+    extra: dict = {}
+    if model:
+        extra["HERMES_MODEL"] = str(model)
+    if provider:
+        extra["HERMES_INFERENCE_PROVIDER"] = str(provider)
+    if extra:
+        kwargs["extra_env"] = extra
+    return kwargs
+
+
 def build_session_manager(registry: AgentRegistry, factory=None) -> SessionManager:
     """One SessionManager for the hub: primary prewarmed, others lazy.
 
     Each bridge is created with its agent's sandbox dir as the session cwd
-    (see resolve_sandbox_cwd). ``factory`` defaults to building real
+    plus its identity kwargs (per-agent HERMES_HOME + model override; see
+    resolve_session_kwargs). ``factory`` defaults to building real
     AgentBridges (hermes engine); tests inject fakes so no engine subprocess
-    is ever spawned — fakes that accept ``cwd=`` still exercise the sandbox
-    resolution path.
+    is ever spawned — fakes that accept ``cwd=`` keep working because
+    identity kwargs are only added when the profile actually carries them.
     """
     if factory is None:
         def factory(agent_id: str):
             return AgentBridge(
-                agent_id=agent_id, cwd=resolve_sandbox_cwd(registry, agent_id)
+                agent_id=agent_id,
+                cwd=resolve_sandbox_cwd(registry, agent_id),
+                session_kwargs=resolve_session_kwargs(registry, agent_id),
             )
     return SessionManager(
         registry,

@@ -208,9 +208,19 @@ class _HermesSession:
             raise AgentSessionError(errors[0])
         return result
 
-    def _create_session(self, cwd: str) -> str:
-        """Create one persistent hermes session; returns its session id."""
-        resp = self._rpccall("session.create", {"cwd": cwd})
+    def _create_session(self, cwd: str, model: str | None = None, provider: str | None = None) -> str:
+        """Create one persistent hermes session; returns its session id.
+
+        ``model``/``provider`` are the fork's documented PER-SESSION overrides
+        (tui_gateway/methods_session.py: the desktop composer ships them on
+        every session.create; they never mutate the profile config).
+        """
+        params: dict = {"cwd": cwd}
+        if model:
+            params["model"] = model
+        if provider:
+            params["provider"] = provider
+        resp = self._rpccall("session.create", params)
         sid = resp.get("session_id") or resp.get("sid")
         if not sid:
             raise AgentSessionError(f"session.create returned no session id: {resp}")
@@ -331,7 +341,108 @@ class _HermesSession:
                 pass
 
 
-def create_agent_session(log=print, cwd: str | None = None):
+# Environment variables the hermes engine actually reads (Step 0(e) of the
+# multi-agent audit, grep of os.environ/os.getenv across agent/, tools/,
+# hermes_cli/, tui_gateway/ in the fork). Everything else is deliberately
+# DROPPED so one bot's context can never leak into another bot's engine.
+_ENGINE_ENV_ALLOWLIST = (
+    "HERMES_HOME",           # per-agent engine config root (identity isolation)
+    "HERMES_PROFILE",        # fork profile selector (profile.* RPC params)
+    "HERMES_MODEL",          # model override (server.py _resolve_model)
+    "HERMES_INFERENCE_MODEL",
+    "HERMES_INFERENCE_PROVIDER",  # provider override (runtime_provider.py)
+    "HERMES_YOLO_MODE",      # approval-prompt bypass (fleet-wide policy)
+    "HERMES_TIMEZONE",
+    "HERMES_QUIET",
+    "HERMES_IGNORE_RULES",
+    "HERMES_CUA_DRIVER_CMD",  # computer-use driver (fleet default)
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "TERMINFO",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
+
+# Fleet-wide provider API keys, passed through EXPLICITLY (never via wholesale
+# env inheritance). The engine prefers its per-agent ``HERMES_HOME/.env`` for
+# bot-specific credentials; these cover the case where keys live only in the
+# hub's launchd environment. Mirrors the providers documented in the fork's
+# cli-config.yaml.example.
+PROVIDER_KEY_VARS = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENROUTER_API_KEY",
+    "NOUS_API_KEY",
+    "GITHUB_TOKEN",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "GLM_API_KEY",
+    "KIMI_API_KEY",
+    "MINIMAX_API_KEY",
+    "MINIMAX_CN_API_KEY",
+    "HF_TOKEN",
+    "NVIDIA_API_KEY",
+    "XIAOMI_API_KEY",
+    "ARCEEAI_API_KEY",
+    "OLLAMA_API_KEY",
+    "DEEPINFRA_API_KEY",
+    "KILOCODE_API_KEY",
+    "AI_GATEWAY_API_KEY",
+)
+
+
+def build_gateway_env(agent_home: str | Path | None = None) -> dict:
+    """Construct the gateway child env explicitly — never ``{**os.environ}``.
+
+    Why (Step 3 of the multi-agent audit): the old spawn inherited the hub's
+    whole environment, so any agent-scoped variable written into the hub
+    process (or set differently between bots) leaked into every gateway and
+    from there into every tool the model runs. The allowlist keeps only
+    engine-relevant vars; provider API keys are read by the engine from the
+    per-agent ``HERMES_HOME/.env`` file, not from this env (the fork resolves
+    ``get_env_path()`` under ``get_hermes_home()`` — hermes_cli/config.py).
+
+    ``agent_home`` is injected as ``HERMES_HOME`` (the fork's documented
+    per-process config-root override — hermes_constants.get_hermes_home),
+    which re-roots config.yaml, SOUL.md, memories/, auth.json, and .env for
+    this gateway process alone.
+
+    Provider API keys that must come via env (only when no per-agent .env
+    exists) can be attached by the hub through ``extra_env``; the bridge
+    itself never forwards the hub's env wholesale.
+    """
+    env: dict[str, str] = {}
+    for key in _ENGINE_ENV_ALLOWLIST:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    for key in PROVIDER_KEY_VARS:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    if agent_home is not None:
+        env["HERMES_HOME"] = str(agent_home)
+    return env
+
+
+def create_agent_session(
+    log=print,
+    cwd: str | None = None,
+    agent_home: str | Path | None = None,
+    extra_env: dict | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+):
     """Start the hermes stdio gateway and wait until a session is ready.
 
     ``cwd`` sets the session workspace the hermes agent runs its tools in
@@ -340,9 +451,17 @@ def create_agent_session(log=print, cwd: str | None = None):
     and persists it as the session's workspace. When omitted, the gateway
     falls back to config ``terminal.cwd`` → ``TERMINAL_CWD`` → process cwd.
 
+    ``agent_home`` gives this gateway its own engine config root, passed to
+    the child as ``HERMES_HOME`` (the fork resolves its entire config tree
+    — config.yaml, SOUL.md, memories/, auth.json, .env — under that var; see
+    hermes_constants.get_hermes_home in the fork). When omitted the child
+    falls back to the hub's own ``HERMES_HOME``/``~/.hermes`` — the legacy
+    single-identity behavior.
+
     VERTUS hub invariant: each agent's session is created with that agent's
-    sandbox directory as cwd, never ``$HOME`` or the repo root (the hub
-    resolves and creates the directory before calling this).
+    sandbox directory as cwd, never ``$HOME`` or the repo root, and (when
+    the hub passes ``agent_home``) with that agent's identity tree as the
+    engine config root.
     """
     if not VENV_PYTHON.exists():
         raise AgentSessionError(f"hermes venv python not found: {VENV_PYTHON}")
@@ -350,6 +469,9 @@ def create_agent_session(log=print, cwd: str | None = None):
         c = Path(cwd).expanduser()
         c.mkdir(parents=True, exist_ok=True)
         cwd = str(c.resolve())
+    child_env = build_gateway_env(agent_home=agent_home)
+    if extra_env:
+        child_env.update({str(k): str(v) for k, v in extra_env.items()})
     proc = subprocess.Popen(
         [str(VENV_PYTHON), "-u", "-c", _GATEWAY_BOOT],
         stdin=subprocess.PIPE,
@@ -358,7 +480,7 @@ def create_agent_session(log=print, cwd: str | None = None):
         text=True,
         bufsize=1,
         cwd=str(FORK_REPO),
-        env={**os.environ},
+        env=child_env,
     )
 
     # The hermes engine writes diagnostics to stderr (e.g. the Copilot
@@ -390,7 +512,7 @@ def create_agent_session(log=print, cwd: str | None = None):
     # module docstring). Mirrors the pi in-memory default.
     cwd = cwd or os.environ.get("VERTUS_CWD") or os.getcwd()
     try:
-        session._session_id = session._create_session(cwd)
+        session._session_id = session._create_session(cwd, model=model, provider=provider)
     except Exception as exc:
         proc.kill()
         raise AgentSessionError(f"hermes session.create failed: {exc}") from exc

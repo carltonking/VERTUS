@@ -3,22 +3,46 @@
 On-disk layout (also documented in README "Multi-agent (WIP)"):
 
     ~/.vertus/agents/
-    ├── _primary                  # text file holding the primary agent's id
+    ├── _primary                    # text file holding the primary agent's id
     └── <agent_id>/
-        ├── profile.json          # {"id", "name", "created_at", "sandbox_path"}
-        └── sandbox/              # per-agent scratch directory
+        ├── profile.json            # schema_version 2 — the SINGLE SOURCE OF TRUTH
+        ├── sandbox/                # per-agent scratch directory (session cwd)
+        ├── memory/                 # this bot's own working notes
+        └── home/                   # per-agent ENGINE config root (HERMES_HOME);
+            ├── config.yaml         #   materialized from profile.model/provider
+            ├── SOUL.md             #   materialized from profile.persona
+            ├── memories/           #   engine-side memory (USER.md / MEMORY.md)
+            ├── auth.json           #   copied from the fleet home at create time
+            ├── .env                #   copied from the fleet home at create time
+            └── skills/             #   templated VERTUS skills (injected paths)
 
-``agent_id`` is the directory name and never changes; ``name`` is display
-only and may change via rename_agent(). The primary marker file starts with
-an underscore so it can never collide with an agent id (ids are lowercase
-slugs, so ``_primary`` is not a valid id).
+    ~/.vertus/memory/shared/        # fleet-wide notes every bot can read/write
+
+``home/`` is DERIVED STATE: profile.json is authoritative and ``home/`` is
+re-materialized on every profile write (see ``_materialize_home_locked``).
+Hand edits under ``home/`` are lost on the next profile update — by design.
+
+Profile schema v2 (``schema_version: 2``):
+
+    id, name, title, description   # identity; title/description drive delegation
+    persona        : str           # the bot's system identity text (→ home/SOUL.md)
+    model, provider: str | None    # None = inherit the fleet default
+    color, emoji   : str | None    # client affordance
+    autonomy       : "ask" | "trusted"   # stored now, enforced in a later phase
+    created_at, updated_at, is_primary, sandbox_path, home_path
+
+Migration: v1 profiles (no ``schema_version``) are upgraded in place on load —
+``title`` backfilled from ``name``, ``persona`` backfilled from the fleet's
+current ``~/.hermes/SOUL.md`` when readable, all v1 keys kept, unknown keys
+preserved. Migration is idempotent (a v2 profile is never rewritten by it).
+The fleet hermes home is ``VERTUS_FLEET_HERMES_HOME`` or ``~/.hermes``.
 
 Deletion policy (documented choice): the last remaining agent can never be
-deleted (ValueError). Deleting the primary agent reassigns primary status
-to the oldest remaining agent (by created_at, then id) rather than
-recreating a fresh empty "primary" while other agents still exist.
+deleted (ValueError). Deleting the primary agent reassigns primary status to
+the oldest remaining agent (by created_at, then id) rather than recreating a
+fresh empty "primary" while other agents still exist.
 
-No network calls, no secrets: this is local, on-disk state only. The
+No network calls, no secrets of its own: this is local, on-disk state. The
 storage root defaults to ~/.vertus/agents and can be overridden with the
 VERTUS_AGENTS_DIR environment variable (used by tests and smoke runs).
 """
@@ -38,9 +62,25 @@ _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _PROFILE_FILE = "profile.json"
 _PRIMARY_MARKER = "_primary"
 
+SCHEMA_VERSION = 2
+
+# Free-form identity/config fields an update_agent() caller may set. Paths,
+# timestamps, and the id are managed by the registry, never by callers.
+EDITABLE_FIELDS = (
+    "title",
+    "description",
+    "persona",
+    "model",
+    "provider",
+    "color",
+    "emoji",
+    "autonomy",
+)
+AUTONOMY_VALUES = ("ask", "trusted")
+
 
 def _utc_now_iso() -> str:
-    """Timestamp used for created_at (ISO-8601 UTC, sorts lexicographically)."""
+    """Timestamp used for created_at/updated_at (ISO-8601 UTC, sorts lexicographically)."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
@@ -50,8 +90,74 @@ def _slugify(name: str) -> str:
     return slug or "agent"
 
 
+def fleet_hermes_home() -> Path:
+    """The fleet default engine config root (source for persona backfill + key copies).
+
+    ``VERTUS_FLEET_HERMES_HOME`` overrides; default ``~/.hermes`` — the same
+    root the un-profiled hermes engine resolves (hermes fork:
+    hermes_constants.get_hermes_home → $HERMES_HOME → ~/.hermes).
+    """
+    env = os.environ.get("VERTUS_FLEET_HERMES_HOME", "").strip()
+    return Path(env).expanduser() if env else Path.home() / ".hermes"
+
+
+def _read_fleet_soul() -> str:
+    """Best-effort read of the fleet SOUL.md, for v1 persona backfill."""
+    try:
+        return (fleet_hermes_home() / "SOUL.md").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def migrate_v1_profile(profile: dict, persona_backfill: str = "") -> tuple[dict, bool]:
+    """Upgrade a v1 profile dict to schema v2. Pure — no I/O.
+
+    Returns ``(profile, changed)``. Idempotent: a dict already carrying
+    ``schema_version >= 2`` is returned unchanged. Unknown keys are preserved
+    (forward compatibility); v1 keys are never dropped.
+    """
+    if int(profile.get("schema_version") or 0) >= SCHEMA_VERSION:
+        return profile, False
+    upgraded = dict(profile)  # unknown keys survive the copy
+    name = str(profile.get("name") or "")
+    upgraded.setdefault("title", name)
+    upgraded.setdefault("description", "")
+    upgraded.setdefault("persona", persona_backfill or "")
+    upgraded.setdefault("model", None)
+    upgraded.setdefault("provider", None)
+    upgraded.setdefault("color", None)
+    upgraded.setdefault("emoji", None)
+    upgraded.setdefault("autonomy", "ask")
+    upgraded.setdefault("updated_at", profile.get("created_at") or _utc_now_iso())
+    upgraded["schema_version"] = SCHEMA_VERSION
+    return upgraded, True
+
+
+def _yaml_dump(data: dict) -> str:
+    """Serialize a config dict to YAML, falling back to JSON if PyYAML is absent."""
+    try:
+        import yaml
+
+        return yaml.safe_dump(data, default_flow_style=False, sort_keys=False)
+    except ImportError:  # pragma: no cover - PyYAML present on all fleet hosts
+        return json.dumps(data, indent=2)
+
+
+def _yaml_load(text: str):
+    """Parse YAML text, falling back to JSON; returns None on any failure."""
+    try:
+        import yaml
+
+        return yaml.safe_load(text)
+    except Exception:
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
+
 class AgentRegistry:
-    """File-backed registry of VERTUS agents, each with its own sandbox.
+    """File-backed registry of VERTUS agents, each with its own sandbox + engine home.
 
     All mutating/reading operations take a process-wide lock — the hub is a
     threaded HTTP server, so concurrent requests must not interleave writes.
@@ -77,7 +183,7 @@ class AgentRegistry:
             return self._ensure_primary_locked()
 
     def create_agent(self, name: str) -> dict:
-        """Create an agent (profile.json + empty sandbox) and return it."""
+        """Create an agent (profile + sandbox + engine home + memory) and return it."""
         name = str(name).strip()
         if not name:
             raise ValueError("agent name must be non-empty")
@@ -98,15 +204,44 @@ class AgentRegistry:
         return agents
 
     def get_agent(self, agent_id: str) -> dict:
-        """One agent by id; raises KeyError when unknown."""
+        """One agent by id; raises KeyError when unknown.
+
+        Loading also applies the v1→v2 migration in place when needed.
+        """
         with self._lock:
             agent_id = self._validated_id(agent_id)
             agent = self._load(agent_id)
         agent["is_primary"] = agent_id == self._read_marker()
         return agent
 
+    def update_agent(self, agent_id: str, **fields) -> dict:
+        """Update editable profile fields; re-materialize the derived home tree.
+
+        Only fields in EDITABLE_FIELDS are accepted (TypeError otherwise, so a
+        typo'd field can never silently no-op). ``autonomy`` is validated.
+        ``model``/``provider`` set to None mean "inherit the fleet default".
+        """
+        unknown = set(fields) - set(EDITABLE_FIELDS)
+        if unknown:
+            raise TypeError(f"unknown profile field(s): {', '.join(sorted(unknown))}")
+        if "autonomy" in fields and fields["autonomy"] not in AUTONOMY_VALUES:
+            raise ValueError(f"autonomy must be one of {AUTONOMY_VALUES}")
+        with self._lock:
+            agent_id = self._validated_id(agent_id)
+            agent = self._load(agent_id)
+            for key, value in fields.items():
+                if value is None and key in ("model", "provider", "color", "emoji"):
+                    agent[key] = None
+                else:
+                    agent[key] = str(value) if key != "model" and key != "provider" else value
+            agent["updated_at"] = _utc_now_iso()
+            self._write_profile(agent_id, agent)
+            self._materialize_home_locked(agent_id, agent)
+        agent["is_primary"] = agent_id == self._read_marker()
+        return agent
+
     def rename_agent(self, agent_id: str, name: str) -> dict:
-        """Update the display name; id, directory, and sandbox are kept."""
+        """Update the display name; id, directory, sandbox, and home are kept."""
         name = str(name).strip()
         if not name:
             raise ValueError("agent name must be non-empty")
@@ -114,12 +249,13 @@ class AgentRegistry:
             agent_id = self._validated_id(agent_id)
             agent = self._load(agent_id)
             agent["name"] = name
+            agent["updated_at"] = _utc_now_iso()
             self._write_profile(agent_id, agent)
         agent["is_primary"] = agent_id == self._read_marker()
         return agent
 
     def delete_agent(self, agent_id: str) -> None:
-        """Delete an agent directory (profile + sandbox).
+        """Delete an agent directory (profile + sandbox + home + memory).
 
         Refuses to delete the last remaining agent (ValueError). Deleting
         the primary reassigns primary status to the oldest remaining agent
@@ -138,6 +274,113 @@ class AgentRegistry:
                     (self._load(aid)["created_at"], aid) for aid in ids if aid != agent_id
                 )[0][1]
                 self._write_marker(oldest)
+
+    def agent_home(self, agent_id: str) -> Path:
+        """The agent's engine config root (HERMES_HOME for its gateway)."""
+        return self.root / agent_id / "home"
+
+    def agent_memory_dir(self, agent_id: str) -> Path:
+        """This bot's own notes directory (skill-injected, never hardcoded)."""
+        return self.root / agent_id / "memory"
+
+    def shared_memory_dir(self) -> Path:
+        """Fleet-wide notes directory every bot reads/writes.
+
+        ``VERTUS_SHARED_MEMORY_DIR`` overrides; default ``~/.vertus/memory/shared``
+        (sibling of the legacy single-agent ``~/.vertus/memory`` store).
+        """
+        env = os.environ.get("VERTUS_SHARED_MEMORY_DIR", "").strip()
+        return Path(env).expanduser() if env else Path.home() / ".vertus" / "memory" / "shared"
+
+    def ensure_memory_dirs(self, agent_id: str) -> tuple[Path, Path]:
+        """Create (if missing) and return ``(agent_memory, shared_memory)``."""
+        agent_mem = self.agent_memory_dir(agent_id)
+        agent_mem.mkdir(parents=True, exist_ok=True)
+        shared = self.shared_memory_dir()
+        shared.mkdir(parents=True, exist_ok=True)
+        return agent_mem, shared
+
+    # ------------------------------------------------------------------
+    # Derived state: the per-agent engine home (HERMES_HOME)
+    # ------------------------------------------------------------------
+
+    def _materialize_home_locked(self, agent_id: str, profile: dict) -> None:
+        """(Re)write everything under ``home/`` from the profile.
+
+        Called on create and on every profile update so the tree always
+        mirrors profile.json. Per-bot copies of auth.json / .env are seeded
+        once (only when the target is missing) — they may hold per-bot
+        credentials and are NOT clobbered by fleet-wide updates.
+        """
+        home = self.agent_home(agent_id)
+        home.mkdir(parents=True, exist_ok=True)
+
+        # config.yaml — per-agent model/provider override, else the fleet
+        # default config (model section included). If the fleet config is
+        # unreadable and no override exists, write a minimal file so the
+        # engine falls back to its own silent default rather than inheriting
+        # a stale one.
+        fleet_cfg_path = fleet_hermes_home() / "config.yaml"
+        cfg = _yaml_load(fleet_cfg_path.read_text(encoding="utf-8")) if fleet_cfg_path.is_file() else None
+        if not isinstance(cfg, dict):
+            cfg = {}
+        cfg.pop("model_aliases", None)  # aliases resolve against fleet credentials we may not copy
+        if profile.get("model"):
+            model_section = {"default": str(profile["model"])}
+            if profile.get("provider"):
+                model_section["provider"] = str(profile["provider"])
+            cfg["model"] = model_section
+        elif profile.get("provider"):
+            cfg.setdefault("model", {})["provider"] = str(profile["provider"])
+        (home / "config.yaml").write_text(_yaml_dump(cfg), encoding="utf-8")
+
+        # SOUL.md — the bot's persona. Empty persona removes any stale file so
+        # the tree stays derived (the engine re-seeds its default identity).
+        soul = home / "SOUL.md"
+        persona = str(profile.get("persona") or "").strip()
+        if persona:
+            soul.write_text(persona + "\n", encoding="utf-8")
+        elif soul.exists():
+            soul.unlink()
+
+        # Engine-side memories dir (USER.md / MEMORY.md are engine-managed).
+        (home / "memories").mkdir(parents=True, exist_ok=True)
+
+        # Templated VERTUS skills with this agent's paths injected (the skill
+        # files in the repo carry {{PLACEHOLDER}} markers — see
+        # vertus/extensions/memory-skill/SKILL.md). Missing repo skill files
+        # are skipped silently (tests run from a bare checkout).
+        substitutions = {
+            "{{AGENT_ID}}": agent_id,
+            "{{AGENT_NAME}}": str(profile.get("name") or agent_id),
+            "{{AGENT_MEMORY_DIR}}": str(self.agent_memory_dir(agent_id)),
+            "{{SHARED_MEMORY_DIR}}": str(self.shared_memory_dir()),
+            "{{AGENT_SOUL_PATH}}": str(home / "SOUL.md"),
+        }
+        for skill_name, source in (
+            ("vertus-memory", _REPO_ROOT / "vertus" / "extensions" / "memory-skill" / "SKILL.md"),
+            ("vertus-persona", _REPO_ROOT / "vertus-persona" / "SKILL.md"),
+        ):
+            try:
+                text = source.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            for marker, value in substitutions.items():
+                text = text.replace(marker, value)
+            skill_dir = home / "skills" / skill_name
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "SKILL.md").write_text(text, encoding="utf-8")
+
+        # Seed per-bot credentials once from the fleet home. Never overwrite:
+        # a bot's keys may have been edited per-bot after creation.
+        for secret in ("auth.json", ".env"):
+            src = fleet_hermes_home() / secret
+            dst = home / secret
+            if src.is_file() and not dst.exists():
+                try:
+                    shutil.copy2(src, dst)
+                except OSError:
+                    pass  # best-effort; the engine falls back to env vars
 
     # ------------------------------------------------------------------
     # Internals (callers must hold self._lock)
@@ -167,10 +410,24 @@ class AgentRegistry:
         profile = {
             "id": agent_id,
             "name": name,
+            "title": name,
+            "description": "",
+            "persona": "",
+            "model": None,
+            "provider": None,
+            "color": None,
+            "emoji": None,
+            "autonomy": "ask",
             "created_at": _utc_now_iso(),
+            "updated_at": _utc_now_iso(),
             "sandbox_path": str(sandbox),
+            "home_path": str(agent_dir / "home"),
+            "schema_version": SCHEMA_VERSION,
         }
         self._write_profile(agent_id, profile)
+        self._materialize_home_locked(agent_id, profile)
+        self.agent_memory_dir(agent_id).mkdir(parents=True, exist_ok=True)
+        self.shared_memory_dir().mkdir(parents=True, exist_ok=True)
         # First agent ever created becomes primary automatically.
         if self._read_marker() not in self._scan_ids():
             self._write_marker(agent_id)
@@ -206,6 +463,12 @@ class AgentRegistry:
         return self.root / agent_id
 
     def _load(self, agent_id: str) -> dict:
+        """Read a profile, migrating v1 → v2 in place when needed.
+
+        Migration rewrites profile.json (idempotently) so every reader after
+        the first sees v2 on disk. Unknown keys are preserved through both
+        the read and the rewrite.
+        """
         profile_path = self._agent_dir(agent_id) / _PROFILE_FILE
         try:
             profile = json.loads(profile_path.read_text())
@@ -213,7 +476,15 @@ class AgentRegistry:
             raise KeyError(agent_id) from exc
         if not isinstance(profile, dict) or profile.get("id") != agent_id:
             raise KeyError(agent_id)
-        return profile
+        migrated, changed = migrate_v1_profile(profile, persona_backfill=_read_fleet_soul())
+        if changed:
+            # Reuse updated_at set by the migration; persist before returning.
+            self._write_profile(agent_id, migrated)
+            try:
+                self._materialize_home_locked(agent_id, migrated)
+            except OSError:
+                pass  # home materialization is best-effort during load
+        return migrated
 
     def _write_profile(self, agent_id: str, profile: dict) -> None:
         self._atomic_write(self._agent_dir(agent_id) / _PROFILE_FILE, profile)
@@ -238,3 +509,8 @@ class AgentRegistry:
         tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
         tmp.write_bytes(payload)
         os.replace(tmp, path)
+
+
+# Repo root, resolved from this file: <root>/vertus/server/agent_registry.py.
+# Used only to locate the templated skill files for home materialization.
+_REPO_ROOT = Path(__file__).resolve().parents[2]

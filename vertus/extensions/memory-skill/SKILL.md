@@ -1,44 +1,43 @@
-/**
- * VERTUS — Long-Term Memory Skill
- *
- * Place in the agent's skills directory (e.g. ~/.pi/agent/skills/ or
- * bundled under vertus/extensions). Pi discovers skills as markdown
- * instruction files.
- *
- * Memory layout:
- *   ~/.vertus/memory/profile.md    stable facts about the user
- *   ~/.vertus/memory/notes/        dated task notes
- *   ~/.vertus/memory/index.json    lightweight index (topics -> files)
- *
- * At session start, VERTUS reads profile.md and recent notes so it
- * remembers the user. When VERTUS learns something durable (a
- * preference, a fact, a standing instruction), it appends/updates the
- * relevant memory file in the same turn.
- */
+---
+name: vertus-memory
+description: "Long-term memory for this agent ({{AGENT_ID}}): per-bot notes plus fleet-shared notes — use at session start and whenever a durable fact is learned"
+---
 
-# Memory
+# VERTUS Memory
 
-You have a persistent memory directory at `~/.vertus/memory/`:
+You have two persistent memory locations, injected for THIS agent at spawn:
 
-- `profile.md` — stable facts about the user: name, role, preferences,
-  projects, machines, standing instructions. Read this at the start of
-  every session. Update it only when you learn something durable and
-  unlikely to change.
-- `notes/` — dated task notes (one file per task or topic, e.g.
-  `2026-09-01-portfolio-rebalance.md`). Read recent notes when they
-  look relevant to the current request. Write a note whenever a task
-  is non-trivial enough that the user may want to refer to it later.
-- `index.json` — lightweight index mapping topics to note files.
+- **Your own memory** — `{{AGENT_MEMORY_DIR}}/`:
+  - `profile.md` — stable facts about the user you handle. Read at the start
+    of every session. Update only with durable, unlikely-to-change facts.
+  - `notes/` — dated task notes, one file per topic, named
+    `YYYY-MM-DD-topic.md`. Read recent notes when relevant. Write a note
+    for any non-trivial task whose outcome may matter later.
+  - `index.json` — lightweight map of topics to note files. Keep it in
+    sync when adding or renaming notes.
+  This directory is YOURS alone — other agents cannot see it.
+
+- **Fleet-shared memory** — `{{SHARED_MEMORY_DIR}}/`:
+  Every VERTUS agent reads and writes this directory. Use it for facts
+  that concern the whole fleet: the user's identity, standing preferences
+  that apply everywhere ("always use pnpm", timezone), machine layouts,
+  cross-agent coordination notes. Prefix shared note files with the topic,
+  not your name; never delete another agent's shared notes.
 
 ## Rules
 
-1. Read `profile.md` and the most recent notes at the start of every
-   session, before answering the first question.
-2. When the user states a durable preference ("always use pnpm",
-   "I'm on Pacific time", "call me Buffy"), add it to `profile.md`
-   immediately, then confirm briefly.
-3. When a task produces reusable knowledge (a fix that worked, a
-   decision made), write a short note under `notes/` with today's
-   date prefix.
-4. Never store secrets (API keys, passwords, tokens) in memory.
+1. At session start, read your `profile.md` and the most recent notes
+   (both locations) before answering the first question.
+2. When the user states a durable preference or fact ("always use pnpm",
+   "I'm on Pacific time"), decide the scope: user-wide → shared memory;
+   task-specific to your duties → your own memory. Write it immediately,
+   then confirm briefly.
+3. When a task produces reusable knowledge (a fix that worked, a decision
+   made), write a short dated note and update `index.json` (own memory for
+   your topics; shared for fleet topics).
+4. Never store secrets (API keys, passwords, tokens) in memory files.
 5. Keep notes short; memory is a working tool, not an archive.
+6. Use the `read` and `write`/`edit` tools on the memory paths — they are
+   ordinary files.
+
+(Your identity lives at `{{AGENT_SOUL_PATH}}` — see your persona skill.)
