@@ -14,17 +14,24 @@ window an agent drives mid-turn (gateway ``tool.start`` events carry the
 tool NAME only, never args) and cannot inject into a running turn, so
 ownership is enforced at the only point the hub controls: the boundary
 between a queued turn and its start. Each agent declares the app bundle
-ids / window titles it works in via ``profile.cua_targets``; a run claims
-its declared targets for the duration of the turn and a second agent whose
-run declares an overlapping target WAITS (FIFO per target) instead of
-starting. Text-only agents and unrestricted CUA agents (``cua_targets``
-null) never claim and never contend — distinct-window concurrency stays
-fully parallel, per the Step 0C measurement.
+ids / window titles it works in via ``profile.cua_targets``; a run whose
+declared targets OVERLAP another RUNNING agent's declaration WAITS (FIFO)
+until that run reaches a terminal state, its gateway dies, or the agent is
+deleted. Disjoint or null declarations run immediately, fully parallel.
+Text-only agents and unrestricted CUA agents (``cua_targets`` null) never
+claim and never contend.
 
 Coarse by necessity: a turn is assumed GUI-bound when its agent declares
 targets, so a pure-text prompt to a target-declared agent will queue behind
 a co-tenant of the same target. That is the documented cost of enforcing
 without a fork change (the declaration IS the GUI intent).
+
+ENFORCEMENT HONESTY: ``cua_targets`` is a DECLARATION, not a sandbox. An
+agent can drive a window it never declared and the hub cannot see it —
+this registry only prevents the predictable collision of two declared
+co-tenants. It provides no isolation.
+
+Caveat surfaced verbatim in GET /api/fleet/screens and the UI.
 """
 
 from __future__ import annotations
@@ -32,6 +39,16 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+
+# Shown in /api/fleet/screens and the fleet UI. The declaration gates only
+# declared-target collisions; it is not a sandbox and not per-action consent.
+SCREEN_POLICY_CAVEAT = (
+    "cua_targets is a DECLARATION, not a sandbox: it only prevents two "
+    "agents from running turns that declare the same app/window at once. "
+    "The hub cannot see which window an agent actually drives mid-turn, and "
+    "an agent can target something it never declared. This policy provides "
+    "no isolation — real isolation needs a VM or headless display per agent."
+)
 
 
 @dataclass
@@ -150,31 +167,53 @@ class ScreenLeaseManager:
             self._waiters = [w for w in self._waiters if w.agent_id != agent_id]
             self._try_grant_in_order()
 
-    def screens(self) -> list[dict]:
-        """Roster of who holds what and who is waiting (GET /api/fleet/screens)."""
+    def owners(self) -> dict[str, tuple[str, str, float]]:
+        """Live leases: target -> (agent_id, run_id, since_epoch)."""
         with self._lock:
-            out = []
-            for target in sorted(self._leases):
-                agent_id, run_id, since = self._leases[target]
-                out.append({
-                    "target": target,
-                    "owner_agent": agent_id,
-                    "owner_run": run_id,
-                    "since": since,
-                    "waiters": [w.agent_id for w in self._waiters if target in w.targets],
-                })
-            return out
+            return dict(self._leases)
 
-    def waiting_targets(self, agent_id: str) -> list[str]:
-        """Targets this agent is currently blocked on, if it is a waiter."""
+    def blocked_by(self, agent_id: str) -> list[dict]:
+        """For a waiting agent, the target → holder pairs it is blocked on.
+
+        Each entry: ``{target, holder_agent, holder_run}``. Empty when the
+        agent is not currently a waiter (or nothing it wants is leased).
+        """
         with self._lock:
             for w in self._waiters:
-                if w.agent_id == agent_id:
-                    return [t for t in w.targets if t in self._leases]
+                if w.agent_id != agent_id:
+                    continue
+                out: list[dict] = []
+                for t in w.targets:
+                    holder = self._leases.get(t)
+                    if holder is not None and holder[0] != agent_id:
+                        out.append({
+                            "target": t,
+                            "holder_agent": holder[0],
+                            "holder_run": holder[1],
+                        })
+                return out
             return []
 
+    def blocked(self) -> list[dict]:
+        """Every waiter with the target/holder pair it is blocked on."""
+        with self._lock:
+            out: list[dict] = []
+            for w in self._waiters:
+                for t in w.targets:
+                    holder = self._leases.get(t)
+                    if holder is not None and holder[0] != w.agent_id:
+                        out.append({
+                            "agent_id": w.agent_id,
+                            "run_id": w.run_id,
+                            "target": t,
+                            "holder_agent": holder[0],
+                            "holder_run": holder[1],
+                        })
+            return out
+
     def is_waiting(self, agent_id: str) -> bool:
-        return any(w.agent_id == agent_id for w in self._waiters)
+        with self._lock:
+            return any(w.agent_id == agent_id for w in self._waiters)
 
     # ------------------------------------------------------------------
     # Internals (callers hold self._lock)

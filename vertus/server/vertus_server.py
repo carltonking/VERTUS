@@ -56,12 +56,12 @@ from urllib.parse import parse_qs, urlsplit
 try:
     from agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
     from run_store import RunStore, RUN_STATES  # type: ignore
-    from screen_lease import ScreenLeaseManager  # type: ignore
+    from screen_lease import ScreenLeaseManager, SCREEN_POLICY_CAVEAT  # type: ignore
     from session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 except ImportError:  # pragma: no cover - only hit under package invocation
     from .agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
     from .run_store import RunStore, RUN_STATES  # type: ignore
-    from .screen_lease import ScreenLeaseManager  # type: ignore
+    from .screen_lease import ScreenLeaseManager, SCREEN_POLICY_CAVEAT  # type: ignore
     from .session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 
 VERTUS_DIR = Path.home() / ".vertus"
@@ -355,9 +355,10 @@ class AgentBridge:
         unit tests leave it None). Targets are resolved fresh each turn via
         ``_screen_targets`` so a profile PATCH applies to the next turn even
         though the gateway itself respawns lazily. While blocked, the turn is
-        still logically queued: status() reports ``waiting_on_screen`` so the
-        bot never looks idle. Returns (without owning anything) when the
-        bridge closed mid-wait — the caller's closed check abandons the run.
+        still logically queued and status() reports ``blocked_on_target``
+        (with the holder named), so a blocked bot never looks idle. Returns
+        (without owning anything) when the bridge closed mid-wait — the
+        caller's closed check abandons the run.
         """
         leases = self.screen_leases
         if leases is None:
@@ -376,6 +377,19 @@ class AgentBridge:
                 self._active_screen_targets = list(targets)
                 self._waiting_on = None
             return
+
+        def holder_pairs(ts: list[str]) -> list[dict]:
+            owners = leases.owners()
+            return [
+                {
+                    "target": t,
+                    "holder_agent": owners[t][0],
+                    "holder_run": owners[t][1],
+                }
+                for t in ts
+                if t in owners and owners[t][0] != self.agent_id
+            ]
+
         # Contended: register as a FIFO waiter and poll with a short timeout
         # so bridge close is noticed (and the waiter cancelled) promptly.
         while True:
@@ -384,8 +398,11 @@ class AgentBridge:
                     leases.cancel_wait(self.agent_id, run_key)
                     self._waiting_on = None
                     return
-                blocked = leases.waiting_targets(self.agent_id)
-                self._waiting_on = blocked or list(targets)
+                # Before the first wait_for_grant the agent is not yet a
+                # registered waiter, so fall back to the owners() snapshot;
+                # once registered, blocked_by() reports exactly its waits.
+                blocked = leases.blocked_by(self.agent_id) or holder_pairs(targets)
+                self._waiting_on = blocked
             got = leases.wait_for_grant(self.agent_id, run_key, targets)
             if got is not None:
                 with self._status_lock:
@@ -428,6 +445,14 @@ class AgentBridge:
             if closed:
                 # A close raced the enqueue (DELETE refuses busy bridges, so
                 # this is defensive): the run never started — mark it so.
+                # The worker may also have waited out a screen gate before
+                # noticing close; close() pushed a None sentinel that nobody
+                # will consume now — drain it so status stays truthful.
+                while True:
+                    try:
+                        self._queue.get_nowait()
+                    except Empty:
+                        break
                 self._abandon_run()
                 break
             try:
@@ -747,8 +772,9 @@ class AgentBridge:
             "gateway_alive": gateway_alive,
         }
         if waiting:
-            # A bot blocked on a screen lease must show as such, not idle.
-            out["waiting_on_screen"] = list(waiting)
+            # A bot blocked on a declared target must show as such (with the
+            # holder named), not idle — and never as running.
+            out["blocked_on_target"] = [dict(b) for b in waiting]
         return out
 
     def reconfigure(self, session_kwargs: dict) -> None:
@@ -1430,17 +1456,48 @@ class VertusHandler(BaseHTTPRequestHandler):
         self._json(200, {"activity": activity})
 
     def _handle_fleet_screens(self) -> None:
-        """GET /api/fleet/screens — who holds which screen target, who waits.
+        """GET /api/fleet/screens — declared targets, who is running, who waits.
 
-        The roster behind the per-window computer-use ownership policy:
-        only agents with computer_use enabled AND declared cua_targets ever
-        appear as owners or waiters.
+        Roster behind the per-window computer-use policy. Every agent with
+        computer_use enabled and non-null cua_targets appears; each target
+        shows who declared it, which run currently owns it (if any), and
+        which agents are waiting on it. The response carries the policy
+        caveat verbatim: targets are declarations, not a sandbox — the hub
+        cannot see what an agent actually drives mid-turn.
         """
         leases = self.screen_leases
         if leases is None:
-            self._json(200, {"screens": []})
+            self._json(200, {"screens": [], "caveat": SCREEN_POLICY_CAVEAT})
             return
-        self._json(200, {"screens": leases.screens()})
+        owners = leases.owners()
+        blocked = leases.blocked()
+        try:
+            agents = self.registry.list_agents()
+        except Exception:  # noqa: BLE001 — roster is best-effort
+            agents = []
+        declared: dict[str, list[str]] = {}
+        for agent in agents:
+            if not bool(agent.get("computer_use")):
+                continue
+            for target in agent.get("cua_targets") or []:
+                declared.setdefault(str(target), []).append(agent["id"])
+        screens: list[dict] = []
+        for target in sorted(set(declared) | set(owners)):
+            entry: dict = {
+                "target": target,
+                "declared_by": sorted(declared.get(target, [])),
+            }
+            holder = owners.get(target)
+            entry["running"] = (
+                {"agent_id": holder[0], "run_id": holder[1], "since": holder[2]}
+                if holder
+                else None
+            )
+            entry["waiting"] = sorted(
+                b["agent_id"] for b in blocked if b["target"] == target
+            )
+            screens.append(entry)
+        self._json(200, {"screens": screens, "caveat": SCREEN_POLICY_CAVEAT})
 
     def log_message(self, fmt: str, *args) -> None:
         pass
