@@ -46,7 +46,7 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 import threading
 from threading import Thread
 from urllib.parse import parse_qs, urlsplit
@@ -55,9 +55,11 @@ from urllib.parse import parse_qs, urlsplit
 # fall back to a package-relative import for `python -m vertus.server.vertus_server`.
 try:
     from agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
+    from run_store import RunStore, RUN_STATES  # type: ignore
     from session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 except ImportError:  # pragma: no cover - only hit under package invocation
     from .agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
+    from .run_store import RunStore, RUN_STATES  # type: ignore
     from .session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 
 VERTUS_DIR = Path.home() / ".vertus"
@@ -129,8 +131,13 @@ class AgentBridge:
     subscribers only.
     """
 
-    def __init__(self, agent_id: str = DEFAULT_AGENT_ID, create_session_factory=None, cwd: str | None = None, session_kwargs: dict | None = None) -> None:
+    def __init__(self, agent_id: str = DEFAULT_AGENT_ID, create_session_factory=None, cwd: str | None = None, session_kwargs: dict | None = None, store=None) -> None:
         self.agent_id = agent_id
+        # Durable run store (Step: run history). When set, every wire event is
+        # committed BEFORE it is fanned out and stamped agent_id/run_id/seq/ts.
+        # When None (legacy/unit tests), events fan out un-enriched exactly as
+        # before.
+        self.store = store
         # Session workspace: the agent's sandbox dir (never $HOME / repo root).
         self.cwd = cwd
         # Identity kwargs forwarded to every engine session this bridge creates
@@ -154,11 +161,19 @@ class AgentBridge:
         self._turn_started_at: float | None = None
         self._stale = False      # a profile PATCH happened; respawn on next turn
         self._closed = False     # close() called; no new turns may start
+        # Current-run tracking (Step: run history). Guarded by _status_lock.
+        # Events emitted by the engine's reader thread while the worker is
+        # inside a turn are attributed to the run the worker is processing.
+        self._current_run_id: str | None = None
+        self._run_buffer: list[str] | None = None   # folded at turn end
+        self._run_respawns = 0
+        self._run_had_error = False
+        self._run_error_message = ""
         self._worker = Thread(target=self._run_worker, daemon=True)
         self._worker.start()
 
-    def subscribe(self) -> Queue:
-        q: Queue = Queue(maxsize=1000)
+    def subscribe(self, maxsize: int = 1000) -> Queue:
+        q: Queue = Queue(maxsize=maxsize)
         self.subscribers.append(q)
         return q
 
@@ -166,12 +181,137 @@ class AgentBridge:
         if q in self.subscribers:
             self.subscribers.remove(q)
 
-    def _emit(self, event: dict) -> None:
+    def _fanout(self, event: dict) -> None:
+        """Push one (stored) envelope to every subscriber; drop laggards.
+
+        A subscriber whose queue fills is dropped — but the drop is now
+        recoverable: the client reconnects with since=<last seq it saw> and
+        replays the gap from the store. A best-effort ``lagged`` marker with
+        the overflow seq is pushed first when the queue has room; when it is
+        completely full the marker cannot fit either and the subscriber is
+        dropped silently (it resumes from its own last-seen seq).
+        """
+        dead: list[Queue] = []
         for q in list(self.subscribers):
             try:
                 q.put_nowait(event)
-            except Exception:
-                self.unsubscribe(q)
+            except Full:
+                try:
+                    q.put_nowait({
+                        "type": "lagged",
+                        "last_seq": event.get("seq"),
+                        "agent_id": event.get("agent_id"),
+                    })
+                except Full:
+                    pass
+                dead.append(q)
+        for q in dead:
+            self.unsubscribe(q)
+
+    def _emit(self, event: dict) -> None:
+        """Route one wire event: persist FIRST, then fan out the envelope.
+
+        Durability rule: an event is written to the store BEFORE it reaches
+        any subscriber. On a store write failure the run goes to error and
+        nothing is fanned out — no event that isn't in the store ever reaches
+        a client. Events with no active run (a store-backed hub) are dropped:
+        they belong to no run and cannot be stored or replayed.
+
+        Legacy mode (no store): the pre-history behavior, un-enriched.
+        """
+        with self._status_lock:
+            run_id = self._current_run_id
+            if event.get("type") == "text" and self._run_buffer is not None:
+                text = event.get("text")
+                if isinstance(text, str) and text:
+                    self._run_buffer.append(text)
+            if event.get("type") == "error":
+                self._run_had_error = True
+                msg = event.get("message") or event.get("text") or ""
+                self._run_error_message = str(msg)[:200]
+        if self.store is None:
+            self._fanout(event)
+            return
+        if run_id is None:
+            # Store-backed hub but no run context: not storable, not replayable.
+            return
+        try:
+            envelope = self.store.record_event(self.agent_id, run_id, event)
+        except Exception as exc:  # noqa: BLE001 — store is the durability boundary
+            print(
+                f"[vertus] event store write failed (run {run_id}): {exc}",
+                file=sys.stderr,
+            )
+            self._store_failure(run_id, exc)
+            return
+        self._fanout(envelope)
+
+    def _store_failure(self, run_id: str, exc: BaseException) -> None:
+        """A store write failed: the run can't be trusted — mark it error."""
+        try:
+            self.store.finish_run(
+                run_id, "error", error=f"event store failure: {exc}"[:200]
+            )
+        except Exception:  # noqa: BLE001 — store is down; best effort only
+            pass
+
+    def _begin_run(self, run_id: str) -> None:
+        """Enter a run context (worker thread, before the turn runs)."""
+        with self._status_lock:
+            self._current_run_id = run_id
+            self._run_buffer = []
+            self._run_respawns = 0
+            self._run_had_error = False
+            self._run_error_message = ""
+        if self.store is not None:
+            try:
+                self.store.mark_running(run_id, self.agent_id)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[vertus] mark_running failed ({run_id}): {exc}", file=sys.stderr)
+
+    def _abandon_run(self) -> None:
+        """A run was dequeued but never started (bridge closed) — interrupt it."""
+        with self._status_lock:
+            run_id = self._current_run_id
+            self._current_run_id = None
+            self._run_buffer = None
+        if run_id and self.store is not None:
+            try:
+                self.store.finish_run(run_id, "interrupted")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _end_run(self) -> None:
+        """Leave the run context: fold the assistant text, set the terminal
+        state exactly once (worker thread, after the turn finished)."""
+        with self._status_lock:
+            run_id = self._current_run_id
+            buffer = self._run_buffer
+            had_error = self._run_had_error
+            error_msg = self._run_error_message
+            respawns = self._run_respawns
+            self._current_run_id = None
+            self._run_buffer = None
+            self._run_error_message = ""
+        if not run_id or self.store is None:
+            return
+        store = self.store
+        if buffer:
+            text = "".join(buffer).strip()
+            if text:
+                try:
+                    store.add_message(run_id, self.agent_id, "assistant", text)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[vertus] assistant message fold failed: {exc}", file=sys.stderr)
+        try:
+            store.finish_run(
+                run_id,
+                "error" if had_error else "done",
+                error=error_msg or None,
+                gateway_respawns=respawns,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[vertus] finish_run failed ({run_id}): {exc}", file=sys.stderr)
 
     def _load_pi(self):
         """Load the agent bridge: forked hermes engine by default, pi fallback.
@@ -213,27 +353,39 @@ class AgentBridge:
             # ``remote`` is carried explicitly on the item (Step 4: the old
             # os.environ["VERTUS_REMOTE"] write was process-global — two
             # agents running concurrently overwrote each other's flag).
-            text, remote = item
-            if self._create_session is None:
-                self._emit({"type": "error", "message": "agent SDK not available"})
-                continue
-            # Stale profile config (a PATCH happened since the last turn) is
-            # consumed BETWEEN turns: the old gateway finishes any in-flight
-            # turn undisturbed; the NEXT spawn uses the new kwargs. The
-            # running marker wraps the whole turn INCLUDING the respawn retry
-            # path — a turn being retried is still "running".
-            self._consume_stale()
+            # ``run_id`` is the store row created at enqueue time — the run
+            # context that stamps every event of this turn.
+            text, remote, run_id = item
+            if run_id is not None:
+                self._begin_run(run_id)
             with self._status_lock:
-                if self._closed:
-                    break
-                self._running = True
-                self._turn_started_at = time.monotonic()
+                closed = self._closed
+                if not closed:
+                    self._running = True
+                    self._turn_started_at = time.monotonic()
+            if closed:
+                # A close raced the enqueue (DELETE refuses busy bridges, so
+                # this is defensive): the run never started — mark it so.
+                self._abandon_run()
+                break
             try:
-                self._run_prompt_with_respawn(text, remote=remote)
+                if self._create_session is None:
+                    self._emit({"type": "error", "message": "agent SDK not available"})
+                else:
+                    # Stale profile config (a PATCH happened since the last
+                    # turn) is consumed BETWEEN turns: the old gateway
+                    # finishes any in-flight turn undisturbed; the NEXT spawn
+                    # uses the new kwargs. The running marker wraps the whole
+                    # turn INCLUDING the respawn retry path — a turn being
+                    # retried is still "running".
+                    self._consume_stale()
+                    self._run_prompt_with_respawn(text, remote=remote)
             finally:
                 with self._status_lock:
                     self._running = False
                     self._turn_started_at = None
+                # Fold assistant text + set the terminal state exactly once.
+                self._end_run()
 
     def _spawn_session(self, remote: bool):
         """Create one engine session with this agent's identity + spawn-mode env.
@@ -372,6 +524,8 @@ class AgentBridge:
                             f"[vertus] agent gateway died at startup ({exc}); respawning",
                             file=sys.stderr,
                         )
+                        with self._status_lock:
+                            self._run_respawns += 1
                         continue
                     self._emit({"type": "error", "message": f"agent start failed: {exc}"})
                     return
@@ -402,6 +556,8 @@ class AgentBridge:
                 self._session = None
                 if dead and _attempt == 0:
                     print(f"[vertus] agent gateway died ({exc}); respawning", file=sys.stderr)
+                    with self._status_lock:
+                        self._run_respawns += 1
                     continue
                 self._emit({"type": "error", "message": str(exc)[:500]})
                 return
@@ -473,12 +629,16 @@ class AgentBridge:
         except Exception as exc:  # noqa: BLE001
             return {"commands": [], "skillCount": 0, "error": str(exc)[:200]}
 
-    def prompt(self, text: str, remote: bool) -> None:
-        """Queue one turn. Raises RuntimeError after close() (hub → 409)."""
+    def prompt(self, text: str, remote: bool, run_id: str | None = None) -> None:
+        """Queue one turn. Raises RuntimeError after close() (hub → 409).
+
+        ``run_id`` links every event of this turn to the store row created at
+        enqueue time; None keeps the legacy (un-stored) path used by tests.
+        """
         with self._status_lock:
             if self._closed:
                 raise RuntimeError(f"agent {self.agent_id} is closed")
-        self._queue.put((text, remote))
+        self._queue.put((text, remote, run_id))
 
     # ------------------------------------------------------------------
     # Step A: turn introspection + lifecycle (reconfigure / close)
@@ -585,11 +745,66 @@ class AgentBridge:
         return True
 
 
+class FleetFan:
+    """Fan committed envelopes (ALL agents) to fleet-stream subscribers.
+
+    The hub registers this as the RunStore's ``listener``, so the writer
+    thread pushes every committed event here after commit. Fleet SSE clients
+    subscribe here instead of to one agent's bridge — they see every agent,
+    including agents that start mid-connection. Drop policy mirrors
+    AgentBridge._fanout: a full subscriber is dropped (recoverable via
+    since=), with a best-effort ``lagged`` marker.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.subscribers: list[Queue] = []
+
+    def subscribe(self) -> Queue:
+        q: Queue = Queue(maxsize=1000)
+        with self._lock:
+            self.subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: Queue) -> None:
+        with self._lock:
+            if q in self.subscribers:
+                self.subscribers.remove(q)
+
+    def publish(self, envelope: dict) -> None:
+        dead: list[Queue] = []
+        with self._lock:
+            targets = list(self.subscribers)
+        for q in targets:
+            try:
+                q.put_nowait(envelope)
+            except Full:
+                try:
+                    q.put_nowait({
+                        "type": "lagged",
+                        "last_seq": envelope.get("seq"),
+                        "agent_id": envelope.get("agent_id"),
+                    })
+                except Full:
+                    pass
+                dead.append(q)
+        if dead:
+            self.unsubscribe_all(dead)
+
+    def unsubscribe_all(self, dead: list[Queue]) -> None:
+        with self._lock:
+            for q in dead:
+                if q in self.subscribers:
+                    self.subscribers.remove(q)
+
+
 class VertusHandler(BaseHTTPRequestHandler):
     server_version = "VertusServer/1.1"
     sessions: SessionManager = None  # type: ignore[assignment]
     token: str = ""
     registry: AgentRegistry = None  # type: ignore[assignment]
+    store: RunStore = None  # type: ignore[assignment]
+    fleet: FleetFan = None  # type: ignore[assignment]
 
     def _authed(self) -> bool:
         header = self.headers.get("Authorization", "")
@@ -620,12 +835,24 @@ class VertusHandler(BaseHTTPRequestHandler):
             rest = path[len("/api/agents/"):].strip("/")
             if not rest:
                 self._json(404, {"error": "not found"})
+            elif rest.endswith("/messages"):
+                self._handle_agent_messages(rest[: -len("/messages")])
             elif rest.endswith("/status"):
                 self._handle_agent_status(rest[: -len("/status")])
             else:
                 self._handle_agent_get(rest)
         elif path == "/api/events":
-            self._sse(self._query_param("agent_id"))
+            self._sse(
+                self._query_param("agent_id"),
+                since=self._query_param("since"),
+                run_id=self._query_param("run_id"),
+            )
+        elif path == "/api/runs":
+            self._handle_runs_list()
+        elif path.startswith("/api/runs/"):
+            self._handle_run_get(path[len("/api/runs/"):].strip("/"))
+        elif path == "/api/fleet/activity":
+            self._handle_fleet_activity()
         else:
             self._json(404, {"error": "not found"})
 
@@ -642,14 +869,50 @@ class VertusHandler(BaseHTTPRequestHandler):
             if not text:
                 self._json(400, {"error": "text required"})
                 return
-            remote = self.headers.get("X-Vertus-Client", "local").lower() != "local"
+            source = str(self.headers.get("X-Vertus-Client", "local") or "local")
+            remote = source.lower() != "local"
             agent_id = str(payload.get("agent_id") or DEFAULT_AGENT_ID)
+            # Validate the agent BEFORE creating the run row so an unknown id
+            # never leaves an orphan queued run behind.
             try:
-                self.sessions.get_or_create_session(agent_id).prompt(text, remote=remote)
+                self.registry.get_agent(agent_id)
             except KeyError:
                 self._json(404, {"error": f"agent not found: {agent_id}"})
                 return
+            run_id = None
+            if self.store is not None:
+                try:
+                    # The run row exists at enqueue time (state=queued); the
+                    # worker flips it to running and sets the terminal state.
+                    run_id = self.store.create_run(agent_id, text, remote, source=source)
+                    self.store.add_message(run_id, agent_id, "user", text)
+                except Exception as exc:  # noqa: BLE001
+                    self._json(503, {"error": f"run store unavailable: {str(exc)[:200]}"})
+                    return
+            try:
+                bridge = self.sessions.get_or_create_session(agent_id)
+                if self.store is not None:
+                    # The bridge persists every event of the run to the store
+                    # BEFORE fanout; bind it now (the default factory doesn't
+                    # take a store kwarg so test fakes stay compatible).
+                    bridge.store = self.store
+                bridge.prompt(text, remote=remote, run_id=run_id)
+            except KeyError:
+                # Agent deleted between validation and enqueue (a DELETE won
+                # the race). The queued run must not linger: abandon it.
+                if run_id:
+                    try:
+                        self.store.finish_run(run_id, "abandoned", error="agent deleted")
+                    except Exception:  # noqa: BLE001
+                        pass
+                self._json(404, {"error": f"agent not found: {agent_id}"})
+                return
             except RuntimeError as exc:  # bridge closed mid-DELETE
+                if run_id:
+                    try:
+                        self.store.finish_run(run_id, "abandoned", error=str(exc)[:200])
+                    except Exception:  # noqa: BLE001
+                        pass
                 self._json(409, {"error": str(exc)[:200]})
                 return
             sandbox_path = ""
@@ -657,7 +920,12 @@ class VertusHandler(BaseHTTPRequestHandler):
                 sandbox_path = resolve_sandbox_cwd(self.registry, agent_id)
             except Exception:  # noqa: BLE001  # report path best-effort only
                 pass
-            self._json(202, {"accepted": True, "agent_id": agent_id, "sandbox_path": sandbox_path})
+            self._json(202, {
+                "accepted": True,
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "sandbox_path": sandbox_path,
+            })
         elif route == "/api/agents":
             raw_name = payload.get("name")
             if not isinstance(raw_name, str) or not raw_name.strip():
@@ -827,32 +1095,255 @@ class VertusHandler(BaseHTTPRequestHandler):
             self._json(404, {"error": "agent not found"})
             return
         self._json(200, self.sessions.status(agent_id))
-    def _sse(self, agent_id: str = DEFAULT_AGENT_ID) -> None:
-        try:
-            bridge = self.sessions.get_or_create_session(agent_id or DEFAULT_AGENT_ID)
-        except KeyError:
-            self._json(404, {"error": f"agent not found: {agent_id}"})
-            return
+
+    def _sse(self, agent_id: str = DEFAULT_AGENT_ID, since: str = "",
+             run_id: str = "") -> None:
+        """GET /api/events — agent stream, fleet stream, or a single run.
+
+        Stream shape:
+          agent_id=<id>   this agent's events (live; replay with since=)
+          (omitted)       FLEET STREAM: every agent's events
+          since=<seq>     replay stored events with seq > since, then tail
+                          live with no gap and no duplicate
+          run_id=<id>     only that run; closes after its terminal event
+
+        Replay handoff (the point of this step): subscribe to the live source
+        FIRST, snapshot the store's latest committed seq S0, then drain store
+        rows with seq in (since, S0]. Live events with seq <= S0 are
+        duplicates of the drain and are skipped; every event with seq > S0
+        was emitted after the snapshot (hence after the subscribe) and arrives
+        exactly once via the live queue. An event emitted mid-drain therefore
+        lands in the live queue, not the drain.
+
+        A hub without a store (unit-test fixtures) keeps the legacy behavior:
+        pure live, un-enriched events, no replay.
+        """
+        store = self.store
+        agent = (agent_id or "").strip()
+        run_filter = (run_id or "").strip()
+        since_seq = 0
+        if since.strip():
+            try:
+                since_seq = max(0, int(float(since)))
+            except ValueError:
+                since_seq = 0
+
+        bridge = None
+        live_queue = None
+        agent_drain_filter = None
+        is_run_stream = False
+        do_drain = False
+        terminal_types = ("done", "error")
+
+        if store is not None and run_filter:
+            row = store.get_run(run_filter)
+            if row is None:
+                self._json(404, {"error": f"run not found: {run_filter}"})
+                return
+            is_run_stream = True
+            do_drain = True  # replay the run's history from the store, then tail
+            try:
+                bridge = self.sessions.get_or_create_session(row["agent_id"])
+            except KeyError:
+                bridge = None  # agent deleted; the run is terminal in the store
+            if bridge is not None:
+                live_queue = bridge.subscribe()
+        elif agent:
+            try:
+                bridge = self.sessions.get_or_create_session(agent)
+            except KeyError:
+                self._json(404, {"error": f"agent not found: {agent}"})
+                return
+            live_queue = bridge.subscribe()
+            agent_drain_filter = agent
+            do_drain = store is not None and since != ""
+        else:
+            # Fleet stream: no per-agent bridge (never instantiate N gateways
+            # for one reader). Live events come from the store's listener fan.
+            if self.fleet is None:
+                self._json(404, {"error": "fleet stream unavailable"})
+                return
+            live_queue = self.fleet.subscribe()
+            do_drain = store is not None and since != ""
+
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        q = bridge.subscribe()
+        terminal_seen = False
         try:
-            while True:
-                try:
-                    event = q.get(timeout=15)
-                except Empty:
-                    self.wfile.write(b": keepalive\n\n")
-                    self.wfile.flush()
-                    continue
-                data = json.dumps(event, ensure_ascii=False)
-                self.wfile.write(f"data: {data}\n\n".encode())
-                self.wfile.flush()
+            # --- replay drain (store rows up to the S0 snapshot) ---
+            s0 = None
+            if do_drain and store is not None:
+                s0 = store.latest_seq()
+                cursor = since_seq
+                while True:
+                    rows = store.events_after(
+                        cursor,
+                        agent_id=agent_drain_filter,
+                        run_id=run_filter or None,
+                        limit=500,
+                    )
+                    if not rows:
+                        break
+                    rows = [e for e in rows if e["seq"] <= s0]
+                    if not rows:
+                        break
+                    closed = False
+                    for env in rows:
+                        self._write_sse(env)
+                        if is_run_stream and env.get("type") in terminal_types:
+                            terminal_seen = True
+                            closed = True
+                    cursor = rows[-1]["seq"]
+                    if closed:
+                        break  # run already terminal in the store
+            if live_queue is not None and not (is_run_stream and terminal_seen):
+                # --- live tail with duplicate suppression ---
+                # (a run stream whose terminal was already drained is done;
+                # closing happens in the finally below)
+                while True:
+                    try:
+                        event = live_queue.get(timeout=15)
+                    except Empty:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    if is_run_stream and event.get("run_id") != run_filter:
+                        continue  # another run on the same agent's bridge
+                    if agent_drain_filter is not None and event.get("agent_id"):
+                        if event["agent_id"] != agent_drain_filter:
+                            continue
+                    seq = event.get("seq")
+                    if s0 is not None and isinstance(seq, int) and seq <= s0:
+                        continue  # already drained: exactly-once handoff
+                    self._write_sse(event)
+                    if is_run_stream and event.get("type") in terminal_types:
+                        terminal_seen = True
+                        break
         except (ConnectionAbortedError, BrokenPipeError, OSError):
             pass
         finally:
-            bridge.unsubscribe(q)
+            if live_queue is not None:
+                if bridge is not None:
+                    bridge.unsubscribe(live_queue)
+                elif self.fleet is not None:
+                    self.fleet.unsubscribe(live_queue)
+            if is_run_stream and terminal_seen:
+                # A run stream is done: close the HTTP connection so the
+                # client sees EOF instead of an idle keep-alive socket.
+                self.close_connection = True
+
+    def _write_sse(self, event: dict) -> None:
+        """Write one SSE data frame (dict → JSON)."""
+        data = json.dumps(event, ensure_ascii=False)
+        self.wfile.write(f"data: {data}\n\n".encode())
+        self.wfile.flush()
+
+    # ------------------------------------------------------------------
+    # History endpoints (all read-only; never instantiate a bridge)
+    # ------------------------------------------------------------------
+
+    def _history_store(self) -> RunStore | None:
+        """Return the store or send 503 + None (hub without run store)."""
+        if self.store is None:
+            self._json(503, {"error": "run store not enabled"})
+        return self.store
+
+    def _limit_param(self, name: str, default: int, cap: int) -> int:
+        raw = self._query_param(name)
+        try:
+            value = int(raw)
+        except ValueError:
+            return default
+        return max(1, min(value, cap))
+
+    def _handle_agent_messages(self, agent_id: str) -> None:
+        """GET /api/agents/<id>/messages — paginated folded messages."""
+        if not agent_id:
+            self._json(404, {"error": "not found"})
+            return
+        store = self._history_store()
+        if store is None:
+            return
+        try:
+            self.registry.get_agent(agent_id)  # history is scoped to live agents
+        except KeyError:
+            self._json(404, {"error": "agent not found"})
+            return
+        before_raw = self._query_param("before")
+        before = None
+        try:
+            before = int(before_raw) if before_raw.strip() else None
+        except ValueError:
+            before = None
+        limit = self._limit_param("limit", 50, 200)
+        rows = store.agent_messages(agent_id, limit=limit, before=before)
+        self._json(200, {"agent_id": agent_id, "messages": rows})
+
+    def _handle_runs_list(self) -> None:
+        """GET /api/runs — run list, newest first."""
+        store = self._history_store()
+        if store is None:
+            return
+        agent = self._query_param("agent_id").strip() or None
+        state = self._query_param("state").strip() or None
+        if state is not None and state not in RUN_STATES:
+            self._json(400, {"error": f"state must be one of {list(RUN_STATES)}"})
+            return
+        before_raw = self._query_param("before")
+        before = None
+        try:
+            before = float(before_raw) if before_raw.strip() else None
+        except ValueError:
+            before = None
+        limit = self._limit_param("limit", 50, 200)
+        rows = store.list_runs(agent_id=agent, state=state, limit=limit, before=before)
+        self._json(200, {"runs": rows})
+
+    def _handle_run_get(self, run_id: str) -> None:
+        """GET /api/runs/<run_id> — one run + its folded messages.
+
+        Works for deleted agents too: run history is the record of what the
+        bot did and is deliberately NOT removed by DELETE /api/agents.
+        """
+        store = self._history_store()
+        if store is None:
+            return
+        if not run_id or "/" in run_id:
+            self._json(404, {"error": "not found"})
+            return
+        run = store.get_run(run_id)
+        if run is None:
+            self._json(404, {"error": f"run not found: {run_id}"})
+            return
+        self._json(200, {"run": run, "messages": store.run_messages(run_id)})
+
+    def _handle_fleet_activity(self) -> None:
+        """GET /api/fleet/activity — newest runs across ALL agents (roster UI)."""
+        store = self._history_store()
+        if store is None:
+            return
+        limit = self._limit_param("limit", 20, 100)
+        rows = store.list_runs(limit=limit)
+        activity = [
+            {
+                "run_id": r["run_id"],
+                "agent_id": r["agent_id"],
+                "prompt": r["prompt"][:160],
+                "state": r["state"],
+                "remote": bool(r["remote"]),
+                "source": r["source"],
+                "created_at": r["created_at"],
+                "started_at": r["started_at"],
+                "ended_at": r["ended_at"],
+                "gateway_respawns": r["gateway_respawns"],
+            }
+            for r in rows
+        ]
+        self._json(200, {"activity": activity})
 
     def log_message(self, fmt: str, *args) -> None:
         pass
@@ -999,6 +1490,38 @@ def serve(host: str | None, port: int) -> None:
         # rather than come up half-broken.
         print(f"[vertus] agent registry/session init failed: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
+    # Durable run store: boot recovery + retention. A run left queued/running
+    # when the hub died is marked interrupted; events older than the TTL
+    # (default 30d, VERTUS_EVENT_TTL_DAYS) are pruned on boot and daily.
+    # runs/messages are NEVER pruned — they are the record of what the bots
+    # did. The store's listener fans committed events to fleet subscribers.
+    store = RunStore()
+    fleet = FleetFan()
+    VertusHandler.store = store
+    VertusHandler.fleet = fleet
+    store.listener = fleet.publish
+    try:
+        recovered = store.recover_interrupted()
+        if recovered:
+            print(f"[vertus] crash recovery: {recovered} run(s) marked interrupted")
+        pruned = store.prune_events()
+        if pruned:
+            print(f"[vertus] retention: pruned {pruned} old event row(s)")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vertus] run-store boot maintenance failed: {exc}", file=sys.stderr)
+
+    def _daily_prune() -> None:
+        """Daily retention pass (daemon; events older than the TTL)."""
+        while True:
+            time.sleep(86400)
+            try:
+                n = store.prune_events()
+                if n:
+                    print(f"[vertus] retention: pruned {n} old event row(s)")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[vertus] daily event prune failed: {exc}", file=sys.stderr)
+
+    threading.Thread(target=_daily_prune, daemon=True).start()
     servers: list[ThreadingHTTPServer] = []
     for h in bind_hosts:
         try:
