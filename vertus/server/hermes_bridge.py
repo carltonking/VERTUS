@@ -356,6 +356,8 @@ _ENGINE_ENV_ALLOWLIST = (
     "HERMES_QUIET",
     "HERMES_IGNORE_RULES",
     "HERMES_CUA_DRIVER_CMD",  # computer-use driver (fleet default)
+    "HERMES_COMPUTER_USE_BACKEND",  # per-agent CUA kill switch ("noop")
+
     "PATH",
     "HOME",
     "USER",

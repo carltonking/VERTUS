@@ -424,15 +424,17 @@ def test_same_agent_still_serializes(monkeypatch, tmp_path):
 # ----------------------------------------------------------------------
 
 
-def test_v2_profile_fields_and_home_exist(monkeypatch, tmp_path):
-    """New agents get the full v2 schema and a materialized engine home."""
+def test_v3_profile_fields_and_home_exist(monkeypatch, tmp_path):
+    """New agents get the full v3 schema and a materialized engine home."""
     monkeypatch.setenv("VERTUS_AGENTS_DIR", str(tmp_path / "agents"))
     monkeypatch.setenv("VERTUS_FLEET_HERMES_HOME", str(tmp_path / "fleet-hermes"))
     registry = vs.AgentRegistry()
     agent = registry.create_agent("Scout")
-    assert agent["schema_version"] == 2
+    assert agent["schema_version"] == 3
     assert agent["title"] == "Scout"
     assert agent["autonomy"] == "ask"
+    assert agent["computer_use"] is False, "v3 default: desktop capability off"
+    assert agent["cua_targets"] is None, "v3 default: no declared targets"
     home = Path(agent["home_path"])
     assert home == tmp_path / "agents" / agent["id"] / "home"
     assert (home / "config.yaml").is_file(), "engine home must carry config.yaml"
@@ -467,7 +469,7 @@ def test_update_agent_materializes_soul_and_memory_dirs(monkeypatch, tmp_path):
     # profile.json on disk carries the update.
     on_disk = json.loads((registry.root / agent["id"] / "profile.json").read_text())
     assert on_disk["model"] == "nemotron-3-ultra-free"
-    assert on_disk["schema_version"] == 2
+    assert on_disk["schema_version"] == 3
 
 
 def test_v1_profile_migration_is_idempotent_and_lossless(monkeypatch, tmp_path):
@@ -491,22 +493,24 @@ def test_v1_profile_migration_is_idempotent_and_lossless(monkeypatch, tmp_path):
     (tmp_path / "agents" / "primary" / "profile.json").write_text(json.dumps(v1))
 
     first = registry.get_agent("primary")
-    assert first["schema_version"] == 2
+    assert first["schema_version"] == 3
     assert first["title"] == "Primary", "title backfilled from name"
     assert first["persona"].startswith("You are VERTUS"), (
         "persona backfilled from the fleet SOUL.md fixture"
     )
+    assert first["computer_use"] is False, "v3 migration: CUA defaults OFF"
+    assert first["cua_targets"] is None
     assert first["custom_future_key"] == {"keep": True}, "unknown keys must survive"
     assert first["created_at"] == v1["created_at"], "v1 timestamps kept"
     on_disk = json.loads((tmp_path / "agents" / "primary" / "profile.json").read_text())
-    assert on_disk["schema_version"] == 2
+    assert on_disk["schema_version"] == 3
     assert on_disk["custom_future_key"] == {"keep": True}
 
     # Idempotent: reloading never changes values again.
     before = json.loads((tmp_path / "agents" / "primary" / "profile.json").read_text())
     again = registry.get_agent("primary")
     after = json.loads((tmp_path / "agents" / "primary" / "profile.json").read_text())
-    assert before == after, "migration must not rewrite an already-v2 profile"
+    assert before == after, "migration must not rewrite an already-v3 profile"
     assert again["title"] == "Primary"
 
 

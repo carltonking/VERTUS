@@ -56,10 +56,12 @@ from urllib.parse import parse_qs, urlsplit
 try:
     from agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
     from run_store import RunStore, RUN_STATES  # type: ignore
+    from screen_lease import ScreenLeaseManager  # type: ignore
     from session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 except ImportError:  # pragma: no cover - only hit under package invocation
     from .agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
     from .run_store import RunStore, RUN_STATES  # type: ignore
+    from .screen_lease import ScreenLeaseManager  # type: ignore
     from .session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 
 VERTUS_DIR = Path.home() / ".vertus"
@@ -131,8 +133,16 @@ class AgentBridge:
     subscribers only.
     """
 
-    def __init__(self, agent_id: str = DEFAULT_AGENT_ID, create_session_factory=None, cwd: str | None = None, session_kwargs: dict | None = None, store=None) -> None:
+    def __init__(self, agent_id: str = DEFAULT_AGENT_ID, create_session_factory=None, cwd: str | None = None, session_kwargs: dict | None = None, store=None, screen_leases=None, screen_targets=None) -> None:
         self.agent_id = agent_id
+        # Per-window computer-use ownership (Step: screen leases). ``None``
+        # disables the gate (legacy / unit-test bridges). ``screen_targets``
+        # is a resolver ``(agent_id) -> list[str] | None`` re-read each turn
+        # so a profile PATCH takes effect on the next turn without a respawn.
+        self.screen_leases = screen_leases
+        self._screen_targets = screen_targets
+        self._active_screen_targets: list[str] | None = None
+        self._waiting_on: list[str] | None = None
         # Durable run store (Step: run history). When set, every wire event is
         # committed BEFORE it is fanned out and stamped agent_id/run_id/seq/ts.
         # When None (legacy/unit tests), events fan out un-enriched exactly as
@@ -338,6 +348,51 @@ class AgentBridge:
             print(f"[vertus] pi SDK unavailable: {exc}", file=sys.stderr)
             return None
 
+    def _screen_wait(self, run_id: str | None) -> None:
+        """Block this worker until the turn owns its declared screen targets.
+
+        Only bridges wired with a ScreenLeaseManager gate here (the hub does;
+        unit tests leave it None). Targets are resolved fresh each turn via
+        ``_screen_targets`` so a profile PATCH applies to the next turn even
+        though the gateway itself respawns lazily. While blocked, the turn is
+        still logically queued: status() reports ``waiting_on_screen`` so the
+        bot never looks idle. Returns (without owning anything) when the
+        bridge closed mid-wait — the caller's closed check abandons the run.
+        """
+        leases = self.screen_leases
+        if leases is None:
+            return
+        targets: list[str] | None = None
+        if self._screen_targets is not None:
+            try:
+                targets = self._screen_targets(self.agent_id)
+            except Exception:  # noqa: BLE001 — resolver failure = no claim
+                targets = None
+        if not targets:
+            return
+        run_key = str(run_id or "")
+        if leases.acquire(self.agent_id, run_key, targets):
+            with self._status_lock:
+                self._active_screen_targets = list(targets)
+                self._waiting_on = None
+            return
+        # Contended: register as a FIFO waiter and poll with a short timeout
+        # so bridge close is noticed (and the waiter cancelled) promptly.
+        while True:
+            with self._status_lock:
+                if self._closed:
+                    leases.cancel_wait(self.agent_id, run_key)
+                    self._waiting_on = None
+                    return
+                blocked = leases.waiting_targets(self.agent_id)
+                self._waiting_on = blocked or list(targets)
+            got = leases.wait_for_grant(self.agent_id, run_key, targets)
+            if got is not None:
+                with self._status_lock:
+                    self._active_screen_targets = list(got)
+                    self._waiting_on = None
+                return
+
     def _run_worker(self) -> None:
         if self._create_session is None:
             self._create_session = self._load_pi()
@@ -356,6 +411,13 @@ class AgentBridge:
             # ``run_id`` is the store row created at enqueue time — the run
             # context that stamps every event of this turn.
             text, remote, run_id = item
+            # Screen-lease gate (Step: per-window ownership): a run whose
+            # agent declares cua_targets waits here until it owns every one
+            # of them. The run row stays ``queued`` while waiting and status()
+            # reports waiting_on_screen, so a lease-blocked bot never looks
+            # idle. The lease is held across the whole turn INCLUDING the
+            # respawn-retry path and released in the finally below.
+            self._screen_wait(run_id)
             if run_id is not None:
                 self._begin_run(run_id)
             with self._status_lock:
@@ -381,6 +443,18 @@ class AgentBridge:
                     self._consume_stale()
                     self._run_prompt_with_respawn(text, remote=remote)
             finally:
+                # Screen-lease release (Step: per-window ownership): drop the
+                # turn's target claims whether it finished, errored, or the
+                # gateway died mid-turn; a retry of the same run keeps them.
+                if self.screen_leases is not None:
+                    held = self._active_screen_targets
+                    with self._status_lock:
+                        self._active_screen_targets = None
+                        self._waiting_on = None
+                    if held:
+                        self.screen_leases.release(
+                            self.agent_id, run_id or "", held
+                        )
                 with self._status_lock:
                     self._running = False
                     self._turn_started_at = None
@@ -655,20 +729,27 @@ class AgentBridge:
             running = self._running
             started = self._turn_started_at
             closed = self._closed
+            waiting = self._waiting_on
         session = self._session
         gateway_alive = (
             not closed
             and session is not None
             and not bool(getattr(session, "is_dead", False))
         )
-        depth = self._queue.qsize()
-        state = "running" if running else ("queued" if depth else "idle")
-        return {
+        # A turn held by the screen-lease gate was already popped off the
+        # queue; count it so DELETE's busy guard and UI depth stay truthful.
+        depth = self._queue.qsize() + (1 if waiting else 0)
+        state = "running" if running else ("queued" if (depth or waiting) else "idle")
+        out: dict = {
             "state": state,
             "queue_depth": depth,
             "turn_started_at": started,
             "gateway_alive": gateway_alive,
         }
+        if waiting:
+            # A bot blocked on a screen lease must show as such, not idle.
+            out["waiting_on_screen"] = list(waiting)
+        return out
 
     def reconfigure(self, session_kwargs: dict) -> None:
         """Apply new identity kwargs after a profile PATCH.
@@ -805,6 +886,7 @@ class VertusHandler(BaseHTTPRequestHandler):
     registry: AgentRegistry = None  # type: ignore[assignment]
     store: RunStore = None  # type: ignore[assignment]
     fleet: FleetFan = None  # type: ignore[assignment]
+    screen_leases: ScreenLeaseManager = None  # type: ignore[assignment]
 
     def _authed(self) -> bool:
         header = self.headers.get("Authorization", "")
@@ -853,6 +935,8 @@ class VertusHandler(BaseHTTPRequestHandler):
             self._handle_run_get(path[len("/api/runs/"):].strip("/"))
         elif path == "/api/fleet/activity":
             self._handle_fleet_activity()
+        elif path == "/api/fleet/screens":
+            self._handle_fleet_screens()
         else:
             self._json(404, {"error": "not found"})
 
@@ -1345,16 +1429,29 @@ class VertusHandler(BaseHTTPRequestHandler):
         ]
         self._json(200, {"activity": activity})
 
+    def _handle_fleet_screens(self) -> None:
+        """GET /api/fleet/screens — who holds which screen target, who waits.
+
+        The roster behind the per-window computer-use ownership policy:
+        only agents with computer_use enabled AND declared cua_targets ever
+        appear as owners or waiters.
+        """
+        leases = self.screen_leases
+        if leases is None:
+            self._json(200, {"screens": []})
+            return
+        self._json(200, {"screens": leases.screens()})
+
     def log_message(self, fmt: str, *args) -> None:
         pass
 
 
 def _validate_profile_payload(payload: dict, *, allow_name: bool) -> dict:
-    """Validate a POST/PATCH agent body against the v2 editable schema.
+    """Validate a POST/PATCH agent body against the v3 editable schema.
 
     Returns the registry field dict (``name`` is handled by the caller).
     Raises ValueError with a client-facing message for any 400 condition:
-    unknown keys, non-string values, bad autonomy, persona over the
+    unknown keys, wrong-typed values, bad autonomy, persona over the
     PERSONA_MAX_CHARS cap. The registry itself stays permissive — this is
     the HTTP guard, the only path clients can reach.
     """
@@ -1371,6 +1468,21 @@ def _validate_profile_payload(payload: dict, *, allow_name: bool) -> dict:
             if value not in AUTONOMY_VALUES:
                 raise ValueError(f"autonomy must be one of {AUTONOMY_VALUES}")
             fields[key] = value
+            continue
+        if key == "computer_use":
+            if not isinstance(value, bool):
+                raise ValueError("computer_use must be a boolean")
+            fields[key] = value
+            continue
+        if key == "cua_targets":
+            if value is None:
+                fields[key] = None
+            elif not isinstance(value, list) or not all(
+                isinstance(t, str) and t.strip() for t in value
+            ):
+                raise ValueError("cua_targets must be a list of non-empty strings or null")
+            else:
+                fields[key] = [t.strip() for t in value]
             continue
         if isinstance(value, bool) or (value is not None and not isinstance(value, str)):
             raise ValueError(f"{key} must be a string or null")
@@ -1415,7 +1527,12 @@ def resolve_session_kwargs(registry: AgentRegistry, agent_id: str) -> dict:
       model/provider — forwarded as the per-session model override param.
       extra_env   — HERMES_MODEL / HERMES_INFERENCE_PROVIDER fallbacks so
                     the override holds even for engines that ignore the
-                    session.create model param (belt and suspenders).
+                    session.create model param (belt and suspenders); plus
+                    HERMES_COMPUTER_USE_BACKEND=noop for agents whose
+                    profile has computer_use OFF — the fork's documented
+                    per-process CUA kill switch (the tool stays registered
+                    but its backend is a no-op stub: captures return blank
+                    frames and input actions touch nothing on the desktop).
     """
     agent = registry.get_agent(agent_id)
     kwargs: dict = {}
@@ -1433,12 +1550,18 @@ def resolve_session_kwargs(registry: AgentRegistry, agent_id: str) -> dict:
         extra["HERMES_MODEL"] = str(model)
     if provider:
         extra["HERMES_INFERENCE_PROVIDER"] = str(provider)
+    if not bool(agent.get("computer_use")):
+        # computer_use OFF (the v3 default): cut capability at spawn. The
+        # fork resolves the backend name from process env on first use
+        # (tools/computer_use/tool.py) — noop never spawns cua-driver.
+        extra["HERMES_COMPUTER_USE_BACKEND"] = "noop"
     if extra:
         kwargs["extra_env"] = extra
     return kwargs
 
 
-def build_session_manager(registry: AgentRegistry, factory=None) -> SessionManager:
+def build_session_manager(registry: AgentRegistry, factory=None,
+                          screen_leases: ScreenLeaseManager | None = None) -> SessionManager:
     """One SessionManager for the hub: primary prewarmed, others lazy.
 
     Each bridge is created with its agent's sandbox dir as the session cwd
@@ -1447,14 +1570,41 @@ def build_session_manager(registry: AgentRegistry, factory=None) -> SessionManag
     AgentBridges (hermes engine); tests inject fakes so no engine subprocess
     is ever spawned — fakes that accept ``cwd=`` keep working because
     identity kwargs are only added when the profile actually carries them.
+
+    ``screen_leases`` (the hub's shared ScreenLeaseManager) is attached to
+    every real bridge together with a live resolver of the agent's declared
+    cua_targets, so per-window computer-use ownership gates at turn start.
     """
     if factory is None:
-        def factory(agent_id: str):
-            return AgentBridge(
-                agent_id=agent_id,
-                cwd=resolve_sandbox_cwd(registry, agent_id),
-                session_kwargs=resolve_session_kwargs(registry, agent_id),
-            )
+        # The default factory closes over the shared ScreenLeaseManager. The
+        # lease kwargs are passed ONLY when a manager is actually wired so
+        # test harnesses that monkeypatch ``AgentBridge`` with fakes (which
+        # accept the historical 3-kwarg signature) keep working unchanged.
+        if screen_leases is None:
+            def factory(agent_id: str):
+                return AgentBridge(
+                    agent_id=agent_id,
+                    cwd=resolve_sandbox_cwd(registry, agent_id),
+                    session_kwargs=resolve_session_kwargs(registry, agent_id),
+                )
+        else:
+            def factory(agent_id: str):
+                def targets_resolver(aid: str):
+                    try:
+                        agent = registry.get_agent(aid)
+                    except KeyError:
+                        return None
+                    if not bool(agent.get("computer_use")):
+                        return None
+                    return agent.get("cua_targets") or None
+
+                return AgentBridge(
+                    agent_id=agent_id,
+                    cwd=resolve_sandbox_cwd(registry, agent_id),
+                    session_kwargs=resolve_session_kwargs(registry, agent_id),
+                    screen_leases=screen_leases,
+                    screen_targets=targets_resolver,
+                )
     return SessionManager(
         registry,
         factory=factory,
@@ -1476,13 +1626,18 @@ def serve(host: str | None, port: int) -> None:
     registry = AgentRegistry()
     VertusHandler.registry = registry
     VertusHandler.token = token
+    # Per-window computer-use ownership (Step: screen leases): one fleet-wide
+    # manager shared by every bridge. In-memory by design — a hub restart
+    # clears leases along with the gateways that held them.
+    screen_leases = ScreenLeaseManager()
+    VertusHandler.screen_leases = screen_leases
     # ensure_primary() MUST run before the session manager seeds the primary
     # bridge: on a fresh store the seed factory resolves the sandbox via
     # get_agent("primary"), which raises KeyError until the agent exists.
     try:
         primary = registry.ensure_primary()
         print(f"[vertus] agents root: {registry.root} (primary: {primary['id']})")
-        sessions = build_session_manager(registry)
+        sessions = build_session_manager(registry, screen_leases=screen_leases)
         VertusHandler.sessions = sessions
         print("[vertus] agent session prewarm starting (primary)…", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001

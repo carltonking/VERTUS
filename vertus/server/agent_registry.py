@@ -22,20 +22,27 @@ On-disk layout (also documented in README "Multi-agent (WIP)"):
 re-materialized on every profile write (see ``_materialize_home_locked``).
 Hand edits under ``home/`` are lost on the next profile update — by design.
 
-Profile schema v2 (``schema_version: 2``):
+Profile schema v3 (``schema_version: 3``):
 
     id, name, title, description   # identity; title/description drive delegation
     persona        : str           # the bot's system identity text (→ home/SOUL.md)
     model, provider: str | None    # None = inherit the fleet default
     color, emoji   : str | None    # client affordance
-    autonomy       : "ask" | "trusted"   # stored now, enforced in a later phase
+    autonomy       : "ask" | "trusted"   # spawn-time GUI permission mapping
+    computer_use   : bool          # whether this bot may drive the desktop (v3)
+    cua_targets    : [str] | None  # allowed app bundle ids / window titles it
+                                   # works in; null = unrestricted (v3)
     created_at, updated_at, is_primary, sandbox_path, home_path
 
-Migration: v1 profiles (no ``schema_version``) are upgraded in place on load —
-``title`` backfilled from ``name``, ``persona`` backfilled from the fleet's
-current ``~/.hermes/SOUL.md`` when readable, all v1 keys kept, unknown keys
-preserved. Migration is idempotent (a v2 profile is never rewritten by it).
-The fleet hermes home is ``VERTUS_FLEET_HERMES_HOME`` or ``~/.hermes``.
+Migration: profiles older than v3 (no ``schema_version``, or v1/v2) are
+upgraded in place on load — stepwise v1→v2→v3 so every intermediate rule
+applies exactly once. v1 backfills ``title`` from ``name`` and ``persona``
+from the fleet's current ``~/.hermes/SOUL.md`` when readable; v3 adds
+``computer_use: False`` and ``cua_targets: None`` (existing fleet behavior
+is unchanged: no bot acquires desktop capability on upgrade). All old keys
+are kept and unknown keys preserved. Migration is idempotent (a v3 profile
+is never rewritten by it). The fleet hermes home is
+``VERTUS_FLEET_HERMES_HOME`` or ``~/.hermes``.
 
 Deletion policy (documented choice): the last remaining agent can never be
 deleted (ValueError). Deleting the primary agent reassigns primary status to
@@ -74,7 +81,7 @@ _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _PROFILE_FILE = "profile.json"
 _PRIMARY_MARKER = "_primary"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Free-form identity/config fields an update_agent() caller may set. Paths,
 # timestamps, and the id are managed by the registry, never by callers.
@@ -87,6 +94,8 @@ EDITABLE_FIELDS = (
     "color",
     "emoji",
     "autonomy",
+    "computer_use",
+    "cua_targets",
 )
 AUTONOMY_VALUES = ("ask", "trusted")
 
@@ -122,25 +131,33 @@ def _read_fleet_soul() -> str:
 
 
 def migrate_v1_profile(profile: dict, persona_backfill: str = "") -> tuple[dict, bool]:
-    """Upgrade a v1 profile dict to schema v2. Pure — no I/O.
+    """Upgrade a profile dict to the current schema (v3). Pure — no I/O.
 
-    Returns ``(profile, changed)``. Idempotent: a dict already carrying
-    ``schema_version >= 2`` is returned unchanged. Unknown keys are preserved
-    (forward compatibility); v1 keys are never dropped.
+    Applies the stepwise v1→v2→v3 rules in order so every migration is
+    idempotent and lossless: ``schema_version >= 3`` returns unchanged,
+    unknown keys always survive, old keys are never dropped. v1 lacks the
+    identity extras; v2 lacks the computer-use fields.
     """
-    if int(profile.get("schema_version") or 0) >= SCHEMA_VERSION:
+    version = int(profile.get("schema_version") or 0)
+    if version >= SCHEMA_VERSION:
         return profile, False
     upgraded = dict(profile)  # unknown keys survive the copy
-    name = str(profile.get("name") or "")
-    upgraded.setdefault("title", name)
-    upgraded.setdefault("description", "")
-    upgraded.setdefault("persona", persona_backfill or "")
-    upgraded.setdefault("model", None)
-    upgraded.setdefault("provider", None)
-    upgraded.setdefault("color", None)
-    upgraded.setdefault("emoji", None)
-    upgraded.setdefault("autonomy", "ask")
-    upgraded.setdefault("updated_at", profile.get("created_at") or _utc_now_iso())
+    # v1 → v2 (only when the profile predates v2).
+    if version < 2:
+        name = str(profile.get("name") or "")
+        upgraded.setdefault("title", name)
+        upgraded.setdefault("description", "")
+        upgraded.setdefault("persona", persona_backfill or "")
+        upgraded.setdefault("model", None)
+        upgraded.setdefault("provider", None)
+        upgraded.setdefault("color", None)
+        upgraded.setdefault("emoji", None)
+        upgraded.setdefault("autonomy", "ask")
+        upgraded.setdefault("updated_at", profile.get("created_at") or _utc_now_iso())
+    # v2 → v3: computer-use capability defaults OFF so an upgraded fleet keeps
+    # today's behavior exactly (no bot gains desktop control by accident).
+    upgraded.setdefault("computer_use", False)
+    upgraded.setdefault("cua_targets", None)
     upgraded["schema_version"] = SCHEMA_VERSION
     return upgraded, True
 
@@ -249,10 +266,19 @@ class AgentRegistry:
             agent = self._load(agent_id)
             for key, value in fields.items():
                 if value is None:
-                    # null clears: identity fields → None, text fields → ""
-                    agent[key] = None if key in ("model", "provider", "color", "emoji") else ""
+                    # null clears: nullable identity fields → None, list field
+                    # cua_targets → None (unrestricted), text fields → ""
+                    agent[key] = (
+                        None
+                        if key in ("model", "provider", "color", "emoji", "cua_targets")
+                        else ""
+                    )
                 elif key in ("model", "provider"):
                     agent[key] = value
+                elif key == "computer_use":
+                    agent[key] = bool(value)  # validated above; stored as bool
+                elif key == "cua_targets":
+                    agent[key] = [str(t).strip() for t in value]
                 else:
                     agent[key] = str(value)
             agent["updated_at"] = _utc_now_iso()
@@ -269,6 +295,14 @@ class AgentRegistry:
             raise TypeError(f"unknown profile field(s): {', '.join(sorted(unknown))}")
         if "autonomy" in fields and fields["autonomy"] not in AUTONOMY_VALUES:
             raise ValueError(f"autonomy must be one of {AUTONOMY_VALUES}")
+        if "computer_use" in fields and not isinstance(fields["computer_use"], bool):
+            raise TypeError("computer_use must be a boolean")
+        targets = fields.get("cua_targets")
+        if targets is not None and (
+            not isinstance(targets, list)
+            or not all(isinstance(t, str) and t.strip() for t in targets)
+        ):
+            raise TypeError("cua_targets must be a list of non-empty strings or null")
 
     def rename_agent(self, agent_id: str, name: str) -> dict:
         """Update the display name; id, directory, sandbox, and home are kept."""
@@ -327,6 +361,43 @@ class AgentRegistry:
         """The agent's engine config root (HERMES_HOME for its gateway)."""
         return self.root / agent_id / "home"
 
+    # ------------------------------------------------------------------
+    # Computer-use capability manifest (v3, bounded-mode ceiling)
+    # ------------------------------------------------------------------
+
+    def _cua_manifest_for(self, agent_id: str, home: Path) -> Path | None:
+        """Resolve a cua-driver capability manifest for a trusted CUA agent.
+
+        Candidate order: ``VERTUS_CUA_MANIFEST`` env → ``<home>/cua-manifest.yaml``
+        → fleet hermes home → ``~/.vertus/cua-manifest.yaml``. The first file
+        that exists is copied into the agent home (home/ is derived state) so
+        the engine's ``computer_use.capability_manifest`` path is always a
+        self-contained per-agent file. Returns None when no manifest exists —
+        the caller then falls back to ``standard`` permission mode.
+        """
+        env = os.environ.get("VERTUS_CUA_MANIFEST", "").strip()
+        candidates: list[Path] = []
+        if env:
+            candidates.append(Path(env).expanduser())
+        candidates.append(home / "cua-manifest.yaml")
+        candidates.append(fleet_hermes_home() / "cua-manifest.yaml")
+        candidates.append(Path.home() / ".vertus" / "cua-manifest.yaml")
+        for cand in candidates:
+            if not cand.is_file():
+                continue
+            try:
+                dest = home / "cua-manifest.yaml"
+                dest.write_bytes(cand.read_bytes())
+                return dest
+            except OSError:
+                return None
+        return None
+
+    def cua_manifest_path(self, agent_id: str) -> Path | None:
+        """Public read of the per-agent manifest path if one is materialized."""
+        p = self.agent_home(agent_id) / "cua-manifest.yaml"
+        return p if p.is_file() else None
+
     def agent_memory_dir(self, agent_id: str) -> Path:
         """This bot's own notes directory (skill-injected, never hardcoded)."""
         return self.root / agent_id / "memory"
@@ -380,6 +451,30 @@ class AgentRegistry:
             cfg["model"] = model_section
         elif profile.get("provider"):
             cfg.setdefault("model", {})["provider"] = str(profile["provider"])
+        # computer_use (v3). Enabled agents get an explicit driver permission
+        # mode materialized at SPAWN time (the fork reads config.yaml per
+        # HERMES_HOME; the driver mode is immutable per daemon):
+        #   autonomy=ask    -> standard  (driver default; watched mode)
+        #   autonomy=trusted-> bounded   ONLY when a capability manifest is
+        #                        available (see _cua_manifest_path) — bounded
+        #                        requires one and the fork raises at first
+        #                        CUA call otherwise. No manifest on this host
+        #                        -> trusted degrades to standard (documented
+        #                        compromise: a valid v3 manifest schema is
+        #                        driver-validated and none ships in the fork
+        #                        or on this machine, so none is fabricated).
+        # Disabled agents carry no computer_use block: capability is cut at
+        # the hub's spawn layer (HERMES_COMPUTER_USE_BACKEND=noop) instead.
+        if profile.get("computer_use"):
+            cu_cfg: dict = {"permission_mode": "standard"}
+            if str(profile.get("autonomy") or "ask") == "trusted":
+                manifest = self._cua_manifest_for(agent_id, home)
+                if manifest is not None:
+                    cu_cfg["permission_mode"] = "bounded"
+                    cu_cfg["capability_manifest"] = str(manifest)
+            cfg["computer_use"] = cu_cfg
+        else:
+            cfg.pop("computer_use", None)
         (home / "config.yaml").write_text(_yaml_dump(cfg), encoding="utf-8")
 
         # SOUL.md — the bot's persona. Empty persona removes any stale file so
@@ -467,6 +562,8 @@ class AgentRegistry:
             "color": None,
             "emoji": None,
             "autonomy": "ask",
+            "computer_use": False,
+            "cua_targets": None,
             "created_at": _utc_now_iso(),
             "updated_at": _utc_now_iso(),
             "sandbox_path": str(sandbox),
@@ -481,6 +578,10 @@ class AgentRegistry:
                 continue
             if key in ("model", "provider"):
                 profile[key] = value
+            elif key == "computer_use":
+                profile[key] = bool(value)
+            elif key == "cua_targets":
+                profile[key] = [str(t).strip() for t in value]
             else:
                 profile[key] = str(value)
         self._write_profile(agent_id, profile)
