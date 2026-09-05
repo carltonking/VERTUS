@@ -226,19 +226,42 @@ python3 vertus/server/vertus_server.py serve --host 127.0.0.1 --port 8791
 curl -s -H "Bearer $(cat ~/.vertus/token)" localhost:8791/api/agents/scout | jq .sandbox_path
 ```
 
-## QuickBar
+## macOS apps (Swift Package)
 
-macOS menubar app (SwiftUI) that frames the notch: chat session with message
-bubbles (your prompts right-aligned), thinking indicator, streaming replies,
-and a scrollable transcript capped below the notch and above the prompt bar.
+Both clients are built from **one Swift Package** at `vertus/apps/` with three
+targets:
+
+- `VertusKit` — shared library: wire models, HTTP client, the fleet-wide SSE
+  stream with cursor resume (`since=` + `lagged` recovery), per-agent live
+  state, and transcript/history merging.
+- `VertusBar` — the notch QuickBar (unchanged visual language; now with an
+  agent picker, a compact busy-bot fleet strip, fire-and-forget submit that
+  queues on busy agents, and "Open in Fleet").
+- `VertusFleet` — full-window fleet app: roster with live busy indicators,
+  transcript + run list per agent, bot editor (POST/PATCH/DELETE), fleet
+  activity, and background-completion user notifications.
 
 ```bash
-cd vertus/apps/vertus-bar
-swiftc -o VertusBar VertusQuickBarApp.swift QuickBarRootView.swift QuickBarViewModel.swift MathEval.swift
-./VertusBar          # or launch via the plist in disabled-launchagents/
+# one command builds BOTH apps
+cd vertus/apps && swift build            # debug (default)
+swift build -c release                  # production (launchd)
+
+# bundle Fleet as a real .app (needed for notifications + `open`)
+scripts/make-fleet-app.sh               # wraps .build/debug/VertusFleet
+scripts/make-fleet-app.sh release       # wraps .build/release/VertusFleet
+
+# unit tests (VertusKit against a stub hub — real sockets, no live engine)
+swift test
 ```
 
-Toggle with ⇧⌘J or the menubar icon; the new-session button clears the chat.
+Run the bar from its release build (or the launchd plist in
+`disabled-launchagents/`, which points at `.build/release/VertusBar`); run
+Fleet via `open vertus/apps/dist/VertusFleet.app`. Toggle the bar with ⇧⌘J
+or its menubar icon.
+
+**Client note:** the QuickBar talks to the hub over a persistent fleet
+stream and submits with `agent_id`; the terminal REPL and VertusPhone are
+separate surfaces (see below).
 
 ## VertusPhone
 

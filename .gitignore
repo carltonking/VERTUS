@@ -26,3 +26,10 @@ venv/
 
 # Stray editor/backup files
 *.bak-*
+# Swift Package build products (vertus/apps)
+vertus/apps/.build/
+vertus/apps/dist/
+vertus/apps/.swiftpm/
+
+# Legacy ad-hoc compiled bar binary (replaced by the Swift Package build)
+vertus/apps/vertus-bar/VertusBar

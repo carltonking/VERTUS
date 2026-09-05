@@ -6,7 +6,10 @@
     <string>com.vertusbar.dev</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/carltonking/01 - PROJECTS/VERTUS/vertus/apps/vertus-bar/VertusBar</string>
+        <!-- Swift Package product (swift build -c release in vertus/apps/);
+             the old ad-hoc binary at vertus/apps/vertus-bar/VertusBar is
+             gone from the repo. -->
+        <string>/Users/carltonking/01 - PROJECTS/VERTUS/vertus/apps/.build/release/VertusBar</string>
     </array>
     <!-- Start the bar at login so the toggle always works. -->
     <key>RunAtLoad</key>

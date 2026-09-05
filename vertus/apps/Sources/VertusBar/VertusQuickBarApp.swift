@@ -110,17 +110,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Icons
 
     private func loadIcons() {
-        let dir: URL? = Bundle.main.resourceURL
-            ?? Bundle.main.bundleURL.deletingLastPathComponent().resolvingSymlinksInPath()
+        // The bar is a bare executable: Bundle resources are nil. Assets are
+        // the PNGs in vertus/apps/vertus-bar/ — the legacy ad-hoc build put
+        // the binary next to them; the Swift Package build puts it in
+        // .build/{debug,release}/, which is two levels below vertus/apps/.
+        var dirs: [URL] = []
+        let bundleDir = Bundle.main.resourceURL ?? Bundle.main.bundleURL.deletingLastPathComponent()
+        dirs.append(bundleDir.resolvingSymlinksInPath())
+        dirs.append(bundleDir.deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("vertus-bar"))
         func load(_ name: String, size: CGFloat) -> NSImage? {
-            guard let dir else { return nil }
-            let fileURL = dir.appendingPathComponent(name)
-            if let img = NSImage(contentsOf: fileURL) {
-                img.size = NSSize(width: size, height: size)
-                // Template so the system renders it black on light menu bars
-                // and white on dark ones, matching the other menubar icons.
-                img.isTemplate = true
-                return img
+            for dir in dirs {
+                let fileURL = dir.appendingPathComponent(name)
+                if let img = NSImage(contentsOf: fileURL) {
+                    img.size = NSSize(width: size, height: size)
+                    // Template so the system renders it black on light menu bars
+                    // and white on dark ones, matching the other menubar icons.
+                    img.isTemplate = true
+                    return img
+                }
             }
             return nil
         }

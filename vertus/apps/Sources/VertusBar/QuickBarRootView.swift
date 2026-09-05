@@ -68,17 +68,22 @@ enum NotchPanelMetrics {
         return max(notchBand, screen.frame.maxY - left.minY)
     }
 
-    /// Active base height: top band + window gap + prompt strip.
+    /// Fleet strip row (agent picker + busy dots + open-in-Fleet) between
+    /// the notch band and the chat window. Always present, so busy bots stay
+    /// visible while chatting.
+    static let stripHeight: CGFloat = 16
+
+    /// Active base height: top band + fleet strip + window gap + prompt strip.
     static func height(promptLines: CGFloat = 1) -> CGFloat {
-        topBandHeight + windowGap + promptStripHeight(lines: promptLines)
+        topBandHeight + stripHeight + windowGap + promptStripHeight(lines: promptLines)
     }
-    /// Idle height: top band + idle empty row + prompt strip.
+    /// Idle height: top band + fleet strip + idle empty row + prompt strip.
     static func idleHeight(promptLines: CGFloat = 1) -> CGFloat {
-        topBandHeight + idleGap + promptStripHeight(lines: promptLines)
+        topBandHeight + stripHeight + idleGap + promptStripHeight(lines: promptLines)
     }
     /// Maximum total widget height (top band + full 10-line window + strip).
     static func maxWidgetHeight(promptLines: CGFloat = 1) -> CGFloat {
-        topBandHeight + windowGap + promptStripHeight(lines: promptLines) + maxScrollWindowHeight
+        topBandHeight + stripHeight + windowGap + promptStripHeight(lines: promptLines) + maxScrollWindowHeight
     }
     static let cornerRadius: CGFloat = 17
     /// Corner control-point distance, fitted so the rendered corner matches
@@ -274,14 +279,15 @@ struct NotchPanelContent: View {
         max(0, widgetHeight - NotchPanelMetrics.height(promptLines: model.promptLines) - model.slashMenuSpace)
     }
 
-    /// Empty band below the notch: a clear empty row when idle, a small gap
-    /// under the chat window while chatting (spec: notch row, empty row,
-    /// divider — the empty row is where the conversation grows).
+    /// Empty band below the fleet strip: a clear empty row when idle, a
+    /// small gap under the chat window while chatting (spec: notch row,
+    /// empty row, divider — the empty row is where the conversation grows).
     private var dividerY: CGFloat {
         let gap = outputHeight > 0
             ? NotchPanelMetrics.windowGap
             : NotchPanelMetrics.idleGap
-        return outputHeight + NotchPanelMetrics.topBandHeight + gap
+        return outputHeight + NotchPanelMetrics.topBandHeight
+            + NotchPanelMetrics.stripHeight + gap
     }
 
     var body: some View {
@@ -289,6 +295,7 @@ struct NotchPanelContent: View {
             Color.black
             outputPane
             topBar
+            fleetStrip
             divider
             inputRow
             slashSuggestionsOverlay
@@ -354,6 +361,79 @@ struct NotchPanelContent: View {
         }
     }
 
+    // MARK: Fleet strip — agent picker, busy-bot dots, open-in-Fleet.
+    // One slim row under the notch band, always present: switching agents
+    // and seeing who is busy works whether or not the chat window is open.
+
+    private var fleetStrip: some View {
+        HStack(spacing: 6) {
+            agentChip
+            ForEach(model.busyAgents) { busy in
+                HStack(spacing: 2) {
+                    Text(busy.emoji)
+                        .font(.system(size: 8.5))
+                    Circle()
+                        .fill(busy.running ? Color.orange : Color.yellow)
+                        .frame(width: 5, height: 5)
+                }
+                .help("\(busy.name) \(busy.running ? "running" : "queued")")
+            }
+            if model.queueDepth > 0 {
+                Text("\(model.queueDepth) queued")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+            Spacer(minLength: 4)
+            Button(action: { model.openInFleet() }) {
+                Image(systemName: "arrow.up.right.square")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+            .buttonStyle(.plain)
+            .help("Open in Fleet")
+        }
+        .frame(
+            width: NotchPanelMetrics.bodyWidth,
+            height: NotchPanelMetrics.stripHeight,
+            alignment: .leading
+        )
+        .offset(x: NotchPanelMetrics.chamferInset, y: NotchPanelMetrics.topBandHeight)
+        .opacity(contentReveal)
+    }
+
+    /// The agent picker: emoji + short name; remembers the last used agent.
+    private var agentChip: some View {
+        Menu {
+            ForEach(model.agents) { agent in
+                Button(agent.rosterLabel) {
+                    model.selectAgent(agent.id)
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(model.agents.first { $0.id == model.selectedAgentID }?.emoji ?? "")
+                    .font(.system(size: 9.5))
+                Text(selectedAgentShortName)
+                    .font(.system(size: 10, weight: .medium))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 6.5))
+            }
+            .foregroundStyle(.white.opacity(0.75))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(Color(white: 0.2)))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Agent: \(selectedAgentShortName)")
+    }
+
+    private var selectedAgentShortName: String {
+        let name = model.agents.first { $0.id == model.selectedAgentID }?.displayName ?? model.selectedAgentID
+        return String(name.prefix(14))
+    }
+
     // MARK: Output pane — chat transcript: your prompts and VERTUS's answers
     // as bubbles, capped at ten visible lines; scrolls beyond that. Shown
     // above the prompt bar from the first message on.
@@ -375,9 +455,10 @@ struct NotchPanelContent: View {
             height: max(0, outputHeight),
             alignment: .top
         )
-        // The window starts right underneath the (measured) notch, so
-        // scrolling never sends text up into the icons/notch area.
-        .offset(x: NotchPanelMetrics.chamferInset, y: NotchPanelMetrics.topBandHeight)
+        // The window starts right underneath the (measured) notch + fleet
+        // strip, so scrolling never sends text up into the icons/notch area.
+        .offset(x: NotchPanelMetrics.chamferInset,
+                y: NotchPanelMetrics.topBandHeight + NotchPanelMetrics.stripHeight)
         .opacity(showOutputWindow && outputHeight > 0 ? contentReveal : 0)
         .allowsHitTesting(showOutputWindow && outputHeight > 0 && contentReveal > 0.5)
     }
@@ -887,9 +968,15 @@ struct QuickBarRootView: View {
 // MARK: - Transcript row
 
 struct TranscriptEntry: Identifiable {
-    let id = UUID()
+    let id: String
     let role: String
     var text: String
+
+    init(id: String = UUID().uuidString, role: String, text: String) {
+        self.id = id
+        self.role = role
+        self.text = text
+    }
 }
 
 // MARK: - Chat scroll metrics
