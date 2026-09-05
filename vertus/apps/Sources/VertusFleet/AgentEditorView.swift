@@ -18,6 +18,10 @@ struct AgentEditorView: View {
     @State private var color = ""
     @State private var emoji = ""
     @State private var autonomy = "ask"
+    /// v3: may this agent drive the desktop at all.
+    @State private var computerUse = false
+    /// v3: declared targets, one per line. Empty = unrestricted (null).
+    @State private var targetsText = ""
 
     @State private var saving = false
     @State private var errorText: String?
@@ -70,10 +74,30 @@ struct AgentEditorView: View {
                     TextField("Color (#RRGGBB)", text: $color)
                     TextField("Emoji", text: $emoji)
                 }
-                Picker("Autonomy", selection: $autonomy) {
-                    Text("ask — confirm before acting").tag("ask")
-                    Text("trusted — act on its own").tag("trusted")
+                Toggle("Computer use (drive the desktop)", isOn: $computerUse)
+                if computerUse {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Declared targets — one per line (app bundle id or window title)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextEditor(text: $targetsText)
+                            .font(.system(size: 11.5, design: .monospaced))
+                            .frame(height: 60)
+                            .scrollContentBackground(.hidden)
+                            .padding(4)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(Color(white: 0.13)))
+                        Text("Empty = unrestricted. This is a declaration for conflict gating only — it is not a sandbox, and the hub cannot see which window an agent actually touches.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
                 }
+                Picker("Autonomy", selection: $autonomy) {
+                    Text("ask — standard driver mode").tag("ask")
+                    Text("trusted — bounded when a manifest exists").tag("trusted")
+                }
+                Text("Autonomy selects the GUI driver's spawn-time permission mode. It is not per-action consent: individual computer-use actions cannot be approved or denied mid-turn from here.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
             }
             .formStyle(.grouped)
             .padding(.bottom, 8)
@@ -89,7 +113,7 @@ struct AgentEditorView: View {
                 .padding(.bottom, 8)
             }
         }
-        .frame(width: 520, height: 560)
+        .frame(width: 540, height: 680)
         .onAppear {
             if case .edit(let agent) = mode {
                 name = agent.name
@@ -101,6 +125,8 @@ struct AgentEditorView: View {
                 color = agent.color ?? ""
                 emoji = agent.emoji ?? ""
                 autonomy = agent.autonomy
+                computerUse = agent.computerUse
+                targetsText = (agent.cuaTargets ?? []).joined(separator: "\n")
             }
         }
         .alert("Error", isPresented: Binding(
@@ -117,6 +143,7 @@ struct AgentEditorView: View {
         saving = true
         defer { saving = false }
         do {
+            let targets = parsedTargets
             if isEdit, case .edit(let agent) = mode {
                 let (_, pending) = try await store.updateAgent(
                     agent.id,
@@ -127,7 +154,10 @@ struct AgentEditorView: View {
                     provider: emptyAsNil(provider),
                     color: emptyAsNil(color),
                     emoji: emptyAsNil(emoji),
-                    autonomy: autonomy
+                    autonomy: autonomy,
+                    computerUse: computerUse,
+                    cuaTargets: targets.isEmpty ? nil : targets,
+                    clearTargets: targets.isEmpty
                 )
                 respawnPending = pending
                 if !pending { dismiss() }
@@ -141,7 +171,9 @@ struct AgentEditorView: View {
                     provider: emptyAsNil(provider),
                     color: emptyAsNil(color),
                     emoji: emptyAsNil(emoji),
-                    autonomy: autonomy
+                    autonomy: autonomy,
+                    computerUse: computerUse,
+                    cuaTargets: targets.isEmpty ? nil : targets
                 )
                 dismiss()
             }
@@ -153,5 +185,13 @@ struct AgentEditorView: View {
     private func emptyAsNil(_ s: String) -> String? {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         return t.isEmpty ? nil : t
+    }
+
+    /// Split the targets box on newlines, trim, drop empties. Order kept.
+    private var parsedTargets: [String] {
+        targetsText
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
     }
 }

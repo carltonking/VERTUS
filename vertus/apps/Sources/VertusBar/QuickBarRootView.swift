@@ -372,11 +372,18 @@ struct NotchPanelContent: View {
                 HStack(spacing: 2) {
                     Text(busy.emoji)
                         .font(.system(size: 8.5))
-                    Circle()
-                        .fill(busy.running ? Color.orange : Color.yellow)
-                        .frame(width: 5, height: 5)
+                    if busy.blockedSummary != nil {
+                        // Waiting on a screen target another agent holds.
+                        Image(systemName: "lock.fill")
+                            .font(.system(size: 5.5))
+                            .foregroundStyle(.orange)
+                    } else {
+                        Circle()
+                            .fill(busy.running ? Color.orange : Color.yellow)
+                            .frame(width: 5, height: 5)
+                    }
                 }
-                .help("\(busy.name) \(busy.running ? "running" : "queued")")
+                .help("\(busy.name) \(busy.blockedSummary ?? (busy.running ? "running" : "queued"))")
             }
             if model.queueDepth > 0 {
                 Text("\(model.queueDepth) queued")

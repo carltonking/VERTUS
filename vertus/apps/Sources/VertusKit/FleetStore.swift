@@ -14,6 +14,16 @@ public final class AgentLiveState: ObservableObject, Identifiable {
     @Published public private(set) var lastError: String?
     @Published public private(set) var unreadCount = 0
     @Published public private(set) var hasLoadedHistory = false
+    /// Declared screen targets this agent's turn is blocked on, each naming
+    /// its holder. Empty while the agent runs or is idle.
+    @Published public private(set) var blockedOnTarget: [BlockedTarget] = []
+
+    /// "waiting on Safari (held by doc)" — shown in the roster.
+    public var blockedSummary: String? {
+        blockedOnTarget.first.map { "waiting on \($0.summary)" }
+    }
+
+    public var isBlocked: Bool { !blockedOnTarget.isEmpty }
 
     public let agentID: String
     public var id: String { agentID }
@@ -76,6 +86,7 @@ public final class AgentLiveState: ObservableObject, Identifiable {
     func setActivity(_ text: String?) { currentActivity = text }
     func setRunning(_ running: Bool) { isRunning = running }
     func setQueueDepth(_ depth: Int) { queueDepth = depth }
+    func setBlockedTargets(_ targets: [BlockedTarget]) { blockedOnTarget = targets }
     func setLastRun(_ runID: String?) { lastRunID = runID }
     func setError(_ message: String?) { lastError = message }
     func setHistoryLoaded() { hasLoadedHistory = true }
@@ -105,6 +116,8 @@ public final class FleetStore: ObservableObject {
     @Published public private(set) var agents: [Agent] = []
     @Published public private(set) var connectionState: FleetStream.ConnectionState = .idle
     @Published public private(set) var lastSyncError: String?
+    /// Declared-target roster from GET /api/fleet/screens (refreshScreens).
+    @Published public private(set) var screens: FleetScreensResponse?
     /// Agent currently displayed in the foreground window (drives unread +
     /// notification suppression; written to the shared UI file too).
     @Published public var foregroundAgentID: String? {
@@ -150,6 +163,17 @@ public final class FleetStore: ObservableObject {
         stream.start()
         pollStatusIfNeeded()
         Task { await refreshAgents() }
+        Task { await refreshScreens() }
+    }
+
+    /// GET /api/fleet/screens (called on start, on status-poll cycles, and
+    /// on demand). Best-effort: the roster is a live convenience, not state.
+    public func refreshScreens() async {
+        do {
+            screens = try await client.fleetScreens()
+        } catch {
+            // Keep the last known roster; never surface noise for a busy UI.
+        }
     }
 
     public func stop() {
@@ -234,6 +258,12 @@ public final class FleetStore: ObservableObject {
         return event.text
     }
 
+    /// Human label for an agent id (display name, else raw id) — roster and
+    /// screens views render holder/waiter ids through this.
+    public func displayName(for agentID: String) -> String {
+        agents.first { $0.id == agentID }?.displayName ?? agentID
+    }
+
     private func onLagged() {
         // The stream is reconnecting with since=<cursor>; surface state.
         lastSyncError = "stream lagged — reconnecting"
@@ -311,7 +341,10 @@ public final class FleetStore: ObservableObject {
                     do {
                         let status = try await self.client.status(state.agentID)
                         state.setQueueDepth(status.queueDepth)
-                        if !status.isBusy {
+                        state.setBlockedTargets(status.blockedOnTarget ?? [])
+                        if status.state == "running" {
+                            state.setRunning(true)
+                        } else if !status.isBusy {
                             state.setRunning(false)
                             state.setActivity(nil)
                         }
@@ -319,6 +352,7 @@ public final class FleetStore: ObservableObject {
                         // Hub briefly down; keep the last known state.
                     }
                 }
+                await self.refreshScreens()
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
             self?.statusPolling = false
@@ -331,12 +365,17 @@ public final class FleetStore: ObservableObject {
                             description: String? = nil, persona: String? = nil,
                             model: String? = nil, provider: String? = nil,
                             color: String? = nil, emoji: String? = nil,
-                            autonomy: String? = nil) async throws -> Agent {
+                            autonomy: String? = nil, computerUse: Bool? = nil,
+                            cuaTargets: [String]? = nil,
+                            clearTargets: Bool = false) async throws -> Agent {
         let agent = try await client.createAgent(name: name, title: title,
                                                  description: description,
                                                  persona: persona, model: model,
                                                  provider: provider, color: color,
-                                                 emoji: emoji, autonomy: autonomy)
+                                                 emoji: emoji, autonomy: autonomy,
+                                                 computerUse: computerUse,
+                                                 cuaTargets: cuaTargets,
+                                                 clearTargets: clearTargets)
         await refreshAgents()
         return agent
     }
@@ -345,7 +384,9 @@ public final class FleetStore: ObservableObject {
                             description: String? = nil, persona: String? = nil,
                             model: String? = nil, provider: String? = nil,
                             color: String? = nil, emoji: String? = nil,
-                            autonomy: String? = nil) async throws -> (Agent, Bool) {
+                            autonomy: String? = nil, computerUse: Bool? = nil,
+                            cuaTargets: [String]? = nil,
+                            clearTargets: Bool = false) async throws -> (Agent, Bool) {
         let (agent, pending) = try await client.updateAgent(id, title: title,
                                                             description: description,
                                                             persona: persona,
@@ -353,8 +394,13 @@ public final class FleetStore: ObservableObject {
                                                             provider: provider,
                                                             color: color,
                                                             emoji: emoji,
-                                                            autonomy: autonomy)
+                                                            autonomy: autonomy,
+                                                            computerUse: computerUse,
+                                                            cuaTargets: cuaTargets,
+                                                            clearTargets: clearTargets)
         await refreshAgents()
+        // A PATCH may have changed cua_targets/autonomy; the in-memory copy
+        // returned is authoritative for the caller's editor state.
         return (agent, pending)
     }
 

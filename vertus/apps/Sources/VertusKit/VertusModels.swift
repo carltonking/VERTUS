@@ -16,6 +16,13 @@ public struct Agent: Codable, Identifiable, Equatable {
     public var color: String?
     public var emoji: String?
     public var autonomy: String
+    /// v3: may this agent drive the desktop at all (else its gateway spawns
+    /// with the noop CUA backend and captures come back blank).
+    public var computerUse: Bool
+    /// v3: declared app bundle ids / window titles this agent works in. A
+    /// DECLARATION for conflict gating, not a sandbox (see the caveat on
+    /// /api/fleet/screens); null = unrestricted.
+    public var cuaTargets: [String]?
     public var createdAt: String
     public var updatedAt: String
     public var sandboxPath: String
@@ -36,11 +43,18 @@ public struct Agent: Codable, Identifiable, Equatable {
 
     public static func == (lhs: Agent, rhs: Agent) -> Bool { lhs.id == rhs.id }
 
+    private enum CodingKeys: String, CodingKey {
+        case id, name, title, description, persona, model, provider, color
+        case emoji, autonomy, createdAt, updatedAt, sandboxPath, homePath
+        case schemaVersion, isPrimary, computerUse, cuaTargets
+    }
+
     public init(id: String, name: String, title: String, description: String,
                 persona: String, model: String?, provider: String?,
                 color: String?, emoji: String?, autonomy: String,
                 createdAt: String, updatedAt: String, sandboxPath: String,
-                homePath: String, schemaVersion: Int, isPrimary: Bool) {
+                homePath: String, schemaVersion: Int, isPrimary: Bool,
+                computerUse: Bool = false, cuaTargets: [String]? = nil) {
         self.id = id
         self.name = name
         self.title = title
@@ -51,6 +65,8 @@ public struct Agent: Codable, Identifiable, Equatable {
         self.color = color
         self.emoji = emoji
         self.autonomy = autonomy
+        self.computerUse = computerUse
+        self.cuaTargets = cuaTargets
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.sandboxPath = sandboxPath
@@ -58,16 +74,81 @@ public struct Agent: Codable, Identifiable, Equatable {
         self.schemaVersion = schemaVersion
         self.isPrimary = isPrimary
     }
+
+    // Tolerant decode: computer_use/cua_targets default to off/null so an
+    // older hub (or a stub that omits them) never breaks roster decode.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
+        persona = try c.decodeIfPresent(String.self, forKey: .persona) ?? ""
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        provider = try c.decodeIfPresent(String.self, forKey: .provider)
+        color = try c.decodeIfPresent(String.self, forKey: .color)
+        emoji = try c.decodeIfPresent(String.self, forKey: .emoji)
+        autonomy = try c.decodeIfPresent(String.self, forKey: .autonomy) ?? "ask"
+        computerUse = try c.decodeIfPresent(Bool.self, forKey: .computerUse) ?? false
+        cuaTargets = try c.decodeIfPresent([String].self, forKey: .cuaTargets)
+        createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+        updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt) ?? createdAt
+        sandboxPath = try c.decodeIfPresent(String.self, forKey: .sandboxPath) ?? ""
+        homePath = try c.decodeIfPresent(String.self, forKey: .homePath) ?? ""
+        schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        isPrimary = try c.decodeIfPresent(Bool.self, forKey: .isPrimary) ?? false
+    }
 }
 
-/// GET /api/agents/<id>/status payload.
+/// One target a blocked agent is waiting on, and who holds it.
+public struct BlockedTarget: Codable, Equatable {
+    public var target: String
+    public var holderAgent: String
+    public var holderRun: String?
+
+    public var summary: String {
+        "\(target) (held by \(holderAgent))"
+    }
+}
+
+/// GET /api/agents/<id>/status payload. `blockedOnTarget` appears only while
+/// the agent's turn is gated on a declared screen target held by another run.
 public struct AgentStatus: Codable, Equatable {
     public var state: String          // idle | running | queued
     public var queueDepth: Int
     public var turnStartedAt: Double?
     public var gatewayAlive: Bool
+    public var blockedOnTarget: [BlockedTarget]?
 
     public var isBusy: Bool { state != "idle" || queueDepth > 0 }
+
+    /// Short UI line, e.g. "waiting on Safari (held by doc)".
+    public var blockedSummary: String? {
+        blockedOnTarget?.first.map { "waiting on \($0.summary)" }
+    }
+}
+
+// MARK: - Fleet screens roster (GET /api/fleet/screens)
+
+/// Who runs on a declared target and who waits for it.
+public struct FleetScreenEntry: Codable, Identifiable, Equatable {
+    public var target: String
+    public var declaredBy: [String]
+    public var running: FleetScreenRunning?
+    public var waiting: [String]
+
+    public var id: String { target }
+}
+
+public struct FleetScreenRunning: Codable, Equatable {
+    public var agentId: String
+    public var runId: String
+    public var since: Double
+}
+
+public struct FleetScreensResponse: Codable, Equatable {
+    public var screens: [FleetScreenEntry]
+    public var caveat: String?
 }
 
 /// POST /api/prompt → 202 payload.

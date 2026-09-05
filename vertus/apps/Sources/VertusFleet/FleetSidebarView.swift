@@ -12,6 +12,7 @@ struct FleetSidebarView: View {
 
     @State private var confirmDelete: Agent?
     @State private var errorText: String?
+    @State private var showScreens = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -27,7 +28,7 @@ struct FleetSidebarView: View {
 
             Divider()
 
-            // Fleet activity entry + connection state.
+            // Fleet activity + screens + connection state.
             VStack(alignment: .leading, spacing: 6) {
                 Button(action: onShowActivity) {
                     Label("Fleet activity", systemImage: "clock.arrow.circlepath")
@@ -37,9 +38,25 @@ struct FleetSidebarView: View {
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.secondary)
 
+                Button {
+                    showScreens = true
+                    Task { await store.refreshScreens() }
+                } label: {
+                    Label("Screens", systemImage: "display")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+
                 connectionRow
             }
             .padding(10)
+        }
+        .sheet(isPresented: $showScreens) {
+            FleetScreensSheetView()
+                .environmentObject(store)
+                .frame(width: 560, height: 460)
         }
         .alert("Delete agent?", isPresented: Binding(
             get: { confirmDelete != nil },
@@ -121,7 +138,11 @@ struct FleetSidebarView: View {
                         .font(.system(size: 12.5, weight: .semibold))
                         .lineLimit(1)
                     if let state = store.live[agent.id] {
-                        if state.isRunning {
+                        if state.isBlocked {
+                            Image(systemName: "lock.fill")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.orange)
+                        } else if state.isRunning {
                             busyDot(color: .orange)
                         } else if state.queueDepth > 0 {
                             busyDot(color: .yellow)
@@ -136,7 +157,14 @@ struct FleetSidebarView: View {
                             .background(Capsule().fill(.blue))
                     }
                 }
-                if let activity = store.latestActivityText(for: agent.id) {
+                // While a run is gated on a declared screen target, show who
+                // holds it; otherwise the live activity line.
+                if let state = store.live[agent.id], state.isBlocked, let summary = state.blockedSummary {
+                    Text(summary)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                } else if let activity = store.latestActivityText(for: agent.id) {
                     Text(activity)
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
@@ -194,5 +222,101 @@ struct FleetSidebarView: View {
                 errorText = error.localizedDescription
             }
         }
+    }
+}
+
+/// Fleet screens roster: declared targets, who runs each, who waits, and the
+/// honest caveat — targets are declarations for conflict gating, not a
+/// sandbox the hub enforces.
+struct FleetScreensSheetView: View {
+    @EnvironmentObject private var store: FleetStore
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Screens")
+                    .font(.system(size: 14, weight: .semibold))
+                Spacer()
+                Button("Refresh") {
+                    Task { await store.refreshScreens() }
+                }
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(12)
+
+            Divider()
+
+            if let screens = store.screens {
+                if screens.screens.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "display")
+                            .font(.system(size: 30))
+                            .foregroundStyle(.secondary)
+                        Text("No declared screen targets.")
+                            .font(.system(size: 13))
+                        Text("Agents that declare cua_targets appear here; the rest run fully parallel.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List(screens.screens) { entry in
+                        screenRow(entry)
+                    }
+                }
+
+                Divider()
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                    Text(screens.caveat ?? "")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                }
+                .padding(10)
+            } else {
+                ProgressView("Loading…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    private func screenRow(_ entry: FleetScreenEntry) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text(entry.target)
+                    .font(.system(size: 12.5, weight: .semibold, design: .monospaced))
+                    .lineLimit(1)
+                if entry.running != nil {
+                    Image(systemName: "cursorarrow.click")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.green)
+                }
+            }
+            Text("declared by: \(entry.declaredBy.compactMap { store.displayName(for: $0) }.joined(separator: ", "))")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            if let running = entry.running {
+                Text("▶ \(store.displayName(for: running.agentId)) — run since \(Self.sinceText(running.since))")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.green)
+            }
+            if !entry.waiting.isEmpty {
+                Text("waiting: \(entry.waiting.compactMap { store.displayName(for: $0) }.joined(separator: ", "))")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private static func sinceText(_ ts: Double) -> String {
+        let elapsed = Date().timeIntervalSince1970 - ts
+        if elapsed < 60 { return "\(Int(elapsed))s" }
+        return "\(Int(elapsed / 60))m"
     }
 }

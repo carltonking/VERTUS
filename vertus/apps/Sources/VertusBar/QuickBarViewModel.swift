@@ -44,6 +44,9 @@ final class QuickBarViewModel: ObservableObject {
         let emoji: String
         let name: String
         let running: Bool
+        /// "waiting on <target> (held by <agent>)" while this agent's turn is
+        /// gated on a declared screen target another run holds; nil otherwise.
+        let blockedSummary: String?
     }
 
     init(config: ServerConfig = ServerConfig.load()) {
@@ -117,13 +120,14 @@ final class QuickBarViewModel: ObservableObject {
 
     private func syncBusy() {
         busyAgents = store.live
-            .filter { $0.value.isRunning || $0.value.queueDepth > 0 }
+            .filter { $0.value.isRunning || $0.value.queueDepth > 0 || $0.value.isBlocked }
             .map { id, state in
                 let agent = agents.first { $0.id == id }
                 return BusyAgentInfo(id: id,
                                      emoji: agent?.emoji ?? "",
                                      name: agent?.displayName ?? id,
-                                     running: state.isRunning)
+                                     running: state.isRunning,
+                                     blockedSummary: state.blockedSummary)
             }
             .sorted { $0.name < $1.name }
     }

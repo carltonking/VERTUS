@@ -52,17 +52,21 @@ public final class VertusHTTPClient {
         try await get(AgentStatus.self, path: "/api/agents/\(escaped(id))/status", key: nil)
     }
 
-    /// POST /api/agents with the full v2 editable field set (name required;
+    /// POST /api/agents with the full v3 editable field set (name required;
     /// everything else optional — nulls mean "inherit fleet default").
     public func createAgent(name: String, title: String? = nil,
                             description: String? = nil, persona: String? = nil,
                             model: String? = nil, provider: String? = nil,
                             color: String? = nil, emoji: String? = nil,
-                            autonomy: String? = nil) async throws -> Agent {
+                            autonomy: String? = nil,
+                            computerUse: Bool? = nil,
+                            cuaTargets: [String]? = nil,
+                            clearTargets: Bool = false) async throws -> Agent {
         var body: [String: Any] = ["name": name]
         appendEditable(&body, title: title, description: description, persona: persona,
                        model: model, provider: provider, color: color,
-                       emoji: emoji, autonomy: autonomy)
+                       emoji: emoji, autonomy: autonomy, computerUse: computerUse,
+                       cuaTargets: cuaTargets, clearTargets: clearTargets)
         return try await send("POST", path: "/api/agents", body: body)
     }
 
@@ -72,11 +76,15 @@ public final class VertusHTTPClient {
                             description: String? = nil, persona: String? = nil,
                             model: String? = nil, provider: String? = nil,
                             color: String? = nil, emoji: String? = nil,
-                            autonomy: String? = nil) async throws -> (Agent, respawnPending: Bool) {
+                            autonomy: String? = nil,
+                            computerUse: Bool? = nil,
+                            cuaTargets: [String]? = nil,
+                            clearTargets: Bool = false) async throws -> (Agent, respawnPending: Bool) {
         var body: [String: Any] = [:]
         appendEditable(&body, title: title, description: description, persona: persona,
                        model: model, provider: provider, color: color,
-                       emoji: emoji, autonomy: autonomy)
+                       emoji: emoji, autonomy: autonomy, computerUse: computerUse,
+                       cuaTargets: cuaTargets, clearTargets: clearTargets)
         guard !body.isEmpty else {
             // Empty PATCH: fetch and return unchanged (no respawn).
             return (try await agent(id), false)
@@ -89,6 +97,12 @@ public final class VertusHTTPClient {
         }
         let pending = (json as? [String: Any])?["respawn_pending"] as? Bool ?? false
         return (agent, pending)
+    }
+
+    /// GET /api/fleet/screens — declared screen targets, who runs each, who
+    /// waits, and the policy caveat (declaration, not a sandbox).
+    public func fleetScreens() async throws -> FleetScreensResponse {
+        try await get(FleetScreensResponse.self, path: "/api/fleet/screens", key: nil)
     }
 
     public func deleteAgent(_ id: String) async throws -> DeleteResult {
@@ -178,7 +192,10 @@ public final class VertusHTTPClient {
     private func appendEditable(_ body: inout [String: Any], title: String?,
                                 description: String?, persona: String?,
                                 model: String?, provider: String?,
-                                color: String?, emoji: String?, autonomy: String?) {
+                                color: String?, emoji: String?, autonomy: String?,
+                                computerUse: Bool? = nil,
+                                cuaTargets: [String]? = nil,
+                                clearTargets: Bool = false) {
         // Only non-nil keys are sent; PATCH semantics treat null as clear.
         if let title { body["title"] = title }
         if let description { body["description"] = description }
@@ -188,6 +205,13 @@ public final class VertusHTTPClient {
         if let color { body["color"] = color }
         if let emoji { body["emoji"] = emoji }
         if let autonomy { body["autonomy"] = autonomy }
+        if let computerUse { body["computer_use"] = computerUse }
+        if clearTargets {
+            // Explicit "unrestricted": cua_targets: null clears the list.
+            body["cua_targets"] = NSNull()
+        } else if let cuaTargets {
+            body["cua_targets"] = cuaTargets
+        }
     }
 
     private func escaped(_ s: String) -> String {
