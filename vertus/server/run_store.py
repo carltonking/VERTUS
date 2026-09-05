@@ -104,6 +104,18 @@ CREATE INDEX IF NOT EXISTS idx_events_run_seq  ON events(run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_agent_created ON messages(agent_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_created ON runs(created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_agent_state ON runs(agent_id, state);
+CREATE TABLE IF NOT EXISTS approvals(
+  approval_id TEXT PRIMARY KEY,
+  run_id TEXT,
+  agent_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  target TEXT NOT NULL DEFAULT '',
+  requested_at REAL NOT NULL,
+  decided_at REAL,
+  decision TEXT,
+  decided_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_requested ON approvals(requested_at);
 """
 
 
@@ -294,6 +306,30 @@ class RunStore:
         rows = self._read(lambda c: c.execute(
             "SELECT * FROM messages WHERE run_id = ? ORDER BY id ASC", (run_id,)
         ).fetchall())
+        return [dict(r) for r in rows]
+
+    def list_approvals(self, state: str | None = None,
+                       limit: int = 100) -> list[dict]:
+        """Newest-first approval rows; ``state=pending`` = undecided rows.
+
+        READ-ONLY RECORD: nothing in the hub writes this table today. The
+        gateway's approvals fire only when a per-agent config.yaml carries
+        ``approvals.mode: manual`` (the fleet default is off) AND the request
+        reaches tools/approval.py's generic gate — which computer_use never
+        does in gateway mode. Flipping the mode would make shell/file
+        approvals reachable (see the checkpoint report); until then this
+        endpoint honestly returns an empty ledger.
+        """
+        sql = "SELECT * FROM approvals WHERE 1=1"
+        params: list = []
+        if state == "pending":
+            sql += " AND decision IS NULL"
+        elif state:
+            sql += " AND decision = ?"
+            params.append(state)
+        sql += " ORDER BY requested_at DESC, approval_id DESC LIMIT ?"
+        params.append(int(limit))
+        rows = self._read(lambda c: c.execute(sql, params).fetchall())
         return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------

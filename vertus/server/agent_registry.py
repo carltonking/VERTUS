@@ -5,7 +5,7 @@ On-disk layout (also documented in README "Multi-agent (WIP)"):
     ~/.vertus/agents/
     ├── _primary                    # text file holding the primary agent's id
     └── <agent_id>/
-        ├── profile.json            # schema_version 2 — the SINGLE SOURCE OF TRUTH
+        ├── profile.json            # schema_version 3 — the SINGLE SOURCE OF TRUTH
         ├── sandbox/                # per-agent scratch directory (session cwd)
         ├── memory/                 # this bot's own working notes
         └── home/                   # per-agent ENGINE config root (HERMES_HOME);

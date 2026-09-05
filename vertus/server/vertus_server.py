@@ -955,6 +955,8 @@ class VertusHandler(BaseHTTPRequestHandler):
                 since=self._query_param("since"),
                 run_id=self._query_param("run_id"),
             )
+        elif path == "/api/approvals":
+            self._handle_approvals_list()
         elif path == "/api/runs":
             self._handle_runs_list()
         elif path.startswith("/api/runs/"):
@@ -1430,6 +1432,22 @@ class VertusHandler(BaseHTTPRequestHandler):
             self._json(404, {"error": f"run not found: {run_id}"})
             return
         self._json(200, {"run": run, "messages": store.run_messages(run_id)})
+
+    def _handle_approvals_list(self) -> None:
+        """GET /api/approvals?state= — read-only approval ledger.
+
+        Honest scope: the hub cannot see per-action approval requests today
+        (approvals are off in the fleet config and computer_use never reaches
+        the fork's gateable path in gateway mode), so this ledger is empty
+        until a future phase populates it. The endpoint exists now so the
+        contract — and the client UI — don't have to be invented later.
+        """
+        store = self._history_store()
+        if store is None:
+            return
+        state = self._query_param("state") or None
+        limit = self._limit_param("limit", 100, 500)
+        self._json(200, {"approvals": store.list_approvals(state=state, limit=limit)})
 
     def _handle_fleet_activity(self) -> None:
         """GET /api/fleet/activity — newest runs across ALL agents (roster UI)."""
