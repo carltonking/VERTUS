@@ -25,9 +25,10 @@ Schema
     runs(run_id TEXT PK, agent_id, prompt, remote INT, source, state,
          started_at REAL, ended_at REAL, error, gateway_respawns INT,
          created_at REAL)
-         state in: queued|running|done|error|interrupted|abandoned
+         state in: queued|running|done|error|interrupted|abandoned|
+                    cancelled|timeout
     events(seq INTEGER PK AUTOINCREMENT, run_id, agent_id, ts REAL,
-           type TEXT, payload TEXT)          -- type: text|activity|done|error
+           type TEXT, payload TEXT)   -- type: text|activity|done|error|cancelled
     messages(id INTEGER PK AUTOINCREMENT, run_id, agent_id, role TEXT,
              text TEXT, created_at REAL)     -- role: user|assistant
 
@@ -65,9 +66,29 @@ from typing import Callable, Optional
 
 DEFAULT_DB_PATH = Path.home() / ".vertus" / "fleet.db"
 
-RUN_STATES = ("queued", "running", "done", "error", "interrupted", "abandoned")
-TERMINAL_STATES = ("done", "error", "interrupted", "abandoned")
-WIRE_EVENT_TYPES = ("text", "activity", "done", "error")
+RUN_STATES = (
+    "queued",
+    "running",
+    "done",
+    "error",
+    "interrupted",
+    "abandoned",
+    "cancelled",
+    "timeout",
+)
+TERMINAL_STATES = (
+    "done",
+    "error",
+    "interrupted",
+    "abandoned",
+    "cancelled",
+    "timeout",
+)
+WIRE_EVENT_TYPES = ("text", "activity", "done", "error", "cancelled")
+
+# SQL fragment shared by finish_run / recover: a run is terminal exactly
+# when its state is in TERMINAL_STATES — keep the two in lockstep.
+_TERMINAL_SQL = ",".join(f"'{s}'" for s in TERMINAL_STATES)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs(
@@ -140,6 +161,7 @@ class RunStore:
             target=self._writer_loop, daemon=True, name="fleet-store-writer"
         )
         self._thread.start()
+        self._stopped = False
         # Optional callback invoked BY THE WRITER THREAD after each event is
         # committed (never under the caller's lock). The hub uses it to push
         # committed envelopes to fleet-stream subscriber queues.
@@ -156,7 +178,13 @@ class RunStore:
         can uphold store-before-fanout. ``out`` is a caller-owned dict the op
         fills with results; if it gains an ``_event`` key, the committed
         envelope is dispatched to ``listener`` right after commit.
+
+        After ``stop()`` the writer thread is gone: submitting must FAIL FAST
+        (RuntimeError) rather than enqueue onto a dead queue and hang the
+        caller forever — a hung HTTP handler is worse than a 503.
         """
+        if self._stopped:
+            raise RuntimeError("run store is stopped")
         done = threading.Event()
         error: list[BaseException] = []
         self._queue.put((fn, out, done, error))
@@ -200,7 +228,12 @@ class RunStore:
             conn.close()
 
     def stop(self) -> None:
-        """Flush and stop the writer thread (idempotent)."""
+        """Flush and stop the writer thread (idempotent).
+
+        After this, every _submit fails fast with RuntimeError so a stale
+        reference to a stopped store can never hang a caller.
+        """
+        self._stopped = True
         if self._thread is None or not self._thread.is_alive():
             return
         self._queue.put(None)
@@ -415,18 +448,19 @@ class RunStore:
         """Set the terminal state EXACTLY ONCE.
 
         Only transitions from queued/running; a second call (or a racing
-        recovery pass) is a no-op. Returns True when the row was updated.
+        recovery pass, or a cancel racing a natural completion) is a no-op.
+        Returns True when the row was updated.
         """
         assert state in TERMINAL_STATES, state
         out: dict = {}
 
         def op(conn: sqlite3.Connection) -> None:
             cur = conn.execute(
-                "UPDATE runs SET state = ?, ended_at = ?, "
-                "error = COALESCE(?, error), "
-                "gateway_respawns = CASE WHEN ? IS NOT NULL THEN ? "
-                "                          ELSE gateway_respawns END "
-                "WHERE run_id = ? AND state NOT IN ('done','error','interrupted','abandoned')",
+                f"UPDATE runs SET state = ?, ended_at = ?, "
+                f"error = COALESCE(?, error), "
+                f"gateway_respawns = CASE WHEN ? IS NOT NULL THEN ? "
+                f"                          ELSE gateway_respawns END "
+                f"WHERE run_id = ? AND state NOT IN ({_TERMINAL_SQL})",
                 (state, time.time(), error,
                  gateway_respawns, gateway_respawns, run_id),
             )

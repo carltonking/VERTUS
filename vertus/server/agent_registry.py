@@ -22,7 +22,7 @@ On-disk layout (also documented in README "Multi-agent (WIP)"):
 re-materialized on every profile write (see ``_materialize_home_locked``).
 Hand edits under ``home/`` are lost on the next profile update — by design.
 
-Profile schema v3 (``schema_version: 3``):
+Profile schema v4 (``schema_version: 4``):
 
     id, name, title, description   # identity; title/description drive delegation
     persona        : str           # the bot's system identity text (→ home/SOUL.md)
@@ -32,17 +32,20 @@ Profile schema v3 (``schema_version: 3``):
     computer_use   : bool          # whether this bot may drive the desktop (v3)
     cua_targets    : [str] | None  # allowed app bundle ids / window titles it
                                    # works in; null = unrestricted (v3)
+    stall_timeout_s: number        # silence (no engine event) that ends a turn (v4)
+    hard_timeout_s : number        # absolute ceiling for a non-converging turn (v4)
     created_at, updated_at, is_primary, sandbox_path, home_path
 
-Migration: profiles older than v3 (no ``schema_version``, or v1/v2) are
-upgraded in place on load — stepwise v1→v2→v3 so every intermediate rule
+Migration: profiles older than v4 (no ``schema_version``, or v1–v3) are
+upgraded in place on load — stepwise v1→v2→v3→v4 so every intermediate rule
 applies exactly once. v1 backfills ``title`` from ``name`` and ``persona``
 from the fleet's current ``~/.hermes/SOUL.md`` when readable; v3 adds
 ``computer_use: False`` and ``cua_targets: None`` (existing fleet behavior
-is unchanged: no bot acquires desktop capability on upgrade). All old keys
-are kept and unknown keys preserved. Migration is idempotent (a v3 profile
-is never rewritten by it). The fleet hermes home is
-``VERTUS_FLEET_HERMES_HOME`` or ``~/.hermes``.
+is unchanged: no bot acquires desktop capability on upgrade); v4 adds the
+supervision timeouts (defaults 180s / 3600s — a slow-but-chatty CUA turn is
+never touched). All old keys are kept and unknown keys preserved. Migration
+is idempotent (a current-schema profile is never rewritten by it). The
+fleet hermes home is ``VERTUS_FLEET_HERMES_HOME`` or ``~/.hermes``.
 
 Deletion policy (documented choice): the last remaining agent can never be
 deleted (ValueError). Deleting the primary agent reassigns primary status to
@@ -81,7 +84,7 @@ _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _PROFILE_FILE = "profile.json"
 _PRIMARY_MARKER = "_primary"
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Free-form identity/config fields an update_agent() caller may set. Paths,
 # timestamps, and the id are managed by the registry, never by callers.
@@ -96,6 +99,8 @@ EDITABLE_FIELDS = (
     "autonomy",
     "computer_use",
     "cua_targets",
+    "stall_timeout_s",
+    "hard_timeout_s",
 )
 AUTONOMY_VALUES = ("ask", "trusted")
 
@@ -158,6 +163,13 @@ def migrate_v1_profile(profile: dict, persona_backfill: str = "") -> tuple[dict,
     # today's behavior exactly (no bot gains desktop control by accident).
     upgraded.setdefault("computer_use", False)
     upgraded.setdefault("cua_targets", None)
+    # v3 → v4: supervision timeouts. stall = silence that kills the turn;
+    # hard = absolute ceiling for a turn that emits forever without
+    # converging. Both only take effect once the hub's supervisor runs — a
+    # slow-but-chatty CUA turn (the GUI demo took 251s legitimately) is
+    # untouched by stall_timeout_s and far inside hard_timeout_s.
+    upgraded.setdefault("stall_timeout_s", 180)
+    upgraded.setdefault("hard_timeout_s", 3600)
     upgraded["schema_version"] = SCHEMA_VERSION
     return upgraded, True
 
@@ -267,10 +279,12 @@ class AgentRegistry:
             for key, value in fields.items():
                 if value is None:
                     # null clears: nullable identity fields → None, list field
-                    # cua_targets → None (unrestricted), text fields → ""
+                    # cua_targets → None (unrestricted), timeout fields → None
+                    # (hub default), text fields → ""
                     agent[key] = (
                         None
-                        if key in ("model", "provider", "color", "emoji", "cua_targets")
+                        if key in ("model", "provider", "color", "emoji", "cua_targets",
+                                   "stall_timeout_s", "hard_timeout_s")
                         else ""
                     )
                 elif key in ("model", "provider"):
@@ -279,6 +293,8 @@ class AgentRegistry:
                     agent[key] = bool(value)  # validated above; stored as bool
                 elif key == "cua_targets":
                     agent[key] = [str(t).strip() for t in value]
+                elif key in ("stall_timeout_s", "hard_timeout_s"):
+                    agent[key] = float(value)
                 else:
                     agent[key] = str(value)
             agent["updated_at"] = _utc_now_iso()
@@ -303,9 +319,21 @@ class AgentRegistry:
             or not all(isinstance(t, str) and t.strip() for t in targets)
         ):
             raise TypeError("cua_targets must be a list of non-empty strings or null")
+        for key in ("stall_timeout_s", "hard_timeout_s"):
+            value = fields.get(key)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or value <= 0
+            ):
+                raise TypeError(f"{key} must be a positive number or null")
 
     def rename_agent(self, agent_id: str, name: str) -> dict:
-        """Update the display name; id, directory, sandbox, and home are kept."""
+        """Update the display name; id, directory, sandbox, and home are kept.
+
+        ``rename_agent`` does not re-materialize home/ (the name is a display
+        affordance, not engine state).
+        """
         name = str(name).strip()
         if not name:
             raise ValueError("agent name must be non-empty")
@@ -564,6 +592,8 @@ class AgentRegistry:
             "autonomy": "ask",
             "computer_use": False,
             "cua_targets": None,
+            "stall_timeout_s": 180,
+            "hard_timeout_s": 3600,
             "created_at": _utc_now_iso(),
             "updated_at": _utc_now_iso(),
             "sandbox_path": str(sandbox),
@@ -582,6 +612,8 @@ class AgentRegistry:
                 profile[key] = bool(value)
             elif key == "cua_targets":
                 profile[key] = [str(t).strip() for t in value]
+            elif key in ("stall_timeout_s", "hard_timeout_s"):
+                profile[key] = float(value)
             else:
                 profile[key] = str(value)
         self._write_profile(agent_id, profile)

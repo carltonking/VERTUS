@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import threading
 from pathlib import Path
@@ -145,7 +146,12 @@ class _HermesSession:
         return resp if isinstance(resp, dict) and resp.get("type") else None
 
     def interrupt(self) -> None:
-        """Abort the in-flight turn (best-effort; hub has no abort endpoint yet)."""
+        """Rung 1 of the hub's escalation ladder: RPC-abort the in-flight turn.
+
+        Best-effort: the gateway decides what interrupt means (typically it
+        cancels the agent loop at the next action boundary — an in-flight
+        CUA type/click completes because the driver call is synchronous).
+        """
         with self._lock:
             sid = self._session_id
         if sid:
@@ -153,6 +159,50 @@ class _HermesSession:
                 self._request("session.interrupt", {"session_id": sid})
             except Exception as exc:
                 self._log(f"interrupt failed: {exc}")
+
+    def active_list(self, timeout: float = 5.0) -> dict:
+        """Cheap liveness RPC for the hub's idle-gateway health check.
+
+        ``session.active_list`` in the fork is an in-memory snapshot of the
+        gateway's live sessions — no disk, no agent build — so a healthy
+        idle gateway answers in milliseconds and a hung one times out.
+        """
+        return self._rpccall(
+            "session.active_list",
+            {"current_session_id": self._session_id or ""},
+            timeout=timeout,
+        )
+
+    def terminate_process(self) -> None:
+        """Rung 2 of the hub's escalation ladder: SIGTERM the process group.
+
+        The gateway is spawned with ``start_new_session=True``, so its whole
+        process tree — including the embedded cua-driver daemon the fork
+        spawns for computer use — shares one process group. Group-signalling
+        means the driver dies WITH the gateway instead of being orphaned to
+        launchd when the gateway is killed mid-CUA-action. If the engine has
+        already exited the group is gone; that's not an error here.
+        """
+        try:
+            os.killpg(self._proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"terminate_process failed: {exc}")
+
+    def kill_process(self) -> None:
+        """Rung 3 of the hub's escalation ladder: SIGKILL the process group.
+
+        Same group semantics as terminate_process; SIGKILL cannot be ignored,
+        so after this rung the gateway and its driver are gone by
+        construction and the worker's reader thread observes EOF.
+        """
+        try:
+            os.killpg(self._proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"kill_process failed: {exc}")
 
     def close(self) -> None:
         """Terminate and reap the gateway child (safe when already dead)."""
@@ -483,6 +533,12 @@ def create_agent_session(
         bufsize=1,
         cwd=str(FORK_REPO),
         env=child_env,
+        # Own session/process group per gateway: the escalation ladder kills
+        # the WHOLE group (terminate_process/kill_process use killpg), so the
+        # gateway and any child it spawned — notably the embedded cua-driver
+        # daemon for computer use — die together. No cross-agent interference
+        # (each gateway is its own group) and no orphaned driver processes.
+        start_new_session=True,
     )
 
     # The hermes engine writes diagnostics to stderr (e.g. the Copilot

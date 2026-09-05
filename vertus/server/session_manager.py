@@ -116,11 +116,26 @@ class SessionManager:
         with self._lock:
             bridge = self._sessions.get(agent_id)
         if bridge is None:
+            # Never created: the canonical idle payload, with the agent's OWN
+            # supervision limits resolved from the registry (no bridge side
+            # effect — this must never instantiate an engine).
+            stall, hard = 180.0, 3600.0
+            try:
+                agent = self.registry.get_agent(agent_id)
+                stall = float(agent.get("stall_timeout_s") or 180)
+                hard = float(agent.get("hard_timeout_s") or 3600)
+            except (KeyError, TypeError, ValueError):
+                pass  # unknown/deleted agent: hub defaults
             return {
                 "state": "idle",
                 "queue_depth": 0,
                 "turn_started_at": None,
                 "gateway_alive": False,
+                "stall_timeout_s": stall,
+                "hard_timeout_s": hard,
+                "last_event_at": None,
+                "silence_s": 0.0,
+                "degraded": None,
             }
         return bridge.status()
 

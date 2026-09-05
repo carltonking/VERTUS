@@ -1,6 +1,6 @@
-"""v2→v3 profile schema + per-agent computer-use spawn-time mapping.
+"""v2→v4 profile schema + per-agent computer-use spawn-time mapping.
 
-Covers the schema migration (idempotent, lossless, unknown keys survive),
+Covers the schema migrations (idempotent, lossless, unknown keys survive),
 the derived home materialization (config.yaml ``computer_use`` block), and
 the gateway env mapping (HERMES_COMPUTER_USE_BACKEND=noop for disabled
 agents) via the production ``resolve_session_kwargs``.
@@ -24,11 +24,11 @@ def _registry(tmp_path, monkeypatch) -> AgentRegistry:
 
 
 # ----------------------------------------------------------------------
-# Migration: v2 → v3
+# Migration: v2 → v4
 # ----------------------------------------------------------------------
 
 
-def test_v2_profile_migrates_to_v3_idempotent_and_lossless(monkeypatch, tmp_path):
+def test_v2_profile_migrates_to_v4_idempotent_and_lossless(monkeypatch, tmp_path):
     reg = _registry(tmp_path, monkeypatch)
     reg.ensure_primary()
     # Hand-write a v2 profile exactly as the previous hub version wrote it.
@@ -54,9 +54,11 @@ def test_v2_profile_migrates_to_v3_idempotent_and_lossless(monkeypatch, tmp_path
     (tmp_path / "agents" / "primary" / "profile.json").write_text(json.dumps(v2))
 
     first = reg.get_agent("primary")
-    assert first["schema_version"] == 3
+    assert first["schema_version"] == 4
     assert first["computer_use"] is False, "v3 upgrade must NOT enable CUA by default"
     assert first["cua_targets"] is None
+    assert first["stall_timeout_s"] == 180, "v4 stall default"
+    assert first["hard_timeout_s"] == 3600, "v4 hard-timeout default"
     assert first["custom_future_key"] == {"keep": True}
     assert first["persona"] == "You are VERTUS.", "v2 persona must not be clobbered"
 
@@ -65,15 +67,14 @@ def test_v2_profile_migrates_to_v3_idempotent_and_lossless(monkeypatch, tmp_path
     reg.get_agent("primary")
     disk_after = json.loads((tmp_path / "agents" / "primary" / "profile.json").read_text())
     assert disk_before == disk_after
-    assert disk_after["schema_version"] == 3
+    assert disk_after["schema_version"] == 4
     assert disk_after["custom_future_key"] == {"keep": True}
 
 
-def test_existing_v3_profile_never_rewritten(monkeypatch, tmp_path):
+def test_v3_profile_migrates_to_v4(monkeypatch, tmp_path):
+    """v3 → v4 adds the supervision timeouts; CUA fields untouched."""
     reg = _registry(tmp_path, monkeypatch)
     reg.ensure_primary()
-    # A profile that already declares computer_use=True (created by a later
-    # version, or hand-edited) must pass through untouched on load.
     v3 = {
         "id": "primary",
         "name": "Primary",
@@ -98,11 +99,53 @@ def test_existing_v3_profile_never_rewritten(monkeypatch, tmp_path):
     (tmp_path / "agents" / "primary" / "profile.json").write_text(json.dumps(v3))
 
     loaded = reg.get_agent("primary")
-    assert loaded["computer_use"] is True
+    assert loaded["schema_version"] == 4
+    assert loaded["computer_use"] is True, "v3 CUA enablement survives"
     assert loaded["cua_targets"] == ["com.apple.TextEdit"]
+    assert loaded["stall_timeout_s"] == 180
+    assert loaded["hard_timeout_s"] == 3600
     assert loaded["vendor_x"] == 1
     disk = json.loads((tmp_path / "agents" / "primary" / "profile.json").read_text())
-    assert disk == v3, "a current-schema profile must never be rewritten"
+    assert disk["schema_version"] == 4 and disk["vendor_x"] == 1
+
+
+def test_existing_v4_profile_never_rewritten(monkeypatch, tmp_path):
+    reg = _registry(tmp_path, monkeypatch)
+    reg.ensure_primary()
+    # A profile that already declares the v4 fields must pass through
+    # untouched on load (custom timeouts included).
+    v4 = {
+        "id": "primary",
+        "name": "Primary",
+        "title": "Primary",
+        "description": "",
+        "persona": "",
+        "model": None,
+        "provider": None,
+        "color": None,
+        "emoji": None,
+        "autonomy": "trusted",
+        "computer_use": True,
+        "cua_targets": ["com.apple.TextEdit"],
+        "stall_timeout_s": 45,
+        "hard_timeout_s": 900,
+        "created_at": "2026-09-03T22:40:39+00:00",
+        "updated_at": "2026-09-03T22:40:39+00:00",
+        "sandbox_path": str(tmp_path / "agents" / "primary" / "sandbox"),
+        "home_path": str(tmp_path / "agents" / "primary" / "home"),
+        "schema_version": 4,
+        "vendor_x": 1,
+    }
+    (tmp_path / "agents" / "primary").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "agents" / "primary" / "profile.json").write_text(json.dumps(v4))
+
+    loaded = reg.get_agent("primary")
+    assert loaded["computer_use"] is True
+    assert loaded["stall_timeout_s"] == 45, "custom v4 timeouts survive"
+    assert loaded["hard_timeout_s"] == 900
+    assert loaded["vendor_x"] == 1
+    disk = json.loads((tmp_path / "agents" / "primary" / "profile.json").read_text())
+    assert disk == v4, "a current-schema profile must never be rewritten"
 
 
 def test_v1_profile_steps_through_both_migrations(monkeypatch, tmp_path):
@@ -120,10 +163,12 @@ def test_v1_profile_steps_through_both_migrations(monkeypatch, tmp_path):
     (tmp_path / "agents" / "primary").mkdir(parents=True, exist_ok=True)
     (tmp_path / "agents" / "primary" / "profile.json").write_text(json.dumps(v1))
     loaded = reg.get_agent("primary")
-    assert loaded["schema_version"] == 3
+    assert loaded["schema_version"] == 4
     assert loaded["title"] == "Old", "v1→v2 title backfill"
     assert loaded["persona"] == "FLEET SOUL", "v1→v2 persona backfill"
     assert loaded["computer_use"] is False, "v2→v3 CUA default"
+    assert loaded["stall_timeout_s"] == 180, "v3→v4 stall default"
+    assert loaded["hard_timeout_s"] == 3600, "v3→v4 hard-timeout default"
     assert loaded["autonomy"] == "ask"
 
 

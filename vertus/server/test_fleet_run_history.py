@@ -41,6 +41,13 @@ import vertus_server as vs  # noqa: E402
 from run_store import RunStore  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _fast_respawn_backoff(monkeypatch):
+    """The brokenpipe-once tests drive a real respawn; keep the backoff
+    instant so the suite doesn't crawl on the 1s/4s/16s default."""
+    monkeypatch.setattr(vs, "RESPAWN_BACKOFF", (0.02, 0.04, 0.08))
+
+
 # ----------------------------------------------------------------------
 # Fakes
 # ----------------------------------------------------------------------

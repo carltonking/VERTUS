@@ -28,6 +28,14 @@ from screen_lease import ScreenLeaseManager, SCREEN_POLICY_CAVEAT  # noqa: E402
 TARGET = "com.apple.TextEdit"
 
 
+@pytest.fixture(autouse=True)
+def _fast_respawn_backoff(monkeypatch):
+    """Gateway-death tests exercise the respawn path; real 1/4/16s backoff
+    would make them crawl. The bridge reads the module constant at call
+    time, so monkeypatching is sufficient."""
+    monkeypatch.setattr(vs, "RESPAWN_BACKOFF", (0.02, 0.04, 0.08))
+
+
 def _wait_until(pred, timeout=10.0, step=0.02):
     deadline = time.time() + timeout
     while time.time() < deadline:

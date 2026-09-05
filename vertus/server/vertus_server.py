@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 
 # Line-buffered stdout so launchd log files show progress promptly.
 import functools
@@ -55,12 +56,12 @@ from urllib.parse import parse_qs, urlsplit
 # fall back to a package-relative import for `python -m vertus.server.vertus_server`.
 try:
     from agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
-    from run_store import RunStore, RUN_STATES  # type: ignore
+    from run_store import RunStore, RUN_STATES, TERMINAL_STATES  # type: ignore
     from screen_lease import ScreenLeaseManager, SCREEN_POLICY_CAVEAT  # type: ignore
     from session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 except ImportError:  # pragma: no cover - only hit under package invocation
     from .agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
-    from .run_store import RunStore, RUN_STATES  # type: ignore
+    from .run_store import RunStore, RUN_STATES, TERMINAL_STATES  # type: ignore
     from .screen_lease import ScreenLeaseManager, SCREEN_POLICY_CAVEAT  # type: ignore
     from .session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 
@@ -72,6 +73,47 @@ DEFAULT_PORT = 8787
 # request-body guards). One persona is typically 1–2k characters; 20k is
 # generous headroom while bounding what a client can stuff into SOUL.md.
 PERSONA_MAX_CHARS = 20_000
+
+# ---------------------------------------------------------------------------
+# Supervision policy (Checkpoints 1–4): stall detection, escalation ladder,
+# gateway backoff/degradation, idle health checks, thrash cap.
+# ---------------------------------------------------------------------------
+
+# Gateway respawn backoff: up to 3 RESPAWNS per turn (4 spawn attempts),
+# sleeping the listed delays (jittered ±20%) between attempts. The GUI demo
+# showed a healthy CUA turn can legitimately take 4+ minutes of continuous
+# engine chatter — this backoff is about SPAWN failures, never about turn
+# duration.
+RESPAWN_BACKOFF = (1.0, 4.0, 16.0)
+
+# How long each escalation rung waits for the turn to end before escalating
+# to the next. Worst-case cancel latency is 3× this (interrupt → SIGTERM →
+# SIGKILL). Env-tunable for tests and for hosts where interrupt is known slow.
+ESCALATION_GRACE_S = float(os.environ.get("VERTUS_ESCALATION_GRACE_S", "10"))
+
+# Idle-gateway health check: while an agent is IDLE (no turn, no queue), the
+# supervisor pings its gateway at this interval with a cheap RPC and closes
+# it when the ping times out, so the next prompt spawns fresh instead of
+# inheriting a hung child. 300s default: spawns are ~13s cold, so probing
+# more often just wastes cycles on healthy gateways.
+HEALTH_CHECK_INTERVAL_S = float(os.environ.get("VERTUS_HEALTH_CHECK_S", "300"))
+HEALTH_CHECK_RPC_TIMEOUT_S = 5.0
+
+# Thrash cap: N gateway deaths within M minutes stops auto-respawning and
+# reports degraded (new prompts get 503) until the window slides. N=4 / M=10
+# is justified in the checkpoint report: a single run may legitimately burn
+# 3 deaths while exhausting its own 1s/4s/16s backoff, so the cap must sit
+# ABOVE that or it would preempt the exhaustion path. 4+ deaths in ten
+# minutes therefore means pathology ACROSS runs (this machine has a known
+# stray pkill loop that kills gateways); anything looser just wastes
+# model-token budget on doomed restarts.
+THRASH_MAX = 4
+THRASH_WINDOW_S = 600.0
+
+# After a spawn-exhaustion failure the agent is degraded for this long;
+# prompts during the window get 503, then the next prompt retries a fresh
+# spawn (success clears degraded).
+DEGRADED_RETRY_S = 60.0
 
 # Free-form text fields treat null as "clear to empty" on PATCH; identity
 # fields (model/provider/color/emoji) treat null as "unset → inherit".
@@ -154,7 +196,17 @@ class AgentBridge:
         # (per-agent HERMES_HOME / model / provider). Captured at bridge build
         # time and refreshed by reconfigure() on a profile PATCH — a live
         # gateway keeps its identity until the next turn respawns it.
-        self._session_kwargs: dict = dict(session_kwargs or {})
+        # ``stall_timeout_s``/``hard_timeout_s`` ride in the same kwargs dict
+        # from resolve_session_kwargs but are POPPED here (and in
+        # reconfigure) — they are hub-side supervision policy, never engine
+        # spawn args, so they must not reach create_agent_session.
+        kwargs = dict(session_kwargs or {})
+        # NOTE: these must be assigned HERE, before the supervision-state
+        # block below — that block must NOT re-default them, or per-agent
+        # profile values would be clobbered on every bridge build.
+        self._stall_timeout_s: float = float(kwargs.pop("stall_timeout_s", 180.0))
+        self._hard_timeout_s: float = float(kwargs.pop("hard_timeout_s", 3600.0))
+        self._session_kwargs: dict = kwargs
         # Step 4: remote/local is enforced at SPAWN time (HERMES_YOLO_MODE=0),
         # because prompt.submit has no per-turn context field. Sticky: once a
         # remote prompt is seen, this agent's gateways keep approvals on.
@@ -171,6 +223,21 @@ class AgentBridge:
         self._turn_started_at: float | None = None
         self._stale = False      # a profile PATCH happened; respawn on next turn
         self._closed = False     # close() called; no new turns may start
+        # Supervision state (Checkpoints 1–4). Guarded by _status_lock like
+        # every other in-memory flag; the MONITOR THREAD reads/writes these
+        # and the escalation ladder runs on its own daemon thread — never
+        # under any other lock. stall/hard timeouts were already resolved
+        # from session_kwargs above — do not re-default them here.
+        self._last_event_at: float | None = None   # any wire event refreshes it
+        self._run_cancelled: str | None = None     # None | "cancelled" | "stall" | "hard_timeout"
+        self._run_timeout_msg: str | None = None   # which timeout fired + silence duration
+        self._cancelled_runs: set[str] = set()     # runs cancelled while still queued
+        self._escalating = False
+        self._escalation_rungs: list[str] = []
+        self._degraded: str | None = None
+        self._degraded_until: float | None = None
+        self._respawn_times: list[float] = []      # monotonic stamps for the thrash cap
+        self._last_health_check = time.monotonic()
         # Current-run tracking (Step: run history). Guarded by _status_lock.
         # Events emitted by the engine's reader thread while the worker is
         # inside a turn are attributed to the run the worker is processing.
@@ -181,6 +248,12 @@ class AgentBridge:
         self._run_error_message = ""
         self._worker = Thread(target=self._run_worker, daemon=True)
         self._worker.start()
+        # Per-bridge supervisor: stall/hard timeout detection while running,
+        # idle-gateway health checks while idle. One thread per agent; it
+        # exits when the bridge closes.
+        threading.Thread(
+            target=self._monitor_loop, daemon=True, name=f"monitor-{agent_id}"
+        ).start()
 
     def subscribe(self, maxsize: int = 1000) -> Queue:
         q: Queue = Queue(maxsize=maxsize)
@@ -218,7 +291,7 @@ class AgentBridge:
         for q in dead:
             self.unsubscribe(q)
 
-    def _emit(self, event: dict) -> None:
+    def _emit(self, event: dict, run_id: str | None = None) -> None:
         """Route one wire event: persist FIRST, then fan out the envelope.
 
         Durability rule: an event is written to the store BEFORE it reaches
@@ -227,10 +300,18 @@ class AgentBridge:
         a client. Events with no active run (a store-backed hub) are dropped:
         they belong to no run and cannot be stored or replayed.
 
+        ``run_id`` overrides the active-run context — used by cancel to emit
+        the ``cancelled`` event for a run that never started (its item was
+        still in the queue, so the worker never set the context).
+
         Legacy mode (no store): the pre-history behavior, un-enriched.
+
+        Any event while a run is active refreshes the stall-silence clock:
+        stall detection measures ENGINE silence, so activity pings count.
         """
         with self._status_lock:
-            run_id = self._current_run_id
+            if run_id is None:
+                run_id = self._current_run_id
             if event.get("type") == "text" and self._run_buffer is not None:
                 text = event.get("text")
                 if isinstance(text, str) and text:
@@ -239,6 +320,8 @@ class AgentBridge:
                 self._run_had_error = True
                 msg = event.get("message") or event.get("text") or ""
                 self._run_error_message = str(msg)[:200]
+            if run_id is not None:
+                self._last_event_at = time.monotonic()
         if self.store is None:
             self._fanout(event)
             return
@@ -266,13 +349,13 @@ class AgentBridge:
             pass
 
     def _begin_run(self, run_id: str) -> None:
-        """Enter a run context (worker thread, before the turn runs)."""
-        with self._status_lock:
-            self._current_run_id = run_id
-            self._run_buffer = []
-            self._run_respawns = 0
-            self._run_had_error = False
-            self._run_error_message = ""
+        """Flip the store row queued→running (no-op when already terminal).
+
+        The in-memory run context (flags, silence clock, cancel check) is
+        established in the worker loop when the item is POPPED, not here — a
+        cancel can arrive while the turn waits on the screen-lease gate, and
+        it must see (and be seen by) the run context from that moment on.
+        """
         if self.store is not None:
             try:
                 self.store.mark_running(run_id, self.agent_id)
@@ -292,17 +375,34 @@ class AgentBridge:
                 pass
 
     def _end_run(self) -> None:
-        """Leave the run context: fold the assistant text, set the terminal
-        state exactly once (worker thread, after the turn finished)."""
+        """Leave the run context: fold the assistant text, emit the terminal
+        event, and set the terminal state EXACTLY ONCE (worker thread).
+
+        A cancelled/timed-out run emits its terminal event (``cancelled``, or
+        ``error`` naming the timeout + silence duration) while the run
+        context is still live so the event is stored under this run's
+        identity; the row then goes to ``cancelled`` / ``timeout`` — both
+        first-class terminal states, distinct from error.
+        """
         with self._status_lock:
-            run_id = self._current_run_id
+            cancelled = self._run_cancelled
+            timeout_msg = self._run_timeout_msg
             buffer = self._run_buffer
             had_error = self._run_had_error
             error_msg = self._run_error_message
             respawns = self._run_respawns
+        if cancelled == "cancelled":
+            self._emit({"type": "cancelled", "text": "run cancelled"})
+        elif cancelled:
+            msg = timeout_msg or f"turn ended by {cancelled} escalation"
+            self._emit({"type": "error", "message": msg[:500]})
+        with self._status_lock:
+            run_id = self._current_run_id
             self._current_run_id = None
             self._run_buffer = None
             self._run_error_message = ""
+            self._run_cancelled = None
+            self._run_timeout_msg = None
         if not run_id or self.store is None:
             return
         store = self.store
@@ -314,12 +414,22 @@ class AgentBridge:
                 except Exception as exc:  # noqa: BLE001
                     print(f"[vertus] assistant message fold failed: {exc}", file=sys.stderr)
         try:
-            store.finish_run(
-                run_id,
-                "error" if had_error else "done",
-                error=error_msg or None,
-                gateway_respawns=respawns,
-            )
+            if cancelled == "cancelled":
+                store.finish_run(run_id, "cancelled", gateway_respawns=respawns)
+            elif cancelled:
+                store.finish_run(
+                    run_id,
+                    "timeout",
+                    error=timeout_msg or f"turn ended by {cancelled} escalation",
+                    gateway_respawns=respawns,
+                )
+            else:
+                store.finish_run(
+                    run_id,
+                    "error" if had_error else "done",
+                    error=error_msg or None,
+                    gateway_respawns=respawns,
+                )
         except Exception as exc:  # noqa: BLE001
             print(f"[vertus] finish_run failed ({run_id}): {exc}", file=sys.stderr)
 
@@ -391,10 +501,10 @@ class AgentBridge:
             ]
 
         # Contended: register as a FIFO waiter and poll with a short timeout
-        # so bridge close is noticed (and the waiter cancelled) promptly.
+        # so bridge close — and a cancel of this run — are noticed promptly.
         while True:
             with self._status_lock:
-                if self._closed:
+                if self._closed or self._run_cancelled:
                     leases.cancel_wait(self.agent_id, run_key)
                     self._waiting_on = None
                     return
@@ -428,18 +538,36 @@ class AgentBridge:
             # ``run_id`` is the store row created at enqueue time — the run
             # context that stamps every event of this turn.
             text, remote, run_id = item
+            # Run context is established HERE, at pop time (not in
+            # _begin_run): a cancel can arrive while the turn waits on the
+            # screen-lease gate, and from the pop onward it must address
+            # this run. A run cancelled while still queued is recognized via
+            # _cancelled_runs and folded into the flag the same way.
+            with self._status_lock:
+                self._current_run_id = run_id
+                self._run_buffer = []
+                self._run_respawns = 0
+                self._run_had_error = False
+                self._run_error_message = ""
+                self._run_timeout_msg = None
+                self._run_cancelled = None
+                self._last_event_at = time.monotonic()
+                if run_id is not None and run_id in self._cancelled_runs:
+                    self._cancelled_runs.discard(run_id)
+                    self._run_cancelled = "cancelled"
             # Screen-lease gate (Step: per-window ownership): a run whose
             # agent declares cua_targets waits here until it owns every one
             # of them. The run row stays ``queued`` while waiting and status()
-            # reports waiting_on_screen, so a lease-blocked bot never looks
+            # reports blocked_on_target, so a lease-blocked bot never looks
             # idle. The lease is held across the whole turn INCLUDING the
             # respawn-retry path and released in the finally below.
             self._screen_wait(run_id)
             if run_id is not None:
                 self._begin_run(run_id)
             with self._status_lock:
+                cancelled = self._run_cancelled
                 closed = self._closed
-                if not closed:
+                if not cancelled and not closed:
                     self._running = True
                     self._turn_started_at = time.monotonic()
             if closed:
@@ -456,7 +584,12 @@ class AgentBridge:
                 self._abandon_run()
                 break
             try:
-                if self._create_session is None:
+                if cancelled:
+                    # A cancel raced this turn before it reached the engine:
+                    # never spawn, never run — the finally finalizes it as
+                    # cancelled (the screen gate above already aborted).
+                    pass
+                elif self._create_session is None:
                     self._emit({"type": "error", "message": "agent SDK not available"})
                 else:
                     # Stale profile config (a PATCH happened since the last
@@ -469,8 +602,8 @@ class AgentBridge:
                     self._run_prompt_with_respawn(text, remote=remote)
             finally:
                 # Screen-lease release (Step: per-window ownership): drop the
-                # turn's target claims whether it finished, errored, or the
-                # gateway died mid-turn; a retry of the same run keeps them.
+                # turn's target claims whether it finished, errored, the
+                # gateway died mid-turn, OR the turn was cancelled/timed out.
                 if self.screen_leases is not None:
                     held = self._active_screen_targets
                     with self._status_lock:
@@ -579,7 +712,7 @@ class AgentBridge:
         return None
 
     def _run_prompt_with_respawn(self, text: str, remote: bool = False) -> None:
-        """Run one prompt, restarting a dead agent gateway once in-line.
+        """Run one prompt, respawning a dead gateway with backoff (Checkpoint 4).
 
         The hermes gateway runs as a child process that can be killed
         externally (e.g. SIGTERM). Without recovery, every later prompt
@@ -588,12 +721,24 @@ class AgentBridge:
         same prompt still goes through; genuine agent errors are surfaced
         immediately.
 
+        Respawn policy: up to 3 spawn attempts per turn, sleeping
+        RESPAWN_BACKOFF (1s/4s/16s, jittered ±20%) between attempts. After
+        exhaustion the agent is DEGRADED (status() shows the reason; new
+        prompts get 503) until a successful spawn clears it. A gateway that
+        dies THRASH_MAX times within THRASH_WINDOW_S stops auto-respawning
+        outright.
+
         ``remote`` rides on this call instead of a process-global env var
         (Step 4). Ground truth from the fork's RPC: prompt.submit carries no
         per-turn context field, and the approval guard is a pi-engine
         extension — so remote/local is enforced at SPAWN time via
         HERMES_YOLO_MODE and cannot vary between turns within one gateway
         lifetime (see _spawn_session for the sticky-mode trade-off).
+
+        A turn cancelled or timed out mid-flight (Checkpoints 1–3) must NOT
+        be respawned: the cancelled flag is checked at every attempt boundary
+        and after prompt() returns/raises, and the terminal event then comes
+        from _end_run — never from this loop.
         """
         if remote and not self._remote_seen and self._session is not None:
             # First remote prompt on a locally-spawned gateway: the running
@@ -607,25 +752,48 @@ class AgentBridge:
             except Exception:
                 pass
             self._session = None
-        for _attempt in range(2):
+        for attempt in range(len(RESPAWN_BACKOFF) + 1):
+            with self._status_lock:
+                cancelled = self._run_cancelled
+            if cancelled:
+                # Escalated between attempts (cancel/timeout raced a respawn):
+                # stop — the terminal event comes from _end_run.
+                return
+            if self._thrash_cap_tripped():
+                reason = (
+                    f"gateway thrashing: gateway died {THRASH_MAX} times within "
+                    f"{int(THRASH_WINDOW_S // 60)} min; auto-respawn paused"
+                )
+                self._set_degraded(reason, None)
+                self._emit({"type": "error", "message": "agent gateway thrashing; auto-respawn stopped"})
+                return
             if self._session is None:
                 try:
                     result = self._spawn_session(remote)
                     if not self._adopt_session(result["session"]):
                         return  # bridge was closed while spawning (DELETE)
                     self._session.subscribe(self._on_pi_event)
+                    self._clear_degraded()  # a live spawn ends the degraded state
                 except Exception as exc:
-                    if _attempt == 0 and (
+                    if attempt < len(RESPAWN_BACKOFF) and (
                         "gateway" in str(exc).lower()
                         or "broken pipe" in str(exc).lower()
+                        or "exited" in str(exc).lower()
                     ):
+                        delay = RESPAWN_BACKOFF[attempt] * random.uniform(0.8, 1.2)
                         print(
-                            f"[vertus] agent gateway died at startup ({exc}); respawning",
+                            f"[vertus] agent gateway failed to start ({exc}); "
+                            f"respawning in {delay:.1f}s (attempt {attempt + 1})",
                             file=sys.stderr,
                         )
-                        with self._status_lock:
-                            self._run_respawns += 1
+                        self._note_respawn()
+                        time.sleep(delay)
                         continue
+                    self._set_degraded(
+                        f"gateway failed to start after {len(RESPAWN_BACKOFF) + 1} "
+                        f"attempts: {exc}",
+                        DEGRADED_RETRY_S,
+                    )
                     self._emit({"type": "error", "message": f"agent start failed: {exc}"})
                     return
             expanded = self._expand_slash_text(text)
@@ -636,10 +804,20 @@ class AgentBridge:
                 self._session.prompt(text)
                 # prompt() returning means the agent turn finished; the
                 # bridge may already emit done, but emit it here as a
-                # backstop so clients always see a terminator.
+                # backstop so clients always see a terminator. An escalation
+                # that killed the gateway can make prompt() RETURN (the
+                # reader unblocks it) — check the flag before declaring done.
+                with self._status_lock:
+                    cancelled = self._run_cancelled
+                if cancelled:
+                    return  # escalated mid-turn; terminal event from _end_run
                 self._emit({"type": "done"})
                 return
             except Exception as exc:  # noqa: PERF203
+                with self._status_lock:
+                    cancelled = self._run_cancelled
+                if cancelled:
+                    return  # escalated mid-turn; terminal event from _end_run
                 dead = (
                     bool(getattr(self._session, "is_dead", False))
                     or isinstance(exc, BrokenPipeError)
@@ -653,13 +831,54 @@ class AgentBridge:
                 except Exception:
                     pass
                 self._session = None
-                if dead and _attempt == 0:
-                    print(f"[vertus] agent gateway died ({exc}); respawning", file=sys.stderr)
-                    with self._status_lock:
-                        self._run_respawns += 1
+                if dead and attempt < len(RESPAWN_BACKOFF):
+                    delay = RESPAWN_BACKOFF[attempt] * random.uniform(0.8, 1.2)
+                    print(
+                        f"[vertus] agent gateway died ({exc}); respawning in "
+                        f"{delay:.1f}s (attempt {attempt + 1})",
+                        file=sys.stderr,
+                    )
+                    self._note_respawn()
+                    time.sleep(delay)
                     continue
                 self._emit({"type": "error", "message": str(exc)[:500]})
                 return
+
+    def _note_respawn(self) -> None:
+        """Count one gateway respawn (run row + thrash-cap window)."""
+        with self._status_lock:
+            self._run_respawns += 1
+            self._respawn_times.append(time.monotonic())
+            # The system is actively recovering — refresh the stall-silence
+            # clock so a backoff sleep is not misread as a silent engine.
+            self._last_event_at = time.monotonic()
+
+    def _set_degraded(self, reason: str, retry_after_s: float | None) -> None:
+        with self._status_lock:
+            self._degraded = reason
+            self._degraded_until = (
+                time.monotonic() + retry_after_s if retry_after_s else None
+            )
+
+    def _clear_degraded(self) -> None:
+        with self._status_lock:
+            self._degraded = None
+            self._degraded_until = None
+
+    def _thrash_cap_tripped(self) -> bool:
+        """True when >= THRASH_MAX gateway deaths sit inside the window.
+
+        Self-healing: deaths older than THRASH_WINDOW_S drop out of the
+        sliding window, so a degraded agent that was merely unlucky can be
+        prompted again once the window slides (status() reports degraded
+        meanwhile, and prompts 503).
+        """
+        now = time.monotonic()
+        with self._status_lock:
+            self._respawn_times[:] = [
+                t for t in self._respawn_times if now - t <= THRASH_WINDOW_S
+            ]
+            return len(self._respawn_times) >= THRASH_MAX
 
     def _on_pi_event(self, event) -> None:
         """Translate raw agent session events into structured wire events.
@@ -749,18 +968,41 @@ class AgentBridge:
         ``gateway_alive`` is False when no engine session exists yet (agent
         never prompted, or the last spawn failed) or the current session
         reports itself dead. Pure read — no engine call, no side effect.
+
+        Supervision visibility (Checkpoints 1–4): a slow-but-healthy turn is
+        distinguishable from a stuck one — ``stall_timeout_s``/
+        ``hard_timeout_s`` are the per-agent limits and ``silence_s`` is how
+        long the engine has emitted nothing. ``degraded`` carries a readable
+        reason when the agent's gateway is failing or thrashing.
         """
+        now = time.monotonic()
         with self._status_lock:
             running = self._running
             started = self._turn_started_at
             closed = self._closed
             waiting = self._waiting_on
+            last_event = self._last_event_at
+            stall = self._stall_timeout_s
+            hard = self._hard_timeout_s
+            degraded = self._degraded
+            until = self._degraded_until
+            if until is not None and now >= until:
+                # The degraded window expired: the next prompt may retry a
+                # fresh spawn (success clears the flag for good).
+                self._degraded = None
+                self._degraded_until = None
+                degraded = None
         session = self._session
         gateway_alive = (
             not closed
             and session is not None
             and not bool(getattr(session, "is_dead", False))
         )
+        if degraded is None and self._thrash_cap_tripped():
+            degraded = (
+                f"gateway thrashing: gateway died {THRASH_MAX} times within "
+                f"{int(THRASH_WINDOW_S // 60)} min; auto-respawn paused"
+            )
         # A turn held by the screen-lease gate was already popped off the
         # queue; count it so DELETE's busy guard and UI depth stay truthful.
         depth = self._queue.qsize() + (1 if waiting else 0)
@@ -770,6 +1012,11 @@ class AgentBridge:
             "queue_depth": depth,
             "turn_started_at": started,
             "gateway_alive": gateway_alive,
+            "stall_timeout_s": stall,
+            "hard_timeout_s": hard,
+            "last_event_at": last_event,
+            "silence_s": round(now - last_event, 1) if (running and last_event) else 0.0,
+            "degraded": degraded,
         }
         if waiting:
             # A bot blocked on a declared target must show as such (with the
@@ -784,11 +1031,19 @@ class AgentBridge:
         and respawns with the new config; an in-flight turn keeps running on
         the old gateway to completion. Two PATCHes before the next turn
         coalesce into a single respawn (stale is a boolean).
+
+        Supervision timeouts ride in the same kwargs dict and are popped the
+        same way as in __init__: they are hub-side policy, never engine args.
         """
         with self._status_lock:
             if self._closed:
                 return
-            self._session_kwargs = dict(session_kwargs or {})
+            kwargs = dict(session_kwargs or {})
+            if "stall_timeout_s" in kwargs:
+                self._stall_timeout_s = float(kwargs.pop("stall_timeout_s"))
+            if "hard_timeout_s" in kwargs:
+                self._hard_timeout_s = float(kwargs.pop("hard_timeout_s"))
+            self._session_kwargs = kwargs
             self._stale = True
 
     def close(self) -> None:
@@ -850,6 +1105,273 @@ class AgentBridge:
                 pass
             return False
         return True
+
+    # ------------------------------------------------------------------
+    # Checkpoint 3: cancellation (one ladder, shared with timeouts)
+    # ------------------------------------------------------------------
+
+    def active_run_id(self) -> str | None:
+        """The run currently popped by the worker (running or gated/waiting)."""
+        with self._status_lock:
+            return self._current_run_id
+
+    def escalation_rungs(self) -> list[str]:
+        """Rungs attempted/succeeded for the most recent escalations (tests)."""
+        with self._status_lock:
+            return list(self._escalation_rungs)
+
+    def cancel_run(self, run_id: str, drain_queue: bool = False) -> None:
+        """Cancel one run (Checkpoint 3).
+
+        Active run (popped by the worker): set the cancel flag — the
+        worker skips the engine if it hasn't started, or the escalation
+        ladder runs on a background thread if the turn is mid-prompt. This
+        call returns immediately; the terminal state is set by the worker
+        (exactly once, in _end_run).
+
+        Queued run: removed from the queue, its row finalized cancelled, and
+        a ``cancelled`` event stored/fanned out. ``drain_queue`` ALSO
+        cancels every other run still queued for this agent (each gets its
+        own cancelled row + event). A cancel never touches runs already
+        popped by the worker beyond the target — a cancel kills one run, not
+        the agent's queue, unless drain is requested.
+
+        The caller (HTTP layer) is responsible for terminal-state 409s: this
+        method assumes the run is not yet terminal in the store.
+        """
+        with self._status_lock:
+            active = self._current_run_id == run_id
+            if active:
+                self._run_cancelled = "cancelled"
+            else:
+                self._cancelled_runs.add(run_id)
+        # Drain BEFORE escalating: while this call runs synchronously the
+        # worker is still busy with the current turn (it cannot have popped
+        # a queued item yet), so the queue contents are deterministic here.
+        if drain_queue:
+            self._drain_queued_runs(cancel=None)
+        if active:
+            with self._status_lock:
+                running = self._running
+            if running:
+                self._escalate_async("cancelled")
+            return
+        # Queued: drain the matching item(s) off the queue and finalize.
+        self._drain_queued_runs(cancel=[run_id])
+
+    def _drain_queued_runs(self, cancel: list[str] | None) -> None:
+        """Remove queued items from the worker queue, finalizing the cancelled.
+
+        Items whose run_id is in ``cancel`` (or every run_id item when
+        ``cancel`` is None) are finalized as cancelled; everything else is
+        re-queued in order. The worker may concurrently pop an item — it
+        then handles the cancel itself via _cancelled_runs, so no run is
+        ever double-finalized.
+        """
+        kept: list = []
+        dropped: list[str] = []
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except Empty:
+                break
+            _text, _remote, rid = item
+            if rid is not None and (cancel is None or rid in cancel):
+                dropped.append(rid)
+            else:
+                kept.append(item)
+        for item in kept:
+            self._queue.put(item)
+        for rid in dropped:
+            self._finalize_cancelled(rid)
+
+    def _finalize_cancelled(self, run_id: str) -> None:
+        """Terminalize a run that never started: cancelled row + event."""
+        try:
+            self._emit({"type": "cancelled", "text": "run cancelled"}, run_id=run_id)
+            if self.store is not None:
+                self.store.finish_run(run_id, "cancelled")
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[vertus] finalize-cancel failed ({run_id}): {exc}", file=sys.stderr
+            )
+
+    def _escalate_async(self, reason: str) -> None:
+        """Run the escalation ladder on a background thread (cancel API)."""
+        threading.Thread(
+            target=self._escalate,
+            args=(reason,),
+            daemon=True,
+            name=f"escalate-{self.agent_id}",
+        ).start()
+
+    def _escalate(self, reason: str) -> None:
+        """One escalation ladder (Checkpoint 2), shared by timeout and cancel.
+
+        Rung 1 — session.interrupt RPC, then wait grace for the turn to end
+        (a well-behaved engine stops at the next action boundary).
+        Rung 2 — SIGTERM the gateway's process group (the embedded
+        cua-driver daemon shares the group, so it dies with the gateway).
+        Rung 3 — SIGKILL the group; the turn is terminal by construction.
+
+        Each rung is logged with which one succeeded. Runs on a daemon
+        thread; the worker's prompt call unblocks through the reader (EOF on
+        process death, or the interrupt event), checks the cancel flag, and
+        finalizes the run — so this method never touches the store itself.
+        """
+        with self._status_lock:
+            if self._escalating or not self._running:
+                return
+            self._escalating = True
+            # The reason IS the terminal-state request: the worker's
+            # cancelled check (every attempt boundary + after prompt()) reads
+            # this flag, so escalation must stamp it or the worker would
+            # RESPAWN a turn that was killed on purpose. First writer wins —
+            # a user cancel racing a stall keeps "cancelled".
+            if self._run_cancelled is None:
+                self._run_cancelled = reason
+
+        def log(msg: str) -> None:
+            print(
+                f"[vertus] agent {self.agent_id} escalate[{reason}] {msg}",
+                file=sys.stderr,
+            )
+
+        try:
+            session = self._session
+            if session is None:
+                # Nothing to stop (mid-respawn or pre-spawn): the worker
+                # notices the cancel flag at its next attempt boundary.
+                log("no live session; waiting for the worker to notice")
+                return
+
+            def rung(n: int, label: str, attr: str, done_msg: str) -> bool:
+                call = getattr(session, attr, None)
+                if call is None:
+                    log(f"rung{n} {label} skipped (session lacks {attr})")
+                    return False
+                try:
+                    call()
+                except Exception as exc:  # noqa: BLE001
+                    log(f"rung{n} {label} failed: {exc}")
+                    return False
+                with self._status_lock:
+                    self._escalation_rungs.append(f"rung{n}:{label}")
+                log(done_msg)
+                return True
+
+            rung(1, "interrupt", "interrupt", "rung1 interrupt sent")
+            if self._wait_turn_end(ESCALATION_GRACE_S):
+                log("rung1 succeeded — turn ended within grace")
+                return
+            rung(2, "terminate", "terminate_process", "rung2 SIGTERM sent to gateway process group")
+            if self._wait_turn_end(ESCALATION_GRACE_S):
+                log("rung2 succeeded — turn ended after SIGTERM")
+                return
+            rung(3, "kill", "kill_process", "rung3 SIGKILL sent to gateway process group")
+            self._wait_turn_end(ESCALATION_GRACE_S)
+            log("rung3 done — turn terminal")
+        finally:
+            with self._status_lock:
+                self._escalating = False
+
+    def _wait_turn_end(self, timeout: float) -> bool:
+        """True when the turn stops being ``running`` within ``timeout``."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._status_lock:
+                running = self._running
+            if not running:
+                return True
+            time.sleep(0.05)
+        return False
+
+    # ------------------------------------------------------------------
+    # Checkpoint 1 + 4: the per-bridge supervisor thread
+    # ------------------------------------------------------------------
+
+    def _monitor_loop(self) -> None:
+        """Per-bridge supervisor: stall/hard timeouts + idle gateway health.
+
+        While a turn runs: if the engine has emitted NOTHING for longer than
+        stall_timeout_s (any event type refreshes the clock — a healthy CUA
+        turn pings constantly, a wedged one is silent), or the turn has run
+        longer than hard_timeout_s while emitting forever without
+        converging, escalate. While idle: health-check the gateway.
+        """
+        while True:
+            time.sleep(1.0)
+            with self._status_lock:
+                if self._closed:
+                    return
+                running = self._running
+                escalating = self._escalating
+                started = self._turn_started_at
+                last_event = self._last_event_at
+                stall = self._stall_timeout_s
+                hard = self._hard_timeout_s
+            if not running:
+                self._health_check()
+                continue
+            if escalating:
+                continue
+            now = time.monotonic()
+            if stall > 0 and last_event is not None and now - last_event > stall:
+                msg = (
+                    f"stall timeout: no agent events for {now - last_event:.0f}s "
+                    f"(stall_timeout_s={stall:g})"
+                )
+                with self._status_lock:
+                    self._run_timeout_msg = msg
+                print(f"[vertus] agent {self.agent_id}: {msg}", file=sys.stderr)
+                self._escalate("stall")
+            elif hard > 0 and started is not None and now - started > hard:
+                msg = (
+                    f"hard timeout: turn ran {now - started:.0f}s "
+                    f"(hard_timeout_s={hard:g})"
+                )
+                with self._status_lock:
+                    self._run_timeout_msg = msg
+                print(f"[vertus] agent {self.agent_id}: {msg}", file=sys.stderr)
+                self._escalate("hard_timeout")
+
+    def _health_check(self) -> None:
+        """Idle-gateway liveness (Checkpoint 4).
+
+        A gateway that is alive (process up, pipes open) but does not answer
+        a cheap RPC within HEALTH_CHECK_RPC_TIMEOUT_S is hung, not slow —
+        close it so the next prompt spawns fresh. Only ever runs while the
+        agent is idle, and only on the session captured at check time (a
+        concurrent spawn replacing it is never closed by this check).
+        """
+        now = time.monotonic()
+        with self._status_lock:
+            if self._closed or self._running or self._waiting_on:
+                return
+            if now - self._last_health_check < HEALTH_CHECK_INTERVAL_S:
+                return
+            self._last_health_check = now
+            session = self._session
+            if session is None or bool(getattr(session, "is_dead", False)):
+                return
+        try:
+            ping = getattr(session, "active_list", None)
+            if ping is None:
+                return
+            ping(timeout=HEALTH_CHECK_RPC_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 — unresponsive = reap
+            with self._status_lock:
+                if self._session is session:
+                    self._session = None
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001
+                pass
+            print(
+                f"[vertus] agent {self.agent_id}: idle gateway unresponsive — "
+                "closed for a fresh spawn on next prompt",
+                file=sys.stderr,
+            )
 
 
 class FleetFan:
@@ -985,11 +1507,24 @@ class VertusHandler(BaseHTTPRequestHandler):
             remote = source.lower() != "local"
             agent_id = str(payload.get("agent_id") or DEFAULT_AGENT_ID)
             # Validate the agent BEFORE creating the run row so an unknown id
-            # never leaves an orphan queued run behind.
+            # never leaves an orphan queued run behind; the bridge is fetched
+            # before the row too so a DEGRADED agent (gateway failing/thrash-
+            # ing) is refused with 503 before anything is even queued.
             try:
                 self.registry.get_agent(agent_id)
             except KeyError:
                 self._json(404, {"error": f"agent not found: {agent_id}"})
+                return
+            try:
+                bridge = self.sessions.get_or_create_session(agent_id)
+            except KeyError:
+                # Agent deleted between validation and enqueue (a DELETE won
+                # the race).
+                self._json(404, {"error": f"agent not found: {agent_id}"})
+                return
+            st = getattr(bridge, "status", lambda: {})()
+            if st.get("degraded"):
+                self._json(503, {"error": f"agent degraded: {st['degraded']}"})
                 return
             run_id = None
             if self.store is not None:
@@ -1001,24 +1536,13 @@ class VertusHandler(BaseHTTPRequestHandler):
                 except Exception as exc:  # noqa: BLE001
                     self._json(503, {"error": f"run store unavailable: {str(exc)[:200]}"})
                     return
+            if self.store is not None:
+                # The bridge persists every event of the run to the store
+                # BEFORE fanout; bind it now (the default factory doesn't
+                # take a store kwarg so test fakes stay compatible).
+                bridge.store = self.store
             try:
-                bridge = self.sessions.get_or_create_session(agent_id)
-                if self.store is not None:
-                    # The bridge persists every event of the run to the store
-                    # BEFORE fanout; bind it now (the default factory doesn't
-                    # take a store kwarg so test fakes stay compatible).
-                    bridge.store = self.store
                 bridge.prompt(text, remote=remote, run_id=run_id)
-            except KeyError:
-                # Agent deleted between validation and enqueue (a DELETE won
-                # the race). The queued run must not linger: abandon it.
-                if run_id:
-                    try:
-                        self.store.finish_run(run_id, "abandoned", error="agent deleted")
-                    except Exception:  # noqa: BLE001
-                        pass
-                self._json(404, {"error": f"agent not found: {agent_id}"})
-                return
             except RuntimeError as exc:  # bridge closed mid-DELETE
                 if run_id:
                     try:
@@ -1052,6 +1576,12 @@ class VertusHandler(BaseHTTPRequestHandler):
                 self._json(201, self.registry.create_agent(raw_name.strip(), **fields))
             except (TypeError, ValueError) as exc:  # registry backstop
                 self._json(400, {"error": str(exc)[:200]})
+        elif route.startswith("/api/agents/") and route.endswith("/cancel"):
+            agent_id = route[len("/api/agents/"):-len("/cancel")].strip("/")
+            self._handle_agent_cancel(agent_id)
+        elif route.startswith("/api/runs/") and route.endswith("/cancel"):
+            run_id = route[len("/api/runs/"):-len("/cancel")].strip("/")
+            self._handle_run_cancel(run_id, payload)
         else:
             self._json(404, {"error": "not found"})
 
@@ -1208,6 +1738,70 @@ class VertusHandler(BaseHTTPRequestHandler):
             return
         self._json(200, self.sessions.status(agent_id))
 
+    def _handle_run_cancel(self, run_id: str, payload: dict) -> None:
+        """POST /api/runs/<run_id>/cancel — cancel one run (Checkpoint 3).
+
+        Queued run → dequeued, state=cancelled, never spawns. Running run →
+        the escalation ladder (async; this returns 200 immediately).
+        Terminal run → 409. ``drain_queue: true`` additionally cancels every
+        other run still queued for that agent.
+        """
+        store = self._history_store()
+        if store is None:
+            return
+        if not run_id or "/" in run_id:
+            self._json(404, {"error": "not found"})
+            return
+        run = store.get_run(run_id)
+        if run is None:
+            self._json(404, {"error": f"run not found: {run_id}"})
+            return
+        if run["state"] in TERMINAL_STATES:
+            self._json(409, {"error": f"run already terminal ({run['state']})"})
+            return
+        drain = bool(payload.get("drain_queue", False))
+        agent_id = run["agent_id"]
+        if not self.sessions.has_session(agent_id):
+            # No live bridge (e.g. a DELETE raced the enqueue): the row is
+            # stuck queued — finalize it directly so nothing can hang.
+            try:
+                store.finish_run(run_id, "cancelled")
+            except Exception as exc:  # noqa: BLE001
+                self._json(503, {"error": f"run store unavailable: {str(exc)[:200]}"})
+                return
+            self._json(200, {"cancelled": run_id, "drain_queue": drain})
+            return
+        bridge = self.sessions.get_or_create_session(agent_id)
+        bridge.cancel_run(run_id, drain_queue=drain)
+        self._json(200, {"cancelled": run_id, "drain_queue": drain})
+
+    def _handle_agent_cancel(self, agent_id: str) -> None:
+        """POST /api/agents/<id>/cancel — cancel whatever the agent is doing now.
+
+        Cancels the ACTIVE run only (the queue is left intact — use the
+        run-level drain_queue for that). 409 when the agent is idle or has
+        no run in progress.
+        """
+        if not agent_id:
+            self._json(404, {"error": "not found"})
+            return
+        try:
+            self.registry.get_agent(agent_id)  # KeyError → 404
+        except KeyError:
+            self._json(404, {"error": "agent not found"})
+            return
+        st = self.sessions.status(agent_id)
+        if st["state"] == "idle":
+            self._json(409, {"error": f"agent {agent_id} is idle — nothing to cancel"})
+            return
+        bridge = self.sessions.get_or_create_session(agent_id)
+        run_id = getattr(bridge, "active_run_id", lambda: None)()
+        if run_id is None:
+            self._json(409, {"error": f"agent {agent_id} has no run in progress"})
+            return
+        bridge.cancel_run(run_id, drain_queue=False)
+        self._json(200, {"cancelled": run_id})
+
     def _sse(self, agent_id: str = DEFAULT_AGENT_ID, since: str = "",
              run_id: str = "") -> None:
         """GET /api/events — agent stream, fleet stream, or a single run.
@@ -1245,7 +1839,7 @@ class VertusHandler(BaseHTTPRequestHandler):
         agent_drain_filter = None
         is_run_stream = False
         do_drain = False
-        terminal_types = ("done", "error")
+        terminal_types = ("done", "error", "cancelled")
 
         if store is not None and run_filter:
             row = store.get_run(run_filter)
@@ -1522,7 +2116,7 @@ class VertusHandler(BaseHTTPRequestHandler):
 
 
 def _validate_profile_payload(payload: dict, *, allow_name: bool) -> dict:
-    """Validate a POST/PATCH agent body against the v3 editable schema.
+    """Validate a POST/PATCH agent body against the v4 editable schema.
 
     Returns the registry field dict (``name`` is handled by the caller).
     Raises ValueError with a client-facing message for any 400 condition:
@@ -1558,6 +2152,15 @@ def _validate_profile_payload(payload: dict, *, allow_name: bool) -> dict:
                 raise ValueError("cua_targets must be a list of non-empty strings or null")
             else:
                 fields[key] = [t.strip() for t in value]
+            continue
+        if key in ("stall_timeout_s", "hard_timeout_s"):
+            # Supervision limits: positive seconds, or null → hub default.
+            if value is None:
+                fields[key] = None
+            elif isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise ValueError(f"{key} must be a positive number or null")
+            else:
+                fields[key] = float(value)
             continue
         if isinstance(value, bool) or (value is not None and not isinstance(value, str)):
             raise ValueError(f"{key} must be a string or null")
@@ -1611,6 +2214,11 @@ def resolve_session_kwargs(registry: AgentRegistry, agent_id: str) -> dict:
     """
     agent = registry.get_agent(agent_id)
     kwargs: dict = {}
+    # Supervision policy (v4): stall/hard timeouts ride the same kwargs dict
+    # and are POPPED by AgentBridge (hub-side policy, never engine spawn
+    # args). None/null means "hub default".
+    kwargs["stall_timeout_s"] = float(agent.get("stall_timeout_s") or 180)
+    kwargs["hard_timeout_s"] = float(agent.get("hard_timeout_s") or 3600)
     home = agent.get("home_path") or str(registry.agent_home(agent_id))
     if home and Path(home).is_dir():
         kwargs["agent_home"] = home
