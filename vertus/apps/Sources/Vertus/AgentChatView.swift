@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import VertusKit
 
@@ -15,6 +16,11 @@ struct AgentChatView: View {
     @State private var showHistory = false
     @State private var confirmStop = false
     @State private var stopError: String?
+    /// Visible wrapped lines in the composer (drives its height; 1 at rest,
+    /// grows to 5, then the editor scrolls internally — Bug A6).
+    @State private var promptLines: CGFloat = 1
+    /// Slash-command (skill) suggestions while the prompt is a bare /token.
+    @State private var slashSuggestions: [SlashCommandInfo] = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -22,6 +28,7 @@ struct AgentChatView: View {
             Divider()
             transcript
             Divider()
+            slashBar
             composer
         }
         .sheet(item: $selectedRun) { run in
@@ -65,7 +72,15 @@ struct AgentChatView: View {
                     await store.loadHistory(agentID: agentID)
                 }
                 await loadRuns()
+                await store.ensureSlashCatalog(agentID: agentID)
             }
+            slashSuggestions = []
+        }
+        .onChange(of: prompt) { _ in
+            slashSuggestions = store.slashSuggestions(for: prompt)
+        }
+        .onAppear {
+            Task { await store.ensureSlashCatalog(agentID: agentID) }
         }
     }
 
@@ -315,21 +330,34 @@ struct AgentChatView: View {
     // MARK: - Composer
     // Submit returns immediately; the composer clears and NEVER blocks or
     // disables — busy agents queue server-side and queue depth is shown.
+    // The editor is the panel's PromptTextEditor (Bug A1/A6): ONE line at
+    // rest, grows with content up to 5 lines, then scrolls internally;
+    // Return sends, Shift+Return inserts a newline. No second editor.
+
+    /// The composer's line height for the given font (matches the editor's
+    /// real line fragments — see NotchPanelMetrics.promptLineHeight).
+    private var composerLineHeight: CGFloat {
+        NSLayoutManager().defaultLineHeight(for: NSFont.systemFont(ofSize: composerFontSize))
+    }
+
+    private let composerFontSize: CGFloat = 13
 
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            TextEditor(text: $prompt)
-                .font(.system(size: 12.5))
-                .frame(minHeight: 30, maxHeight: 80)
-                .scrollContentBackground(.hidden)
+            PromptTextEditor(text: $prompt,
+                             onSubmit: submit,
+                             onLinesChange: { promptLines = $0 },
+                             maxLines: 5,
+                             fontSize: composerFontSize)
+                .frame(maxWidth: .infinity)
+                .frame(height: max(promptLines, 1) * composerLineHeight, alignment: .topLeading)
                 .padding(6)
                 .background(RoundedRectangle(cornerRadius: 8).fill(Color(white: 0.13)))
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)
                         .strokeBorder(Color.white.opacity(0.08))
                 )
-                .onSubmit { submit() }
-            Button(action: submit) {
+            Button(action: { submit(prompt) }) {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 24))
                     .foregroundStyle(prompt.isEmpty ? Color.white.opacity(0.3) : Color.accentColor)
@@ -341,8 +369,54 @@ struct AgentChatView: View {
         .padding(10)
     }
 
-    private func submit() {
-        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// Slash-command (skill) suggestions above the composer while the
+    /// prompt is a bare /token — same catalog and matching as the QuickBar
+    /// dropdown, for the SELECTED agent (skills are per-agent). Clicking
+    /// completes into the composer; the hub expands /commands server-side
+    /// when the turn is submitted (same path the CLI uses).
+    @ViewBuilder
+    private var slashBar: some View {
+        if !slashSuggestions.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(slashSuggestions.prefix(4)) { cmd in
+                    Button {
+                        prompt = cmd.name + " "
+                        slashSuggestions = []
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text(cmd.name)
+                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                            Text(cmd.description)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color(white: 0.14))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.08))
+            )
+            .padding(.horizontal, 10)
+            .padding(.bottom, 4)
+        }
+    }
+
+    /// Send (Return, Shift+Return, or the mouse). `raw` is what the editor
+    /// handed over — the binding is already cleared by then, so the caller
+    /// (button) passes `prompt` and the editor passes its own text.
+    private func submit(_ raw: String) {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         prompt = ""
         Task {

@@ -8,6 +8,7 @@ import VertusKit
 /// the index on each one), attributed by writer.
 struct MemoryView: View {
     @EnvironmentObject private var store: FleetStore
+    @Environment(\.dismiss) private var dismiss
 
     enum Scope: String, CaseIterable, Identifiable {
         case shared = "Shared"
@@ -44,6 +45,42 @@ struct MemoryView: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            bodyContent
+        }
+        .task {
+            if !loaded {
+                loaded = true
+                agentID = store.agents.first?.id
+                await store.refreshMemory()
+            }
+        }
+        .alert("Error", isPresented: Binding(
+            get: { errorText != nil }, set: { if !$0 { errorText = nil } }
+        )) {
+            Button("OK") { errorText = nil }
+        } message: {
+            Text(errorText ?? "")
+        }
+    }
+
+    /// Sheet chrome shared with Screens and Threads: a visible Done button
+    /// and Escape (the cancelAction shortcut) — the close affordances that
+    /// made Memory safe to return to a sheet (Bug A5).
+    private var header: some View {
+        HStack {
+            Text("Memory")
+                .font(.system(size: 14, weight: .semibold))
+            Spacer()
+            Button("Done") { dismiss() }
+                .keyboardShortcut(.cancelAction)
+        }
+        .padding(12)
+    }
+
+    private var bodyContent: some View {
         HSplitView {
             // Left: scope picker + entry list.
             VStack(alignment: .leading, spacing: 8) {
@@ -126,20 +163,6 @@ struct MemoryView: View {
             .padding(10)
         }
         .frame(minWidth: 700, minHeight: 420)
-        .task {
-            if !loaded {
-                loaded = true
-                agentID = store.agents.first?.id
-                await store.refreshMemory()
-            }
-        }
-        .alert("Error", isPresented: Binding(
-            get: { errorText != nil }, set: { if !$0 { errorText = nil } }
-        )) {
-            Button("OK") { errorText = nil }
-        } message: {
-            Text(errorText ?? "")
-        }
     }
 
     // MARK: - Panes
