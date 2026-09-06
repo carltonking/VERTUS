@@ -25,7 +25,7 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	"azure-openai-responses": "gpt-5.4",
 	"openai-codex": "gpt-5.5",
 	radius: "auto",
-	nvidia: "nvidia/nemotron-3-ultra:free",
+	nvidia: "nvidia/nemotron-3-ultra-550b-a55b",  // NIM catalog id; the old ":free" HF-style id was never in the generated catalog
 	deepseek: "deepseek-v4-pro",
 	google: "gemini-3.1-pro-preview",
 	"google-vertex": "gemini-3.1-pro-preview",

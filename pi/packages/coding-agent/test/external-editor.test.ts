@@ -22,7 +22,10 @@ async function runExternalEditor(fixtureFlag?: "--fail" | "--empty"): Promise<{
 	const capturePath = join(testDirectory, "capture.json");
 	try {
 		const result = await editInExternalEditor({
-			command: `${process.execPath} ${editorFixturePath} ${capturePath}${fixtureFlag ? ` ${fixtureFlag}` : ""}`,
+			// Paths are quoted: the repo lives under "01 - PROJECTS/…", and the
+			// runtime's splitCommand honors quotes (regression: an unquoted
+			// editor path with a space split at the space and failed to spawn).
+			command: `"${process.execPath}" "${editorFixturePath}" "${capturePath}"${fixtureFlag ? ` ${fixtureFlag}` : ""}`,
 			content: "original",
 		});
 		const capture = JSON.parse(readFileSync(capturePath, "utf-8")) as EditorCapture;

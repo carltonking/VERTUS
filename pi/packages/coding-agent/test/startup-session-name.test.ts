@@ -71,6 +71,9 @@ async function runCli(args: string[], dirs: CliDirs): Promise<CliResult> {
 			...process.env,
 			[ENV_AGENT_DIR]: dirs.agentDir,
 			PI_OFFLINE: "1",
+			// Local-session test; keep the hub proxy out (a live hub would
+			// answer the one-shot prompt and exit 0, bypassing session naming).
+			VERTUS_NO_SERVER: "1",
 			TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
 		},
 		stdio: ["ignore", "ignore", "pipe"],

@@ -24,13 +24,17 @@ async function runCli(args: string[], cwd: string, agentDir: string): Promise<{ 
 	let stderr = "";
 	const code = await new Promise<number | null>((resolvePromise, reject) => {
 		const child = spawn(process.execPath, [cliPath, ...args], {
-			cwd,
-			env: {
-				...process.env,
-				[ENV_AGENT_DIR]: agentDir,
-				PI_OFFLINE: "1",
-				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
-			},
+			cwd,				env: {
+					...process.env,
+					[ENV_AGENT_DIR]: agentDir,
+					PI_OFFLINE: "1",
+					// This test exercises local session-file handling; the VERTUS hub
+					// proxy must not intercept the one-shot prompt (it would exit 0
+					// whenever a hub happens to be running, making the suite
+					// machine-state dependent).
+					VERTUS_NO_SERVER: "1",
+					TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+				},
 			stdio: ["ignore", "ignore", "pipe"],
 		});
 		child.stderr.on("data", (chunk) => {
