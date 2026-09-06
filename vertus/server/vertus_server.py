@@ -41,6 +41,7 @@ import random
 import functools
 print = functools.partial(print, flush=True)  # noqa: A001
 import secrets
+import signal
 import socket
 import subprocess
 import sys
@@ -1023,6 +1024,23 @@ class AgentBridge:
             # holder named), not idle — and never as running.
             out["blocked_on_target"] = [dict(b) for b in waiting]
         return out
+
+    @property
+    def gateway_pgid(self) -> int | None:
+        """Process-group id of the live engine gateway, if any.
+
+        The gateway is spawned with ``start_new_session=True``, so pgid ==
+        gateway pid and every child it spawned (notably the embedded
+        cua-driver) shares it. Used by /api/fleet/screens to attribute
+        driver processes to agents. Pure read, no side effect.
+        """
+        session = self._session
+        if session is None or bool(getattr(session, "is_dead", False)):
+            return None
+        proc = getattr(session, "_proc", None)
+        if proc is None or proc.poll() is not None:
+            return None
+        return proc.pid
 
     def reconfigure(self, session_kwargs: dict) -> None:
         """Apply new identity kwargs after a profile PATCH.
@@ -2067,19 +2085,94 @@ class VertusHandler(BaseHTTPRequestHandler):
         ]
         self._json(200, {"activity": activity})
 
+    @staticmethod
+    def _socket_of_cmd(cmd: str) -> str:
+        """Extract the driver's ``--socket <path>`` (its identity), else ''."""
+        try:
+            return cmd.split("--socket", 1)[1].strip().split()[0]
+        except (IndexError, ValueError):
+            return ""
+
+    def _driver_inventory(self) -> tuple[list[dict], list[dict]]:
+        """Live ps scan of cua-driver processes: owned vs orphaned.
+
+        ``owned``: every driver process whose pgid matches a live gateway
+        (attributed to that agent). ``orphaned``: ppid-1 drivers (``--embedded``)
+        left behind by a dead gateway — the same signature the boot sweep
+        reaps; listed here so operators can see the accumulation live.
+        The user's CuaDriver.app daemon never appears: its args carry
+        ``--cua-internal-gate-engaged``, never ``--embedded``.
+        """
+        try:
+            out = subprocess.run(
+                ["ps", "-axo", "pid=,ppid=,pgid=,command="],
+                capture_output=True, text=True, check=False,
+            )
+        except OSError:
+            return [], []
+        rows = []
+        for line in out.stdout.splitlines():
+            parts = line.strip().split(None, 3)
+            if len(parts) != 4:
+                continue
+            pid, ppid, pgid, cmd = parts
+            if "cua-driver" not in cmd:
+                continue
+            rows.append(
+                {"pid": int(pid), "ppid": int(ppid), "pgid": int(pgid), "cmd": cmd}
+            )
+        owned: list[dict] = []
+        sessions = self.sessions
+        if sessions is not None:
+            for agent_id in sessions.live_ids():
+                # live_ids() only lists EXISTING bridges, so this never
+                # instantiates an engine as a side effect.
+                try:
+                    bridge = sessions.get_or_create_session(agent_id)
+                except Exception:  # noqa: BLE001 — roster is best-effort
+                    continue
+                pgid = getattr(bridge, "gateway_pgid", None)
+                if not pgid:
+                    continue
+                for r in rows:
+                    if r["pgid"] == pgid:
+                        owned.append(
+                            {
+                                "agent_id": agent_id,
+                                "pid": r["pid"],
+                                "role": (
+                                    "embedded" if "--embedded" in r["cmd"] else "mcp"
+                                ),
+                                "socket": self._socket_of_cmd(r["cmd"]),
+                            }
+                        )
+        orphaned = [
+            {"pid": r["pid"], "cmd": r["cmd"][:140]}
+            for r in rows
+            if r["ppid"] == 1 and "--embedded" in r["cmd"]
+        ]
+        return owned, orphaned
+
     def _handle_fleet_screens(self) -> None:
-        """GET /api/fleet/screens — declared targets, who is running, who waits.
+        """GET /api/fleet/screens — declared targets, who is running, who waits,
+        and a live cua-driver process inventory.
 
         Roster behind the per-window computer-use policy. Every agent with
         computer_use enabled and non-null cua_targets appears; each target
         shows who declared it, which run currently owns it (if any), and
         which agents are waiting on it. The response carries the policy
         caveat verbatim: targets are declarations, not a sandbox — the hub
-        cannot see what an agent actually drives mid-turn.
+        cannot see what an agent actually drives mid-turn. ``drivers``
+        attributes each live cua-driver process to its gateway (via process
+        group) and lists anything orphaned from a previous hub life.
         """
         leases = self.screen_leases
         if leases is None:
-            self._json(200, {"screens": [], "caveat": SCREEN_POLICY_CAVEAT})
+            self._json(
+                200,
+                {"screens": [], "caveat": SCREEN_POLICY_CAVEAT,
+                 "drivers": {"owned": [], "orphaned": []}},
+            )
             return
         owners = leases.owners()
         blocked = leases.blocked()
@@ -2109,7 +2202,12 @@ class VertusHandler(BaseHTTPRequestHandler):
                 b["agent_id"] for b in blocked if b["target"] == target
             )
             screens.append(entry)
-        self._json(200, {"screens": screens, "caveat": SCREEN_POLICY_CAVEAT})
+        owned, orphaned = self._driver_inventory()
+        self._json(
+            200,
+            {"screens": screens, "caveat": SCREEN_POLICY_CAVEAT,
+             "drivers": {"owned": owned, "orphaned": orphaned}},
+        )
 
     def log_message(self, fmt: str, *args) -> None:
         pass
@@ -2295,6 +2393,60 @@ def build_session_manager(registry: AgentRegistry, factory=None,
     )
 
 
+def reap_orphaned_drivers(log=print) -> int:
+    """Boot sweep: kill cua-driver processes orphaned by gateways that died
+    in a PREVIOUS hub life, and return how many were reaped.
+
+    Signature: ppid 1 (reparented to launchd after the gateway died) AND
+    ``--embedded`` in the command line — the flag the fork's backend passes
+    when a gateway spawns its own driver
+    (``cua-driver serve --embedded --socket <tmp>/hc-*.sock``).
+
+    The user's pre-existing driver daemon
+    (``CuaDriver.app/.../cua-driver serve --cua-internal-gate-engaged``)
+    NEVER matches: it is a launchd daemon (ppid 1) but its args never
+    contain ``--embedded``. If a future driver revision blurs that line,
+    this sweep must be re-audited before it can be trusted to run at boot.
+
+    Idempotent: a second pass finds nothing to kill. Best-effort: a busy
+    driver gets SIGTERM then a 1s grace then SIGKILL.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError as exc:
+        log(f"[vertus] driver sweep failed (no ps?): {exc}")
+        return 0
+    victims: list[int] = []
+    for line in out.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        pid, ppid, cmd = parts
+        if ppid == "1" and "cua-driver" in cmd and "--embedded" in cmd:
+            victims.append(int(pid))
+    for pid in victims:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    if victims:
+        time.sleep(1.0)
+        for pid in victims:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    if victims:
+        log(
+            f"[vertus] reaped {len(victims)} orphaned cua-driver process(es) "
+            "left by a previous hub life"
+        )
+    return len(victims)
+
+
 def serve(host: str | None, port: int) -> None:
     token = ensure_token()
     # The quick bar runs on this Mac and dials 127.0.0.1; the phone dials the
@@ -2345,6 +2497,9 @@ def serve(host: str | None, port: int) -> None:
         pruned = store.prune_events()
         if pruned:
             print(f"[vertus] retention: pruned {pruned} old event row(s)")
+        reaped = reap_orphaned_drivers()
+        if reaped:
+            print(f"[vertus] driver sweep: reaped {reaped} orphaned cua-driver(s)")
     except Exception as exc:  # noqa: BLE001
         print(f"[vertus] run-store boot maintenance failed: {exc}", file=sys.stderr)
 

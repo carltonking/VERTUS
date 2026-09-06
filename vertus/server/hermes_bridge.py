@@ -204,21 +204,58 @@ class _HermesSession:
         except Exception as exc:  # noqa: BLE001
             self._log(f"kill_process failed: {exc}")
 
+    def _reap_group(self, grace: float = 1.0) -> None:
+        """Reap every survivor of the gateway's process group.
+
+        The gateway is spawned with ``start_new_session=True``, so the
+        embedded cua-driver daemon it spawns for computer use shares its
+        process group. A plain ``proc.terminate()/wait()`` kills only the
+        GROUP LEADER: the driver keeps the pgid and is reparented to
+        launchd — an orphan that accumulates across a long-lived hub
+        (observed live: ppid-1 ``cua-driver serve --embedded`` after a
+        natural gateway exit). This signals the WHOLE group — SIGTERM,
+        grace, then SIGKILL — so the driver dies with its gateway on every
+        teardown path: natural exit (reader EOF), stale respawn, close(),
+        agent DELETE. Idempotent: ProcessLookupError means the group is
+        already empty. The escalation ladder's terminate/kill rungs use the
+        same group semantics, so this is the one shared mechanism.
+
+        pgid-reuse race: if the group empties and the OS hands the pgid to
+        an unrelated new group before the SIGKILL lands, killpg would signal
+        strangers. In practice the grace is a fraction of a second and the
+        pgid is the gateway's own pid — just-freed pids are not recycled
+        that fast; we accept the residual risk rather than track children
+        by pid (which would race the driver's own exit anyway).
+        """
+        try:
+            os.killpg(self._proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return  # group already empty (leader gone, no children)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"reap SIGTERM failed: {exc}")
+            return
+        try:
+            self._proc.wait(timeout=grace)
+        except Exception:
+            pass
+        try:
+            os.killpg(self._proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"reap SIGKILL failed: {exc}")
+        try:
+            self._proc.wait(timeout=2)
+        except Exception:
+            pass
+
     def close(self) -> None:
-        """Terminate and reap the gateway child (safe when already dead)."""
-        if self._proc.poll() is None:
-            try:
-                self._proc.terminate()
-            except Exception:
-                pass
-            try:
-                self._proc.wait(timeout=10)
-            except Exception:
-                try:
-                    self._proc.kill()
-                    self._proc.wait(timeout=10)
-                except Exception:
-                    pass
+        """Terminate and reap the gateway child (safe when already dead).
+
+        Group-signals (see _reap_group) so a driver child dies with the
+        gateway instead of being orphaned to launchd.
+        """
+        self._reap_group(grace=10)
         self.is_dead = True
 
     # -- plumbing ----------------------------------------------------------
@@ -388,6 +425,14 @@ class _HermesSession:
             try:
                 self._proc.wait(timeout=10)
             except Exception:
+                pass
+            # The LEADER is gone but the embedded cua-driver daemon (same
+            # process group) may still be alive — a natural gateway exit
+            # orphans it to launchd (ppid 1). Reap the whole group so no
+            # driver outlives its gateway on ANY exit path.
+            try:
+                self._reap_group(grace=1.0)
+            except Exception:  # noqa: BLE001 — cleanup is best-effort
                 pass
 
 
