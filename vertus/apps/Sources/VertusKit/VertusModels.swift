@@ -259,6 +259,57 @@ public struct RunRow: Codable, Identifiable, Equatable {
     public var isRoutine: Bool { runKind == "routine" }
 }
 
+/// GET /api/health — REAL hub health. The historical {status, time} keys
+/// are kept for old parsers; everything else is optional and tolerated, so
+/// an old hub or the test stub (which answers {"ok": true}) never breaks
+/// decode.
+public struct HubHealth: Codable, Equatable {
+    public var status: String            // ok | degraded
+    public var time: Int?
+    public var uptimeS: Int?
+    public var subsystems: [String: SubsystemHealth]?
+    public var agents: Int?
+    public var runningRuns: Int?
+    public var degradedAgents: [HubDegradedAgent]?
+    public var schedulerNextFire: Double?
+
+    /// Names of subsystems that failed their live probe, e.g. ["routines"].
+    public var failingSubsystems: [String] {
+        (subsystems ?? [:]).compactMap { name, sub in
+            sub.ok == false ? name : nil
+        }.sorted()
+    }
+
+    public var isHealthy: Bool { status != "degraded" && failingSubsystems.isEmpty }
+
+    private enum CodingKeys: String, CodingKey {
+        case status, time, uptimeS, subsystems, agents, runningRuns
+        case degradedAgents, schedulerNextFire
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        status = try c.decodeIfPresent(String.self, forKey: .status) ?? "ok"
+        time = try c.decodeIfPresent(Int.self, forKey: .time)
+        uptimeS = try c.decodeIfPresent(Int.self, forKey: .uptimeS)
+        subsystems = try c.decodeIfPresent([String: SubsystemHealth].self, forKey: .subsystems)
+        agents = try c.decodeIfPresent(Int.self, forKey: .agents)
+        runningRuns = try c.decodeIfPresent(Int.self, forKey: .runningRuns)
+        degradedAgents = try c.decodeIfPresent([HubDegradedAgent].self, forKey: .degradedAgents)
+        schedulerNextFire = try c.decodeIfPresent(Double.self, forKey: .schedulerNextFire)
+    }
+}
+
+public struct SubsystemHealth: Codable, Equatable {
+    public var ok: Bool?
+    public var reason: String?
+}
+
+public struct HubDegradedAgent: Codable, Equatable {
+    public var agentId: String
+    public var reason: String?
+}
+
 /// One fleet-activity item (GET /api/fleet/activity).
 public struct FleetActivityItem: Codable, Identifiable, Equatable {
     public var runId: String

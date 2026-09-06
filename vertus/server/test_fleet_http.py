@@ -41,11 +41,20 @@ from test_session_manager import FakeBridge, FakeSession, make_manager  # noqa: 
 
 @pytest.fixture()
 def hub(monkeypatch, tmp_path):
-    """A real ThreadingHTTPServer running VertusHandler with fake bridges."""
+    """A real ThreadingHTTPServer running VertusHandler with fake bridges.
+
+    Resets the store-family class attrs it does NOT own: a store leaked by
+    an earlier file (e.g. the health tests' stopped store) would silently
+    503 every /api/prompt here."""
     mgr, registry = make_manager(monkeypatch, tmp_path)
     vs.VertusHandler.sessions = mgr
     vs.VertusHandler.registry = registry
     vs.VertusHandler.token = "test-token"
+    vs.VertusHandler.store = None
+    vs.VertusHandler.routines = None
+    vs.VertusHandler.messenger = None
+    vs.VertusHandler.health_snapshot = {}
+    vs.VertusHandler.fleet = None
     server = ThreadingHTTPServer(("127.0.0.1", 0), vs.VertusHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"

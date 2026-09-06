@@ -133,6 +133,19 @@ public final class FleetStore: ObservableObject {
     @Published public private(set) var activity: [FleetActivityItem] = []
     /// All routines (refreshRoutines) — the bot editor lists per agent.
     @Published public private(set) var routines: [Routine] = []
+    /// Real hub health (refreshHealth) — nil until the first probe answers.
+    @Published public private(set) var hubHealth: HubHealth?
+
+    /// Failing subsystem names (e.g. ["routines"]) — the sidebar banner
+    /// shows them so a dead scheduler is visible, not just logged.
+    public var failingSubsystems: [String] {
+        hubHealth?.failingSubsystems ?? []
+    }
+
+    public var hubDegraded: Bool {
+        guard let hubHealth else { return false }
+        return !hubHealth.isHealthy
+    }
     /// Agent currently displayed in the foreground window (drives unread +
     /// notification suppression; written to the shared UI file too).
     @Published public var foregroundAgentID: String? {
@@ -182,6 +195,7 @@ public final class FleetStore: ObservableObject {
         Task { await refreshThreads() }
         Task { await refreshActivity() }
         Task { await refreshRoutines() }
+        Task { await refreshHealth() }
     }
 
     /// GET /api/fleet/screens (called on start, on status-poll cycles, and
@@ -426,6 +440,7 @@ public final class FleetStore: ObservableObject {
                 }
                 await self.refreshScreens()
                 await self.refreshActivity()
+                await self.refreshHealth()
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
             self?.statusPolling = false
@@ -502,6 +517,16 @@ public final class FleetStore: ObservableObject {
             lastSyncError = nil
         } catch {
             lastSyncError = error.localizedDescription
+        }
+    }
+
+    /// GET /api/health — refreshed on start and on every status-poll cycle.
+    /// A hub that answers but reports a dead subsystem flips hubDegraded.
+    public func refreshHealth() async {
+        do {
+            hubHealth = try await client.hubHealth()
+        } catch {
+            // Hub unreachable: keep the last known payload (nil on first run).
         }
     }
 

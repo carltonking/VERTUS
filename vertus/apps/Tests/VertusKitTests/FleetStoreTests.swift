@@ -490,6 +490,44 @@ final class FleetStoreTests: XCTestCase {
         XCTAssertEqual(fallback.baseURL, "http://127.0.0.1:8787")
     }
 
+    // MARK: Hub health
+
+    func testHubHealthDecodesRealPayload() throws {
+        let json: [String: Any] = [
+            "status": "degraded",
+            "time": 1234,
+            "uptime_s": 3600,
+            "subsystems": [
+                "store": ["ok": true, "reason": "writer round-trip 0.4ms"],
+                "routines": ["ok": false, "reason": "scheduler thread dead"],
+            ],
+            "agents": 2,
+            "running_runs": 1,
+            "degraded_agents": [["agent_id": "scout", "reason": "gateway down"]],
+            "scheduler_next_fire": 1788658061,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: json)
+        let health = try JSONDecoder.vertus().decode(HubHealth.self, from: data)
+        XCTAssertEqual(health.status, "degraded")
+        XCTAssertEqual(health.failingSubsystems, ["routines"])
+        XCTAssertFalse(health.isHealthy)
+        XCTAssertEqual(health.agents, 2)
+        XCTAssertEqual(health.degradedAgents?.first?.agentId, "scout")
+    }
+
+    func testHubHealthToleratesLegacyShapes() throws {
+        // The stub hub answers {"ok": true} — old shape, no new keys.
+        let legacy = try JSONDecoder.vertus().decode(HubHealth.self, from:
+            JSONSerialization.data(withJSONObject: ["ok": true]))
+        XCTAssertEqual(legacy.status, "ok")
+        XCTAssertTrue(legacy.isHealthy)
+        // Historical real shape {"status", "time"} only.
+        let historical = try JSONDecoder.vertus().decode(HubHealth.self, from:
+            JSONSerialization.data(withJSONObject: ["status": "ok", "time": 9]))
+        XCTAssertEqual(historical.status, "ok")
+        XCTAssertEqual(historical.time, 9)
+    }
+
     // MARK: Routines
 
     func testRoutineCRUDRoundTrip() async throws {

@@ -37,9 +37,12 @@ import json
 import os
 import random
 
-# Line-buffered stdout so launchd log files show progress promptly.
-import functools
-print = functools.partial(print, flush=True)  # noqa: A001
+# One logging path for the whole hub: every print site AND every subsystem
+# logger (fleet_routines etc.) flows into ~/.vertus/logs/vertus.log (rotated)
+# plus stdout for launchd. See vertus_logging.py — the scheduler-once-died-
+# silently bug is exactly what this unifies away.
+from vertus_logging import hub_print  # type: ignore
+print = hub_print  # noqa: A001  (accepts print kwargs; logs at INFO)
 import secrets
 import signal
 import socket
@@ -63,6 +66,7 @@ try:
     from fleet_routines import (  # type: ignore
         RoutineManager, RoutineValidationError, parse_schedule, parse_trigger,
     )
+    from vertus_logging import setup_logging  # type: ignore
     from session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 except ImportError:  # pragma: no cover - only hit under package invocation
     from .agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
@@ -72,6 +76,7 @@ except ImportError:  # pragma: no cover - only hit under package invocation
     from .fleet_routines import (  # type: ignore
         RoutineManager, RoutineValidationError, parse_schedule, parse_trigger,
     )
+    from .vertus_logging import setup_logging  # type: ignore
 
 VERTUS_DIR = Path.home() / ".vertus"
 TOKEN_FILE = VERTUS_DIR / "token"
@@ -1541,6 +1546,9 @@ class VertusHandler(BaseHTTPRequestHandler):
     fleet: FleetFan = None  # type: ignore[assignment]
     screen_leases: ScreenLeaseManager = None  # type: ignore[assignment]
     routines: RoutineManager = None  # type: ignore[assignment]
+    # Boot self-check snapshot (name -> {ok, reason}); /api/health re-probes
+    # the live subsystems and merges this for anything without a live probe.
+    health_snapshot: dict = {}  # type: ignore[assignment]
 
     def _authed(self) -> bool:
         header = self.headers.get("Authorization", "")
@@ -1561,7 +1569,7 @@ class VertusHandler(BaseHTTPRequestHandler):
         # Route on the path only; agent_id etc. arrive as query params.
         path = urlsplit(self.path).path
         if path == "/api/health":
-            self._json(200, {"status": "ok", "time": int(time.time())})
+            self._handle_health()
         elif path == "/api/skills":
             agent_id = self._query_param("agent_id")
             self._json(200, self.sessions.get_or_create_session(agent_id).slash_catalog())
@@ -1849,6 +1857,73 @@ class VertusHandler(BaseHTTPRequestHandler):
 
     def _query_param(self, name: str) -> str:
         return (parse_qs(urlsplit(self.path).query).get(name) or [""])[0]
+
+    def _handle_health(self) -> None:
+        """GET /api/health — REAL hub health: uptime, live subsystem probes,
+        fleet census, and scheduler state.
+
+        Keeps the historical {status, time} keys so existing clients keep
+        parsing it. ``status`` is "ok" only when every probed subsystem is
+        live; otherwise "degraded" with the failing subsystems named in
+        ``subsystems``. The store probe runs a real writer round-trip, so a
+        wedged writer thread shows here within seconds, not days.
+        """
+        store = self.store
+        checks: dict = {}
+        if store is not None:
+            try:
+                ms = store.ping()
+                checks["store"] = {"ok": True, "reason": f"writer round-trip {ms:.1f}ms"}
+            except Exception as exc:  # noqa: BLE001
+                checks["store"] = {"ok": False, "reason": str(exc)[:200]}
+            try:
+                checks["scheduler_next_fire"] = store.next_routine_fire()
+            except Exception:  # noqa: BLE001
+                checks["scheduler_next_fire"] = None
+            try:
+                running = store.running_run_count()
+            except Exception:  # noqa: BLE001
+                running = 0
+        else:
+            running = 0
+        thr = getattr(self.routines, "_thread", None) if self.routines else None
+        routines_ok = thr is not None and thr.is_alive()
+        checks["routines"] = {
+            "ok": routines_ok,
+            "reason": "scheduler thread alive" if routines_ok else "scheduler thread dead",
+        }
+        checks["messenger"] = {
+            "ok": self.messenger is not None,
+            "reason": ("message bus wired" if self.messenger is not None
+                       else "message bus not wired"),
+        }
+        if store is not None and store.listener is not None:
+            checks["fleet_listener"] = {"ok": True, "reason": "store listener registered"}
+        # Merge the boot snapshot for subsystems without a live probe.
+        for name, check in (self.health_snapshot or {}).items():
+            checks.setdefault(name, check)
+        ok_all = all(c.get("ok") for c in checks.values() if isinstance(c, dict))
+        # Fleet census: agents, live degraded agents, in-flight runs.
+        degraded_agents: list[dict] = []
+        agent_count = 0
+        try:
+            agent_count = len(self.registry.list_agents())
+            for aid in self.sessions.live_ids():
+                st = self.sessions.status(aid)
+                if st.get("degraded"):
+                    degraded_agents.append({"agent_id": aid, "reason": st["degraded"]})
+        except Exception:  # noqa: BLE001 — census is best-effort
+            pass
+        self._json(200, {
+            "status": "ok" if ok_all else "degraded",
+            "time": int(time.time()),
+            "uptime_s": int(time.time() - _SERVE_STARTED),
+            "subsystems": checks,
+            "agents": agent_count,
+            "running_runs": running,
+            "degraded_agents": degraded_agents,
+            "scheduler_next_fire": checks.get("scheduler_next_fire"),
+        })
 
     def _handle_agents_list(self) -> None:
         """GET /api/agents — self-heals the registry (primary) then lists."""
@@ -2922,7 +2997,63 @@ def reap_orphaned_drivers(log=print) -> int:
     return len(victims)
 
 
+def subsystem_checks(store, routines, messenger, sessions, registry) -> dict:
+    """Probe every subsystem and return name -> {ok, reason}.
+
+    Used by the boot self-check (one loud log line per subsystem) and by
+    GET /api/health (re-probed live). Every check is side-effect free: no
+    bridge creation, no engine spawn.
+    """
+    checks: dict = {}
+    if store is not None:
+        try:
+            ms = store.ping()
+            checks["store"] = {"ok": True, "reason": f"writer round-trip {ms:.1f}ms"}
+        except Exception as exc:  # noqa: BLE001
+            checks["store"] = {"ok": False, "reason": str(exc)[:200]}
+    else:
+        checks["store"] = {"ok": False, "reason": "run store not wired"}
+    thr = getattr(routines, "_thread", None)
+    if routines is not None:
+        alive = thr is not None and thr.is_alive()
+        checks["routines"] = {
+            "ok": alive,
+            "reason": "scheduler thread alive" if alive else "scheduler thread dead",
+        }
+    else:
+        checks["routines"] = {"ok": False, "reason": "routine scheduler not wired"}
+    checks["messenger"] = {
+        "ok": messenger is not None,
+        "reason": "message bus wired" if messenger is not None else "message bus not wired",
+    }
+    checks["fleet_listener"] = {
+        "ok": store is not None and store.listener is not None,
+        "reason": ("store listener (fanout+routines) registered"
+                   if store is not None and store.listener is not None
+                   else "store listener not registered"),
+    }
+    if sessions is not None:
+        try:
+            sessions.get_or_create_session(DEFAULT_AGENT_ID)  # prewarmed: no creation
+            checks["sessions"] = {"ok": True, "reason": "session manager live (primary prewarmed)"}
+        except Exception as exc:  # noqa: BLE001
+            checks["sessions"] = {"ok": False, "reason": str(exc)[:200]}
+    else:
+        checks["sessions"] = {"ok": False, "reason": "session manager not wired"}
+    if registry is not None:
+        try:
+            registry.ensure_primary()
+            checks["registry"] = {"ok": True, "reason": "agent registry live"}
+        except Exception as exc:  # noqa: BLE001
+            checks["registry"] = {"ok": False, "reason": str(exc)[:200]}
+    return checks
+
+
+_SERVE_STARTED = time.time()
+
+
 def serve(host: str | None, port: int) -> None:
+    setup_logging()
     token = ensure_token()
     # The quick bar runs on this Mac and dials 127.0.0.1; the phone dials the
     # tailnet address. Bind both so every client reaches the same hub.
@@ -3006,6 +3137,22 @@ def serve(host: str | None, port: int) -> None:
         routines.catch_up()
     except Exception as exc:  # noqa: BLE001
         print(f"[vertus] run-store boot maintenance failed: {exc}", file=sys.stderr)
+
+    # Boot self-check: one explicit line per subsystem. A subsystem that
+    # failed to start must be LOUD here and visible in GET /api/health, not
+    # just buried in a log nobody reads.
+    health_snapshot = subsystem_checks(
+        store, routines, messenger, sessions, registry
+    )
+    VertusHandler.health_snapshot = health_snapshot
+    for name, check in health_snapshot.items():
+        if check.get("ok"):
+            print(f"[vertus] self-check {name}: ok ({check['reason']})")
+        else:
+            print(f"[vertus] SELF-CHECK FAILED {name}: {check['reason']}")
+    if not all(c.get("ok") for c in health_snapshot.values()):
+        failed = [n for n, c in health_snapshot.items() if not c.get("ok")]
+        print(f"[vertus] HUB DEGRADED at boot: {', '.join(failed)} (see /api/health)")
 
     def _daily_prune() -> None:
         """Daily retention pass (daemon; events older than the TTL)."""

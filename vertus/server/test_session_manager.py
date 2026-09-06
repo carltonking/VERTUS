@@ -151,6 +151,9 @@ def hub(monkeypatch, tmp_path):
     vs.VertusHandler.store = None
     vs.VertusHandler.fleet = None
     vs.VertusHandler.screen_leases = None
+    vs.VertusHandler.routines = None
+    vs.VertusHandler.messenger = None
+    vs.VertusHandler.health_snapshot = {}
     server = ThreadingHTTPServer(("127.0.0.1", 0), vs.VertusHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
@@ -294,8 +297,14 @@ def test_http_agents_endpoints_still_work(hub):
     base = hub
     status, body = _req(base, "/api/agents")
     assert status == 200 and [a["id"] for a in body["agents"]] == ["primary", "scout"]
+    # Health is REAL now: this minimal fixture wires no store/routines, so
+    # the honest answer is "degraded" with the failing subsystems named —
+    # but the historical {status, time} keys must still parse.
     status, body = _req(base, "/api/health")
-    assert status == 200 and body["status"] == "ok"
+    assert status == 200 and body["status"] == "degraded"
+    assert isinstance(body["time"], int)
+    assert isinstance(body["subsystems"], dict)
+    assert any(not c["ok"] for c in body["subsystems"].values())
     status, body = _req(base, "/api/skills?agent_id=scout")
     assert status == 200  # routes through the scout session (fake has no catalog → 0 commands)
     # Auth still enforced.

@@ -27,6 +27,27 @@ struct FleetSidebarView: View {
             }
             .listStyle(.sidebar)
 
+            if store.hubDegraded {
+                // A dead subsystem (scheduler, store writer, …) must be
+                // visible in the app, not just in the hub log. This is the
+                // difference between "my bot didn't do the thing" and
+                // "the scheduler has been dead since Tuesday".
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Hub degraded")
+                        .font(.system(size: 11, weight: .bold))
+                    Text("Failing: \(store.failingSubsystems.joined(separator: ", "))")
+                        .font(.system(size: 10))
+                        .opacity(0.9)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.red.opacity(0.85)))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 8)
+                .padding(.top, 6)
+            }
+
             Divider()
 
             // Fleet activity + screens + connection state.

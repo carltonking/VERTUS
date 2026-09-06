@@ -223,6 +223,14 @@ public final class VertusHTTPClient {
                       key: "activity", query: [URLQueryItem(name: "limit", value: String(limit))])
     }
 
+    // MARK: - Health
+
+    /// GET /api/health — real hub health (uptime, live subsystem probes,
+    /// fleet census, scheduler next fire).
+    public func hubHealth() async throws -> HubHealth {
+        try await get(HubHealth.self, path: "/api/health", key: nil)
+    }
+
     // MARK: - Routines
 
     /// GET /api/routines?agent_id= — all routines, or one agent's.

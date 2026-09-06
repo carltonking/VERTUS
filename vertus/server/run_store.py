@@ -609,6 +609,31 @@ class RunStore:
         ).fetchall())
         return [dict(r) for r in rows]
 
+    def ping(self) -> float:
+        """Write-health probe: one trivial op through the writer queue.
+
+        Returns the round-trip in milliseconds. Raises RuntimeError when the
+        writer thread is gone (a stopped store) — callers surface that as an
+        unhealthy subsystem instead of hanging.
+        """
+        start = time.perf_counter()
+        self._submit(lambda conn: None, {})
+        return (time.perf_counter() - start) * 1000.0
+
+    def next_routine_fire(self) -> float | None:
+        """Earliest next fire across enabled schedule routines (health view)."""
+        rows = self._read(lambda c: c.execute(
+            "SELECT MIN(next_run_at) FROM routines "
+            "WHERE enabled = 1 AND next_run_at IS NOT NULL"
+        ).fetchall())
+        return rows[0][0] if rows and rows[0][0] is not None else None
+
+    def running_run_count(self) -> int:
+        rows = self._read(lambda c: c.execute(
+            "SELECT COUNT(*) FROM runs WHERE state = 'running'"
+        ).fetchall())
+        return rows[0][0] if rows else 0
+
     def list_approvals(self, state: str | None = None,
                        limit: int = 100) -> list[dict]:
         """Newest-first approval rows; ``state=pending`` = undecided rows.
