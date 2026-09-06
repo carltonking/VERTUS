@@ -892,6 +892,120 @@ def launchd_checks() -> list[dict]:
     return out
 
 
+# launchd labels that legitimately live on a production machine. Anything
+# else under com.vertus.* is a demo that outlived its demo (two occurrences
+# this session: com.vertus.demo.memory and an earlier one).
+_KNOWN_LAUNCHD_LABELS = {"com.vertus.server", "com.vertusbar.dev"}
+
+
+def _stray_vertus_labels() -> list[str]:
+    try:
+        out = subprocess.run(["launchctl", "list"], capture_output=True,
+                             text=True, timeout=10, check=False)
+    except Exception:
+        return []
+    stray: list[str] = []
+    for line in out.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[2].startswith("com.vertus."):
+            if parts[2] not in _KNOWN_LAUNCHD_LABELS:
+                stray.append(parts[2])
+    return sorted(stray)
+
+
+def terminal_checks() -> list[dict]:
+    """The terminal as a fleet client (VERTUS_ENGINE=hub, hub-session.ts):
+    hub reachable, the configured agent resolvable, and the steer endpoint
+    live. The steer probe is side-effect-free: POSTing to an IDLE agent
+    returns 409 and touches nothing; a RUNNING agent is never probed (that
+    would inject a steer into a live turn) — reported unverified instead.
+    """
+    out: list[dict] = []
+    cfg = _cfg()
+    token = cfg["token_file"].read_text().strip() if cfg["token_file"].is_file() else ""
+    agent_id = (os.environ.get("VERTUS_AGENT", "primary").strip() or "primary")
+    base = f"http://127.0.0.1:{cfg['hub_port']}"
+    quote = urllib.request.quote
+
+    def request(path: str, method: str = "GET", payload: dict | None = None):
+        data = json.dumps(payload).encode() if payload is not None else None
+        try:
+            req = urllib.request.Request(base + path, data=data, method=method)
+            if token:
+                req.add_header("Authorization", f"Bearer {token}")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                raw = resp.read()
+                try:
+                    return resp.status, json.loads(raw or b"{}")
+                except Exception:
+                    return resp.status, {}
+        except urllib.error.HTTPError as exc:
+            try:
+                return exc.code, json.loads(exc.read() or b"{}")
+            except Exception:
+                return exc.code, {}
+        except Exception:
+            return 0, {}
+
+    # The launchd sweep is independent of hub state — a demo job must be
+    # flagged even (especially) when nothing else is healthy.
+    if not cfg["skip_launchd"]:
+        stray = _stray_vertus_labels()
+        if stray:
+            out.append(_check("terminal.launchd_strays", "warn",
+                              f"unexpected com.vertus.* labels loaded: {', '.join(stray)}",
+                              "launchctl bootout gui/$(id -u)/<label> — a demo agent "
+                              "must not outlive its demo"))
+        else:
+            out.append(_check("terminal.launchd_strays", "ok",
+                              "only com.vertus.server and com.vertusbar.dev loaded"))
+
+    health = _hub_health()
+    if health is None:
+        # Warn, not fail — same contract as hub.process: a dev box without a
+        # hub is not a broken installation, but hub mode cannot attach.
+        out.append(_check(
+            "terminal.hub_reachable", "warn",
+            f"hub not answering on :{cfg['hub_port']} — VERTUS_ENGINE=hub has nothing to attach to",
+            "start the hub: launchctl bootstrap gui/$(id -u) "
+            "~/Library/LaunchAgents/com.vertus.server.plist"))
+        return out
+    out.append(_check("terminal.hub_reachable", "ok", "hub answering /api/health"))
+
+    status, _ = request(f"/api/agents/{quote(agent_id)}")
+    if status == 200:
+        out.append(_check("terminal.agent_resolvable", "ok",
+                          f"agent {agent_id!r} resolves (VERTUS_AGENT)"))
+    else:
+        out.append(_check("terminal.agent_resolvable", "fail",
+                          f"agent {agent_id!r} not found (HTTP {status})",
+                          "create it in the Fleet app (bot editor) or POST /api/agents"))
+
+    status, body = request(f"/api/agents/{quote(agent_id)}/status")
+    running = isinstance(body, dict) and body.get("state") == "running"
+    if status != 200:
+        out.append(_check("terminal.steer_endpoint", "unverified",
+                          f"status endpoint unreachable (HTTP {status})", ""))
+    elif running:
+        out.append(_check("terminal.steer_endpoint", "unverified",
+                          f"agent {agent_id!r} is RUNNING — steer endpoint not probed "
+                          "(a probe would inject a steer into a live turn)", ""))
+    else:
+        status, body = request(f"/api/steer", "POST",
+                               {"agent_id": agent_id, "text": "doctor probe"})
+        if status == 409:
+            out.append(_check("terminal.steer_endpoint", "ok",
+                              "POST /api/steer answers 409 on an idle agent (endpoint live)"))
+        else:
+            out.append(_check("terminal.steer_endpoint", "fail",
+                              f"POST /api/steer answered {status} instead of 409 — "
+                              "mid-turn corrections from the terminal would fail",
+                              "check the hub log; the steer route must be present "
+                              "(hub on current code)"))
+
+    return out
+
+
 def memory_checks() -> list[dict]:
     """Hub-owned memory (fleet_memory.py): canonical dirs, migration marker,
     index health, fork-mirror consistency, pending conflicts, and — the one
@@ -1033,6 +1147,7 @@ def run(json_out: bool = False, spawner=None) -> int:
     all_checks += registry_checks()
     all_checks += memory_checks()
     all_checks += launchd_checks()
+    all_checks += terminal_checks()
     runtime_s = time.monotonic() - started
     exit_code = 1 if any(c["status"] == "fail" for c in all_checks) else 0
     if json_out:

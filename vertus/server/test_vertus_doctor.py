@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -379,6 +380,98 @@ def test_memory_mirror_pending_warns(monkeypatch, isolated_env, tmp_path):
     (canon / "USER.md").write_text("fork learned this", encoding="utf-8")
     results = vd.memory_checks()
     assert _status(results, "memory.mirror") == "ok"
+
+
+# -- terminal (hub mode) -----------------------------------------------------
+
+@pytest.fixture()
+def live_hub(monkeypatch, tmp_path):
+    """Real VertusHandler with fakes + store on a random port, env pointed at
+    it so terminal_checks() talks to it exactly like the real doctor run."""
+    import threading
+    import urllib.request as _ur
+    from http.server import ThreadingHTTPServer
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import vertus_server as vs  # noqa: E402
+    from run_store import RunStore  # noqa: E402
+    from test_session_manager import make_manager  # noqa: E402
+
+    mgr, registry = make_manager(monkeypatch, tmp_path)
+    store = RunStore(path=tmp_path / "fleet.db")
+    vs.VertusHandler.sessions = mgr
+    vs.VertusHandler.registry = registry
+    vs.VertusHandler.store = store
+    vs.VertusHandler.token = "test-token"
+    vs.VertusHandler.routines = None
+    vs.VertusHandler.messenger = None
+    vs.VertusHandler.health_snapshot = {}
+    vs.VertusHandler.fleet = None
+    server = ThreadingHTTPServer(("127.0.0.1", 0), vs.VertusHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    (tmp_path / "token").write_text("test-token")
+    monkeypatch.setenv("VERTUS_TOKEN_PATH", str(tmp_path / "token"))
+    monkeypatch.setenv("VERTUS_PORT", str(server.server_address[1]))
+    monkeypatch.setenv("VERTUS_DOCTOR_SKIP_LAUNCHD", "1")
+    yield {"server": server, "mgr": mgr}
+    server.shutdown()
+    store.stop()
+    vs.VertusHandler.store = None
+    vs.VertusHandler.sessions = None
+    vs.VertusHandler.registry = None
+
+
+def test_terminal_checks_pass_against_live_hub(live_hub):
+    results = vd.terminal_checks()
+    by = _by_name(results)
+    assert by["terminal.hub_reachable"]["status"] == "ok"
+    assert by["terminal.agent_resolvable"]["status"] == "ok"
+    assert by["terminal.steer_endpoint"]["status"] == "ok"
+    assert "409" in by["terminal.steer_endpoint"]["reason"]
+
+
+def test_terminal_steer_not_probed_while_running(live_hub):
+    import json as _json
+    import urllib.request as _ur
+
+    bridge = live_hub["mgr"].get_session("primary")
+    session = bridge.sessions[0]
+    session.delay = 2.0
+    req = _ur.Request(
+        "http://127.0.0.1:%d/api/prompt" % live_hub["server"].server_address[1],
+        data=_json.dumps({"agent_id": "primary", "text": "long turn"}).encode(),
+        method="POST",
+        headers={"Authorization": "Bearer test-token"},
+    )
+    _ur.urlopen(req, timeout=10).read()
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline and bridge.status()["state"] != "running":
+        time.sleep(0.03)
+    assert bridge.status()["state"] == "running"
+    by = _by_name(vd.terminal_checks())
+    assert by["terminal.steer_endpoint"]["status"] == "unverified"
+    assert "RUNNING" in by["terminal.steer_endpoint"]["reason"]
+
+
+def test_terminal_hub_down_warns_not_fails(monkeypatch, isolated_env):
+    results = vd.terminal_checks()
+    assert _status(results, "terminal.hub_reachable") == "warn"
+    assert len(results) == 1, "no point checking agents against a dead hub"
+
+
+def test_stray_launchd_labels_flagged(monkeypatch, isolated_env):
+    monkeypatch.setenv("VERTUS_DOCTOR_SKIP_LAUNCHD", "")
+    monkeypatch.setattr(vd, "_stray_vertus_labels", lambda: ["com.vertus.demo.memory"])
+    by = _by_name(vd.terminal_checks())
+    assert by["terminal.launchd_strays"]["status"] == "warn"
+    assert "com.vertus.demo.memory" in by["terminal.launchd_strays"]["reason"]
+
+
+def test_no_stray_launchd_labels_passes(monkeypatch, isolated_env):
+    monkeypatch.setenv("VERTUS_DOCTOR_SKIP_LAUNCHD", "")
+    monkeypatch.setattr(vd, "_stray_vertus_labels", lambda: [])
+    by = _by_name(vd.terminal_checks())
+    assert by["terminal.launchd_strays"]["status"] == "ok"
 
 
 # -- hub / exit / json ------------------------------------------------------
