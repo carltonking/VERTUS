@@ -105,6 +105,17 @@ class SessionManager:
         with self._lock:
             return agent_id in self._sessions
 
+    def get_session(self, agent_id: str):
+        """The live bridge for an agent, or None — never creates one.
+
+        Steer and other live-turn operations must not instantiate an engine
+        as a side effect (same rule as status()); an agent that has never
+        run simply has no bridge to steer.
+        """
+        agent_id = str(agent_id or DEFAULT_AGENT_ID).strip() or DEFAULT_AGENT_ID
+        with self._lock:
+            return self._sessions.get(agent_id)
+
     def status(self, agent_id: str) -> dict:
         """Live turn state for an agent WITHOUT creating a bridge.
 

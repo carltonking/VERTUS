@@ -167,6 +167,22 @@ class _HermesSession:
             except Exception as exc:
                 self._log(f"interrupt failed: {exc}")
 
+    def steer(self, text: str) -> None:
+        """Inject a user note into the live turn (fork's ``session.steer``).
+
+        Safe to call while a turn is running: the fork appends the text to
+        the last tool result of the NEXT tool batch (no interrupt, no new
+        user turn, no role-alternation violation — see methods_session.py
+        session.steer in the fork). Raises AgentSessionError when the
+        gateway refuses (no session, agent without steer support).
+        """
+        with self._lock:
+            sid = self._session_id
+        if not sid:
+            raise AgentSessionError("no gateway session to steer")
+        self._rpccall("session.steer", {"session_id": sid, "text": text},
+                      timeout=15)
+
     def active_list(self, timeout: float = 5.0) -> dict:
         """Cheap liveness RPC for the hub's idle-gateway health check.
 

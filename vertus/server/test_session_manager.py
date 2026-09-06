@@ -40,7 +40,9 @@ class FakeSession:
         self.bridge = bridge
         self.delay = delay
         self.prompts: list[str] = []
+        self.steers: list[str] = []
         self.closed = False
+        self.is_dead = False  # supervisor/mid-respawn marker (steer guard)
 
     def subscribe(self, listener) -> None:  # bridge calls this post-create
         pass
@@ -51,6 +53,10 @@ class FakeSession:
         # Hermes-like: stream text only; the turn ends when prompt() returns
         # and the bridge's backstop emits the single "done" wire event.
         self.bridge._on_pi_event({"type": "text", "text": f"reply-to:{text}"})
+
+    def steer(self, text: str) -> None:
+        """Mirror the fork's session.steer: record, don't interrupt."""
+        self.steers.append(text)
 
     def close(self) -> None:
         self.closed = True

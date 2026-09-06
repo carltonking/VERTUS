@@ -184,6 +184,15 @@ def _tailnet_ip_cli() -> str | None:
     return None
 
 
+class SteerNotRunningError(RuntimeError):
+    """POST /api/steer hit a bridge with no live turn to steer (hub → 409).
+
+    Raised when the agent is idle, or its gateway is mid-respawn (steering
+    into a dead gateway would be silently lost). Distinct from other
+    RuntimeErrors so the API layer can return a precise status + message.
+    """
+
+
 class AgentBridge:
     """Owns the pi agent session and serializes prompts through a queue.
 
@@ -261,6 +270,12 @@ class AgentBridge:
         # Events emitted by the engine's reader thread while the worker is
         # inside a turn are attributed to the run the worker is processing.
         self._current_run_id: str | None = None
+        # Pending steering text for the LIVE turn (Checkpoint 1: hub steer).
+        # Guarded by _status_lock. Steered text is a mid-turn correction, NOT
+        # a new turn: it is recorded as a ``steer`` event on the current run
+        # and mirrored in the ``queue_update`` wire event; it never creates a
+        # run row or a messages row. Cleared when the turn ends.
+        self._pending_steers: list[str] = []
         # Bot-to-bot attribution of the current run (fleet message bus): who
         # asked for this turn (from_agent), in which thread, and with which
         # kind. ``on_run_terminal`` is the hub's BotMessenger.run_terminal —
@@ -429,6 +444,8 @@ class AgentBridge:
             from_agent = self._run_from_agent
             thread_id = self._run_thread_id
             run_kind = self._run_kind
+            pending_steers = list(self._pending_steers)
+            self._pending_steers = []
             self._current_run_id = None
             self._run_from_agent = None
             self._run_thread_id = None
@@ -437,6 +454,12 @@ class AgentBridge:
             self._run_error_message = ""
             self._run_cancelled = None
             self._run_timeout_msg = None
+        if pending_steers and run_id:
+            # The turn ended with steers still pending (they landed on a tool
+            # batch the turn never reached): tell every client the queue is
+            # empty again, attributed to the same run.
+            self._emit({"type": "queue_update", "steering": [],
+                        "follow_up": []}, run_id=run_id)
         if not run_id or self.store is None:
             return
         store = self.store
@@ -1046,6 +1069,41 @@ class AgentBridge:
     # ------------------------------------------------------------------
     # Step A: turn introspection + lifecycle (reconfigure / close)
     # ------------------------------------------------------------------
+
+    def steer(self, text: str) -> str:
+        """Inject a mid-turn correction into the live turn (POST /api/steer).
+
+        Raises SteerNotRunningError (hub → 409) when there is no turn to
+        steer — idle, or the gateway is mid-respawn (steering into a dead
+        gateway would be silently lost; the caller must retry after the
+        turn settles). Steered text is recorded as a ``steer`` event on the
+        CURRENT run (store-before-fanout, so replay shows it) plus a
+        ``queue_update`` reflecting the pending list — attributed as
+        steering, never as a new turn.
+        """
+        with self._status_lock:
+            if self._closed or not self._running:
+                raise SteerNotRunningError(
+                    f"agent {self.agent_id} has no turn running")
+            session = self._session
+            run_id = self._current_run_id
+            restarting = session is None or bool(getattr(session, "is_dead", False))
+        if restarting:
+            raise SteerNotRunningError(
+                f"agent {self.agent_id} is restarting its gateway; "
+                "steer after the turn settles")
+        try:
+            session.steer(text)
+        except Exception as exc:  # noqa: BLE001 - RPC refusal, broken pipe, …
+            raise SteerNotRunningError(
+                f"gateway refused steer: {exc}") from exc
+        with self._status_lock:
+            self._pending_steers.append(text)
+            pending = list(self._pending_steers)
+        self._emit({"type": "steer", "text": text}, run_id=run_id)
+        self._emit({"type": "queue_update", "steering": pending,
+                    "follow_up": []}, run_id=run_id)
+        return run_id or ""
 
     def status(self) -> dict:
         """Live turn state: idle | running | queued, plus queue/gateway health.
@@ -1700,6 +1758,8 @@ class VertusHandler(BaseHTTPRequestHandler):
                 "run_id": run_id,
                 "sandbox_path": sandbox_path,
             })
+        elif route == "/api/steer":
+            self._handle_steer(payload)
         elif route == "/api/messages":
             self._handle_message_send(payload)
         elif route == "/api/routines":
@@ -2870,6 +2930,38 @@ class VertusHandler(BaseHTTPRequestHandler):
             "content": data.decode("utf-8", errors="replace"),
             "size": len(data),
         })
+
+    def _handle_steer(self, payload: dict) -> None:
+        """POST /api/steer {agent_id, text} — mid-turn correction.
+
+        Steered text is injected into the LIVE turn (the fork's
+        session.steer lands it on the next tool batch — no interrupt, no new
+        user turn) and recorded as a ``steer`` event on the current run,
+        attributed as steering, never as a new run. 409 when there is no
+        turn running (idle, or the gateway is mid-respawn). Never creates a
+        bridge as a side effect.
+        """
+        agent_id = str(payload.get("agent_id") or DEFAULT_AGENT_ID)
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            self._json(400, {"error": "text required"})
+            return
+        try:
+            self.registry.get_agent(agent_id)
+        except KeyError:
+            self._json(404, {"error": f"agent not found: {agent_id}"})
+            return
+        bridge = self.sessions.get_session(agent_id)
+        if bridge is None:
+            self._json(409, {"error": f"agent {agent_id} has no turn running"})
+            return
+        try:
+            run_id = bridge.steer(text)
+        except SteerNotRunningError as exc:
+            self._json(409, {"error": str(exc)[:200]})
+            return
+        self._json(200, {"steered": text, "agent_id": agent_id,
+                         "run_id": run_id})
 
     def _handle_memory_write(self, rest: str, payload: dict) -> None:
         """PUT /api/memory/<scope>/<path> {content} — human-initiated write."""
