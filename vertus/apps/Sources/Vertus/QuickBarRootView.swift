@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
+import VertusKit
 
 // MARK: - Expansion state (shared between AppDelegate and the view)
 
@@ -822,7 +823,15 @@ struct QuickBarRootView: View {
     var logo: NSImage?
     @ObservedObject var expansionState: ExpansionState
 
-    @StateObject private var model = QuickBarViewModel()
+    @StateObject private var model: QuickBarViewModel
+
+    /// The merged app injects its ONE store; the panel never builds a second
+    /// stream of its own.
+    init(logo: NSImage?, expansionState: ExpansionState, store: FleetStore) {
+        self.logo = logo
+        self.expansionState = expansionState
+        _model = StateObject(wrappedValue: QuickBarViewModel(store: store))
+    }
     /// True while the prompt currently parses as a live math expression —
     /// the bar shows the result chip instead of (or dimming) the chat.
     @State private var mathActive = false
@@ -990,7 +999,9 @@ struct QuickBarRootView: View {
 
 // MARK: - Transcript row
 
-struct TranscriptEntry: Identifiable {
+/// The QuickBar's own transcript row (id/role/text). Named distinctly from
+/// VertusKit.TranscriptEntry — both are in scope in the merged module.
+struct BarTranscriptEntry: Identifiable {
     let id: String
     let role: String
     var text: String
@@ -1030,7 +1041,7 @@ private struct ChatScrollMetricsKey: PreferenceKey {
 /// text on the pasteboard and briefly flashes a checkmark; the text itself
 /// also stays selectable for the usual Cmd+C path.
 struct TranscriptBubbleView: View {
-    var entry: TranscriptEntry
+    var entry: BarTranscriptEntry
 
     @State private var hovering = false
     @State private var justCopied = false
@@ -1273,6 +1284,15 @@ struct TypingDots: View {
 
 #if DEBUG
 #Preview {
-    QuickBarRootView(expansionState: ExpansionState())
+    // The merged app owns the store; the preview shows the panel chrome
+    // with a bare store pointed at the default hub.
+    let config = ServerConfig.load()
+    QuickBarRootView(
+        logo: nil,
+        expansionState: ExpansionState(),
+        store: FleetStore(client: VertusHTTPClient(config: config),
+                          stream: FleetStream(config: config,
+                                              cursor: StreamCursor(processName: "vertus-preview")))
+    )
 }
 #endif

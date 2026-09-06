@@ -10,7 +10,7 @@ import VertusKit
 @MainActor
 final class QuickBarViewModel: ObservableObject {
     // Mirrors of the store, in the bar's own types (the view is untouched).
-    @Published var transcript: [TranscriptEntry] = []
+    @Published var transcript: [BarTranscriptEntry] = []
     @Published var isStreaming = false
     @Published var currentActivity: String?
     /// Did the in-flight turn produce any reply text yet? Drives the
@@ -52,11 +52,11 @@ final class QuickBarViewModel: ObservableObject {
         let workingFor: String?
     }
 
-    init(config: ServerConfig = ServerConfig.load()) {
-        let cursor = StreamCursor(processName: "vertusbar")
-        let client = VertusHTTPClient(config: config)
-        let stream = FleetStream(config: config, cursor: cursor)
-        self.store = FleetStore(client: client, stream: stream)
+    /// The merged app owns ONE store (one fleet stream, one cursor) and
+    /// injects it into both the main window and the panel — the pre-merge
+    /// bar built its own second stream here.
+    init(store: FleetStore) {
+        self.store = store
         self.selectedAgentID = UserDefaults.standard.string(forKey: "vertus.bar.agent") ?? "primary"
         store.selectedAgentID = selectedAgentID
         store.foregroundAgentID = selectedAgentID
@@ -136,8 +136,8 @@ final class QuickBarViewModel: ObservableObject {
             .sorted { $0.name < $1.name }
     }
 
-    private static func map(_ e: VertusKit.TranscriptEntry) -> TranscriptEntry {
-        TranscriptEntry(id: e.id, role: e.role == "user" ? "you" : "vertus", text: e.text)
+    private static func map(_ e: VertusKit.TranscriptEntry) -> BarTranscriptEntry {
+        BarTranscriptEntry(id: e.id, role: e.role == "user" ? "you" : "vertus", text: e.text)
     }
 
     // MARK: - Slash commands (skills)
@@ -269,8 +269,8 @@ final class QuickBarViewModel: ObservableObject {
 
     func seedDemoOutput() {
         sentAtLeastOnce = true
-        transcript.append(TranscriptEntry(role: "you", text: "Show me the new chat bubbles!"))
-        transcript.append(TranscriptEntry(
+        transcript.append(BarTranscriptEntry(role: "you", text: "Show me the new chat bubbles!"))
+        transcript.append(BarTranscriptEntry(
             role: "vertus",
             text: "Done — your prompts sit on the right, my replies on the "
                 + "left, and the bar hugs the conversation."
@@ -280,14 +280,14 @@ final class QuickBarViewModel: ObservableObject {
     func seedLongOutput() {
         sentAtLeastOnce = true
         let lines = (1...24).map { "Line \($0): VERTUS output row number \($0) with enough text to wrap comfortably." }
-        transcript.append(TranscriptEntry(role: "vertus", text: lines.joined(separator: "\n")))
+        transcript.append(BarTranscriptEntry(role: "vertus", text: lines.joined(separator: "\n")))
     }
 
     // MARK: - Transcript helpers
 
     @MainActor
     private func appendAssistant(_ text: String) {
-        transcript.append(TranscriptEntry(role: "vertus", text: text))
+        transcript.append(BarTranscriptEntry(role: "vertus", text: text))
         turnHasText = true
     }
 }
@@ -322,34 +322,12 @@ struct SlashCommand: Identifiable, Equatable {
     var id: String { name }
 }
 
-// MARK: - Open in Fleet
+// MARK: - Open the main window
 
 extension QuickBarViewModel {
-    /// Hand the conversation to the full-window fleet app: launch the
-    /// VertusFleet product next to the bar's own binary (app bundle
-    /// preferred, bare executable fallback).
+    /// The merged app is one process: "Open in Fleet" is now an in-process
+    /// window activation, never a second executable.
     func openInFleet() {
-        let dir = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
-            .deletingLastPathComponent()
-        let candidates = [
-            dir.deletingLastPathComponent().deletingLastPathComponent()
-                .appendingPathComponent("dist/VertusFleet.app"),       // apps/dist
-            dir.appendingPathComponent("VertusFleet"),                  // same build dir
-            dir.deletingLastPathComponent().appendingPathComponent("VertusFleet"),
-        ]
-        for url in candidates {
-            let exists = FileManager.default.fileExists(atPath: url.path)
-            if exists, url.pathExtension == "app" {
-                NSWorkspace.shared.open(url)
-                return
-            }
-            if exists {
-                let proc = Process()
-                proc.executableURL = url
-                try? proc.run()
-                return
-            }
-        }
-        vertusTrace("openInFleet: no VertusFleet product found near \(dir.path)")
+        AppDelegate.shared?.openMainWindow()
     }
 }

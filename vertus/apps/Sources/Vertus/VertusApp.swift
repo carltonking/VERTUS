@@ -4,6 +4,8 @@ import Combine
 import QuartzCore
 import ServiceManagement
 import SwiftUI
+import UserNotifications
+import VertusKit
 
 // MARK: - Diagnostics
 
@@ -20,17 +22,33 @@ func vertusTrace(_ message: String) {
     }
 }
 
-/// VERTUS Quick Bar — a notch prompt bar that hides inside the notch and
-/// grows out of it when summoned. The panel is an exact replica of the
-/// reference screenshot (316×127 pt body, 329 pt top edge, chamfered top
-/// corners, 17 pt bottom radius), positioned flush with the very top of the
-/// screen so it frames the notch. Toggle: ⇧⌘J or the menubar icon.
+/// VERTUS — one app, one process: the full window (roster, chat, memory,
+/// threads, screens, activity, bot editor) AND the notch QuickBar menubar
+/// extra (⇧⌘J). One FleetStore, one fleet-stream connection, one health
+/// poll, one memory index — the pre-merge VertusBar/VertusFleet pair ran
+/// two processes and two of everything.
+///
+/// Activation policy: .regular (the default for a SwiftUI app). The QuickBar
+/// panel keeps its window-level protections — .nonactivatingPanel,
+/// .statusBar level, .canJoinAllSpaces/.fullScreenAuxiliary — so its
+/// not-stealing behavior is identical under a regular app; see Checkpoint 0
+/// of the merge prompt for the analysis.
 @main
-struct VertusQuickBarApp: App {
+struct VertusApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
         Settings { EmptyView() }
+            .commands {
+                // Replacing .newItem keeps ⌘N out (no second window concept).
+                CommandGroup(replacing: .newItem) { }
+                CommandMenu("VERTUS") {
+                    Button("Open VERTUS Window") {
+                        AppDelegate.shared?.openMainWindow()
+                    }
+                    .keyboardShortcut("o", modifiers: [.command])
+                }
+            }
     }
 }
 
@@ -55,8 +73,13 @@ private let hotKeySignature: OSType = 0x414C4241
 private let hotKeyID = EventHotKeyID(signature: hotKeySignature, id: 1)
 private var hotKeyRef: EventHotKeyRef?
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     static var shared: AppDelegate?
+
+    /// ONE store for the whole process: the main window and the QuickBar
+    /// panel observe the same fleet stream, health poll, and memory index.
+    let store: FleetStore
 
     private var panel: KeyablePanel?
     private var host: NSHostingView<QuickBarRootView>?
@@ -69,21 +92,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var heightObserver: AnyCancellable?
     private var currentWidgetHeight = NotchPanelMetrics.idleHeight()
     private let expansionState = ExpansionState()
+    private var mainWindow: NSWindow?
+    private var notifier: CompletionNotifier?
+
+    override init() {
+        let config = ServerConfig.load()
+        self.store = FleetStore(
+            client: VertusHTTPClient(config: config),
+            stream: FleetStream(config: config,
+                                cursor: StreamCursor(processName: "vertus"))
+        )
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Self.shared = self
-        // Bare executables (no app bundle / Info.plist) default to a
-        // .prohibited activation policy, which makes the window server treat
-        // this as a background-only app: the NSOpenPanel appears but is
-        // dismissed the moment it tries to become key. Accessory = menu-bar
-        // app that can still activate on demand (no dock icon).
-        NSApp.setActivationPolicy(.accessory)
+        // Regular app by default (the SwiftUI @main App policy); set it
+        // explicitly so the intent survives refactors. The Dock icon and
+        // ⌘Tab presence are the accepted cost of one app with a real window;
+        // nothing about the panel's non-stealing behavior depends on policy.
+        NSApp.setActivationPolicy(.regular)
         vertusTrace("activation policy → \(NSApp.activationPolicy().rawValue)")
         loadIcons()
         buildPanel()
         registerHotkey()
         installMenubarIcon()
         registerLaunchAtLogin()
+        installNotifications()
+        openMainWindow()
 
         if CommandLine.arguments.contains("--verify-nub") {
             renderPanel(progress: 0)
@@ -110,10 +146,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Icons
 
     private func loadIcons() {
-        // The bar is a bare executable: Bundle resources are nil. Assets are
-        // the PNGs in vertus/apps/vertus-bar/ — the legacy ad-hoc build put
-        // the binary next to them; the Swift Package build puts it in
-        // .build/{debug,release}/, which is two levels below vertus/apps/.
+        // Bundle resources when bundled; the legacy PNGs in vertus-bar/ as
+        // the bare-executable fallback.
         var dirs: [URL] = []
         let bundleDir = Bundle.main.resourceURL ?? Bundle.main.bundleURL.deletingLastPathComponent()
         dirs.append(bundleDir.resolvingSymlinksInPath())
@@ -125,21 +159,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let fileURL = dir.appendingPathComponent(name)
                 if let img = NSImage(contentsOf: fileURL) {
                     img.size = NSSize(width: size, height: size)
-                    // Template so the system renders it black on light menu bars
-                    // and white on dark ones, matching the other menubar icons.
                     img.isTemplate = true
                     return img
                 }
             }
             return nil
         }
-        menubarIcon = load("menubar-icon.png", size: 18)		// Template image — exactly like the menubar icon: the system paints
-		// it using the current appearance (white on the black bar, black on
-		// light surfaces), so it can never go "black on black".
-		// LOGO_DARKMODE.png is the white hexagon with the triangle as a
-		// transparent cutout; template rendering uses the alpha channel
-		// only, so the bar background shows through the triangle.
-		appLogo = load("LOGO_DARKMODE.png", size: 14)
+        menubarIcon = load("menubar-icon.png", size: 18)
+        appLogo = load("LOGO_DARKMODE.png", size: 14)
     }
 
     // MARK: - Panel
@@ -171,7 +198,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let host = NSHostingView(rootView: QuickBarRootView(
             logo: appLogo,
-            expansionState: expansionState
+            expansionState: expansionState,
+            store: store
         ))
         host.wantsLayer = true
         // The hosting view must NEVER resize the window on its own: its
@@ -200,11 +228,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         heightObserver = expansionState.$widgetHeight
             .removeDuplicates()
             .sink { [weak self] height in
-                guard let self, let panel = self.panel else { return }
-                self.currentWidgetHeight = height
-                if panel.isVisible {
-                    let frame = self.restingFrame(on: panel.screen ?? NSScreen.main ?? NSScreen.screens.first ?? .init())
-                    panel.setFrame(frame, display: true)
+                MainActor.assumeIsolated {
+                    guard let self, let panel = self.panel else { return }
+                    self.currentWidgetHeight = height
+                    if panel.isVisible {
+                        let frame = self.restingFrame(on: panel.screen ?? NSScreen.main ?? NSScreen.screens.first ?? .init())
+                        panel.setFrame(frame, display: true)
+                    }
                 }
             }
         // The SwiftUI content can resize while the panel is hidden (typing in
@@ -218,12 +248,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: panel,
             queue: .main
         ) { [weak self] _ in
-            guard let self, let panel = self.panel else { return }
-            guard panel.occlusionState.contains(.visible) else { return }
-            panel.setFrame(
-                self.restingFrame(on: panel.screen ?? NSScreen.main ?? NSScreen.screens.first ?? .init()),
-                display: false
-            )
+            MainActor.assumeIsolated {
+                guard let self, let panel = self.panel else { return }
+                guard panel.occlusionState.contains(.visible) else { return }
+                panel.setFrame(
+                    self.restingFrame(on: panel.screen ?? NSScreen.main ?? NSScreen.screens.first ?? .init()),
+                    display: false
+                )
+            }
         }
         // Keep the top edge flush when displays change (resolution, plugged/
         // unplugged monitor): the frame must be recomputed for the new screen.
@@ -232,12 +264,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self, let panel = self.panel, panel.isVisible else { return }
-            self.currentWidgetHeight = self.expansionState.widgetHeight
-            panel.setFrame(
-                self.restingFrame(on: panel.screen ?? NSScreen.main ?? NSScreen.screens.first ?? .init()),
-                display: true
-            )
+            MainActor.assumeIsolated {
+                guard let self, let panel = self.panel, panel.isVisible else { return }
+                self.currentWidgetHeight = self.expansionState.widgetHeight
+                panel.setFrame(
+                    self.restingFrame(on: panel.screen ?? NSScreen.main ?? NSScreen.screens.first ?? .init()),
+                    display: true
+                )
+            }
         }
     }
 
@@ -256,6 +290,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             width: NotchPanelMetrics.windowWidth,
             height: h
         )
+    }
+
+    // MARK: - Main window (owned by the delegate, so "Open in Fleet" is an
+    // in-process activation, never a second process)
+
+    /// Open (or bring forward) the main VERTUS window. Closing it hides it —
+    /// the menubar item and ⇧⌘J keep working; Quit from the menubar quits
+    /// everything.
+    @objc func openMainWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let window = mainWindow {
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1180, height: 760),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "VERTUS"
+        window.contentView = NSHostingView(
+            rootView: FleetRootView().environmentObject(store)
+        )
+        window.setFrameAutosaveName("VERTUSMainWindow")
+        window.center()
+        window.delegate = self
+        mainWindow = window
+        window.makeKeyAndOrderFront(nil)
     }
 
     // MARK: - Show / hide transitions
@@ -280,11 +343,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         vertusTrace("after activate: policy=\(NSApp.activationPolicy().rawValue) active=\(NSApp.isActive) key=\(panel.isKeyWindow) fieldFocusScheduled")
 
         withAnimation(.timingCurve(0.16, 1.0, 0.3, 1.0, duration: 0.6)) {
-            expansionState.progress = 1
+            MainActor.assumeIsolated { expansionState.progress = 1 }
         }
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.2
-            panel.animator().alphaValue = 1.0
+            MainActor.assumeIsolated {
+                ctx.duration = 0.2
+                panel.animator().alphaValue = 1.0
+            }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
             NotificationCenter.default.post(name: .vertusFocusInput, object: nil)
@@ -299,16 +364,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         vertusTrace("hidePanel")
 
         withAnimation(.easeIn(duration: 0.32)) {
-            expansionState.progress = 0
+            MainActor.assumeIsolated { expansionState.progress = 0 }
         }
         NSAnimationContext.runAnimationGroup({ [weak self] ctx in
-            ctx.duration = 0.32
-            self?.panel?.animator().alphaValue = 0
+            MainActor.assumeIsolated {
+                ctx.duration = 0.32
+                self?.panel?.animator().alphaValue = 0
+            }
         }, completionHandler: { [weak self] in
-            guard let self, self.isHiding else { return } // hide was reversed → keep shown
-            self.panel?.orderOut(nil)
-            self.panel?.alphaValue = 1.0
-            self.isHiding = false
+            MainActor.assumeIsolated {
+                guard let self, self.isHiding else { return } // hide was reversed → keep shown
+                self.panel?.orderOut(nil)
+                self.panel?.alphaValue = 1.0
+                self.isHiding = false
+            }
         })
     }
 
@@ -402,13 +471,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
             button.image = menubarIcon
-            button.toolTip = "VERTUS Quick Bar (⇧⌘J)"
+            button.toolTip = "VERTUS (⇧⌘J)"
         }
         let menu = NSMenu()
-        menu.addItem(withTitle: "Toggle Quick Bar (⇧⌘J)", action: #selector(togglePanel), keyEquivalent: "j")
+        menu.addItem(withTitle: "Toggle VERTUS (⇧⌘J)", action: #selector(togglePanel), keyEquivalent: "j")
+            .target = self
+        menu.addItem(withTitle: "Open VERTUS Window", action: #selector(openMainWindow), keyEquivalent: "o")
             .target = self
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit VERTUS Bar", action: #selector(quitApp), keyEquivalent: "q").target = self
+        menu.addItem(withTitle: "Quit VERTUS", action: #selector(quitApp), keyEquivalent: "q").target = self
         item.menu = menu
         statusItem = item
     }
@@ -421,6 +492,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if SMAppService.mainApp.status == .notRegistered {
             try? SMAppService.mainApp.register()
         }
+    }
+
+    // MARK: - Notifications (bundle-only, as before the merge)
+
+    private func installNotifications() {
+        guard notificationsAvailable else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            if !granted {
+                // Degrade silently: the in-app unread badge still works.
+            }
+        }
+        let notifier = CompletionNotifier(store: store)
+        self.notifier = notifier
+        if CommandLine.arguments.contains("--smoke-probe") {
+            Task {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                let settings = await UNUserNotificationCenter.current().notificationSettings()
+                print("SMOKE authorization=\(settings.authorizationStatus.rawValue)")
+                let delivered = await UNUserNotificationCenter.current().deliveredNotifications()
+                for n in delivered {
+                    print("SMOKE delivered: \(n.request.content.title) | \(n.request.content.body.prefix(80))")
+                }
+                exit(0)
+            }
+        }
+    }
+
+    // MARK: - Lifecycle
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        // Closing the main window must not quit the app: the menubar item
+        // and ⇧⌘J stay. Quit from the menubar quits everything.
+        false
     }
 
     // MARK: - Offscreen verification renders
@@ -473,8 +577,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
         }
     }
+}
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+// MARK: - Window delegate: closing the main window hides it (object stays)
+
+extension AppDelegate: NSWindowDelegate {
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)
+        return false
+    }
 }
 
 // MARK: - Notifications

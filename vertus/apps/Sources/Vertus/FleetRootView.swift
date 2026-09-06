@@ -3,73 +3,13 @@ import SwiftUI
 import UserNotifications
 import VertusKit
 
-// MARK: - App
-
-@main
-struct VertusFleetApp: App {
-    @NSApplicationDelegateAdaptor(FleetAppDelegate.self) private var appDelegate
-    // The store is app-owned: one fleet SSE stream, one demultiplexed store,
-    // injected into every view (QuickBarViewModel builds its own for the bar).
-    @StateObject private var store = FleetStore(
-        client: VertusHTTPClient(config: ServerConfig.load()),
-        stream: FleetStream(config: ServerConfig.load(),
-                            cursor: StreamCursor(processName: "vertusfleet"))
-    )
-
-    var body: some Scene {
-        WindowGroup {
-            FleetRootView()
-                .environmentObject(store)
-        }
-        .commands {
-            CommandGroup(replacing: .newItem) { }   // no New Window
-        }
-    }
-}
-
-// MARK: - Delegate
-
 /// UNUserNotificationCenter.current() raises NSInternalInconsistencyException
 /// ("bundleProxyForCurrentProcess is nil") when the process has no app bundle
-/// — i.e. a bare binary launched straight from .build/ during development,
-/// which is how the smoke tests and this demo launch it. Degrade cleanly:
-/// notifications off, everything else works. The wrapped VertusFleet.app
-/// (scripts/make-fleet-app.sh) gets real banners.
-private var notificationsAvailable: Bool {
+/// — i.e. a bare binary launched straight from .build/ during development.
+/// Degrade cleanly: notifications off, everything else works. The bundled
+/// VERTUS.app always gets real banners.
+var notificationsAvailable: Bool {
     Bundle.main.bundleURL.pathExtension == "app"
-}
-
-final class FleetAppDelegate: NSObject, NSApplicationDelegate {
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        guard notificationsAvailable else { return }
-        // Local notifications need explicit permission; the Fleet window is
-        // where background completions land while the user is elsewhere.
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
-            if !granted {
-                // Degrade silently: the in-app unread badge still works.
-            }
-        }
-        // Hidden smoke-test probe: prints notification permission + any
-        // delivered completion notifications, then exits. Used by the
-        // demo harness to verify background-completion delivery.
-        if CommandLine.arguments.contains("--smoke-probe") {
-            Task {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                let settings = await UNUserNotificationCenter.current().notificationSettings()
-                print("SMOKE authorization=\(settings.authorizationStatus.rawValue)")
-                let delivered = await UNUserNotificationCenter.current().deliveredNotifications()
-                for n in delivered {
-                    print("SMOKE delivered: \(n.request.content.title) | \(n.request.content.body.prefix(80))")
-                }
-                exit(0)
-            }
-        }
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
-    }
 }
 
 // MARK: - Notification service
