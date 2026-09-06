@@ -162,7 +162,9 @@ describe("InteractiveMode.renderSessionEntries", () => {
 		});
 
 		expect(fakeThis.pendingTools.has(TOOL_CALL_ID)).toBe(false);
-		expect(renderChat(fakeThis.chatContainer)).toContain("FINAL_RESULT");
+		// VERTUS: tool calls and their results stay out of the session window —
+		// only user input and assistant output are rendered.
+		expect(renderChat(fakeThis.chatContainer)).not.toContain("FINAL_RESULT");
 	});
 
 	test("does not keep completed historical tool calls registered as pending", () => {
@@ -177,6 +179,7 @@ describe("InteractiveMode.renderSessionEntries", () => {
 		);
 
 		expect(fakeThis.pendingTools.size).toBe(0);
-		expect(renderChat(fakeThis.chatContainer)).toContain("HISTORICAL_RESULT");
+		// VERTUS: historical tool results are not rendered in the session window.
+		expect(renderChat(fakeThis.chatContainer)).not.toContain("HISTORICAL_RESULT");
 	});
 });
