@@ -378,6 +378,45 @@ public struct RunDetail: Codable, Equatable {
     public var children: [RunRow]
 }
 
+// MARK: - Memory (hub-owned canonical store; see fleet_memory.py)
+
+/// One entry in the hub's memory index (GET /api/memory).
+public struct MemoryEntry: Codable, Identifiable, Equatable {
+    public var scope: String      // "shared" | "agent"
+    public var agentId: String?   // non-nil only for agent scope
+    public var path: String       // relpath within the scope root
+    public var size: Int?
+    public var mtime: Double?
+    public var sha: String?
+    public var writer: String?    // agent id, "human", or "external"
+    public var updatedAt: Double?
+
+    public var id: String { "\(scope)-\(agentId ?? "shared")-\(path)" }
+    public var displayName: String { path }
+}
+
+/// GET /api/memory/<scope>/<path> — one entry's content.
+public struct MemoryContent: Codable, Equatable {
+    public var scope: String
+    public var agentId: String
+    public var path: String
+    public var content: String
+    public var size: Int
+}
+
+/// PUT /api/memory/<scope>/<path> response.
+public struct MemoryWriteResult: Codable, Equatable {
+    public var written: String
+    public var scope: String
+    public var agentId: String
+    public var size: Int
+}
+
+/// GET /api/memory/search response wrapper.
+public struct MemorySearchResponse: Codable, Equatable {
+    public var results: [MemoryEntry]
+}
+
 // MARK: - Routines (scheduled/triggered per-agent work)
 
 /// Schedule representation: interval seconds only (see fleet_routines.py —

@@ -14,6 +14,7 @@ struct FleetSidebarView: View {
     @State private var errorText: String?
     @State private var showScreens = false
     @State private var showThreads = false
+    @State private var showMemory = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -82,6 +83,17 @@ struct FleetSidebarView: View {
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.secondary)
 
+                Button {
+                    showMemory = true
+                    Task { await store.refreshMemory() }
+                } label: {
+                    Label("Memory", systemImage: "brain")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+
                 connectionRow
             }
             .padding(10)
@@ -95,6 +107,11 @@ struct FleetSidebarView: View {
             ThreadsView()
                 .environmentObject(store)
                 .frame(width: 780, height: 520)
+        }
+        .sheet(isPresented: $showMemory) {
+            MemoryView()
+                .environmentObject(store)
+                .frame(width: 820, height: 560)
         }
         .alert("Delete agent?", isPresented: Binding(
             get: { confirmDelete != nil },

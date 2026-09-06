@@ -101,6 +101,8 @@ struct AgentEditorView: View {
                 if isEdit, case .edit(let agent) = mode {
                     RoutineListView(agentID: agent.id)
                         .environmentObject(store)
+                    AgentMemorySection(agentID: agent.id)
+                        .environmentObject(store)
                 }
             }
             .formStyle(.grouped)

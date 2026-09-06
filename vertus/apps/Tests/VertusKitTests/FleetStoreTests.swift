@@ -619,4 +619,119 @@ final class FleetStoreTests: XCTestCase {
             "failure_count": failureCount,
         ]
     }
+
+    // MARK: - 14. Memory (hub-owned canonical store)
+
+    /// List / read / write / delete round-trip through the real client path,
+    /// plus the event-driven refresh: a write fans out memory_changed and the
+    /// store re-fetches the index without a manual refresh.
+    func testMemoryListReadWriteDeleteRoundTrip() async throws {
+        let alpha = try await makeAgent("alpha")
+        hub.seedMemory(scope: "shared", agentID: nil, path: "profile.md",
+                       content: "The user is Carlton.", writer: "external")
+        await store.refreshMemory()
+
+        let seeded = try await waitUntil {
+            self.store.memoryEntries.contains {
+                $0.scope == "shared" && $0.path == "profile.md"
+                    && $0.writer == "external"
+            }
+        }
+        XCTAssertTrue(seeded, "seeded entry should list after refreshMemory")
+
+        // Write through the client — the emitted memory_changed event must
+        // refresh the store's index by itself.
+        let write = try await store.client.writeMemory(
+            scope: "agent", agentID: alpha.id, path: "notes/todo.md",
+            content: "ship the fleet")
+        XCTAssertEqual(write.written, "notes/todo.md")
+        XCTAssertEqual(write.scope, "agent")
+        XCTAssertEqual(write.agentId, alpha.id)
+
+        let listed = await waitUntil {
+            self.store.memoryEntries.contains {
+                $0.scope == "agent" && $0.agentId == alpha.id
+                    && $0.path == "notes/todo.md"
+            }
+        }
+        XCTAssertTrue(listed, "write should appear in the store via memory_changed")
+
+        // Read back the content.
+        let content = try await store.client.memoryContent(
+            scope: "agent", agentID: alpha.id, path: "notes/todo.md")
+        XCTAssertEqual(content.content, "ship the fleet")
+
+        // Delete; the store's index empties again via the delete event.
+        try await store.client.deleteMemory(scope: "agent", agentID: alpha.id,
+                                            path: "notes/todo.md")
+        let gone = await waitUntil {
+            !self.store.memoryEntries.contains {
+                $0.scope == "agent" && $0.agentId == alpha.id
+                    && $0.path == "notes/todo.md"
+            }
+        }
+        XCTAssertTrue(gone, "deleted entry should leave the store's index")
+    }
+
+    /// Search hits across scopes with a snippet; shared vs per-agent scoping
+    /// is respected by the list endpoint.
+    func testMemorySearchAndScoping() async throws {
+        let alpha = try await makeAgent("alpha")
+        let beta = try await makeAgent("beta")
+        hub.seedMemory(scope: "shared", agentID: nil, path: "profile.md",
+                       content: "The user is Carlton King.", writer: "human")
+        hub.seedMemory(scope: "agent", agentID: alpha.id, path: "private.md",
+                       content: "alpha's favorite color is blue.", writer: "alpha")
+        hub.seedMemory(scope: "agent", agentID: beta.id, path: "private.md",
+                       content: "beta prefers green.", writer: "beta")
+        await store.refreshMemory()
+
+        let hits = try await store.client.searchMemory("Carlton")
+        XCTAssertEqual(hits.count, 1)
+        XCTAssertEqual(hits[0].scope, "shared")
+        XCTAssertEqual(hits[0].path, "profile.md")
+
+        let shared = try await store.client.memoryEntries(scope: "shared")
+        XCTAssertEqual(shared.count, 1)
+        XCTAssertEqual(shared[0].scope, "shared")
+
+        let alphaOnly = try await store.client.memoryEntries(scope: "agent",
+                                                             agentID: alpha.id)
+        XCTAssertEqual(alphaOnly.count, 1)
+        XCTAssertEqual(alphaOnly[0].agentId, alpha.id)
+        XCTAssertEqual(alphaOnly[0].path, "private.md")
+
+        let all = try await store.client.memoryEntries(scope: "all")
+        XCTAssertEqual(all.count, 3)
+    }
+
+    /// A memory_changed event with no run_id (bot write, detected by the hub
+    /// watcher) refreshes the store and carries attribution. In the real hub
+    /// the event is emitted only after the file is written and indexed, so
+    /// the stub seeds the file first, exactly like the hub's write path.
+    func testMemoryChangedEventCarriesAttribution() async throws {
+        _ = try await makeAgent("alpha")
+        await store.refreshMemory()
+
+        hub.seedMemory(scope: "shared", agentID: nil, path: "notes/from-bot.md",
+                       content: "alpha learned something", writer: "alpha")
+        hub.inject(type: "memory_changed",
+                   payload: ["scope": "shared", "agent_id": "",
+                             "path": "notes/from-bot.md", "action": "write",
+                             "writer": "alpha"])
+
+        let seen = await waitUntil {
+            self.store.memoryEntries.contains {
+                $0.scope == "shared" && $0.path == "notes/from-bot.md"
+                    && $0.writer == "alpha"
+            }
+        }
+        XCTAssertTrue(seen, "memory_changed should refresh the store's index")
+        // Memory events must not disturb run-scoped state: no transcript
+        // text, no running flag.
+        if let live = store.live.first(where: { $0.key == "alpha" })?.value {
+            XCTAssertEqual(live.transcriptText, "", "memory events must not add transcript text")
+            XCTAssertFalse(live.isRunning, "memory events must not touch run state")
+        }
+    }
 }

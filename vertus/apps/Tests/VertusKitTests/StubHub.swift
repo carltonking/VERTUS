@@ -46,6 +46,11 @@ final class StubHub {
     private var routines: [[String: Any]] = []
     private var routineSeq = 0
 
+    // Memory store (mirror of the hub's canonical memory: key =
+    // "shared/<rel>" or "agent/<id>/<rel>", with writer attribution).
+    private var memoryFiles: [String: String] = [:]
+    private var memoryWriters: [String: String] = [:]
+
     // Event log: global seq → envelope (type/agent_id/run_id/ts + payload).
     private var eventLog: [Int: [String: Any]] = [:]
     private var liveSeq = 0
@@ -61,6 +66,19 @@ final class StubHub {
     private var running = false
     private let lock = NSLock()
     private var threads: [Thread] = []
+
+    // MARK: - Test seeds (memory + message bus + runs)
+
+    /// Seed a canonical memory entry as the hub would have it after
+    /// migration or a bot/human write.
+    func seedMemory(scope: String, agentID: String?, path: String, content: String,
+                    writer: String = "external") {
+        lock.withLock {
+            let key = memoryKey(scope: scope, agentID: agentID, path: path)
+            memoryFiles[key] = content
+            memoryWriters[key] = writer
+        }
+    }
 
     // MARK: - Test seeds (message bus + runs)
 
@@ -348,7 +366,9 @@ final class StubHub {
             case "/api/routines":
                 response = json(200, ["routines": routines])
             default:
-                if path.hasPrefix("/api/agents/") {
+                if path.hasPrefix("/api/memory") {
+                    response = memoryGet(path: path, rawPath: request.rawPath)
+                } else if path.hasPrefix("/api/agents/") {
                     let rest = String(path.dropFirst("/api/agents/".count))
                     if rest.hasSuffix("/status") {
                         let id = String(rest.dropLast("/status".count))
@@ -409,6 +429,12 @@ final class StubHub {
                     break
                 }
             }
+        } else if request.method == "PUT", path.hasPrefix("/api/memory/") {
+            let rest = String(path.dropFirst("/api/memory/".count))
+            response = memoryWrite(rest: rest, request: request)
+        } else if request.method == "DELETE", path.hasPrefix("/api/memory/") {
+            let rest = String(path.dropFirst("/api/memory/".count))
+            response = memoryDelete(rest: rest)
         } else if request.method == "PATCH", path.hasPrefix("/api/agents/") {
             let id = String(path.dropFirst("/api/agents/".count))
             response = patchAgentResponse(id, request: request)
@@ -425,6 +451,175 @@ final class StubHub {
         writeHTTP(fd, status: response.0,
                   headers: ["Content-Type": "application/json"],
                   body: response.1)
+    }
+
+    // MARK: - Memory endpoints (mirror of vertus_server's /api/memory)
+
+    private func queryParam(_ rawPath: String, _ name: String) -> String? {
+        guard let q = rawPath.firstIndex(of: "?") else { return nil }
+        let query = String(rawPath[rawPath.index(after: q)...])
+        for pair in query.split(separator: "&") {
+            let kv = pair.split(separator: "=", maxSplits: 1)
+            if kv.count == 2, String(kv[0]) == name {
+                return String(kv[1]).removingPercentEncoding
+            }
+        }
+        return nil
+    }
+
+    private func memoryKey(scope: String, agentID: String?, path: String) -> String {
+        if scope == "agent", let agentID { return "agent/\(agentID)/\(path)" }
+        return "shared/\(path)"
+    }
+
+    private func parseMemoryKey(_ key: String) -> (String, String?, String) {
+        let parts = key.split(separator: "/").map(String.init)
+        if parts.first == "agent", parts.count >= 3 {
+            return ("agent", parts[1], parts.dropFirst(2).joined(separator: "/"))
+        }
+        return ("shared", nil, parts.dropFirst().joined(separator: "/"))
+    }
+
+    private func memoryEntry(_ key: String, _ content: String) -> [String: Any] {
+        let (scope, agentID, rel) = parseMemoryKey(key)
+        let now = Date().timeIntervalSince1970
+        return ["scope": scope, "agent_id": agentID ?? "", "path": rel,
+                "size": content.utf8.count, "mtime": now, "sha": "stub",
+                "writer": memoryWriters[key] ?? "external", "updated_at": now]
+    }
+
+    private func memoryGet(path: String, rawPath: String) -> (Int, Data) {
+        if path == "/api/memory" {
+            let scope = queryParam(rawPath, "scope") ?? "all"
+            let agentID = queryParam(rawPath, "agent_id")
+            return lock.withLock {
+                var items: [[String: Any]] = []
+                for (key, content) in memoryFiles {
+                    let (entryScope, entryAgent, _) = parseMemoryKey(key)
+                    if scope == "shared" && entryScope != "shared" { continue }
+                    if scope == "agent" {
+                        if entryScope != "agent" { continue }
+                        if let agentID, entryAgent != agentID { continue }
+                    }
+                    items.append(memoryEntry(key, content))
+                }
+                items.sort {
+                    let aScope = $0["scope"] as? String ?? ""
+                    let bScope = $1["scope"] as? String ?? ""
+                    if aScope != bScope { return aScope < bScope }
+                    return ($0["path"] as? String ?? "") < ($1["path"] as? String ?? "")
+                }
+                return json(200, ["entries": items])
+            }
+        }
+        if path == "/api/memory/search" {
+            guard let q = queryParam(rawPath, "q"), !q.isEmpty else {
+                return json(400, ["error": "q required"])
+            }
+            return lock.withLock {
+                var hits: [[String: Any]] = []
+                for (key, content) in memoryFiles
+                where content.lowercased().contains(q.lowercased()) {
+                    var entry = memoryEntry(key, content)
+                    entry["snippet"] = memorySnippet(content, needle: q)
+                    hits.append(entry)
+                }
+                return json(200, ["results": hits])
+            }
+        }
+        if path.hasPrefix("/api/memory/") {
+            return memoryRead(rest: String(path.dropFirst("/api/memory/".count)))
+        }
+        return json(404, ["error": "not found"])
+    }
+
+    private func memoryTarget(_ rest: String) -> (String, String?, String)? {
+        let parts = rest.split(separator: "/").map(String.init)
+        if parts.first == "shared" {
+            return ("shared", nil, parts.dropFirst().joined(separator: "/"))
+        }
+        if parts.first == "agent", parts.count >= 3 {
+            return ("agent", parts[1], parts.dropFirst(2).joined(separator: "/"))
+        }
+        return nil
+    }
+
+    private func memoryAgentKnown(_ agentID: String?) -> Bool {
+        guard let agentID else { return true }
+        return agents[agentID] != nil
+    }
+
+    private func memoryRead(rest: String) -> (Int, Data) {
+        guard let (scope, agentID, rel) = memoryTarget(rest) else {
+            return json(400, ["error": "malformed memory path"])
+        }
+        if !memoryAgentKnown(agentID) {
+            return json(404, ["error": "agent not found: \(agentID ?? "")"])
+        }
+        return lock.withLock {
+            let key = memoryKey(scope: scope, agentID: agentID, path: rel)
+            guard let content = memoryFiles[key] else {
+                return json(404, ["error": "no such entry: \(rel)"])
+            }
+            return json(200, ["scope": scope, "agent_id": agentID ?? "",
+                              "path": rel, "content": content,
+                              "size": content.utf8.count])
+        }
+    }
+
+    private func memoryWrite(rest: String, request: ReceivedRequest) -> (Int, Data) {
+        guard let (scope, agentID, rel) = memoryTarget(rest) else {
+            return json(400, ["error": "malformed memory path"])
+        }
+        guard let content = request.body?["content"] as? String else {
+            return json(400, ["error": "content required (string)"])
+        }
+        if !memoryAgentKnown(agentID) {
+            return json(404, ["error": "agent not found: \(agentID ?? "")"])
+        }
+        lock.withLock {
+            let key = memoryKey(scope: scope, agentID: agentID, path: rel)
+            memoryFiles[key] = content
+            memoryWriters[key] = "human"
+        }
+        // Mirror the hub: every canonical write fans out a memory_changed
+        // event (store-before-fanout in the real hub; the stub just emits).
+        inject(type: "memory_changed",
+               payload: ["scope": scope, "agent_id": agentID ?? "",
+                         "path": rel, "action": "write", "writer": "human"])
+        return json(200, ["written": rel, "scope": scope,
+                          "agent_id": agentID ?? "", "size": content.utf8.count])
+    }
+
+    private func memoryDelete(rest: String) -> (Int, Data) {
+        guard let (scope, agentID, rel) = memoryTarget(rest) else {
+            return json(400, ["error": "malformed memory path"])
+        }
+        if !memoryAgentKnown(agentID) {
+            return json(404, ["error": "agent not found: \(agentID ?? "")"])
+        }
+        let existed = lock.withLock {
+            memoryFiles.removeValue(forKey: memoryKey(scope: scope, agentID: agentID, path: rel)) != nil
+        }
+        guard existed else {
+            return json(404, ["error": "no such entry: \(rel)"])
+        }
+        inject(type: "memory_changed",
+               payload: ["scope": scope, "agent_id": agentID ?? "",
+                         "path": rel, "action": "delete", "writer": "human"])
+        return json(200, ["deleted": rel, "scope": scope,
+                          "agent_id": agentID ?? ""])
+    }
+
+    private func memorySnippet(_ text: String, needle: String) -> String {
+        guard let lowerRange = text.lowercased().range(of: needle.lowercased()) else {
+            return String(text.prefix(120)).replacingOccurrences(of: "\n", with: " ")
+        }
+        let start = text.distance(from: text.startIndex, to: lowerRange.lowerBound)
+        let from = max(0, start - 60)
+        let startIdx = text.index(text.startIndex, offsetBy: from, limitedBy: text.endIndex) ?? text.startIndex
+        let endIdx = text.index(startIdx, offsetBy: 120, limitedBy: text.endIndex) ?? text.endIndex
+        return String(text[startIdx..<endIdx]).replacingOccurrences(of: "\n", with: " ")
     }
 
     private func writeSSEHeaders(_ fd: Int32) {

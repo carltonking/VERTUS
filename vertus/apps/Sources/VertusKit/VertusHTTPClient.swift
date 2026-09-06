@@ -223,6 +223,47 @@ public final class VertusHTTPClient {
                       key: "activity", query: [URLQueryItem(name: "limit", value: String(limit))])
     }
 
+    // MARK: - Memory
+
+    /// GET /api/memory?scope=shared|agent|all&agent_id= — index-backed listing.
+    public func memoryEntries(scope: String = "all", agentID: String? = nil) async throws -> [MemoryEntry] {
+        var q = [URLQueryItem(name: "scope", value: scope)]
+        if let agentID { q.append(URLQueryItem(name: "agent_id", value: agentID)) }
+        return try await get([MemoryEntry].self, path: "/api/memory", key: "entries", query: q)
+    }
+
+    /// GET /api/memory/<scope>/<path> — one entry's content.
+    public func memoryContent(scope: String, agentID: String? = nil, path: String) async throws -> MemoryContent {
+        try await get(MemoryContent.self, path: memoryPath(scope, agentID: agentID, path: path), key: nil)
+    }
+
+    /// PUT /api/memory/<scope>/<path> {content} — human-initiated write.
+    public func writeMemory(scope: String, agentID: String? = nil, path: String,
+                            content: String) async throws -> MemoryWriteResult {
+        try await send("PUT", path: memoryPath(scope, agentID: agentID, path: path),
+                       body: ["content": content])
+    }
+
+    /// DELETE /api/memory/<scope>/<path>.
+    public func deleteMemory(scope: String, agentID: String? = nil, path: String) async throws {
+        _ = try await sendJSON("DELETE", path: memoryPath(scope, agentID: agentID, path: path), body: nil)
+    }
+
+    /// "/api/memory/shared/<path>" or "/api/memory/agent/<id>/<path>" (agent
+    /// scope requires an agent id).
+    private func memoryPath(_ scope: String, agentID: String?, path: String) -> String {
+        if scope == "agent", let agentID {
+            return "/api/memory/agent/\(escaped(agentID))/\(escaped(path))"
+        }
+        return "/api/memory/shared/\(escaped(path))"
+    }
+
+    /// GET /api/memory/search?q= — substring search across all scopes.
+    public func searchMemory(_ q: String) async throws -> [MemoryEntry] {
+        try await get(MemorySearchResponse.self, path: "/api/memory/search",
+                      key: nil, query: [URLQueryItem(name: "q", value: q)]).results
+    }
+
     // MARK: - Health
 
     /// GET /api/health — real hub health (uptime, live subsystem probes,

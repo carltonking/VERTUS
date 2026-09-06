@@ -133,6 +133,9 @@ public final class FleetStore: ObservableObject {
     @Published public private(set) var activity: [FleetActivityItem] = []
     /// All routines (refreshRoutines) — the bot editor lists per agent.
     @Published public private(set) var routines: [Routine] = []
+    /// Hub memory index across all scopes (refreshMemory) — drives the
+    /// memory view; refreshed live on every memory_changed fleet event.
+    @Published public private(set) var memoryEntries: [MemoryEntry] = []
     /// Real hub health (refreshHealth) — nil until the first probe answers.
     @Published public private(set) var hubHealth: HubHealth?
 
@@ -196,6 +199,7 @@ public final class FleetStore: ObservableObject {
         Task { await refreshActivity() }
         Task { await refreshRoutines() }
         Task { await refreshHealth() }
+        Task { await refreshMemory() }
     }
 
     /// GET /api/fleet/screens (called on start, on status-poll cycles, and
@@ -283,6 +287,14 @@ public final class FleetStore: ObservableObject {
     // MARK: - Event intake (main actor)
 
     private func handle(_ event: WireEvent) {
+        // Memory changes are fleet-wide and carry no run_id — they must be
+        // handled before the run-scoped guards below. The hub index is the
+        // single source of truth; we re-fetch it so any writer (bot, human,
+        // fork mirror) is reflected identically.
+        if event.type == "memory_changed" {
+            Task { await refreshMemory() }
+            return
+        }
         guard let agentID = event.agentId else { return }
         let state = liveState(for: agentID)
         guard let runID = event.runId else { return }
@@ -527,6 +539,17 @@ public final class FleetStore: ObservableObject {
             hubHealth = try await client.hubHealth()
         } catch {
             // Hub unreachable: keep the last known payload (nil on first run).
+        }
+    }
+
+    /// GET /api/memory — the hub index, all scopes. Refreshed on start and
+    /// on every memory_changed fleet event, so bot writes and human edits
+    /// both show up live, attributed.
+    public func refreshMemory() async {
+        do {
+            memoryEntries = try await client.memoryEntries(scope: "all")
+        } catch {
+            // Best-effort: the memory view shows what it last had.
         }
     }
 
