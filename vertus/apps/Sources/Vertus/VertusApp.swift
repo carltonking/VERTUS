@@ -489,8 +489,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Launch at login
 
     private func registerLaunchAtLogin() {
-        if SMAppService.mainApp.status == .notRegistered {
-            try? SMAppService.mainApp.register()
+        let status = SMAppService.mainApp.status
+        // SMAppService.Status: notRegistered=0, enabled=1, requiresApproval=2,
+        // notFound=3. Only .enabled means the login item actually exists;
+        // .notFound (an app not in /Applications, or an ad-hoc-signed bundle
+        // that never persisted) must retry registration, not skip it.
+        if status == .enabled {
+            vertusTrace("login item already enabled")
+            return
+        }
+        vertusTrace("login item status \(status.rawValue) — registering")
+        do {
+            try SMAppService.mainApp.register()
+            vertusTrace("login item registered via SMAppService")
+        } catch {
+            // Ad-hoc signed bundles can be refused by SMAppService on some
+            // macOS builds (it fails silently with a domain error). Fall
+            // back to a launchd plist that launches the BUNDLE binary (not a
+            // raw swiftc product), so the notification entitlement context is
+            // preserved — the whole reason Checkpoint 2 demands a bundle.
+            vertusTrace("SMAppService.register failed: \(error) — falling back to launchd plist")
+            installLegacyLoginPlist()
+        }
+    }
+
+    private func installLegacyLoginPlist() {
+        let binary = Bundle.main.executablePath ?? ""
+        guard !binary.isEmpty else {
+            vertusTrace("login item fallback: no executable path to install")
+            return
+        }
+        let plistPath = NSHomeDirectory() + "/Library/LaunchAgents/com.vertus.app.plist"
+        let plist: [String: Any] = [
+            "Label": "com.vertus.app",
+            "ProgramArguments": [binary],
+            "RunAtLoad": true,
+            "KeepAlive": false,
+        ]
+        do {
+            let data = try PropertyListSerialization.data(fromPropertyList: plist,
+                                                          format: .xml, options: 0)
+            try data.write(to: URL(fileURLWithPath: plistPath))
+            vertusTrace("login item fallback plist written: \(plistPath)")
+        } catch {
+            vertusTrace("login item fallback plist write failed: \(error)")
         }
     }
 
