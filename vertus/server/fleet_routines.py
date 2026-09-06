@@ -11,9 +11,10 @@ cron. Justification: the Python stdlib has no cron parser (adding a parser
 dependency for this is not worth it), intervals are fully deterministic and
 testable, and the fleet's runs are irregular-length tasks where wall-clock
 alignment (\"at 9am\") buys nothing over \"every N seconds\". One syntax, never
-two. N must be a positive integer; sub-60s values exist for tests and demos
-— nothing prevents them because the NEVER-CONCURRENT rule bounds the damage
-of a fast interval to one in-flight turn.
+two. N must be an integer >= 30s at the API (MIN_INTERVAL_S); tests use the
+internal store path to go faster — NEVER-CONCURRENT bounds the damage of a
+fast interval to one in-flight turn, but 30s keeps a mis-set routine from
+becoming a token-burn footgun.
 
 Trigger vocabulary (``trigger`` JSON; keep it SMALL and enumerable — this is
 deliberately not a rules engine):
@@ -68,7 +69,11 @@ from typing import Callable, Optional
 log = logging.getLogger("vertus.routines")
 
 DEFAULT_TICK_S = 1.0
-MIN_INTERVAL_S = 1
+# External callers (the HTTP API) cannot schedule faster than every 30s —
+# sub-30s intervals are token-burn footguns and exist only for tests, which
+# bypass the parser entirely by creating routine rows directly on the store
+# (the internal path: store.create_routine + RoutineManager.arm).
+MIN_INTERVAL_S = 30
 FAILURE_THRESHOLD = 3
 
 TERMINAL_EVENT_TYPES = ("done", "error", "cancelled", "timeout")

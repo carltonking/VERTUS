@@ -116,6 +116,14 @@ def test_routine_validation(hub):
         "schedule": {"interval_s": -1},
     })
     assert code == 400
+    # The 30s floor is an EXTERNAL contract: the API rejects sub-30s
+    # intervals with a readable message (tests use the internal store path).
+    code, body = _req(base, "/api/routines", "POST", {
+        "agent_id": scout, "name": "R", "prompt": "x",
+        "schedule": {"interval_s": 5},
+    })
+    assert code == 400
+    assert "30" in body["error"]
     # Unknown trigger type (vocabulary is small and enumerable)
     code, body = _req(base, "/api/routines", "POST", {
         "agent_id": scout, "name": "R", "prompt": "x",

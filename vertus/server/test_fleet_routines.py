@@ -324,9 +324,14 @@ def test_success_resets_failure_history(tmp_path):
 def test_schedule_validation():
     assert parse_schedule({"interval_s": 60}) == {"interval_s": 60}
     assert parse_schedule(None) is None
-    for bad in ({"interval_s": 0}, {"interval_s": -5}, {"interval_s": "60"},
+    # The 30s floor is the EXTERNAL contract: the parser rejects anything
+    # below it. Tests bypass the parser via store.create_routine (internal
+    # path), so sub-30s intervals remain testable.
+    for bad in ({"interval_s": 0}, {"interval_s": 1}, {"interval_s": 15},
+                {"interval_s": 29}, {"interval_s": -5}, {"interval_s": "60"},
                 {"interval_s": True}, {"every": 60}, {}):
         _expect_validation(bad, parse_schedule)
+    assert parse_schedule({"interval_s": 30}) == {"interval_s": 30}
 
 
 def test_trigger_validation():
