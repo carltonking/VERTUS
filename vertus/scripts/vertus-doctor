@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# vertus-doctor — fleet diagnostics, from any cwd.
+#
+# Thin shim over `python3 vertus/server/vertus_server.py doctor` (the hub's
+# own entry point, same interpreter the launchd agent uses). Installed to
+# ~/.local/bin/vertus-doctor, matching the existing ~/.local/bin/vertus
+# wrapper mechanism.
+#
+# The repo path contains a space ("01 - PROJECTS"), which is why this shim
+# exists at all — quoting a spaced absolute path in every shell is exactly
+# the friction the standalone command removes.
+
+# Resolve the real script path through the ~/.local/bin symlink so the repo
+# root is found no matter how the command was reached.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+	DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+	SOURCE="$(readlink "$SOURCE")"
+	[[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+REPO_DIR="$(cd -P "$(dirname "$SOURCE")/../.." && pwd)"
+
+exec /usr/bin/python3 "$REPO_DIR/vertus/server/vertus_server.py" doctor "$@"

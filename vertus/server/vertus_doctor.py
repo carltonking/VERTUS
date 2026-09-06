@@ -281,16 +281,12 @@ def env_checks() -> list[dict]:
                           f"venv python missing at {venv_py}",
                           "create the fork's venv, or set VERTUS_HERMES_PYTHON"))
 
-    # interpreter + stdlib assumptions: the hub's code is 3.10+ syntax; the
-    # real proof is that the server modules import under this interpreter.
-    py = sys.version_info
-    if py >= (3, 10):
-        out.append(_check("env.python_interp", "ok",
-                          f"Python {py.major}.{py.minor}.{py.micro} (>= 3.10)"))
-    else:
-        out.append(_check("env.python_interp", "fail",
-                          f"Python {py.major}.{py.minor} — hub code uses 3.10+ syntax",
-                          "run doctor (and the hub) with Python >= 3.10"))
+    # interpreter + stdlib assumptions. The REAL gate is importability: the
+    # hub runs under /usr/bin/python3 (3.9.6 on this machine, per the launchd
+    # plist) and every module compiles+imports under it — the old blanket
+    # "3.10+ syntax" claim was false-positive under the hub's own
+    # interpreter. Version below 3.10 with working imports is a warn, not a
+    # fail; an interpreter that cannot import the server is the fail.
     try:
         subprocess.run(
             [sys.executable, "-c",
@@ -298,12 +294,34 @@ def env_checks() -> list[dict]:
             cwd=str(Path(__file__).parent), capture_output=True, text=True,
             timeout=20, check=True,
         )
+        imported = True
+        import_err = ""
+    except subprocess.CalledProcessError as exc:
+        imported = False
+        import_err = exc.stderr.strip()[:200]
+
+    py = sys.version_info
+    if not imported:
+        out.append(_check("env.server_modules_import", "fail",
+                          f"a server module fails to import: {import_err}",
+                          "fix the import error — the hub cannot boot either"))
+        out.append(_check("env.python_interp", "fail",
+                          f"Python {py.major}.{py.minor} cannot import the server modules",
+                          "use a Python that imports vertus_server (the launchd plist's "
+                          "/usr/bin/python3 is the reference)"))
+    else:
         out.append(_check("env.server_modules_import", "ok",
                           "vertus_server, run_store, agent_registry, hermes_bridge import"))
-    except subprocess.CalledProcessError as exc:
-        out.append(_check("env.server_modules_import", "fail",
-                          f"a server module fails to import: {exc.stderr.strip()[:200]}",
-                          "fix the import error — the hub cannot boot either"))
+        if py >= (3, 10):
+            out.append(_check("env.python_interp", "ok",
+                              f"Python {py.major}.{py.minor}.{py.micro} (>= 3.10)"))
+        else:
+            out.append(_check("env.python_interp", "warn",
+                              f"Python {py.major}.{py.minor} — below 3.10 but all server "
+                              "modules import under it (the launchd hub runs exactly "
+                              "this interpreter)",
+                              "informational: the import check is the gate, not the "
+                              "version number"))
 
     # cua-driver
     driver_cmd = os.environ.get("HERMES_CUA_DRIVER_CMD", "").strip()
