@@ -2012,7 +2012,9 @@ class VertusHandler(BaseHTTPRequestHandler):
             self._json(500, {"error": str(exc)[:200]})
             return
         self.routines.arm(routine["routine_id"], schedule)
-        self._json(201, self._routine_wire(routine))
+        # Re-read AFTER arming so the response carries the truth: next_run_at
+        # is set by arm() (the create-time row predates it).
+        self._json(201, self._routine_wire(store.get_routine(routine["routine_id"])))
 
     @staticmethod
     def _routine_wire(row: dict | None) -> dict | None:
@@ -2979,7 +2981,9 @@ def serve(host: str | None, port: int) -> None:
     # never race each other. The store's event listener composes fleet fanout
     # with the trigger scan — the listener runs on the STORE WRITER thread, so
     # on_event() only queues work (never blocks, never writes).
-    routines = RoutineManager(store, registry, lambda: sessions)
+    # Provider callables, not instances: the manager resolves the store and
+    # session manager lazily (mirrors BotMessenger's construction pattern).
+    routines = RoutineManager(lambda: store, registry, lambda: sessions)
     VertusHandler.routines = routines
 
     def _composed_listener(envelope: dict) -> None:

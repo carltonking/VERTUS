@@ -78,6 +78,9 @@ def test_routine_crud_round_trip(hub):
     assert body["schedule"] == {"interval_s": 3600}
     assert body["trigger"] == {"type": "run_completed", "agent_id": primary}
     assert body["enabled"] is True
+    # Regression: the create response is read AFTER arming, so next_run_at
+    # must already be set (found live: the response used to show null).
+    assert body["next_run_at"] is not None
     # GET list + GET one
     code, listing = _req(base, "/api/routines")
     assert code == 200 and len(listing["routines"]) == 1
