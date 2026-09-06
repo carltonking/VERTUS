@@ -131,6 +131,8 @@ public final class FleetStore: ObservableObject {
     /// Newest runs across all agents (refreshActivity) — drives the
     /// "working for X" roster line and user-vs-bot activity badges.
     @Published public private(set) var activity: [FleetActivityItem] = []
+    /// All routines (refreshRoutines) — the bot editor lists per agent.
+    @Published public private(set) var routines: [Routine] = []
     /// Agent currently displayed in the foreground window (drives unread +
     /// notification suppression; written to the shared UI file too).
     @Published public var foregroundAgentID: String? {
@@ -179,6 +181,7 @@ public final class FleetStore: ObservableObject {
         Task { await refreshScreens() }
         Task { await refreshThreads() }
         Task { await refreshActivity() }
+        Task { await refreshRoutines() }
     }
 
     /// GET /api/fleet/screens (called on start, on status-poll cycles, and
@@ -481,7 +484,67 @@ public final class FleetStore: ObservableObject {
             selectedAgentID = agents.first { $0.id != id }?.id
         }
         await refreshAgents()
+        await refreshRoutines()
         return result
+    }
+
+    // MARK: - Routines
+
+    /// All routines, optionally one agent's (the bot editor scopes to it).
+    public func routines(for agentID: String? = nil) -> [Routine] {
+        guard let agentID else { return routines }
+        return routines.filter { $0.agentId == agentID }
+    }
+
+    public func refreshRoutines(agentID: String? = nil) async {
+        do {
+            routines = try await client.routines(agentID: agentID)
+            lastSyncError = nil
+        } catch {
+            lastSyncError = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    public func createRoutine(agentID: String, name: String, prompt: String,
+                              intervalS: Int? = nil, trigger: RoutineTrigger? = nil,
+                              enabled: Bool = true) async throws -> Routine {
+        let routine = try await client.createRoutine(agentID: agentID, name: name,
+                                                     prompt: prompt,
+                                                     intervalS: intervalS,
+                                                     trigger: trigger,
+                                                     enabled: enabled)
+        await refreshRoutines()
+        return routine
+    }
+
+    @discardableResult
+    public func updateRoutine(_ id: String, name: String? = nil, prompt: String? = nil,
+                              intervalS: Int? = nil, trigger: RoutineTrigger? = nil,
+                              enabled: Bool? = nil,
+                              clearSchedule: Bool = false,
+                              clearTrigger: Bool = false) async throws -> Routine {
+        let routine = try await client.updateRoutine(id, name: name, prompt: prompt,
+                                                     intervalS: intervalS,
+                                                     trigger: trigger, enabled: enabled,
+                                                     clearSchedule: clearSchedule,
+                                                     clearTrigger: clearTrigger)
+        await refreshRoutines()
+        return routine
+    }
+
+    public func deleteRoutine(_ id: String) async throws {
+        _ = try await client.deleteRoutine(id)
+        await refreshRoutines()
+    }
+
+    /// Fire now (ignores the schedule). Throws the hub's typed error — 409
+    /// when the routine's turn is already in flight, 503 when degraded.
+    @discardableResult
+    public func runRoutineNow(_ id: String) async throws -> String {
+        let runID = try await client.runRoutineNow(id)
+        await refreshRoutines()
+        return runID
     }
 
     // MARK: - Cancellation (supervision)

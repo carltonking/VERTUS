@@ -43,6 +43,8 @@ final class StubHub {
     // Bot-to-bot messaging (mirror of bot_messages/threads).
     private var botThreads: [[String: Any]] = []
     private var botMessages: [[String: Any]] = []
+    private var routines: [[String: Any]] = []
+    private var routineSeq = 0
 
     // Event log: global seq → envelope (type/agent_id/run_id/ts + payload).
     private var eventLog: [Int: [String: Any]] = [:]
@@ -343,6 +345,8 @@ final class StubHub {
                 response = json(200, ["messages": botMessages])
             case "/api/runs":
                 response = json(200, ["runs": runs])
+            case "/api/routines":
+                response = json(200, ["routines": routines])
             default:
                 if path.hasPrefix("/api/agents/") {
                     let rest = String(path.dropFirst("/api/agents/".count))
@@ -358,6 +362,13 @@ final class StubHub {
                 } else if path.hasPrefix("/api/runs/") {
                     let id = String(path.dropFirst("/api/runs/".count))
                     response = runDetailResponse(id)
+                } else if path.hasPrefix("/api/routines/"), path.hasSuffix("/history") {
+                    let rid = String(path.dropFirst("/api/routines/".count).dropLast("/history".count))
+                    response = json(200, ["routine_id": rid,
+                                          "runs": runs.filter { $0["routine_id"] as? String == rid }])
+                } else if path.hasPrefix("/api/routines/") {
+                    let rid = String(path.dropFirst("/api/routines/".count))
+                    response = routineResponse(rid)
                 }
             }
         } else if request.method == "POST" {
@@ -383,12 +394,17 @@ final class StubHub {
             } else if path.hasPrefix("/api/agents/"), path.hasSuffix("/cancel") {
                 let id = String(path.dropFirst("/api/agents/".count).dropLast("/cancel".count))
                 response = cancelAgentResponse(id)
+            } else if path.hasPrefix("/api/routines/"), path.hasSuffix("/run") {
+                let rid = String(path.dropFirst("/api/routines/".count).dropLast("/run".count))
+                response = runRoutineNowResponse(rid)
             } else {
                 switch path {
                 case "/api/prompt":
                     response = promptResponse(request)
                 case "/api/agents":
                     response = createAgentResponse(request)
+                case "/api/routines":
+                    response = createRoutineResponse(request)
                 default:
                     break
                 }
@@ -396,9 +412,15 @@ final class StubHub {
         } else if request.method == "PATCH", path.hasPrefix("/api/agents/") {
             let id = String(path.dropFirst("/api/agents/".count))
             response = patchAgentResponse(id, request: request)
+        } else if request.method == "PATCH", path.hasPrefix("/api/routines/") {
+            let id = String(path.dropFirst("/api/routines/".count))
+            response = patchRoutineResponse(id, request: request)
         } else if request.method == "DELETE", path.hasPrefix("/api/agents/") {
             let id = String(path.dropFirst("/api/agents/".count))
             response = deleteAgentResponse(id)
+        } else if request.method == "DELETE", path.hasPrefix("/api/routines/") {
+            let id = String(path.dropFirst("/api/routines/".count))
+            response = deleteRoutineResponse(id)
         }
         writeHTTP(fd, status: response.0,
                   headers: ["Content-Type": "application/json"],
@@ -592,6 +614,124 @@ final class StubHub {
         agents.removeValue(forKey: id)
         agentOrder.removeAll { $0 == id }
         return json(200, ["deleted": id, "archived_to": "/tmp/stub/.trash/\(id)-123"])
+    }
+
+    // MARK: - Routines
+
+    private func routineResponse(_ id: String) -> (Int, Data) {
+        if let routine = routines.first(where: { $0["routine_id"] as? String == id }) {
+            return json(200, routine)
+        }
+        return json(404, ["error": "routine not found: \(id)"])
+    }
+
+    private func createRoutineResponse(_ request: ReceivedRequest) -> (Int, Data) {
+        guard let body = request.body,
+              let agentID = body["agent_id"] as? String,
+              agents[agentID] != nil else {
+            return json(404, ["error": "agent not found"])
+        }
+        guard let name = body["name"] as? String, !name.isEmpty else {
+            return json(400, ["error": "name required"])
+        }
+        guard let prompt = body["prompt"] as? String, !prompt.isEmpty else {
+            return json(400, ["error": "prompt required"])
+        }
+        guard body["schedule"] != nil || body["trigger"] != nil else {
+            return json(400, ["error": "routine needs schedule and/or trigger"])
+        }
+        let now = Date().timeIntervalSince1970
+        let interval = ((body["schedule"] as? [String: Any])?["interval_s"] as? Int)
+        let trigger = body["trigger"] as? [String: Any]
+        let created: [String: Any] = lock.withLock {
+            routineSeq += 1
+            let rid = "routine-\(routineSeq)"
+            routines.append([
+                "routine_id": rid,
+                "agent_id": agentID,
+                "name": name,
+                "prompt": prompt,
+                "schedule": interval.map { ["interval_s": $0] } as Any,
+                "trigger": trigger as Any,
+                "enabled": body["enabled"] as? Bool ?? true,
+                "created_at": now,
+                "last_run_at": NSNull(),
+                "last_run_id": NSNull(),
+                "next_run_at": interval.map { now + Double($0) } as Any,
+                "failure_count": 0,
+            ])
+            return routines[routines.count - 1]
+        }
+        return json(201, created)
+    }
+
+    private func patchRoutineResponse(_ id: String, request: ReceivedRequest) -> (Int, Data) {
+        guard let i = routines.firstIndex(where: { $0["routine_id"] as? String == id }) else {
+            return json(404, ["error": "routine not found: \(id)"])
+        }
+        if let body = request.body {
+            let allowed = ["name", "prompt", "schedule", "trigger", "enabled"]
+            if body.keys.contains(where: { !allowed.contains($0) }) {
+                return json(400, ["error": "unknown routine fields"])
+            }
+            for (key, value) in body {
+                routines[i][key] = value
+            }
+            if let interval = ((body["schedule"] as? [String: Any])?["interval_s"] as? Int) {
+                routines[i]["next_run_at"] = Date().timeIntervalSince1970 + Double(interval)
+            }
+        }
+        return json(200, routines[i])
+    }
+
+    private func deleteRoutineResponse(_ id: String) -> (Int, Data) {
+        guard let i = routines.firstIndex(where: { $0["routine_id"] as? String == id }) else {
+            return json(404, ["error": "routine not found: \(id)"])
+        }
+        routines.remove(at: i)
+        return json(200, ["deleted": id])
+    }
+
+    private func runRoutineNowResponse(_ id: String) -> (Int, Data) {
+        guard let i = routines.firstIndex(where: { $0["routine_id"] as? String == id }) else {
+            return json(404, ["error": "routine not found: \(id)"])
+        }
+        let routine = routines[i]
+        guard routine["enabled"] as? Bool != false else {
+            return json(400, ["error": "routine is disabled"])
+        }
+        let agentID = routine["agent_id"] as! String
+        // Never-concurrent: a routine run still queued/running blocks a re-fire.
+        let active = runs.contains { $0["routine_id"] as? String == id
+            && ["queued", "running"].contains($0["state"] as? String) }
+        if active {
+            return json(409, ["error": "already running"])
+        }
+        var runID = ""
+        lock.withLock {
+            runSeq += 1
+            runID = "run-\(runSeq)"
+            let now = Date().timeIntervalSince1970
+            runs.append([
+                "run_id": runID,
+                "agent_id": agentID,
+                "prompt": routine["prompt"] as? String ?? "",
+                "remote": 0,
+                "source": "routine:\(id)",
+                "state": "queued",
+                "created_at": now,
+                "started_at": NSNull(),
+                "ended_at": NSNull(),
+                "error": NSNull(),
+                "gateway_respawns": 0,
+                "run_kind": "routine",
+                "routine_id": id,
+            ])
+            routines[i]["last_run_id"] = runID
+            routines[i]["last_run_at"] = now
+            routines[i]["failure_count"] = 0
+        }
+        return json(202, ["accepted": true, "fired": true, "run_id": runID])
     }
 
     // MARK: - Cancellation (supervision)

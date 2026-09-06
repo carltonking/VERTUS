@@ -98,6 +98,10 @@ struct AgentEditorView: View {
                 Text("Autonomy selects the GUI driver's spawn-time permission mode. It is not per-action consent: individual computer-use actions cannot be approved or denied mid-turn from here.")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
+                if isEdit, case .edit(let agent) = mode {
+                    RoutineListView(agentID: agent.id)
+                        .environmentObject(store)
+                }
             }
             .formStyle(.grouped)
             .padding(.bottom, 8)

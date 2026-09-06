@@ -67,6 +67,11 @@ struct FleetActivityView: View {
                     .font(.system(size: 9))
                     .foregroundStyle(.blue)
                     .help("bot-initiated")
+            } else if item.isRoutine {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.purple)
+                    .help("routine-initiated")
             }
             Text(item.prompt)
                 .font(.system(size: 12))

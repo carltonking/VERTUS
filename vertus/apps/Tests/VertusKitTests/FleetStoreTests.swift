@@ -489,4 +489,96 @@ final class FleetStoreTests: XCTestCase {
         let fallback = ServerConfig.load(environment: [:])
         XCTAssertEqual(fallback.baseURL, "http://127.0.0.1:8787")
     }
+
+    // MARK: Routines
+
+    func testRoutineCRUDRoundTrip() async throws {
+        let agent = try await makeAgent("alpha")
+
+        let created = try await store.createRoutine(
+            agentID: agent.id, name: "Nightly scan", prompt: "scan for drift",
+            intervalS: 3600,
+            trigger: RoutineTrigger(type: "run_completed", agentId: agent.id))
+        XCTAssertEqual(created.schedule?.intervalS, 3600)
+        XCTAssertEqual(created.trigger?.type, "run_completed")
+        XCTAssertEqual(created.humanSchedule, "every 1h")
+        XCTAssertTrue(created.enabled)
+
+        await store.refreshRoutines()
+        let listed = store.routines(for: agent.id)
+        XCTAssertEqual(listed.count, 1)
+        XCTAssertEqual(listed[0].routineId, created.routineId)
+
+        let patched = try await store.updateRoutine(created.routineId, enabled: false)
+        XCTAssertFalse(patched.enabled)
+
+        try await store.deleteRoutine(created.routineId)
+        await store.refreshRoutines()
+        XCTAssertTrue(store.routines.isEmpty)
+    }
+
+    func testRunNowFiresAndAttributesRun() async throws {
+        let agent = try await makeAgent("alpha")
+        let routine = try await store.createRoutine(
+            agentID: agent.id, name: "R", prompt: "do it",
+            intervalS: 86400)  // far future: run-now must ignore the schedule
+        let runID = try await store.runRoutineNow(routine.routineId)
+        XCTAssertEqual(runID, "run-1")
+        let runs = try await store.client.runs(agentID: agent.id)
+        XCTAssertEqual(runs.count, 1)
+        XCTAssertEqual(runs[0].runKind, "routine")
+        XCTAssertTrue(runs[0].isRoutine)
+        // Routine row records the fire.
+        await store.refreshRoutines()
+        XCTAssertEqual(store.routines.first?.lastRunId, runID)
+        // Never-concurrent: the queued run blocks a second run-now → 409.
+        do {
+            _ = try await store.runRoutineNow(routine.routineId)
+            XCTFail("second run-now should 409 while the first run is active")
+        } catch VertusError.conflict(let message) {
+            XCTAssertTrue(message.contains("already running"))
+        }
+    }
+
+    func testRoutineHistoryAndDisabledByFailures() async throws {
+        let agent = try await makeAgent("alpha")
+        let routine = try await store.createRoutine(
+            agentID: agent.id, name: "Fragile", prompt: "x",
+            intervalS: 60)
+        _ = try await store.runRoutineNow(routine.routineId)
+        let history = try await store.client.routineHistory(routine.routineId)
+        XCTAssertEqual(history.count, 1)
+        XCTAssertEqual(history[0].routineId, routine.routineId)
+
+        // A routine disabled after failures decodes and flags loudly.
+        let disabled = try JSONDecoder.vertus().decode(Routine.self, from:
+            JSONSerialization.data(withJSONObject: routineJson(
+                routineId: routine.routineId, agentId: agent.id,
+                failureCount: 3, enabled: false)))
+        XCTAssertTrue(disabled.disabledByFailures)
+        XCTAssertEqual(disabled.humanSchedule, "every 1m")
+        let fine = try JSONDecoder.vertus().decode(Routine.self, from:
+            JSONSerialization.data(withJSONObject: routineJson(
+                routineId: "r2", agentId: agent.id,
+                failureCount: 1, enabled: false)))
+        XCTAssertFalse(fine.disabledByFailures, "1 failure is not a disable")
+    }
+
+    private func routineJson(routineId: String, agentId: String,
+                             failureCount: Int, enabled: Bool) -> [String: Any] {
+        [
+            "routine_id": routineId,
+            "agent_id": agentId,
+            "name": "R",
+            "prompt": "p",
+            "schedule": ["interval_s": 60],
+            "trigger": NSNull(),
+            "enabled": enabled,
+            "created_at": 1.0,
+            "last_run_at": NSNull(),
+            "last_run_id": NSNull(),
+            "next_run_at": 61.0,
+            "failure_count": failureCount,
+        ]
+    }
 }

@@ -240,6 +240,7 @@ public struct RunRow: Codable, Identifiable, Equatable {
     public var threadId: String?
     public var runKind: String?
     public var parentRunId: String?
+    public var routineId: String?
 
     public var id: String { runId }
 
@@ -253,6 +254,9 @@ public struct RunRow: Codable, Identifiable, Equatable {
         guard let fromAgent, !fromAgent.isEmpty else { return false }
         return true
     }
+
+    /// True when a ROUTINE spawned this turn (run_kind=routine).
+    public var isRoutine: Bool { runKind == "routine" }
 }
 
 /// One fleet-activity item (GET /api/fleet/activity).
@@ -270,6 +274,7 @@ public struct FleetActivityItem: Codable, Identifiable, Equatable {
     public var fromAgent: String?
     public var runKind: String?
     public var parentRunId: String?
+    public var routineId: String?
 
     public var id: String { runId }
 
@@ -278,6 +283,9 @@ public struct FleetActivityItem: Codable, Identifiable, Equatable {
         guard let fromAgent, !fromAgent.isEmpty else { return false }
         return true
     }
+
+    /// True when a ROUTINE spawned this turn (run_kind=routine).
+    public var isRoutine: Bool { runKind == "routine" }
 }
 
 // MARK: - Message bus (bot-to-bot)
@@ -317,6 +325,102 @@ public struct RunDetail: Codable, Equatable {
     public var messages: [MessageRow]
     public var parent: RunRow?
     public var children: [RunRow]
+}
+
+// MARK: - Routines (scheduled/triggered per-agent work)
+
+/// Schedule representation: interval seconds only (see fleet_routines.py —
+/// one syntax, never two; sub-60s values are for tests/demos).
+public struct RoutineSchedule: Codable, Equatable {
+    public var intervalS: Int
+}
+
+/// Trigger vocabulary is deliberately small and enumerable: run_completed
+/// (another agent's run hit a terminal state) or bot_message (a delivered
+/// bot message arrived), each with optional filters. Not a rules engine.
+public struct RoutineTrigger: Codable, Equatable {
+    public var type: String            // run_completed | bot_message
+    public var agentId: String?        // run_completed: whose run; bot_message: from_agent filter
+    public var fromAgent: String?      // bot_message: sender filter (from_agent)
+    public var threadId: String?       // bot_message only
+
+    public init(type: String, agentId: String? = nil, fromAgent: String? = nil,
+                threadId: String? = nil) {
+        self.type = type
+        self.agentId = agentId
+        self.fromAgent = fromAgent
+        self.threadId = threadId
+    }
+}
+
+/// One routine row (routines table). `nextRunAt` is when the scheduler will
+/// next fire it; `failureCount` >= 3 with enabled=false means it was
+/// DISABLED BY FAILURES — the UI must show that loudly, not as a normal
+/// toggle-off.
+public struct Routine: Codable, Identifiable, Equatable {
+    public var routineId: String
+    public var agentId: String
+    public var name: String
+    public var prompt: String
+    public var schedule: RoutineSchedule?
+    public var trigger: RoutineTrigger?
+    public var enabled: Bool
+    public var createdAt: Double
+    public var lastRunAt: Double?
+    public var lastRunId: String?
+    public var nextRunAt: Double?
+    public var failureCount: Int
+
+    public var id: String { routineId }
+
+    /// Hub's consecutive-failure threshold (FAILURE_THRESHOLD in
+    /// fleet_routines.py) — at it, the hub disables the routine itself.
+    public static let failureThreshold = 3
+
+    public var disabledByFailures: Bool {
+        failureCount >= Self.failureThreshold && !enabled
+    }
+
+    public var humanSchedule: String {
+        guard let s = schedule?.intervalS else { return "triggered" }
+        if s < 60 { return "every \(s)s" }
+        if s % 3600 == 0 { return "every \(s / 3600)h" }
+        if s % 60 == 0 { return "every \(s / 60)m" }
+        return "every \(s)s"
+    }
+
+    public var humanTrigger: String {
+        guard let t = trigger else { return "" }
+        switch t.type {
+        case "run_completed":
+            return t.agentId.map { "when \($0) finishes" } ?? "when a run finishes"
+        case "bot_message":
+            return t.fromAgent.map { "message from \($0)" } ?? "on any bot message"
+        default:
+            return t.type
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case routineId, agentId, name, prompt, schedule, trigger, enabled
+        case createdAt, lastRunAt, lastRunId, nextRunAt, failureCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        routineId = try c.decode(String.self, forKey: .routineId)
+        agentId = try c.decode(String.self, forKey: .agentId)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        prompt = try c.decodeIfPresent(String.self, forKey: .prompt) ?? ""
+        schedule = try c.decodeIfPresent(RoutineSchedule.self, forKey: .schedule)
+        trigger = try c.decodeIfPresent(RoutineTrigger.self, forKey: .trigger)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        createdAt = try c.decodeIfPresent(Double.self, forKey: .createdAt) ?? 0
+        lastRunAt = try c.decodeIfPresent(Double.self, forKey: .lastRunAt)
+        lastRunId = try c.decodeIfPresent(String.self, forKey: .lastRunId)
+        nextRunAt = try c.decodeIfPresent(Double.self, forKey: .nextRunAt)
+        failureCount = try c.decodeIfPresent(Int.self, forKey: .failureCount) ?? 0
+    }
 }
 
 /// A single SSE envelope, decoded from the flat JSON line.

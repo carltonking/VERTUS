@@ -234,6 +234,11 @@ struct AgentChatView: View {
                         .font(.system(size: 8))
                         .foregroundStyle(.blue)
                         .help("bot-initiated")
+                } else if run.isRoutine {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.purple)
+                        .help("routine-initiated")
                 }
                 Text(run.prompt.prefix(34))
                     .font(.system(size: 11))

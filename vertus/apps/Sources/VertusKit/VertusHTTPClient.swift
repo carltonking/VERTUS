@@ -223,6 +223,76 @@ public final class VertusHTTPClient {
                       key: "activity", query: [URLQueryItem(name: "limit", value: String(limit))])
     }
 
+    // MARK: - Routines
+
+    /// GET /api/routines?agent_id= — all routines, or one agent's.
+    public func routines(agentID: String? = nil) async throws -> [Routine] {
+        var q: [URLQueryItem] = []
+        if let agentID { q.append(URLQueryItem(name: "agent_id", value: agentID)) }
+        return try await get([Routine].self, path: "/api/routines", key: "routines", query: q)
+    }
+
+    /// POST /api/routines. At least one of intervalS / trigger must be set.
+    public func createRoutine(agentID: String, name: String, prompt: String,
+                              intervalS: Int? = nil, trigger: RoutineTrigger? = nil,
+                              enabled: Bool = true) async throws -> Routine {
+        var body: [String: Any] = [
+            "agent_id": agentID, "name": name, "prompt": prompt,
+            "enabled": enabled,
+        ]
+        if let intervalS { body["schedule"] = ["interval_s": intervalS] }
+        if let trigger { body["trigger"] = triggerWire(trigger) }
+        return try await send("POST", path: "/api/routines", body: body)
+    }
+
+    /// PATCH /api/routines/<id>. Passing nil for a field leaves it untouched;
+    /// clearSchedule/clearTrigger send an explicit null (schedule-only and
+    /// trigger-only routines are both legal, but not neither).
+    public func updateRoutine(_ id: String, name: String? = nil, prompt: String? = nil,
+                              intervalS: Int? = nil, trigger: RoutineTrigger? = nil,
+                              enabled: Bool? = nil,
+                              clearSchedule: Bool = false,
+                              clearTrigger: Bool = false) async throws -> Routine {
+        var body: [String: Any] = [:]
+        if let name { body["name"] = name }
+        if let prompt { body["prompt"] = prompt }
+        if let intervalS { body["schedule"] = ["interval_s": intervalS] }
+        if clearSchedule { body["schedule"] = NSNull() }
+        if let trigger { body["trigger"] = triggerWire(trigger) }
+        if clearTrigger { body["trigger"] = NSNull() }
+        if let enabled { body["enabled"] = enabled }
+        return try await send("PATCH", path: "/api/routines/\(escaped(id))", body: body)
+    }
+
+    /// DELETE /api/routines/<id> — removes the routine; its runs stay.
+    public func deleteRoutine(_ id: String) async throws -> String {
+        let json = try await sendJSON("DELETE", path: "/api/routines/\(escaped(id))", body: [String: Any]())
+        return (json as? [String: Any])?["deleted"] as? String ?? id
+    }
+
+    /// POST /api/routines/<id>/run — fire now, ignoring the schedule.
+    /// 409 when the routine's turn is already in flight; 503 when the
+    /// agent is degraded. Returns the spawned run id.
+    public func runRoutineNow(_ id: String) async throws -> String {
+        let json = try await sendJSON("POST", path: "/api/routines/\(escaped(id))/run",
+                                      body: [String: Any]())
+        return (json as? [String: Any])?["run_id"] as? String ?? id
+    }
+
+    /// GET /api/routines/<id>/history — runs produced by one routine.
+    public func routineHistory(_ id: String, limit: Int = 50) async throws -> [RunRow] {
+        try await get([RunRow].self, path: "/api/routines/\(escaped(id))/history",
+                      key: "runs", query: [URLQueryItem(name: "limit", value: String(limit))])
+    }
+
+    private func triggerWire(_ t: RoutineTrigger) -> [String: Any] {
+        var d: [String: Any] = ["type": t.type]
+        if let agentId = t.agentId { d["agent_id"] = agentId }
+        if let fromAgent = t.fromAgent { d["from_agent"] = fromAgent }
+        if let threadId = t.threadId { d["thread_id"] = threadId }
+        return d
+    }
+
     // MARK: - Skills (QuickBar autocomplete)
 
     public func slashCommands() async throws -> [SlashCommandInfo] {
