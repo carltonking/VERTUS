@@ -27,6 +27,11 @@ final class QuickBarViewModel: ObservableObject {
     @Published var busyAgents: [BusyAgentInfo] = []
     @Published var streamLabel = "offline"
 
+    /// The new-session view cut over the store mirror (see BarViewCut): the
+    /// hub keeps the agent's full transcript; this only hides entries from
+    /// THIS panel view. Pure logic, unit-tested in VertusKitTests.
+    private let viewCut = BarViewCut()
+
     // Slash commands (skills) — unchanged behavior, now via VertusKit.
     @Published var slashCommands: [SlashCommand] = []
     @Published var slashSuggestions: [SlashCommand] = []
@@ -112,7 +117,16 @@ final class QuickBarViewModel: ObservableObject {
     private func syncSelected() {
         guard let state = store.live[selectedAgentID] else { return }
         selectedLive = state
-        transcript = state.transcript.map(Self.map)
+        // Mirror with the new-session cut applied: hidden entries drop out,
+        // and the re-anchored in-flight reply is truncated to the text that
+        // streamed after the cut (still growing in place, same id).
+        transcript = state.transcript.compactMap { entry in
+            guard let text = viewCut.visibleText(of: entry) else { return nil }
+            // An assistant entry with no visible text yet (the reply right
+            // after a cut) shows the working bubble instead of an empty pill.
+            guard !text.isEmpty || entry.role == "user" else { return nil }
+            return Self.map(entry, text: text)
+        }
         isStreaming = state.isRunning
         currentActivity = state.currentActivity
         queueDepth = state.queueDepth
@@ -136,8 +150,8 @@ final class QuickBarViewModel: ObservableObject {
             .sorted { $0.name < $1.name }
     }
 
-    private static func map(_ e: VertusKit.TranscriptEntry) -> BarTranscriptEntry {
-        BarTranscriptEntry(id: e.id, role: e.role == "user" ? "you" : "vertus", text: e.text)
+    private static func map(_ e: VertusKit.TranscriptEntry, text: String) -> BarTranscriptEntry {
+        BarTranscriptEntry(id: e.id, role: e.role == "user" ? "you" : "vertus", text: text)
     }
 
     // MARK: - Slash commands (skills)
@@ -204,6 +218,8 @@ final class QuickBarViewModel: ObservableObject {
         selectedAgentID = id
         UserDefaults.standard.set(id, forKey: "vertus.bar.agent")
         turnHasText = false
+        // A switch to another agent starts an uncut view of that agent.
+        viewCut.reset()
         store.selectedAgentID = id
         store.foregroundAgentID = id
         syncSelected()
@@ -261,8 +277,22 @@ final class QuickBarViewModel: ObservableObject {
         sentAtLeastOnce = false
     }
 
+    /// New session — a VIEW reset, never a server-side reset. The hub has no
+    /// per-agent session to clear: an agent owns one continuous transcript
+    /// and run history, which stay intact (the main window shows it all).
+    /// Everything currently on screen is hidden. If a reply is mid-stream
+    /// it is NOT discarded: the run keeps going and the reply is re-anchored
+    /// so only the text streamed after this click shows (and keeps growing)
+    /// in the fresh view.
     func newSession() {
+        guard let state = store.live[selectedAgentID] else {
+            viewCut.reset()
+            reset()
+            return
+        }
+        viewCut.cut(entries: state.transcript, isRunning: state.isRunning)
         reset()
+        syncSelected()
     }
 
     // MARK: - Demo seeds (--demo-output / --demo-long)
@@ -320,14 +350,4 @@ struct SlashCommand: Identifiable, Equatable {
     let name: String
     let description: String
     var id: String { name }
-}
-
-// MARK: - Open the main window
-
-extension QuickBarViewModel {
-    /// The merged app is one process: "Open in Fleet" is now an in-process
-    /// window activation, never a second executable.
-    func openInFleet() {
-        AppDelegate.shared?.openMainWindow()
-    }
 }

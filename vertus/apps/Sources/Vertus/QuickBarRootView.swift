@@ -39,6 +39,14 @@ enum NotchPanelMetrics {
     static let promptMaxLines: CGFloat = 3
     static let promptTopPad: CGFloat = 8
     static let promptBottomPad: CGFloat = 10
+    /// Prompt-bar left gutter: the agent-picker chip sits at the far left,
+    /// the editor starts right of it. Body is 316 pt wide with a 6.5 pt
+    /// chamfer inset → left edge at 6.5; chip ~66 pt + 11 pt gap → editor
+    /// at 84, ending at 320 (2.5 pt margin to the 322.5 right edge).
+    static let pickerLeft: CGFloat = 9
+    static let pickerChipHeight: CGFloat = 17
+    static let editorLeft: CGFloat = 84
+    static let editorWidth: CGFloat = 236
 
     /// Strip height for a given number of visible prompt lines (clamped to
     /// 1…3): one line by default — the strip only grows once the text in
@@ -211,10 +219,12 @@ struct NotchPanelContent: View {
     }
 
     /// The output window is needed when there's a live math result, a math
-    /// expression in progress, or an existing conversation; idle+plain-text
+    /// expression in progress, an existing conversation, or a reply still
+    /// streaming (a fresh new-session cut can leave the transcript empty
+    /// while the re-anchored reply is between deltas); idle+plain-text
     /// = no window.
     private var showOutputWindow: Bool {
-        mathPreview != nil || isMathInProgress || !model.transcript.isEmpty
+        mathPreview != nil || isMathInProgress || model.isStreaming || !model.transcript.isEmpty
     }
 
     /// The prompt is shaping up into a math expression but doesn't fully
@@ -347,8 +357,10 @@ struct NotchPanelContent: View {
             .frame(width: 14, height: 14)
             .position(x: logoCenterX, y: 12.5)
 
-            // New session: small square with a pencil; clears VERTUS's
-            // output and starts a fresh session.
+            // New session: small square with a pencil. A VIEW reset — the
+            // hub keeps the agent's full transcript and run history. If a
+            // reply is mid-stream it is not discarded: the run continues
+            // and the reply keeps streaming into the cleared view.
             Button(action: onNewSession) {
                 Image(systemName: "square.and.pencil")
                     .font(.system(size: 11, weight: .regular))
@@ -356,19 +368,18 @@ struct NotchPanelContent: View {
                     .foregroundStyle(.white)
             }
             .buttonStyle(.plain)
-            .help("New session (clears Vertus's output)")
+            .help("New session — clears this view; a running reply keeps streaming here (history stays in VERTUS)")
             .frame(width: 14, height: 14)
             .position(x: pencilCenterX, y: 13.75)
         }
     }
 
-    // MARK: Fleet strip — agent picker, busy-bot dots, open-in-Fleet.
-    // One slim row under the notch band, always present: switching agents
-    // and seeing who is busy works whether or not the chat window is open.
+    // MARK: Fleet strip — busy-bot dots (the agent picker now lives in the
+    // prompt bar's bottom-left corner). One slim row under the notch band,
+    // always present, so busy bots stay visible while chatting.
 
     private var fleetStrip: some View {
         HStack(spacing: 6) {
-            agentChip
             ForEach(model.busyAgents) { busy in
                 HStack(spacing: 2) {
                     Text(busy.emoji)
@@ -407,14 +418,6 @@ struct NotchPanelContent: View {
                     .font(.system(size: 9))
                     .foregroundStyle(.white.opacity(0.6))
             }
-            Spacer(minLength: 4)
-            Button(action: { model.openInFleet() }) {
-                Image(systemName: "arrow.up.right.square")
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.6))
-            }
-            .buttonStyle(.plain)
-            .help("Open VERTUS")
         }
         .frame(
             width: NotchPanelMetrics.bodyWidth,
@@ -756,27 +759,37 @@ struct NotchPanelContent: View {
 
     private var inputRow: some View {
         return ZStack(alignment: .topLeading) {
+            // Agent picker: bottom-left corner of the prompt bar, inline
+            // with the composer (it moved down from the fleet strip). It
+            // centers on the editor's first line, so a prompt growing to
+            // 2-3 lines never shoves it around. Keeps the last-used agent.
+            agentChip
+                .offset(
+                    x: NotchPanelMetrics.pickerLeft,
+                    y: dividerY + NotchPanelMetrics.promptTopPad
+                        + (NotchPanelMetrics.promptLineHeight - NotchPanelMetrics.pickerChipHeight) / 2
+                )
             // Idle placeholder — slightly faded; hides as soon as the user types.
             if prompt.isEmpty {
                 Text("Ask Vertus anything...")
                     .font(.system(size: 13.4, weight: .regular))
                     .foregroundStyle(.white.opacity(0.5))
-                    .frame(width: 280, height: 16, alignment: .leading)
-                    .offset(x: 30.5, y: dividerY + NotchPanelMetrics.promptTopPad)
+                    .frame(width: NotchPanelMetrics.editorWidth, height: 16, alignment: .leading)
+                    .offset(x: NotchPanelMetrics.editorLeft + 3, y: dividerY + NotchPanelMetrics.promptTopPad)
                     .allowsHitTesting(false)
             }
             // Wrapping text editor: text goes to the line below instead of
-            // running under a button; the strip grows with it, capped at 3
-            // visible lines — anything longer scrolls inside the editor.
+            // running under the agent chip; the strip grows with it, capped
+            // at 3 visible lines — anything longer scrolls inside.
             PromptTextEditor(text: $prompt, onSubmit: submit) { lines in
                 if model.promptLines != lines { model.promptLines = lines }
             }
             .frame(
-                width: 280,
+                width: NotchPanelMetrics.editorWidth,
                 height: max(model.promptLines, 1) * NotchPanelMetrics.promptLineHeight,
                 alignment: .topLeading
             )
-            .offset(x: 27.5, y: dividerY + NotchPanelMetrics.promptTopPad)
+            .offset(x: NotchPanelMetrics.editorLeft, y: dividerY + NotchPanelMetrics.promptTopPad)
         }
     }
 
@@ -903,7 +916,7 @@ struct QuickBarRootView: View {
         // both idle and chatting states, so the strip floats above the
         // dropdown instead of the menu being clipped by the panel edge.
         let menuExtra = model.slashMenuSpace
-        let active = mathActive || !model.transcript.isEmpty
+        let active = mathActive || model.isStreaming || !model.transcript.isEmpty
         let lines = model.promptLines
         let target = (active
             ? NotchPanelMetrics.height(promptLines: lines) + desiredOutputHeight()

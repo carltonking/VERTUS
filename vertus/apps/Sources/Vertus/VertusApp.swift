@@ -140,11 +140,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             renderPanel(progress: 1, delay: 1.1)
             return
         }
-        if CommandLine.arguments.contains("--show") {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-                self?.showPanel()
-            }
-        }
+        // (No --show flag: showing the panel is ⇧⌘J's job, and a launch-time
+        // auto-show made GUI verification loops hard to reason about. Render
+        // verification uses --verify*, which captures and exits on its own.)
     }
 
     // MARK: - Icons
