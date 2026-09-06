@@ -186,6 +186,107 @@ def test_fork_git_sha_ok_and_dirty_warn(monkeypatch, isolated_env, tmp_path):
     assert _status(results, "env.fork_git_sha") == "ok"
 
 
+def _make_venv_with_editable(fork: Path, target: Path, editable: bool = True,
+                             url: str | None = None) -> None:
+    """A venv-only fork dir whose site-packages holds one dist-info with a
+    direct_url.json pointing at `target` (or `url`, percent-encoded)."""
+    py = fork / "venv" / "lib" / "python3.11" / "site-packages"
+    py.mkdir(parents=True)
+    info = py / "hermes_agent-0.20.2.dist-info"
+    info.mkdir()
+    if url is None:
+        url = "file://" + str(target)
+    direct = {"url": url, "dir_info": {"editable": editable}}
+    (info / "direct_url.json").write_text(json.dumps(direct))
+    (py / "hermes_agent-0.20.2.dist-info" / "METADATA").write_text("Name: hermes-agent\n")
+    venv_py = fork / "venv" / "bin" / "python"
+    venv_py.parent.mkdir(parents=True)
+    venv_py.write_text("#!/bin/sh\necho 'Python 3.11.9'\n")
+    venv_py.chmod(0o755)
+
+
+def test_fork_git_sha_editable_install_resolves_real_checkout(monkeypatch, isolated_env, tmp_path):
+    """The blind spot this whole change exists for: fork dir is venv-only
+    (no .git), the venv holds an editable install, and the REAL checkout is
+    dirty — the doctor must see the real checkout's drift."""
+    fork = tmp_path / "fork"
+    fork.mkdir()
+    real = _git_dir(tmp_path, name="real-fork")
+    _make_venv_with_editable(fork, real)
+    (real / "touched.txt").write_text("x")  # dirty
+    monkeypatch.setenv("VERTUS_HERMES_REPO", str(fork))
+    results = vd.env_checks()
+    by = _by_name(results)
+    assert by["env.fork_git_sha"]["status"] == "warn"
+    assert "editable install →" in by["env.fork_git_sha"]["reason"]
+    assert str(real) in by["env.fork_git_sha"]["reason"]
+    assert "1 uncommitted change(s)" in by["env.fork_git_sha"]["reason"]
+    # Clean the real checkout -> ok with its SHA and branch.
+    subprocess.run(["git", "-C", str(real), "add", "touched.txt"], check=True)
+    subprocess.run(["git", "-C", str(real), "commit", "-qm", "x"], check=True)
+    results = vd.env_checks()
+    by = _by_name(results)
+    assert by["env.fork_git_sha"]["status"] == "ok"
+    assert "on master" in by["env.fork_git_sha"]["reason"] or "on main" in by["env.fork_git_sha"]["reason"]
+
+
+def test_fork_git_sha_editable_url_with_space_decodes(monkeypatch, isolated_env, tmp_path):
+    """The real machine's checkout lives under '01 - PROJECTS/...'; the
+    direct_url.json stores it percent-encoded — decoding must be exact."""
+    fork = tmp_path / "fork"
+    fork.mkdir()
+    real = _git_dir(tmp_path, name="01 - PROJECTS/real-fork")
+    _make_venv_with_editable(fork, real,
+                             url="file://" + str(tmp_path) + "/01%20-%20PROJECTS/real-fork")
+    monkeypatch.setenv("VERTUS_HERMES_REPO", str(fork))
+    results = vd.env_checks()
+    assert _status(results, "env.fork_git_sha") == "ok"
+    assert "01 - PROJECTS/real-fork" in _by_name(results)["env.fork_git_sha"]["reason"]
+
+
+def test_fork_git_sha_editable_failure_modes_distinct(monkeypatch, isolated_env, tmp_path):
+    real = _git_dir(tmp_path, name="real-fork")
+    cases = [
+        ("no site-packages", None, "venv has no site-packages"),
+        ("no dist-info", "empty", "no dist-info"),
+        ("no direct_url.json", "nourl", "no direct_url.json"),
+        ("non-editable", "noneditable", "not editable installs"),
+        ("target missing", "missing", "editable install target missing"),
+    ]
+    for name, variant, needle in cases:
+        fork = tmp_path / name
+        fork.mkdir()
+        if variant is None:
+            pass  # venv exists but has no lib/ -> no site-packages
+        else:
+            py = fork / "venv" / "lib" / "python3.11" / "site-packages"
+            py.mkdir(parents=True)
+            if variant != "empty":
+                info = py / "hermes_agent-0.20.2.dist-info"
+                info.mkdir()
+                if variant == "nourl":
+                    pass  # dist-info with no direct_url.json
+                elif variant == "noneditable":
+                    (info / "direct_url.json").write_text(
+                        json.dumps({"url": "file://" + str(real),
+                                    "dir_info": {"editable": False}}))
+                elif variant == "missing":
+                    (info / "direct_url.json").write_text(
+                        json.dumps({"url": "file:///nonexistent/target",
+                                    "dir_info": {"editable": True}}))
+            venv_py = fork / "venv" / "bin" / "python"
+            venv_py.parent.mkdir(parents=True)
+            venv_py.write_text("#!/bin/sh\necho 'Python 3.11.9'\n")
+            venv_py.chmod(0o755)
+        monkeypatch.setenv("VERTUS_HERMES_REPO", str(fork))
+        results = vd.env_checks()
+        by = _by_name(results)
+        assert by["env.fork_git_sha"]["status"] == "unverified", name
+        assert needle in by["env.fork_git_sha"]["reason"], f"{name}: {by['env.fork_git_sha']['reason']}"
+        assert by["env.fork_git_sha"]["remediation"], name
+        monkeypatch.delenv("VERTUS_HERMES_REPO", raising=False)
+
+
 # -- dialect fail paths via the stub gateway --------------------------------
 
 def test_dialect_missing_rpc_flagged_via_stub(monkeypatch, isolated_env):

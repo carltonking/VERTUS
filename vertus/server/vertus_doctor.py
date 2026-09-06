@@ -38,6 +38,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -119,6 +120,62 @@ def _git(args: list[str], cwd: Path) -> str | None:
         return None
 
 
+def _venv_site_packages(venv_py: Path) -> Path | None:
+    """venv/bin/python -> venv/lib/python3.X/site-packages (newest py)."""
+    base = venv_py.parent.parent
+    lib = base / "lib"
+    if not lib.is_dir():
+        return None
+    pys = sorted(lib.glob("python3.*"))
+    if not pys:
+        return None
+    sp = pys[-1] / "site-packages"
+    return sp if sp.is_dir() else None
+
+
+def _editable_install_target(fork: Path, venv_py: Path) -> tuple[Path | None, str | None]:
+    """When `fork` is a venv-only dir (no .git), find the real checkout the
+    venv runs via an editable install. Returns (target, None) or
+    (None, reason) with a DISTINCT reason per failure mode."""
+    sp = _venv_site_packages(venv_py)
+    if sp is None:
+        return None, "venv has no site-packages to inspect"
+    infos = list(sp.glob("*.dist-info"))
+    if not infos:
+        return None, "venv site-packages has no dist-info (nothing installed?)"
+    seen_non_editable = False
+    for info in infos:
+        direct = info / "direct_url.json"
+        if not direct.is_file():
+            continue
+        try:
+            data = json.loads(direct.read_text())
+        except Exception:
+            continue
+        if data.get("dir_info", {}).get("editable") is not True:
+            seen_non_editable = True
+            continue
+        url = data.get("url", "")
+        if not url.startswith("file://"):
+            continue
+        target = Path(urllib.parse.unquote(url[len("file://"):]))
+        if not target.is_dir():
+            return None, f"editable install target missing: {target}"
+        return target, None
+    if seen_non_editable:
+        return None, "dist-info present but no editable direct_url.json " \
+                     "(packages are regular copies, not editable installs)"
+    return None, "no direct_url.json in any dist-info (non-pip install?)"
+
+
+def _fork_git_target(fork: Path, venv_py: Path) -> tuple[Path | None, str | None]:
+    """The git repo the fork ACTUALLY runs from: the checkout itself when it
+    has .git, otherwise the editable-install target from the venv."""
+    if (fork / ".git").exists():
+        return fork, None
+    return _editable_install_target(fork, venv_py)
+
+
 def _entry_imports(venv_python: Path, fork: Path) -> bool:
     """Can the gateway's entry module be imported under the venv from the
     fork cwd? The real precondition of every spawn (import is inert — it
@@ -168,24 +225,36 @@ def env_checks() -> list[dict]:
                               "recreate the venv or point VERTUS_HERMES_REPO at the "
                               "real checkout"))
 
-    # fork git SHA + local drift (the "recorded so drift is visible run over
-    # run" half: uncommitted fork changes are the fastest way the dialect
-    # drifts without a version bump; the SHA itself is printed every run)
-    sha = _git(["rev-parse", "HEAD"], fork) if fork.is_dir() else None
-    if sha:
-        dirty = _git(["status", "--porcelain"], fork)
-        reason = f"fork SHA {sha[:12]}"
-        if dirty:
-            out.append(_check("env.fork_git_sha", "warn",
-                              reason + f" + {len(dirty.splitlines())} uncommitted change(s)",
-                              "commit or stash fork changes; the dialect you test may "
-                              "not be the dialect that runs"))
-        else:
-            out.append(_check("env.fork_git_sha", "ok", reason))
-    else:
+    # fork git SHA + local drift — against the checkout the venv ACTUALLY
+    # runs (a venv-only dir with an editable install used to report
+    # "unverified" while the live hub ran a dirty clone the doctor could not
+    # see: a drift check that cannot see drift is worse than no check).
+    target, resolve_err = _fork_git_target(fork, venv_py) if fork.is_dir() else (None, "checkout dir missing")
+    if target is None:
         out.append(_check("env.fork_git_sha", "unverified",
-                          "no git metadata in this checkout (editable-install venv "
-                          "style) — SHA drift is invisible run over run"))
+                          f"cannot resolve a git checkout for {fork}: {resolve_err}",
+                          "set VERTUS_HERMES_REPO to a checkout that has .git, or "
+                          "reinstall the fork editable from a git clone"))
+    else:
+        sha = _git(["rev-parse", "HEAD"], target)
+        if sha is None:
+            out.append(_check("env.fork_git_sha", "unverified",
+                              f"{target} is not a git repo (no HEAD) — SHA drift is "
+                              "invisible run over run",
+                              "the fork's real checkout has no .git; commit or clone "
+                              "properly if you want drift visible"))
+        else:
+            branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], target) or "detached"
+            dirty = _git(["status", "--porcelain"], target)
+            where = f" (editable install → {target})" if target != fork else ""
+            reason = f"fork SHA {sha[:12]} on {branch}{where}"
+            if dirty:
+                out.append(_check("env.fork_git_sha", "warn",
+                                  reason + f" + {len(dirty.splitlines())} uncommitted change(s)",
+                                  "commit or stash fork changes; the dialect you test may "
+                                  "not be the dialect that runs"))
+            else:
+                out.append(_check("env.fork_git_sha", "ok", reason))
 
     # venv python present and runnable
     if venv_py.is_file():
