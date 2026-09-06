@@ -59,6 +59,7 @@ from urllib.parse import parse_qs, urlsplit
 # Script-dir import (python3 vertus/server/vertus_server.py) keeps this plain;
 # fall back to a package-relative import for `python -m vertus.server.vertus_server`.
 try:
+    import vertus_paths  # type: ignore
     from agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
     from run_store import RunStore, RUN_STATES, TERMINAL_STATES  # type: ignore
     from screen_lease import ScreenLeaseManager, SCREEN_POLICY_CAVEAT  # type: ignore
@@ -70,6 +71,7 @@ try:
     from vertus_logging import setup_logging  # type: ignore
     from session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 except ImportError:  # pragma: no cover - only hit under package invocation
+    from . import vertus_paths  # type: ignore
     from .agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
     from .run_store import RunStore, RUN_STATES, TERMINAL_STATES  # type: ignore
     from .screen_lease import ScreenLeaseManager, SCREEN_POLICY_CAVEAT  # type: ignore
@@ -80,8 +82,9 @@ except ImportError:  # pragma: no cover - only hit under package invocation
     from .fleet_memory import MemoryStore, migrate_legacy_memory  # type: ignore
     from .vertus_logging import setup_logging  # type: ignore
 
-VERTUS_DIR = Path.home() / ".vertus"
-TOKEN_FILE = VERTUS_DIR / "token"
+# Token path resolution lives in vertus_paths.token_path (VERTUS_TOKEN_PATH
+# → VERTUS_ROOT → ~/.vertus/token), resolved at call time so temp hubs never
+# read or create the real user token (env-divergence sweep).
 DEFAULT_PORT = 8787
 
 # HTTP/API policy limits (the registry itself stays permissive; these are
@@ -137,15 +140,16 @@ _TEXT_FIELDS = ("title", "description", "persona")
 
 def ensure_token() -> str:
     """Load or create the bearer token."""
-    VERTUS_DIR.mkdir(parents=True, exist_ok=True)
-    if TOKEN_FILE.exists():
-        token = TOKEN_FILE.read_text().strip()
+    token_file = vertus_paths.token_path()
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    if token_file.exists():
+        token = token_file.read_text().strip()
         if token:
             return token
     token = secrets.token_urlsafe(32)
-    TOKEN_FILE.write_text(token + "\n")
+    token_file.write_text(token + "\n")
     if os.name != "nt":
-        TOKEN_FILE.chmod(0o600)
+        token_file.chmod(0o600)
     return token
 
 
@@ -3383,7 +3387,7 @@ def serve(host: str | None, port: int) -> None:
         servers.append(server)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         print(f"[vertus] serving on http://{h}:{port}")
-    print(f"[vertus] token file: {TOKEN_FILE}")
+    print(f"[vertus] token file: {vertus_paths.token_path()}")
     try:
         while True:
             time.sleep(3600)

@@ -53,24 +53,31 @@ import threading
 import time
 from pathlib import Path
 
+# Dual import like vertus_server.py: plain for script-dir invocation, package-relative for -m.
+try:
+    import vertus_paths  # type: ignore
+except ImportError:  # pragma: no cover - only hit under package invocation
+    from . import vertus_paths  # type: ignore
+
 # ---------------------------------------------------------------------------
-# Paths (env-overridable so tests can point the whole module at a temp tree)
+# Paths — thin wrappers over vertus_paths, the ONE resolver for every root.
+# No fallback logic lives here (see vertus_paths.py for the precedence rule:
+# concept env var → VERTUS_ROOT → production default). The env-divergence bug
+# that sent a temp hub's bots at the real ~/.vertus was this file resolving
+# its own roots; keep it that way.
 # ---------------------------------------------------------------------------
 
 
 def memory_root() -> Path:
-    env = os.environ.get("VERTUS_MEMORY_DIR", "").strip()
-    return Path(env).expanduser() if env else Path.home() / ".vertus" / "memory"
+    return vertus_paths.memory_root()
 
 
 def shared_dir() -> Path:
-    env = os.environ.get("VERTUS_SHARED_MEMORY_DIR", "").strip()
-    return Path(env).expanduser() if env else memory_root() / "shared"
+    return vertus_paths.shared_memory_dir()
 
 
 def agents_dir() -> Path:
-    env = os.environ.get("VERTUS_AGENTS_DIR", "").strip()
-    return Path(env).expanduser() if env else Path.home() / ".vertus" / "agents"
+    return vertus_paths.agents_dir()
 
 
 def agent_memory_dir(agent_id: str) -> Path:
@@ -83,16 +90,16 @@ def agent_home_memories_dir(agent_id: str) -> Path:
 
 
 def fleet_hermes_home() -> Path:
-    """The fleet default engine config root (~/.hermes). Its memories/ dir is
-    OUTSIDE mirror scope: no fleet gateway ever uses it as HERMES_HOME (every
-    gateway gets a per-agent home); only the legacy CLI touches it."""
-    env = os.environ.get("VERTUS_FLEET_HERMES_HOME", "").strip()
-    return Path(env).expanduser() if env else Path.home() / ".hermes"
+    """The fleet default engine config root. Its memories/ dir is OUTSIDE
+    mirror scope: no fleet gateway ever uses it as HERMES_HOME (every gateway
+    gets a per-agent home); only the legacy CLI touches it. Resolution lives
+    in vertus_paths (under VERTUS_ROOT a hermetic hub derives it from the
+    temp root rather than consulting the real ~/.hermes)."""
+    return vertus_paths.fleet_hermes_home()
 
 
 def backups_dir() -> Path:
-    env = os.environ.get("VERTUS_BACKUP_DIR", "").strip()
-    return Path(env).expanduser() if env else Path.home() / ".vertus" / "backups"
+    return vertus_paths.backups_dir()
 
 
 def index_path() -> Path:

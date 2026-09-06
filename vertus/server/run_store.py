@@ -79,7 +79,16 @@ import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
-DEFAULT_DB_PATH = Path.home() / ".vertus" / "fleet.db"
+# Dual import like vertus_server.py: plain for script-dir invocation, package-relative for -m.
+try:
+    import vertus_paths  # type: ignore
+except ImportError:  # pragma: no cover - only hit under package invocation
+    from . import vertus_paths  # type: ignore
+
+# DB path resolution lives in vertus_paths.fleet_db_path (VERTUS_DB_PATH →
+# VERTUS_ROOT → ~/.vertus/fleet.db); the constructor default is call-time so
+# env changes are honored without module reloads. No other module resolves
+# the DB path on its own (env-divergence sweep).
 
 RUN_STATES = (
     "queued",
@@ -200,8 +209,7 @@ class RunStore:
     """Thread-safe durable run store. One writer thread; readers per-call."""
 
     def __init__(self, path: str | Path | None = None) -> None:
-        env = os.environ.get("VERTUS_DB_PATH", "").strip()
-        self.path = Path(path or env or DEFAULT_DB_PATH).expanduser()
+        self.path = Path(path or vertus_paths.fleet_db_path()).expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self.path), isolation_level=None)
         try:

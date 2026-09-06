@@ -22,7 +22,11 @@ import os
 import sys
 from pathlib import Path
 
-DEFAULT_LOG_DIR = Path.home() / ".vertus" / "logs"
+# Dual import like vertus_server.py: plain for script-dir invocation, package-relative for -m.
+try:
+    import vertus_paths  # type: ignore
+except ImportError:  # pragma: no cover - only hit under package invocation
+    from . import vertus_paths  # type: ignore
 
 _configured = False
 
@@ -42,7 +46,9 @@ def setup_logging(log_dir: str | Path | None = None,
         return root
     root.setLevel((level or os.environ.get("VERTUS_LOG_LEVEL", "INFO")).upper())
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-    directory = Path(log_dir or os.environ.get("VERTUS_LOG_DIR") or DEFAULT_LOG_DIR)
+    # Log dir resolution lives in vertus_paths.logs_dir (VERTUS_LOG_DIR →
+    # VERTUS_ROOT → ~/.vertus/logs), call-time so hermetic hubs log to temp.
+    directory = Path(log_dir or vertus_paths.logs_dir())
     try:
         directory.mkdir(parents=True, exist_ok=True)
         file_handler = logging.handlers.RotatingFileHandler(

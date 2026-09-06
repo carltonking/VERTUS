@@ -41,6 +41,12 @@ import time
 import urllib.request
 from pathlib import Path
 
+# Dual import like vertus_server.py: plain for script-dir invocation, package-relative for -m.
+try:
+    import vertus_paths  # type: ignore
+except ImportError:  # pragma: no cover - only hit under package invocation
+    from . import vertus_paths  # type: ignore
+
 from hermes_bridge import (
     FORK_REPO,
     VENV_PYTHON,
@@ -58,12 +64,9 @@ def _cfg() -> dict:
         "rpc_timeout_s": float(os.environ.get("VERTUS_DOCTOR_RPC_TIMEOUT_S", "10")),
         "skip_launchd": os.environ.get("VERTUS_DOCTOR_SKIP_LAUNCHD") == "1",
         "hub_port": int(os.environ.get("VERTUS_PORT", "8787")),
-        "agents_dir": Path(os.environ.get("VERTUS_AGENTS_DIR",
-                                           str(Path.home() / ".vertus" / "agents"))),
-        "db_path": Path(os.environ.get("VERTUS_DB_PATH",
-                                        str(Path.home() / ".vertus" / "fleet.db"))),
-        "token_file": Path(os.environ.get("VERTUS_TOKEN_PATH",
-                                           str(Path.home() / ".vertus" / "token"))),
+        "agents_dir": vertus_paths.agents_dir(),
+        "db_path": vertus_paths.fleet_db_path(),
+        "token_file": vertus_paths.token_path(),
     }
 
 # The event types the bridge's _handle_event actually parses. All but
@@ -135,10 +138,8 @@ def _entry_imports(venv_python: Path, fork: Path) -> bool:
 
 def env_checks() -> list[dict]:
     out: list[dict] = []
-    fork = Path(os.environ.get("VERTUS_HERMES_REPO",
-                               str(Path.home() / ".hermes" / "hermes-agent")))
-    venv_py = Path(os.environ.get("VERTUS_HERMES_PYTHON",
-                                  str(fork / "venv" / "bin" / "python")))
+    fork = vertus_paths.fork_repo()
+    venv_py = vertus_paths.venv_python()
 
     # fork checkout — functionally: spawn cwd exists AND the gateway entry
     # imports under the venv. (.git is NOT required: this machine's checkout
@@ -397,8 +398,7 @@ def _spawn_throwaway_gateway(log) -> tuple[_HermesSession, Path, Path]:
     """One throwaway gateway on a temp HERMES_HOME — the real fork, the real
     spawn machinery, nothing shared with the fleet. Returns (session, home,
     cwd); caller MUST close() the session."""
-    fork_repo = Path(os.environ.get("VERTUS_HERMES_REPO",
-                                    str(Path.home() / ".hermes" / "hermes-agent")))
+    fork_repo = vertus_paths.fork_repo()
     home = Path(tempfile.mkdtemp(prefix="vertus-doctor-home-"))
     cwd = Path(tempfile.mkdtemp(prefix="vertus-doctor-cwd-"))
     # Mirror the fleet materializer's config.yaml shape: model/provider
@@ -426,8 +426,7 @@ def _spawn_throwaway_gateway(log) -> tuple[_HermesSession, Path, Path]:
                 (home / name).write_bytes(src.read_bytes())
             except OSError:
                 pass
-    venv_py = Path(os.environ.get("VERTUS_HERMES_PYTHON",
-                                  str(fork_repo / "venv" / "bin" / "python")))
+    venv_py = vertus_paths.venv_python()
     if not venv_py.is_file():
         raise FileNotFoundError(f"venv python missing: {venv_py}")
     env = build_gateway_env(agent_home=home)
@@ -446,8 +445,7 @@ def _spawn_throwaway_gateway(log) -> tuple[_HermesSession, Path, Path]:
 
 
 def _fleet_home() -> Path:
-    env = os.environ.get("VERTUS_FLEET_HERMES_HOME", "").strip()
-    return Path(env).expanduser() if env else Path.home() / ".hermes"
+    return vertus_paths.fleet_hermes_home()
 
 
 def _fleet_model_defaults() -> tuple[str | None, str | None]:

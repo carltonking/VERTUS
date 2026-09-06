@@ -80,6 +80,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Dual import like vertus_server.py: plain for script-dir invocation, package-relative for -m.
+try:
+    import vertus_paths  # type: ignore
+except ImportError:  # pragma: no cover - only hit under package invocation
+    from . import vertus_paths  # type: ignore
+
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _PROFILE_FILE = "profile.json"
 _PRIMARY_MARKER = "_primary"
@@ -119,12 +125,12 @@ def _slugify(name: str) -> str:
 def fleet_hermes_home() -> Path:
     """The fleet default engine config root (source for persona backfill + key copies).
 
-    ``VERTUS_FLEET_HERMES_HOME`` overrides; default ``~/.hermes`` — the same
-    root the un-profiled hermes engine resolves (hermes fork:
-    hermes_constants.get_hermes_home → $HERMES_HOME → ~/.hermes).
+    Resolution lives in vertus_paths.fleet_hermes_home (the ONE resolver):
+    ``VERTUS_FLEET_HERMES_HOME`` → ``VERTUS_ROOT/hermes`` under a hermetic
+    root → ``~/.hermes`` (the same root the un-profiled hermes engine
+    resolves: hermes_constants.get_hermes_home → $HERMES_HOME → ~/.hermes).
     """
-    env = os.environ.get("VERTUS_FLEET_HERMES_HOME", "").strip()
-    return Path(env).expanduser() if env else Path.home() / ".hermes"
+    return vertus_paths.fleet_hermes_home()
 
 
 def _read_fleet_soul() -> str:
@@ -205,8 +211,10 @@ class AgentRegistry:
     """
 
     def __init__(self, root: str | Path | None = None) -> None:
-        env = os.environ.get("VERTUS_AGENTS_DIR")
-        self.root = Path(root or env or (Path.home() / ".vertus" / "agents")).expanduser()
+        # Root resolution lives in vertus_paths.agents_dir (env var →
+        # VERTUS_ROOT → production default); the explicit ``root`` argument
+        # (tests, temp hubs) still wins when given.
+        self.root = Path(root or vertus_paths.agents_dir()).expanduser()
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -403,13 +411,13 @@ class AgentRegistry:
         self-contained per-agent file. Returns None when no manifest exists —
         the caller then falls back to ``standard`` permission mode.
         """
-        env = os.environ.get("VERTUS_CUA_MANIFEST", "").strip()
+        env = vertus_paths.cua_manifest_override()
         candidates: list[Path] = []
         if env:
             candidates.append(Path(env).expanduser())
         candidates.append(home / "cua-manifest.yaml")
         candidates.append(fleet_hermes_home() / "cua-manifest.yaml")
-        candidates.append(Path.home() / ".vertus" / "cua-manifest.yaml")
+        candidates.append(vertus_paths.vertus_root() / "cua-manifest.yaml")
         for cand in candidates:
             if not cand.is_file():
                 continue
@@ -433,20 +441,16 @@ class AgentRegistry:
     def shared_memory_dir(self) -> Path:
         """Fleet-wide notes directory every bot reads/writes.
 
-        ``VERTUS_SHARED_MEMORY_DIR`` overrides; falls back to
-        ``VERTUS_MEMORY_DIR/shared``; default ``~/.vertus/memory/shared``.
-        Must agree with ``fleet_memory.shared_dir`` — a hub with only
-        ``VERTUS_MEMORY_DIR`` set would otherwise materialize skills pointing
-        at the real ``~/.vertus`` while the store writes to the temp root,
-        sending bots at the user's actual memory.
+        Resolution lives in vertus_paths.shared_memory_dir (the ONE
+        resolver): ``VERTUS_SHARED_MEMORY_DIR`` → ``VERTUS_MEMORY_DIR/shared``
+        → ``VERTUS_ROOT/memory/shared``. This used to be its own hardcoded
+        ``~/.vertus/memory/shared`` here while fleet_memory resolved the same
+        concept from env — a hub with only ``VERTUS_MEMORY_DIR`` set
+        materialized skills pointing at the real ``~/.vertus`` while the
+        store wrote to the temp root, sending bots at the user's actual
+        memory. One resolver, one fallback chain, forever.
         """
-        env = os.environ.get("VERTUS_SHARED_MEMORY_DIR", "").strip()
-        if env:
-            return Path(env).expanduser()
-        mem_env = os.environ.get("VERTUS_MEMORY_DIR", "").strip()
-        if mem_env:
-            return Path(mem_env).expanduser() / "shared"
-        return Path.home() / ".vertus" / "memory" / "shared"
+        return vertus_paths.shared_memory_dir()
 
     def ensure_memory_dirs(self, agent_id: str) -> tuple[Path, Path]:
         """Create (if missing) and return ``(agent_memory, shared_memory)``."""
@@ -540,7 +544,7 @@ class AgentRegistry:
         # FLEET.md — the inter-bot protocol for THIS bot, spelled out so the
         # model can follow it with curl. Derived state: rewritten on every
         # profile write, so the self-identity can never drift from profile.json.
-        hub_url = os.environ.get("VERTUS_HUB_URL", "http://127.0.0.1:8787").strip().rstrip("/")
+        hub_url = vertus_paths.hub_url().rstrip("/")
         (home / "FLEET.md").write_text(
             "# VERTUS Fleet — inter-bot protocol (hub-generated; derived state)\n\n"
             f"You are agent `{agent_id}` (\"{profile.get('name') or agent_id}\") in the VERTUS fleet.\n"

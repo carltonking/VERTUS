@@ -22,10 +22,17 @@ import subprocess
 import threading
 from pathlib import Path
 
-FORK_REPO = Path(os.environ.get("VERTUS_HERMES_REPO", str(Path.home() / ".hermes" / "hermes-agent")))
-VENV_PYTHON = Path(
-    os.environ.get("VERTUS_HERMES_PYTHON", str(FORK_REPO / "venv" / "bin" / "python"))
-)
+# Dual import like vertus_server.py: plain for script-dir invocation, package-relative for -m.
+try:
+    import vertus_paths  # type: ignore
+except ImportError:  # pragma: no cover - only hit under package invocation
+    from . import vertus_paths  # type: ignore
+
+# Fork/venv resolution lives in vertus_paths (VERTUS_HERMES_REPO /
+# VERTUS_HERMES_PYTHON → ~/.hermes/hermes-agent). Frozen at import like
+# before — the doctor resolves at call time from the same single resolver.
+FORK_REPO = vertus_paths.fork_repo()
+VENV_PYTHON = vertus_paths.venv_python()
 READY_TIMEOUT_S = float(os.environ.get("VERTUS_HERMES_READY_TIMEOUT_S", "60"))
 
 # A stray automation loop on this machine runs `pkill -f tui_gateway.entry`
