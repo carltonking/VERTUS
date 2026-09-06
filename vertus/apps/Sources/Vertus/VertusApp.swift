@@ -119,6 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installMenubarIcon()
         registerLaunchAtLogin()
         installNotifications()
+        installPanelQuitMonitor()
         openMainWindow()
 
         if CommandLine.arguments.contains("--verify-nub") {
@@ -485,6 +486,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func quitApp() { NSApp.terminate(nil) }
+
+    // MARK: - ⌘Q while the panel is key
+
+    /// The QuickBar panel is a .nonactivatingPanel (VertusApp.swift:77-78):
+    /// using it never activates VERTUS, and key-equivalent dispatch (⌘Q)
+    /// belongs to the ACTIVE app — so while another app is frontmost, the
+    /// standard menu's "Quit VERTUS" (⌘Q) is unreachable and ⌘Q would quit
+    /// the frontmost app instead. Key events to the key panel ARE delivered
+    /// to this app (that is how typing into the bar works), so a local
+    /// monitor can intercept ⌘Q exactly when the panel is key and terminate
+    /// ourselves. When VERTUS is the active app the panel is never key with
+    /// an external menu bar owning ⌘Q, so we pass the event through and the
+    /// standard menu handles it — exactly one path fires in every state.
+    private func installPanelQuitMonitor() {
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            let hasCmd = event.modifierFlags.contains(.command)
+            let hasShift = event.modifierFlags.contains(.shift)
+            let isQ = event.charactersIgnoringModifiers?.lowercased() == "q"
+            guard hasCmd && !hasShift && isQ else { return event }
+            guard let panel = self.panel, panel.isKeyWindow else { return event }
+            vertusTrace("⌘Q intercepted while QuickBar panel is key — terminating")
+            NSApp.terminate(nil)
+            return nil
+        }
+    }
 
     // MARK: - Launch at login
 
