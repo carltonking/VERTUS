@@ -322,6 +322,51 @@ history endpoints, agent CRUD/409 typing, hub health.
 - **VertusBar**: the notch panel, ⇧⌘J, unchanged visual language — agent
   picker (remembers last used), fire-and-forget submit, compact busy strip,
   deep-link to Fleet.
+
+### Terminal REPL — hub mode (`VERTUS_ENGINE=hub`)
+
+The pi UI is untouched (`HubSession` extends `AgentSession` through the same
+seam `HermesSession` uses, swapping only the turn machinery). Engine
+selection lives in code (`sdk.ts`), not the shell wrapper: unset/`pi` =
+local native engine (the default, unchanged and verified), `hermes` = the
+hermes brain, `hub` = fleet client. Agent selection: `--agent <id>` >
+`VERTUS_AGENT` env > `primary`. Hub URL: `VERTUS_SERVER_URL` >
+127.0.0.1:8787; token from `~/.vertus/token`.
+
+Hub mode: transcript seeds from `/api/agents/<id>/messages`; the fleet SSE
+stream resumes with `since=<persisted cursor>` so closing the terminal never
+abandons a running turn; prompt → `POST /api/prompt` (202/run_id); steer →
+`POST /api/steer`; abort → `POST /api/agents/<id>/cancel`. Bot messages,
+handoffs, and routines for that agent render as attributed bubbles. Run
+history, replay, memory, and the message bus are shared with every other
+surface.
+
+**Steer delivery is honest.** The fork's `session.steer` lands only at the
+next tool-batch boundary; a generation-only turn can end with an accepted
+steer that never reached the model. The terminal says so on every accepted
+steer, and the hub infers delivery (an `activity` event starting with
+`"running "` marks a tool boundary; a steer recorded after the last one was
+undelivered) and emits `steer_undelivered` on the fleet stream at turn end.
+
+**Degradation table** — every REPL feature in hub mode. Nothing fails
+silently; each degraded feature posts a one-time or per-use visible notice:
+
+| Feature | In hub mode | What the user sees |
+|---|---|---|
+| prompt / follow-up | works | queued on the hub, streamed back |
+| steer mid-turn | works (tool-boundary delivery) | `Steering:` pending display + caveat notice on every accepted steer; `steer_undelivered` notice when a turn ends without delivering |
+| abort (Esc/Ctrl-C flow) | works | hub escalation ladder via `/api/agents/<id>/cancel` |
+| transcript seed + resume | works | history renders at start; reopen continues a closed terminal's turn |
+| bot message / handoff / routine bubbles | works | `⟨message from X⟩ …` attributed user bubble |
+| thinking-level set/cycle | disabled with message | "fixed by the agent profile — change it in the Fleet app or PATCH /api/agents" |
+| model set/cycle/picker (`setModel`, `cycleModel`, `setScopedModels`) | disabled with message | "model is owned by the agent profile; it applies on the next turn via the hub's deferred respawn" |
+| compaction (`compact`, auto-compaction toggle) | disabled with message | "gateway manages its own context; restart the agent in the Fleet app if a turn is losing the thread" |
+| session naming | disabled with message | "the agent has one identity (its fleet name), not per-terminal sessions" |
+| steering/follow-up queue modes | disabled with message | "steering is delivered straight to the live turn; follow-ups queue locally and drain as new hub turns" |
+| interactive bash (`executeBash`/`recordBashResult`) | runs locally, never reaches the model | still executes as a scratch shell + one-time notice "the hub model cannot see it (the gateway has its own sandbox shell)" |
+| context stats / exports / navigation / history | works (local view) | terminal-side only |
+| `/login`, local auth, model discovery | falls back to local | startup happens as before; the hub agent's gateway owns the model |
+
 - Both ship as `.app` bundles from one command:
   `cd vertus/apps && bash scripts/build-apps.sh` (bundles are not cosmetic —
   `UNUserNotificationCenter` crashes outside a bundle). `VERTUS_HUB_URL`

@@ -225,12 +225,32 @@ a dead scheduler is visible in the UI, not just in a log.
   (⇧⌘J): agent picker, fire-and-forget submit (closing the panel never
   abandons a run), a compact busy strip (with Stop and "working for X"),
   and "Open in Fleet".
-- **Terminal REPL** — the pi UI runs its **own in-process session** (it
-  does not talk to the hub); engine selection is in code (`sdk.ts`): the
-  default is the native pi `AgentSession`, and `VERTUS_ENGINE=hermes`
-  opts into the hermes brain. The README previously claimed hermes was the
-  terminal default — it is not. One-shot `vertus "<question>"` proxies
-  through the hub.
+- **Terminal REPL** — the pi UI in three engine modes (selected in code,
+  `sdk.ts`; the wrapper defaults to `pi`):
+  - `VERTUS_ENGINE` unset / `pi` — the native pi `AgentSession`, fully
+    local, byte-for-byte the pre-fleet REPL (verified: a local turn
+    renders its reply and writes session state to `~/.vertus/agent`
+    without creating any hub run). The README previously claimed hermes
+    was the terminal default — it is not.
+  - `VERTUS_ENGINE=hermes` — the hermes brain (unchanged).
+  - `VERTUS_ENGINE=hub` — the terminal as a **fleet client**
+    (`HubSession`): the pi UI unchanged, but every turn runs on a
+    fleet agent's hub-managed gateway. Agent selection: `--agent <id>`
+    > `VERTUS_AGENT` env > `primary`. Transcript seeds from
+    `/api/agents/<id>/messages`; the live fleet stream resumes with
+    `since=` and a persisted cursor, so closing the terminal never
+    abandons a running turn. Steer (mid-turn correction) →
+    `POST /api/steer`; abort → the hub's escalation ladder. Bot
+    messages / handoffs / routines for that agent render as attributed
+    bubbles. REPL features the hub cannot honor (thinking level, model
+    switching, compaction, session naming, queue modes, interactive
+    bash context injection) degrade EXPLICITLY — a visible notice says
+    why; see the full degradation table in VERTUS_PLAN.md §9. Steer
+    delivery is honest: the fork injects steers only at the next tool
+    batch, so a generation-only turn may never receive one — the
+    terminal says so, and the hub emits `steer_undelivered` when a turn
+    ends with an undelivered steer. One-shot `vertus "<question>"`
+    proxies through the hub.
 - **VertusPhone** — iOS scaffold over Tailscale; chat surface only.
 
 Build everything with one command:
@@ -255,7 +275,11 @@ temp HERMES_HOME and probing every RPC and the event vocabulary (no model
 turns — turn-only checks report `unverified` rather than hanging). Also
 checks the fork/venv, cua-driver + empirical TCC probes, hub health and
 code currency, store integrity/WAL/schema, agent profile schema versions,
-and the launchd agents. Safe against a live hub and with none running; it
+memory canonical/mirror consistency and the injected skill paths, the
+launchd agents, a sweep for stray `com.vertus.*` launchd labels (a demo
+agent must not outlive its demo), and the terminal's hub-mode attach path
+(hub reachable, `VERTUS_AGENT` resolvable, steer endpoint live — probed
+only on an idle agent). Safe against a live hub and with none running; it
 never writes to ~/.vertus.
 
 See [docs/FIRST_RUN.md](docs/FIRST_RUN.md) for the tested fresh-machine
