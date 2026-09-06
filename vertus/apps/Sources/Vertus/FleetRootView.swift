@@ -102,7 +102,8 @@ struct FleetRootView: View {
             FleetSidebarView(
                 onNewAgent: { editorMode = .create; showEditor = true },
                 onEditAgent: { agent in editorMode = .edit(agent); showEditor = true },
-                onShowActivity: { showActivity = true }
+                onShowActivity: { showActivity = true },
+                onShowMemory: { AppDelegate.shared?.showMemoryWindow() }
             )
             .navigationSplitViewColumnWidth(min: 220, ideal: 250)
         } detail: {

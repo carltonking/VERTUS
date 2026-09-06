@@ -84,6 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: KeyablePanel?
     private var host: NSHostingView<QuickBarRootView>?
     private var localMonitor: Any?
+    private var windowCloseMonitor: Any?
     private var statusItem: NSStatusItem?
     private var menubarIcon: NSImage?
     private var appLogo: NSImage?
@@ -93,6 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var currentWidgetHeight = NotchPanelMetrics.idleHeight()
     private let expansionState = ExpansionState()
     private var mainWindow: NSWindow?
+    private var memoryWindow: NSWindow?
     private var notifier: CompletionNotifier?
 
     override init() {
@@ -120,6 +122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerLaunchAtLogin()
         installNotifications()
         installPanelQuitMonitor()
+        installWindowCloseMonitor()
         openMainWindow()
 
         if CommandLine.arguments.contains("--verify-nub") {
@@ -322,6 +325,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
     }
 
+    /// The Memory view as its OWN window, not a sheet. Memory browsing is a
+    /// place you spend time (read, edit, search, watch bots write) — a
+    /// borderless sheet with no close control was a trap (Bug 2: the app had
+    /// to be force-quit). A titled, resizable window gives it the platform
+    /// conventions: traffic-light close, ⌘W via the Window menu, ⌘M, resize.
+    func showMemoryWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let window = memoryWindow {
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 860, height: 600),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Memory"
+        window.contentView = NSHostingView(
+            rootView: MemoryView().environmentObject(store)
+        )
+        window.setFrameAutosaveName("VERTUSMemoryWindow")
+        window.isReleasedWhenClosed = false
+        memoryWindow = window
+        window.makeKeyAndOrderFront(nil)
+    }
+
     // MARK: - Show / hide transitions
 
     /// Grows the bar out of the notch: the panel shape animates from a small
@@ -509,6 +539,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let panel = self.panel, panel.isKeyWindow else { return event }
             vertusTrace("⌘Q intercepted while QuickBar panel is key — terminating")
             NSApp.terminate(nil)
+            return nil
+        }
+    }
+
+    // MARK: - ⌘W for manually-created windows
+
+    /// SwiftUI's generated Window > Close (⌘W) command only acts on
+    /// scene-managed windows; both our windows are created by the delegate
+    /// (main + Memory), so the shortcut no-ops while the menu item's click
+    /// works. Intercept ⌘W and performClose on the key window ourselves:
+    /// the main window hides (windowShouldClose -> orderOut), the Memory
+    /// window closes. The panel is not a closable window — ⌘W while the
+    /// panel is key passes through (⇧⌘J is its close).
+    private func installWindowCloseMonitor() {
+        windowCloseMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            let hasCmd = event.modifierFlags.contains(.command)
+            let hasShift = event.modifierFlags.contains(.shift)
+            let isW = event.charactersIgnoringModifiers?.lowercased() == "w"
+            guard hasCmd && !hasShift && isW else { return event }
+            guard let key = NSApp.keyWindow, key !== self.panel else { return event }
+            vertusTrace("⌘W intercepted for key window \(key.title) — closing")
+            key.performClose(nil)
             return nil
         }
     }
