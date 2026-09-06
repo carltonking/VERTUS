@@ -45,6 +45,8 @@ export interface Args {
 	useTheme?: string;
 	noThemes?: boolean;
 	noContextFiles?: boolean;
+	/** VERTUS hub mode: the fleet agent to attach to (default VERTUS_AGENT env → primary). */
+	agent?: string;
 	listModels?: string | true;
 	offline?: boolean;
 	tuiMode?: TuiMode;
@@ -193,6 +195,9 @@ export function parseArgs(args: string[]): Args {
 			result.noThemes = true;
 		} else if (arg === "--no-context-files" || arg === "-nc") {
 			result.noContextFiles = true;
+		} else if (arg === "--agent" && i + 1 < args.length) {
+			// VERTUS hub mode: which fleet agent to attach to.
+			result.agent = args[++i].trim();
 		} else if (arg === "--list-models") {
 			// Check if next arg is a search pattern (not a flag or file arg)
 			if (i + 1 < args.length && !args[i + 1].startsWith("-") && !args[i + 1].startsWith("@")) {

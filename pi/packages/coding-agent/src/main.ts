@@ -611,6 +611,13 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 	}
 	time("parseArgs");
+	// VERTUS hub mode agent selection: --agent flag wins over the
+	// VERTUS_AGENT env var (HubSession falls back to "primary" when neither
+	// is set). Threaded via env because HubSession resolves its identity at
+	// construction, deep inside createAgentSession.
+	if (parsed.agent) {
+		process.env.VERTUS_AGENT = parsed.agent;
+	}
 	// VERTUS hub proxy (one-shot only): run the prompt through the hub
 	// session so the CLI shares the transcript with the quick bar and the
 	// phone — before any local session, model discovery, or extension

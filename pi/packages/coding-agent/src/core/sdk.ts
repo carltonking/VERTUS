@@ -403,15 +403,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// VERTUS fork: the pi engine executes agent turns by default (native
 	// pi agent loop — no Python gateway subprocess, no hermes dependency).
 	// The session type stays AgentSession either way; opt back into the
-	// hermes brain with VERTUS_ENGINE=hermes. The default lives in code,
-	// not the shell wrapper, so stale shells and hashed PATHs cannot
-	// silently revert.
+	// hermes brain with VERTUS_ENGINE=hermes, or attach to the fleet hub
+	// with VERTUS_ENGINE=hub (see core/hub-session.ts — turns run on the
+	// agent's hub-managed gateway, sharing run store, memory, and stream
+	// with every other client). The default lives in code, not the shell
+	// wrapper, so stale shells and hashed PATHs cannot silently revert.
 	const session =
 		process.env.VERTUS_ENGINE === "hermes"
-			? // hermes path stays lazily imported so the default bundle
-			  // never loads it (bundle splits it into its own chunk).
+			? // hermes/hub paths stay lazily imported so the default bundle
+			  // never loads them (bundling splits each into its own chunk).
 			  new (await import("./hermes-session.ts")).HermesSession(sessionConfig)
-			: new AgentSession(sessionConfig);
+			: process.env.VERTUS_ENGINE === "hub"
+				? new (await import("./hub-session.ts")).HubSession(sessionConfig)
+				: new AgentSession(sessionConfig);
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {
