@@ -1,124 +1,351 @@
-# VERTUS — Full Blueprint
+# VERTUS — Full Blueprint (as built)
 
-Personal AI assistant with full computer control: a fork of the **pi** agent harness (earendil-works/pi), a **menubar-driven quick bar** under the macOS notch, and **native phone access** over Tailscale.
+VERTUS is a **multi-agent fleet** that runs named agent instances on one Mac,
+each with its own identity, config root, and gateway process, coordinated by a
+single hub. The original plan — a single pi-based agent with a Bun/TS server,
+NVIDIA NIM, and a Tailscale phone app — is history. What exists today, and the
+decisions behind it, are below.
 
-## Architecture
+The short version is [README.md](README.md); the tested fresh-machine
+walkthrough is [docs/FIRST_RUN.md](docs/FIRST_RUN.md). This document is the
+blueprint: architecture, invariants, decisions, limits.
+
+---
+
+## 1. Architecture
 
 ```
 ┌─────────────────────────┐      ┌──────────────────────────────┐
-│  Quick Bar (SwiftUI)    │      │  VERTUS Server (Bun/TS)      │
-│  menubar icon, ⇧⌘J,     │─────▶│  pi-agent-core session loop  │
-│  850×400, frames notch  │ HTTP │  tools: files/shell/web      │
-└─────────────────────────┘ SSE  │  memory store (JSON+MD)      │
-                                 │  auth: tailnet + token       │
-┌─────────────────────────┐      │  LLM: NVIDIA NIM (OpenAI-    │
-│  Phone app (native)     │─────▶│  compatible, pi-ai provider) │
-│  over Tailscale         │ WSS  └──────────────────────────────┘
-└─────────────────────────┘               │ full control of
-                                          ▼ your Mac (cwd = $HOME)
+│  VertusBar (SwiftUI)    │      │  Vertus hub (Python)         │
+│  notch panel, ⇧⌘J,      │─────▶│  vertus_server.py            │
+│  fast path only         │ HTTP │  - session manager (bridges) │
+├─────────────────────────┤ SSE  │  - run store (SQLite)        │
+│  VertusFleet (SwiftUI)  │      │  - routine scheduler         │
+│  full window: roster,   │─────▶│  - message bus               │
+│  chat, runs, routines,  │      │  - screen target registry    │
+│  approvals, activity    │      │  - approval ledger (ro)      │
+└─────────────────────────┘      └──────────────────────────────┘
+                                        │ spawn (env allowlist,
+                                        │ per-agent HOME)
+                                        ▼
+                     ~/.hermes/hermes-agent (fork, branch `vertus`)
+                     TUI-gateway JSON-RPC per agent — one gateway
+                     process per agent, killed/reaped by the hub
 ```
 
-One long-running **VERTUS server** owns the agent (sessions, tools, memory, NIM calls). Three thin clients — CLI, quick bar, phone app — all talk to it.
+- **One hub process**, stdlib `ThreadingHTTPServer`, binds 127.0.0.1 + the
+  Tailscale IP, bearer-token auth, SSE for events. Launched by launchd
+  (`disabled-launchagents/com.vertus.server.plist`), KeepAlive.
+- **One gateway per agent** (`hermes_bridge.py`): the hermes fork's
+  `tui_gateway` JSON-RPC server, spawned with an explicit allowlisted env and
+  a per-agent home. The hub is the only client of the fork; the fork is never
+  modified.
+- **One event stream for the whole fleet.** Every emitted event carries
+  `agent_id`, `run_id`, `seq`, `ts`. Clients subscribe to the fleet stream and
+  demultiplex; `since=` replay makes disconnects recoverable.
+- **SQLite as the source of truth** for runs, events, messages, bot_messages,
+  threads, approvals, routines. One dedicated writer thread; readers use their
+  own connections. WAL mode. No ORM.
 
-## Phase 1 — Agent core (fork pi → VERTUS)
+---
 
-1. **Fork & brand**: clone earendil-works/pi, rename the CLI entry to `vertus`, custom system prompt/persona (VERTUS personality, your preferences, house rules).
-2. **NVIDIA NIM provider** — no fork of pi-ai needed. One extension file (`extensions/nim-provider.ts`):
-   ```ts
-   pi.registerProvider("nvidia-nim", {
-     baseUrl: "https://integrate.api.nvidia.com/v1",
-     apiKey: "$NVIDIA_API_KEY",
-     api: "openai-completions",
-     models: [ /* NIM model ids, contextWindow, maxTokens */ ]
-   });
-   ```
-3. **Full-control tools**: keep pi's read/bash/edit tools, default cwd `$HOME`, plus an approval-guard extension for destructive commands initiated **remotely** (local runs trusted).
-4. **Long-term memory**: `~/.vertus/memory/` — `profile.md` (stable facts about you), `notes/` (task notes), JSON index; a pi skill makes VERTUS read it at session start and update it when it learns something durable.
+## 2. Per-agent identity and homes
 
-## Phase 2 — VERTUS server + CLI client
+Each agent's profile lives in `~/.vertus/agents/<id>/profile.json`
+(`agent_registry.py`) — the **single source of truth**. Schema-versioned
+(v3 today) with lossless, idempotent migrations: v1→v2 added persona/model/
+provider/color/emoji/autonomy; v2→v3 added `computer_use` and `cua_targets`.
+Unknown keys are never dropped.
 
-5. **Server daemon** (`vertus serve`): wraps `createAgentSessionRuntime` from pi's SDK; exposes `POST /api/prompt`, `GET /api/events` (SSE stream), `POST /api/steer`, `/api/abort`; binds to the Tailscale interface only + bearer token. **The SSE stream emits structured `text` / `activity` / `done` / `error` events** so clients can render streamed replies nicely.
-6. **CLI client** (`vertus "<request>"`): forked pi TUI for interactive work + one-shot mode through the server so all clients share one session history.
+The on-disk home is **derived state**, re-materialized on create and on every
+profile update:
 
-## Phase 3 — Quick-access bar (macOS)
+```
+~/.vertus/agents/<id>/home/
+    config.yaml     # model/provider, permission mode from autonomy
+    SOUL.md         # written from profile.persona
+    memories/USER.md
+    FLEET.md        # hub URL + curl templates for messaging/delegation
+~/.vertus/agents/<id>/memory/     # this bot's own notes (per-bot)
+~/.vertus/memory/shared/          # fleet-wide notes (all bots read/write)
+```
 
-7. **SwiftUI overlay app**: borderless non-activating `NSPanel` at **status level**, **850×400 px**, pinned **top-center on the full screen frame** so it frames the 16" notch footprint (220×38 dead space at top center, content wrapping around it); toggled by the **menubar icon** (VERTUS.icns) or global hotkey (default **⇧⌘J**); animated grow/retract out of and back into the notch; stays pinned (ignores outside clicks) until **Cancel**/**Upload** is pressed; logo flank = attach file (system picker on top layer), New Session flank = clear output; vibrancy material; Enter → `POST /api/prompt`; live streaming reply (scrollable transcript); launch-at-login + menu-bar extra.
+The hub spawns each gateway with its own `HOME`-equivalent so config, persona,
+and memory never leak across bots (see §7 — this replaced the original
+`env={**os.environ}` inheritance and a `VERTUS_REMOTE` process-global race).
 
-## Phase 4 — Phone app (native, over Tailscale)
+## 3. Run store and replay
 
-8. **Native iOS app** (SwiftUI): Mac's MagicDNS tailnet address + token in Keychain; streaming chat, tool-activity feed, remote-approval prompts; Android via KMP later if wanted.
+`run_store.py` — `~/.vertus/fleet.db` (env `VERTUS_DB_PATH`), WAL, one writer
+thread with a queue.
 
-## Security posture
+- **`runs`**: `run_id, agent_id, prompt, remote, source, state, started_at,
+  ended_at, error, gateway_respawns, run_kind, parent_run_id, routine_id,
+  from_agent, thread_id`. States: `queued|running|done|error|interrupted|
+  abandoned|cancelled|timeout`.
+- **`events`**: every wire event, with a global monotonic `seq` across the
+  whole fleet — one cursor, not per-agent. **Durability rule: an event is
+  written to the store *before* it is fanned out.** No event reaches a client
+  that is not in the store; a store failure fails the run.
+- **`messages`**: folded user/assistant turns — deltas are stored as emitted,
+  and the assembled assistant text is folded into one row per message at turn
+  end, so history reads are O(messages), not O(deltas).
+- Replay: `GET /api/events?since=<seq>` drains the store past the cursor then
+  hands off to live with no gap and no duplicate (tested with an event
+  landing mid-drain). A subscriber whose queue overflows is dropped (existing
+  behavior) but the drop is recoverable: a `lagged` event carries the last
+  `seq`, and the client resumes with `since=`.
+- Crash recovery: runs left `queued|running` at boot are marked `interrupted`
+  (count logged). `events` older than `VERTUS_EVENT_TTL_DAYS` (default 30)
+  are pruned on boot and daily; `runs` and `messages` are never pruned — they
+  are the record of what the fleet did, and outlive agent deletion.
 
-- Server binds **only** to the tailnet interface; never 0.0.0.0.
-- Bearer token on every request; token stored in the phone's Keychain only.
-- Remote requests run in **approval mode** for destructive shell commands; local requests trusted.
-- NIM API key only in the server env, never in clients.
+## 4. Supervision and cancellation
 
-## Build order
+The fork's `session.interrupt` RPC was never called by any code path before
+this work; it is now the first rung of the escalation ladder:
 
-| # | Milestone | Deliverable | Status |
-|---|-----------|-------------|--------|
-| 1 | Fork + NIM + persona | `vertus` CLI answers via NIM with your system prompt | ✅ |
-| 2 | Memory | VERTUS remembers facts across sessions | ✅ |
-| 3 | Server + auth | `vertus serve` on the tailnet, streaming API | ✅ |
-| 4 | Quick bar | ⇧⌘J / menubar-icon notch bar (300×500) with live streaming replies | ✅ |
-| 5 | Phone app | Native iOS chat over Tailscale with approvals | ⬜ scaffold only |
-| 6 | Polish | Autostart, settings, model switching, logs | ⬜ |
+1. `session.interrupt`, wait `grace_s` (default 10);
+2. terminate the gateway process (group signal), wait;
+3. `kill -9`;
+4. mark the run terminal, release declared targets, drop the dead session so
+   the next prompt respawns.
 
-Milestones 1–3 already give a phone-accessible VERTUS (mobile browser as stopgap); bar and native app layer on without rework.
+Each rung is logged with which one succeeded. Stalls are detected by **event
+silence, not wall clock** (a healthy CUA turn is slow but chatty): per-agent
+`stall_timeout_s` (default 180) and `hard_timeout_s` (default 3600, a backstop
+for a turn that emits forever). Both are visible in `status()`, along with
+elapsed silence, so a slow-but-healthy turn is distinguishable from a stuck
+one. A timeout ends the run `state=timeout`.
 
-## Hermes engine migration (2026-09-01)
+Gateway supervision (`hermes_bridge.py`):
 
-The agent engine moved from the pi fork to a **fork of NousResearch/hermes-agent**
-(`/Users/carltonking/01 - PROJECTS/Hermes desktop/hermes-agent`, branch `vertus`;
-GitHub fork pending `gh auth login`). The VERTUS terminal UI and the phone/bar
-clients are unchanged — only the engine underneath swapped.
+- respawn with backoff: 3 attempts, 1s/4s/16s, jittered; after exhaustion the
+  agent is **degraded** (visible in `status()`, prompts 503 with a readable
+  reason) until a successful spawn clears it;
+- thrash cap: a gateway that dies more than **4 times in 10 minutes** stops
+  auto-respawning and reports degraded — a couple of crashes can be transient,
+  five is a broken configuration, and the hub should not thrash a wallet
+  against a dead loop;
+- idle-gateway health check on an interval (default 300s): a live but
+  unresponsive gateway is closed so the next prompt spawns fresh;
+- gateway teardown — natural exit, stale-respawn, close(), agent DELETE —
+  **reaps the embedded cua-driver children** (process-group signals), and a
+  boot sweep catches drivers orphaned by a previous hub life, identified by
+  the embedded socket path, never by process name (the user's pre-existing
+  `CuaDriver.app` daemon must never be touched).
 
-**Terminal (`vertus`)** — the pi-style UI stays (user requirement: hermes is
-only the brain, never the UI):
+Cancellation is a first-class terminal state, distinct from `error` and
+`interrupted`: `POST /api/runs/<id>/cancel {drain_queue}` and
+`POST /api/agents/<id>/cancel`, emitting a `cancelled` fleet event. A queued
+run is dequeued and never spawns; a running run takes the ladder; a terminal
+run 409s. Cancelling one run never touches the rest of the agent's queue
+unless `drain_queue` is set.
 
-- `vertus` → the pi terminal bundle (unchanged UI/UX). `vertus-hermes` → the
-  forked hermes terminal with the VERTUS skin, opt-in only.
-- One-shot `vertus "…"` proxies through the hub when it is up → hermes brain,
-  pi UI (verified: CLI_HERMES_OK streamed back). The interactive REPL runs the
-  pi agent in-process (the pi TUI is fused to the in-process session; a
-  hermes-backed session adapter for the REPL is a large build, not a config).
-- The branded hermes terminal (opt-in) uses `skins/vertus.yaml` in the fork
-  (monochrome palette, VERTUS logo, `Welcome Back, Carlton`, `VERTUS v0.01.0`),
-  installed to `~/.hermes/skins/`, active via `display.skin: vertus` in
-  `~/.hermes/config.yaml`. Fork edits are skin-driven (built-in skins
-  unchanged): `hermes_cli/banner.py` + `cli.py` render the skin's
-  welcome/version and skip the hermes info panel and tips for user skins;
-  `hermes_cli/skin_engine.py` gained `is_user_skin()`.
-- Providers: config default is local Ollama (`nemotron-3-super:cloud`); Nous
-  Portal is native (`hermes auth add nous` — manual OAuth, pending).
+## 5. Computer use — and its honest limits
 
-**Hub (`vertus/server/vertus_server.py`)** — the bridge now defaults to
-`hermes_bridge.py` (spawns `python -m tui_gateway.entry` in the hermes venv and
-speaks the documented TUI-gateway JSON-RPC: `session.create`, `prompt.submit`,
-streaming `message.delta` / `message.complete`). `VERTUS_BRIDGE=pi` forces the
-old `pi_bridge.mjs` path. Re-armed as the `com.vertus.server` launchd keepalive
-(plist: `disabled-launchagents/com.vertus.server.plist`).
+Per-agent `computer_use: bool` and `cua_targets: [str] | null` (allowed app
+bundle ids / window titles; null = unrestricted) sit in the profile (v3).
+Disabled agents get `HERMES_COMPUTER_USE_BACKEND=noop` in their env
+allowlist — a blank-capture stub. **Caveat stated in code and docs: a disabled
+agent gets blank captures rather than a clean tool error, which a model may
+misread as "nothing on screen".**
 
-Verified end-to-end: CLI one-shot (`vertus -z …` → VERTUS_OK), hub SSE
-(`HUB_E2E_OK` streamed, `done` terminated), tailnet health at
-`http://100.84.144.109:8787/api/health` (what the phone dials).
+Conflict policy is **declared-target, not lease** (named in code
+`screen_lease.py`): two drivers on distinct windows measurably do not
+interfere (real cursor never moves, frontmost app undisturbed, `type` routes
+via AX `insertText` to the target window), so GUI work is *not* serialized.
+Instead a run whose agent declares non-null targets checks, at run start,
+whether another **running** agent declares an overlapping target: overlap → the
+run waits (`blocked_on_target` naming the holder in `status()`), released on
+the holder's terminal state, gateway death, or agent DELETE — it is impossible
+for a wait to outlive its holder (crash path tested). Disjoint or null
+declarations run fully parallel. `GET /api/fleet/screens` returns declared
+targets, holders, waiters, and the driver-process inventory.
 
-Manual steps still pending: `gh auth login` (fork to GitHub), `hermes auth add
-nous` (Nous Portal OAuth; the old proxy daemon `com.vertus.hermes` stays down
-until then).
+**`cua_targets` is a declaration, not a sandbox.** The hub can see only
+`tool.start` with a tool name — never the args, never the window an agent
+actually touches. An agent can target a window it never declared and the hub
+cannot see it. This is said in the code, in the `/api/fleet/screens` payload,
+in the Fleet UI, and in README LIMITS. Per-agent screen *isolation* would
+require VM-per-agent or headless displays; this repo does not provide it.
 
-## Key facts verified
+Approval: **no per-action GUI approval exists.** In gateway mode the fork
+never registers its approval callback for computer-use actions
+(`tools/computer_use/tool.py:643-646`), so an allow/deny queue for GUI actions
+is impossible without a fork change. `autonomy` therefore selects a spawn-time
+permission mode (`ask` → `standard`, `trusted` → `standard`, with `bounded`
+the intended target once a manifest schema exists — none is locally
+available). The `approvals` table exists and `GET /api/approvals?state=`
+works, but it is a read-only ledger of what the hub can actually observe —
+which today is nothing. Flipping a per-agent `approvals: mode` to `manual` in
+config.yaml would make *shell/file* approvals hub-answerable, at the cost of a
+much wider blast radius; it is not flipped anywhere.
 
-- pi SDK: `createAgentSessionRuntime`, `session.prompt/steer/abort`, `session.subscribe` event streaming — everything the server and bar need.
-- pi extension API: `registerProvider` supports OpenAI-compatible endpoints (NIM) incl. `$ENV` key refs, async model discovery, per-model `compat` flags.
-- pi has **no built-in permission system** — hence the explicit approval-guard extension.
-- NIM is OpenAI Chat Completions compatible → `api: "openai-completions"`.
-- pi session events: `message_update` → `assistantMessageEvent.type == "text_delta"` carries streamed assistant text; `tool_execution_start` carries `toolName` for activity feed; `agent_end` marks turn completion.
+## 6. Messaging, delegation, routines
 
-## Next steps
+### Message bus
 
-1. Rebuild the bar: `cd vertus/apps/vertus-bar && swiftc -o VertusBar VertusQuickBarApp.swift QuickBarRootView.swift QuickBarViewModel.swift MathEval.swift` (typechecks clean, 0 errors).
-2. Launch: `cd vertus/apps/vertus-bar && ./VertusBar` (background it; long-lived GUI processes don't survive this sandbox's shell timeouts, so launch from your own terminal or via `launchctl`).
-3. Start Milestone 5: native iOS app scaffolding under `vertus/apps/VertusPhone/`.
+`bot_messages` and `threads` tables (separate from user/assistant
+`messages`). A message to an idle agent starts a run with the message as the
+prompt, attributed (`from_agent`, `thread_id` on the run row); a message to a
+busy agent queues behind its work. Everything emits on the fleet stream.
+
+Loop protection, both caps hub-computed so bots cannot spoof them:
+
+- **Depth: 5 per (sender, thread)**. Results reuse the triggering depth so
+  they never inflate a chain; a legitimate chain is 1–2 hops. A ping-pong
+  dies at 5 hops per sender.
+- **Rate: 10 messages/60s per recipient**, bounding burn *rate* on top of
+  depth. A rejected attempt still consumes a slot so retrying can't beat it.
+
+When a cap trips, exactly: the message is stored with
+`status: dropped_depth|dropped_rate`, a `bot_message_rejected` event goes on
+the stream, no run is created, and the POST response says so — the sending
+bot sees it in its curl output.
+
+### Delegation
+
+Fork is off-limits and the hub cannot inject a tool into the gateway, so
+delegation is **persona + message-bus convention with a hub-deterministic
+return path**. Materialization writes `FLEET.md` (hub URL, exact curl
+template, handoff semantics) into every agent home and appends a fleet block
+to SOUL.md. The model delegates by `POST /api/messages {kind: "handoff"}`;
+the hub creates the child run (`run_kind=handoff`, `parent_run_id` recorded,
+depth checked) and returns a handle — it never blocks the delegator. When the
+child run reaches a terminal state the hub itself sends `kind=result` back
+(hub-side, not model-dependent), waking an idle delegator with a turn of its
+own. Flakiness is confined to the *outbound* decision — a model that never
+delegates simply doesn't — never the inbound result.
+
+### Routines
+
+Scheduled/triggered per-agent work (`fleet_routines.py`), the point of which
+is work that happens while you are not there. `routines` table with
+`schedule` (interval seconds only), `trigger` (null for pure schedule, else
+an event condition: `run_completed` or `bot_message`, each with a small
+enumerable filter vocabulary), `enabled`, `next_run_at`, `failure_count`.
+
+Decisions:
+
+- **Schedule representation: interval seconds only.** No cron parser in
+  stdlib, intervals are deterministic and testable, and wall-clock alignment
+  buys nothing for irregular-length bot tasks. One syntax, never two.
+- **Missed-fire policy: exactly one catch-up run at boot, then resync to
+  now + interval.** A laptop sleeping 10h wakes to one run, never 40; the
+  next fire is a full interval away. Bounded no matter what.
+- **Failure threshold: 3 consecutive failures disables the routine loudly**
+  (fleet event + orange UI state). One flake is transient, two is bad luck,
+  three is a broken routine.
+- A routine firing at a busy agent queues behind current work; at a degraded
+  agent it does not fire and increments `failure_count`. A routine can never
+  fire concurrently with itself. `POST /api/routines/<id>/run` fires now,
+  ignoring schedule. Runs created by a routine carry `run_kind=routine` and
+  the `routine_id`, so attribution, the run graph, and activity views pick
+  them up with no special-casing. Deleting an agent disables its routines.
+- **Interval floor: 30s at the API** (tests bypass via an internal path).
+  Below the floor is a 400 with a readable message.
+
+The scheduler lives **in the hub**, not launchd: the hub is already under
+launchd KeepAlive, and a second scheduling layer is a second failure mode —
+one that failed *silently* once (a logging split), which is what §9
+exists to prevent.
+
+## 7. Spawn isolation
+
+`hermes_bridge.py` builds each gateway's env explicitly — no `**os.environ`
+inheritance. Allowlist only what the engine needs (PATH, locale,
+`HERMES_*`/provider-key vars), inject the agent's home as the gateway's
+config root, and deny anything agent-specific from leaking across bots. The
+per-agent home is the override mechanism the fork honors (its config root is
+the env-injectable home; `~/.hermes` is only a fallback). `remote` is carried
+on the queue item and passed at spawn, never via process-global mutation —
+the `VERTUS_REMOTE` `os.environ` write is gone, and the whole repo is free of
+module-level per-turn/per-agent mutable state (grep-verified).
+
+## 8. Clients
+
+Both macOS clients are Swift Package targets under `vertus/apps/` sharing
+**VertusKit** — one client implementation: auth (token file or UserDefaults),
+agent CRUD + status, prompt → 202/run_id, one fleet-stream SSE connection
+demultiplexed by agent, `since=` resume with backoff, `lagged` recovery,
+history endpoints, agent CRUD/409 typing, hub health.
+
+- **VertusFleet**: full window — roster with live busy/blocked/degraded
+  state, per-agent chat with scroll-back pagination merging live deltas,
+  run list + past-run reopening, bot editor (identity, persona, model,
+  provider, color, emoji, autonomy, computer_use toggle, cua_targets),
+  routines block (create/edit/toggle/run-now, loud disabled-by-failures),
+  bot-thread view distinct from your own chat, fleet activity with
+  user-vs-bot-vs-routine attribution, approvals view, fleet screens view
+  (with the not-a-sandbox caveat in the UI), hub-health banner, and **user
+  notifications on background completion** — the feature that makes
+  "fire it off and walk away" real, with per-agent mute and suppression for
+  the foreground agent.
+- **VertusBar**: the notch panel, ⇧⌘J, unchanged visual language — agent
+  picker (remembers last used), fire-and-forget submit, compact busy strip,
+  deep-link to Fleet.
+- Both ship as `.app` bundles from one command:
+  `cd vertus/apps && bash scripts/build-apps.sh` (bundles are not cosmetic —
+  `UNUserNotificationCenter` crashes outside a bundle). `VERTUS_HUB_URL`
+  (env > UserDefaults > 127.0.0.1:8787) points dev builds at a temp hub.
+- VertusPhone is untouched by the fleet work and remains a separate client.
+
+## 9. Observability
+
+One logging path for the whole hub (`vertus_logging.py`): every subsystem —
+the hub's print sites, scheduler, messenger, bridges — through one logger to
+`~/.vertus/logs/vertus.log` (rotated) with stdout kept for launchd. The boot
+self-check verifies each subsystem is actually live (store writer thread,
+routine scheduler thread, messenger, session manager, each listener
+registered) and logs one explicit line per subsystem; a subsystem that fails
+to start is **loud and visible in the API**, not just the log. `GET
+/api/health` is real: uptime, subsystem status, agent count, running runs,
+degraded agents, scheduler next-fire, store write health — while keeping the
+original `{status, time}` keys so existing clients parse it. The Fleet app
+surfaces an unhealthy subsystem as a banner; that is the difference between
+"my bot didn't do the thing" and "the scheduler has been dead since Tuesday".
+
+## 10. Limits
+
+Same honesty, stated once, in full. The README carries the short version;
+the code carries it in comments; `/api/fleet/screens` and the Fleet UI carry
+the parts users can act on.
+
+- `cua_targets` is a **declaration, not a sandbox** — the hub gates
+  conflicts between agents, not what an agent actually touches.
+- **No per-action GUI approval** without a fork change; autonomy is a
+  spawn-time permission mode, not per-action consent.
+- **One desktop means no per-agent screen isolation.** Distinct windows run
+  in parallel without disturbing the real cursor or focus, but the
+  `same_pid_keyboard_ambiguity` guard means background typing is refused
+  when the target pid owns several top-level windows. Clicks are unaffected;
+  typing into such apps may fail. VM-per-agent or headless displays would
+  provide real isolation; this repo does not.
+- **Model compliance with delegation conventions is not guaranteed.** The
+  return path is deterministic; the outbound decision is model behavior, and
+  models flake (observed). Depth/rate caps bound the damage.
+- **Sandbox is a default working directory, not a jail.**
+- **Routines and delegated work run unattended**; stall/hard timeouts, the
+  thrash cap, and the  failure threshold are the brakes, and the logs +
+  health endpoint are the witness. (Thrash cap: 4 gateway deaths in 10
+  minutes pauses auto-respawn until a manual/intervening success; routine
+  failure threshold: 3 consecutive failures disables the routine.)
+
+---
+
+## 11. Build history (branch `fleet/per-agent-identity`)
+
+The fleet was built in ordered, individually-testable commits. The lineage,
+oldest to newest: identity/spawn isolation → HTTP surface + status + lock
+discipline → run history + replay → macOS clients → computer use + approvals
+ledger → driver reaping + messaging + delegation → hub URL override +
+routines → observability + interval floor + packaging + docs. Every commit
+has a green full test run (Python suite currently 157 tests; Swift suite
+19 tests). Tests live beside the code: `vertus/server/test_*.py` and
+`vertus/apps/Tests/VertusKitTests/`. Run either suite from the repo root:
+
+```bash
+python3 -m pytest vertus/server/ -q
+cd vertus/apps && swift test
+```
