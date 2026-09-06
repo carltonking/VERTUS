@@ -1529,6 +1529,7 @@ class AgentBridge:
                     f"stall timeout: no agent events for {now - last_event:.0f}s "
                     f"(stall_timeout_s={stall:g})"
                 )
+                msg = self._enrich_timeout_msg(msg)
                 with self._status_lock:
                     self._run_timeout_msg = msg
                 print(f"[vertus] agent {self.agent_id}: {msg}", file=sys.stderr)
@@ -1538,10 +1539,40 @@ class AgentBridge:
                     f"hard timeout: turn ran {now - started:.0f}s "
                     f"(hard_timeout_s={hard:g})"
                 )
+                msg = self._enrich_timeout_msg(msg)
                 with self._status_lock:
                     self._run_timeout_msg = msg
                 print(f"[vertus] agent {self.agent_id}: {msg}", file=sys.stderr)
                 self._escalate("hard_timeout")
+
+    def _enrich_timeout_msg(self, msg: str) -> str:
+        """Append the gateway's own last provider/engine error to a timeout
+        message, so a reaped run names WHY (Sept 6 incident: the fork sleeps
+        600s between 429 retries and emits nothing during the sleep, so a
+        retrying-but-doomed agent is reaped as a plain stall with no clue).
+        Best-effort look-back at the gateway's agent.log — never blocks, and
+        a missing/unreadable log changes nothing."""
+        try:
+            home = self._session_kwargs.get("agent_home")
+            if not home:
+                return msg
+            log = Path(home) / "logs" / "agent.log"
+            if not log.is_file():
+                return msg
+            text = log.read_text(encoding="utf-8", errors="replace")
+            hits = [
+                ln.strip() for ln in text.splitlines()
+                if any(t in ln for t in (
+                    "Retrying API call", "error_type=", "HTTP 429", "HTTP 4",
+                    "HTTP 5", "FreeUsageLimitError", "RateLimitError",
+                    "CreditsError", "Connection error",
+                ))
+            ]
+            if hits:
+                msg = f"{msg} — gateway log: {hits[-1][:220]}"
+        except Exception:  # noqa: BLE001 — diagnostics must never break supervision
+            pass
+        return msg
 
     def _health_check(self) -> None:
         """Idle-gateway liveness (Checkpoint 4).

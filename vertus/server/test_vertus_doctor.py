@@ -5,12 +5,14 @@ no-state-mutation guarantee (doctor must be read-only)."""
 
 from __future__ import annotations
 
+import http.server
 import json
 import os
 import plistlib
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -120,6 +122,10 @@ def isolated_env(monkeypatch, tmp_path):
     monkeypatch.setenv("VERTUS_TOKEN_PATH", str(tmp_path / "token"))
     monkeypatch.setenv("VERTUS_MEMORY_DIR", str(tmp_path / "memory"))
     monkeypatch.setenv("VERTUS_SHARED_MEMORY_DIR", str(tmp_path / "memory" / "shared"))
+    # The fleet engine home must be hermetic too: the provider-health probe
+    # (and dialect defaults) read it, and pointing it at the real ~/.hermes
+    # would probe the user's actual provider config from a test.
+    monkeypatch.setenv("VERTUS_FLEET_HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("VERTUS_DOCTOR_SKIP_LAUNCHD", "1")
     monkeypatch.setenv("VERTUS_PORT", "59999")  # nothing listens here
     return tmp_path
@@ -795,3 +801,233 @@ def test_doctor_cli_subcommand_parses(monkeypatch, isolated_env, capsys):
     assert exc.value.code == 1
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["checks"]
+
+# -- provider health probe -------------------------------------------------
+
+_COMPLETION_OK = (
+    '{"id":"x","object":"chat.completion","created":0,'
+    '"model":"muse-spark-1.2-contributor-free",'
+    '"choices":[{"index":0,"message":{"role":"assistant","content":"p"},'
+    '"finish_reason":"stop"}]}'
+)
+
+_429_BODY = (
+    '{"type":"error","error":{"type":"FreeUsageLimitError",'
+    '"message":"Rate limit exceeded. Please try again later. Add a payment '
+    'method at https://opencode.ai/workspace/wrk_TEST/billing"},"metadata":{}}'
+)
+
+
+def _stub_handler_for(body: str, status: int, hang: bool = False):
+    """A handler class bound to one response; assign to
+    ``srv.RequestHandlerClass`` to swap the stub's behavior mid-test
+    (ThreadingHTTPServer reads it per request)."""
+    state = _StubState(status, body, hang)
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            state.requests += 1
+            if state.hang:
+                time.sleep(30)
+            payload = (state.body or "").encode()
+            self.send_response(state.status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    return _H, state
+
+
+class _StubState:
+    def __init__(self, status: int, body: str, hang: bool = False):
+        self.status = status
+        self.body = body
+        self.hang = hang
+        self.requests = 0
+
+
+def _start_provider_stub(status: int, body: str, hang: bool = False):
+    handler, state = _stub_handler_for(body, status, hang)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, state
+
+
+def _probe_env(monkeypatch, tmp_path, fleet_model="muse-spark-1.2-contributor-free",
+               fleet_provider="opencode-zen", fleet_env_key=True,
+               agents=None, deadline=None):
+    """Point the probe at a temp fleet + agents + a stub provider endpoint.
+
+    ``agents``: {agent_id: (model, provider)} — homes written only when the
+    pair differs from the fleet default (the real collection rule).
+    Returns the stub (srv, state) plus the deadline to pass.
+    """
+    hermes = tmp_path / "hermes"
+    hermes.mkdir(parents=True)
+    (hermes / "config.yaml").write_text(json.dumps({
+        "model": {"default": fleet_model, "provider": fleet_provider},
+    }), encoding="utf-8")
+    if fleet_env_key:
+        (hermes / ".env").write_text("OPENCODE_ZEN_API_KEY=probe-dummy-key\n",
+                                     encoding="utf-8")
+    if agents:
+        for agent_id, (model, provider) in agents.items():
+            home = tmp_path / "agents" / agent_id / "home"
+            home.mkdir(parents=True)
+            (home / "config.yaml").write_text(json.dumps({
+                "model": {"default": model, "provider": provider},
+            }), encoding="utf-8")
+            (home / ".env").write_text("OPENCODE_ZEN_API_KEY=agent-dummy-key\n",
+                                       encoding="utf-8")
+    monkeypatch.setenv("VERTUS_FLEET_HERMES_HOME", str(hermes))
+    monkeypatch.setenv("VERTUS_AGENTS_DIR", str(tmp_path / "agents"))
+    srv, state = _start_provider_stub(200, _COMPLETION_OK)
+    monkeypatch.setenv("VERTUS_DOCTOR_PROBE_BASE_URL",
+                       f"http://127.0.0.1:{srv.server_port}")
+    try:
+        yield srv, state
+    finally:
+        srv.shutdown()
+
+
+def test_provider_probe_ok_via_stub(monkeypatch, isolated_env, tmp_path):
+    gen = _probe_env(monkeypatch, tmp_path)
+    srv, state = next(gen)
+    try:
+        results = vd.provider_checks()
+        by = _by_name(results)
+        assert by["provider.health.fleet"]["status"] == "ok", by
+        assert "muse-spark-1.2-contributor-free" in by["provider.health.fleet"]["reason"]
+        assert "latency" in by["provider.health.fleet"]["reason"]
+        assert state.requests == 1, "exactly one completion per distinct config"
+    finally:
+        gen.close()
+
+
+def test_provider_probe_429_surfaces_provider_text_verbatim(monkeypatch, isolated_env, tmp_path):
+    gen = _probe_env(monkeypatch, tmp_path)
+    srv, state = next(gen)
+    handler, _ = _stub_handler_for(_429_BODY, 429)
+    srv.RequestHandlerClass = handler
+    try:
+        results = vd.provider_checks()
+        by = _by_name(results)
+        check = by["provider.health.fleet"]
+        assert check["status"] == "fail", check
+        assert "FreeUsageLimitError" in check["reason"]
+        assert "Rate limit exceeded" in check["reason"]
+        assert "https://opencode.ai/workspace/wrk_TEST/billing" in check["reason"], \
+            "the billing URL is what the user actually needs"
+        assert check["remediation"], "a fail must say what to DO"
+    finally:
+        gen.close()
+
+
+def test_provider_probe_hang_fails_within_budget(monkeypatch, isolated_env, tmp_path):
+    monkeypatch.setenv("VERTUS_DOCTOR_PROBE_TIMEOUT_S", "1")
+    gen = _probe_env(monkeypatch, tmp_path)
+    srv, state = next(gen)
+    handler, _ = _stub_handler_for("", 200, hang=True)
+    srv.RequestHandlerClass = handler
+    try:
+        t0 = time.monotonic()
+        results = vd.provider_checks()
+        elapsed = time.monotonic() - t0
+        check = _by_name(results)["provider.health.fleet"]
+        assert check["status"] == "fail", check
+        assert "timed out" in check["reason"], check
+        assert elapsed < 20, f"probe must not inherit the fork's 600s retry sleep ({elapsed:.1f}s)"
+    finally:
+        gen.close()
+
+
+def test_provider_probe_skips_cleanly_without_key(monkeypatch, isolated_env, tmp_path):
+    gen = _probe_env(monkeypatch, tmp_path, fleet_env_key=False)
+    srv, state = next(gen)
+    try:
+        results = vd.provider_checks()
+        check = _by_name(results)["provider.health.fleet"]
+        assert check["status"] == "unverified", check
+        assert "no API key" in check["reason"], check
+        assert state.requests == 0, "no key -> no completion attempted"
+    finally:
+        gen.close()
+
+
+def test_provider_probe_dedups_shared_and_adds_differing_agent(monkeypatch, isolated_env, tmp_path):
+    """Three agents: two share the fleet default (one probe), one differs
+    (its own probe) — the whole point of per-config dedup."""
+    gen = _probe_env(monkeypatch, tmp_path, agents={
+        "primary": ("muse-spark-1.2-contributor-free", "opencode-zen"),  # same
+        "scout": ("muse-spark-1.2-contributor-free", "opencode-zen"),     # same
+        "agent": ("some-other-model", "opencode-zen"),                    # differs
+    })
+    srv, state = next(gen)
+    try:
+        results = vd.provider_checks()
+        by = _by_name(results)
+        assert by["provider.health.fleet"]["status"] == "ok"
+        assert by["provider.health.agent"]["status"] == "ok"
+        assert "provider.health.primary" not in by, "primary shares the fleet default"
+        assert "provider.health.scout" not in by, "scout shares the fleet default"
+        assert state.requests == 2, f"two distinct configs -> two probes, got {state.requests}"
+    finally:
+        gen.close()
+
+
+def test_provider_probe_unknown_provider_fails(monkeypatch, isolated_env, tmp_path):
+    gen = _probe_env(monkeypatch, tmp_path, fleet_provider="no-such-provider-xyz")
+    srv, state = next(gen)
+    try:
+        results = vd.provider_checks()
+        check = _by_name(results)["provider.health.fleet"]
+        assert check["status"] == "fail", check
+        assert "not resolvable" in check["reason"], check
+    finally:
+        gen.close()
+
+
+def test_provider_probe_respects_budget(monkeypatch, isolated_env, tmp_path):
+    gen = _probe_env(monkeypatch, tmp_path)
+    srv, state = next(gen)
+    try:
+        def _boom(*a, **k):
+            raise AssertionError("probe must not run past the deadline")
+        monkeypatch.setattr(vd, "_run_probe", _boom)
+        results = vd.provider_checks(deadline=time.monotonic() - 1)
+        check = _by_name(results)["provider.health.fleet"]
+        assert check["status"] == "unverified", check
+        assert "budget" in check["reason"], check
+    finally:
+        gen.close()
+
+
+def test_provider_probe_skips_when_venv_missing(monkeypatch, isolated_env, tmp_path):
+    gen = _probe_env(monkeypatch, tmp_path)
+    srv, state = next(gen)
+    try:
+        monkeypatch.setenv("VERTUS_HERMES_PYTHON", "/nonexistent/venv/bin/python")
+        results = vd.provider_checks()
+        assert results[0]["name"] == "provider.health"
+        assert results[0]["status"] == "unverified"
+        assert "venv python" in results[0]["reason"]
+        assert state.requests == 0
+    finally:
+        gen.close()
+
+
+def test_provider_probe_skips_when_no_model_configured(monkeypatch, isolated_env, tmp_path):
+    gen = _probe_env(monkeypatch, tmp_path, fleet_model=None)
+    srv, state = next(gen)
+    try:
+        results = vd.provider_checks()
+        check = _by_name(results)["provider.health.fleet"]
+        assert check["status"] == "unverified", check
+        assert "no model/provider" in check["reason"], check
+        assert state.requests == 0
+    finally:
+        gen.close()

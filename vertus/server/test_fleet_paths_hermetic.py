@@ -58,7 +58,15 @@ _CONCEPT_VARS = (
 # launchd KeepAlive on this machine): the DB + its WAL sidecars and the
 # rotating log. Everything else under ~/.vertus must be untouched.
 def _noise(rel: str) -> bool:
-    return "fleet.db" in rel or rel.startswith("logs/")
+    # Derived state the LIVE launchd hub rewrites while this suite runs:
+    # the DB + WAL sidecars, the rotating log, and its memory index (the
+    # watcher re-indexes on a 2s poll — .hub-index.json was caught mid-rewrite
+    # here, size 1758→1759, from the live hub alone). Everything else under
+    # ~/.vertus — every real memory FILE, agent home, profile — must be
+    # byte-identical; the test separately proves the BOOT's own index lands
+    # under the temp root.
+    return ("fleet.db" in rel or rel.startswith("logs/")
+            or rel == "memory/.hub-index.json")
 
 
 def _snapshot(root: Path) -> dict[str, tuple[int, str]]:

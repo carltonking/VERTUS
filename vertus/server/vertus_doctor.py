@@ -23,10 +23,17 @@ Rules baked into every check:
     homes, never kills the user's CuaDriver.app daemon (identified by
     ``--cua-internal-gate-engaged``, not by process name);
   - safe against a live hub (only GET /api/health) and with no hub running;
-  - no real model turns: if a check can only be proven by one, it is
+  - no real model turns EXCEPT the provider-health probe: one minimal
+    completion (max_tokens=1, retries disabled, ~8s cap) per DISTINCT
+    provider/model config, to catch the failure class no dialect check can
+    — a gateway that spawns and answers RPCs but whose provider rejects
+    every real call (exhausted free tier, unpaid account). Everything else
+    stays offline-safe; anything provable only by a real turn is
     ``unverified`` with the reason — never a hang;
   - a ``fail`` always carries a remediation, never just a complaint;
-  - under 30s end to end (the gateway cold start is ~12s and dominates).
+  - under 30s end to end (the gateway cold start is ~12s and dominates; the
+    probe runs under a monotonic deadline and skips remaining configs as
+    ``unverified`` rather than blowing the budget).
 """
 
 from __future__ import annotations
@@ -63,12 +70,132 @@ def _cfg() -> dict:
     return {
         "ready_timeout_s": float(os.environ.get("VERTUS_DOCTOR_READY_TIMEOUT_S", "20")),
         "rpc_timeout_s": float(os.environ.get("VERTUS_DOCTOR_RPC_TIMEOUT_S", "10")),
+        "probe_timeout_s": float(os.environ.get("VERTUS_DOCTOR_PROBE_TIMEOUT_S", "8")),
+        # Test-only: point the probe at a stub HTTP server instead of the
+        # provider's real endpoint. The production default ("") resolves the
+        # base_url from the fork's provider definition — never hardcoded.
+        "probe_base_url": os.environ.get("VERTUS_DOCTOR_PROBE_BASE_URL", ""),
         "skip_launchd": os.environ.get("VERTUS_DOCTOR_SKIP_LAUNCHD") == "1",
         "hub_port": int(os.environ.get("VERTUS_PORT", "8787")),
         "agents_dir": vertus_paths.agents_dir(),
         "db_path": vertus_paths.fleet_db_path(),
         "token_file": vertus_paths.token_path(),
     }
+
+# ----------------------------------------------------------------------------
+# Provider-health probe (the 429 incident, Sept 6): a gateway that spawns,
+# reports alive, and never emits is the worst failure class — the stall
+# supervisor reaps it at 180s with no clue WHY. The probe answers the why
+# directly: one minimal completion (max_tokens=1) against the configured
+# provider/model/key, with the fork's retry policy DISABLED (max_retries=0,
+# short client timeout) so it can never inherit the fork's 600s retry sleep.
+#
+# The script runs under the fork's venv so base_url + key env-var names come
+# from the fork's OWN provider definitions (never hardcoded in this repo):
+#   - base_url: get_provider(name).base_url (allow_network=False — offline)
+#   - key vars: hermes_cli.auth.PROVIDER_REGISTRY first (matches what the
+#     runtime credential pool actually uses — get_provider's merged
+#     api_key_env_vars is the models.dev overlay and disagrees with it for
+#     opencode-zen), get_provider().api_key_env_vars as fallback.
+#
+# The key itself is read from the scope's .env (fleet home or agent home —
+# the same file the hub seeds each gateway with), never from the hub env.
+_PROBE_SCRIPT = r'''
+import json, os, sys, time
+
+def _load_env_file(path):
+    if not path:
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip())
+    except OSError:
+        pass
+
+_load_env_file(os.environ.get("VERTUS_PROBE_ENV_FILE", ""))
+provider = os.environ.get("VERTUS_PROBE_PROVIDER", "")
+model = os.environ.get("VERTUS_PROBE_MODEL", "")
+base_url = os.environ.get("VERTUS_PROBE_BASE_URL", "")
+key_vars: list = []
+try:
+    from hermes_cli.auth import PROVIDER_REGISTRY
+    p = PROVIDER_REGISTRY.get(provider)
+    if p is not None and getattr(p, "api_key_env_vars", None):
+        key_vars = list(p.api_key_env_vars)
+except Exception:
+    pass
+pdef = None
+try:
+    from hermes_cli.providers import get_provider
+    pdef = get_provider(provider, allow_network=False)
+except Exception as exc:
+    print(json.dumps({"ok": False, "kind": "resolve_error",
+                      "detail": str(exc)[:200]}))
+    sys.exit(2)
+if not base_url:
+    base_url = (pdef.base_url if pdef is not None else "") or ""
+if not key_vars and pdef is not None:
+    key_vars = list(pdef.api_key_env_vars or ())
+if pdef is None and not key_vars:
+    print(json.dumps({"ok": False, "kind": "unknown_provider",
+                      "detail": provider}))
+    sys.exit(2)
+key = None
+for var in key_vars:
+    if os.environ.get(var):
+        key = os.environ[var]
+        break
+if not key:
+    print(json.dumps({"ok": False, "kind": "no_key",
+                      "detail": ",".join(key_vars)}))
+    sys.exit(2)
+if not base_url:
+    print(json.dumps({"ok": False, "kind": "no_base_url",
+                      "detail": provider}))
+    sys.exit(2)
+import openai
+try:
+    client = openai.OpenAI(
+        api_key=key, base_url=base_url,
+        timeout=float(os.environ.get("VERTUS_PROBE_TIMEOUT_S", "8")),
+        max_retries=0,
+    )
+    t0 = time.monotonic()
+    resp = client.chat.completions.create(
+        model=model, max_tokens=1,
+        messages=[{"role": "user", "content": "ping"}],
+    )
+    print(json.dumps({"ok": True,
+                      "model": getattr(resp, "model", None) or model,
+                      "latency_s": round(time.monotonic() - t0, 2)}))
+except openai.APITimeoutError as exc:
+    print(json.dumps({"ok": False, "kind": "hang",
+                      "detail": str(exc)[:200]}))
+    sys.exit(1)
+except Exception as exc:
+    status = ""
+    body = ""
+    if hasattr(exc, "response"):
+        r = exc.response
+        try:
+            status = str(getattr(r, "status_code", ""))
+        except Exception:
+            pass
+        try:
+            body = (getattr(r, "text", "") or "")[:600]
+        except Exception:
+            pass
+    print(json.dumps({"ok": False, "kind": "http_error",
+                      "status": status, "body": body,
+                      "detail": str(exc)[:300]}))
+    sys.exit(1)
+'''
+
 
 # The event types the bridge's _handle_event actually parses. All but
 # gateway.ready are only observable during a live turn.
@@ -536,10 +663,16 @@ def _fleet_home() -> Path:
 
 
 def _fleet_model_defaults() -> tuple[str | None, str | None]:
-    """Read model.default/provider from the fleet config.yaml (read-only).
-    Reuses agent_registry's loader; falls back to a tiny regex if yaml is
-    unavailable in this interpreter."""
-    cfg_path = _fleet_home() / "config.yaml"
+    """Read model.default/provider from the fleet config.yaml (read-only)."""
+    return _read_home_model(_fleet_home())
+
+
+def _read_home_model(home: Path) -> tuple[str | None, str | None]:
+    """model.default/provider from ONE engine home's config.yaml, or None.
+    Reuses agent_registry's yaml loader; None when the file is absent or
+    unparseable (an unreadable config is NOT a probe failure — the hub
+    itself falls back to fork defaults the same way)."""
+    cfg_path = home / "config.yaml"
     if not cfg_path.is_file():
         return None, None
     try:
@@ -556,6 +689,187 @@ def _fleet_model_defaults() -> tuple[str | None, str | None]:
         )
     except Exception:
         return None, None
+
+
+# -- provider health --------------------------------------------------------
+
+def _provider_probe_configs() -> list[dict]:
+    """Distinct (provider, model, key-scope) configs worth probing.
+
+    The fleet default first; then one entry per agent whose home config
+    DIFFERS from the fleet default (an agent sharing the default needs no
+    second probe — the fleet probe already answers for it). Deduped, so ten
+    identical agents cost one probe, not ten.
+    """
+    fleet_model, fleet_provider = _fleet_model_defaults()
+    cfgs: list[dict] = [{
+        "scope": "fleet",
+        "model": fleet_model,
+        "provider": fleet_provider,
+        "home": _fleet_home(),
+    }]
+    seen = {(fleet_model, fleet_provider)}
+    agents_dir = _cfg()["agents_dir"]
+    if agents_dir.is_dir():
+        for home in sorted(agents_dir.glob("*/home")):
+            model, provider = _read_home_model(home)
+            if (model, provider) in seen:
+                continue
+            seen.add((model, provider))
+            cfgs.append({
+                "scope": home.parent.name,
+                "model": model,
+                "provider": provider,
+                "home": home,
+            })
+    return cfgs
+
+
+def _run_probe(cfg: dict, timeout_s: float, base_url_override: str = "") -> dict:
+    """One minimal completion against one config, through the fork's venv.
+
+    The subprocess timeout is probe timeout + 10s of import slack; the
+    probe's OWN client timeout (max_retries=0) is what actually bounds the
+    call — the fork's 600s retry sleep can never leak in because retries
+    are disabled at the client.
+    """
+    venv_py = vertus_paths.venv_python()
+    fork = vertus_paths.fork_repo()
+    env = dict(os.environ)
+    env.update({
+        "VERTUS_PROBE_PROVIDER": cfg.get("provider") or "",
+        "VERTUS_PROBE_MODEL": cfg.get("model") or "",
+        "VERTUS_PROBE_ENV_FILE": str(cfg["home"] / ".env"),
+        "VERTUS_PROBE_TIMEOUT_S": str(timeout_s),
+        "VERTUS_PROBE_BASE_URL": base_url_override,
+    })
+    try:
+        r = subprocess.run(
+            [str(venv_py), "-u", "-c", _PROBE_SCRIPT],
+            cwd=str(fork), env=env, capture_output=True, text=True,
+            timeout=timeout_s + 10, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "kind": "hang",
+                "detail": f"probe subprocess exceeded {timeout_s + 10:.0f}s"}
+    except Exception as exc:
+        return {"ok": False, "kind": "script_error", "detail": str(exc)[:200]}
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1] or "{}")
+    except Exception:
+        return {"ok": False, "kind": "script_error",
+                "detail": (r.stderr or r.stdout).strip()[-200:]}
+
+
+def provider_checks(deadline: float | None = None) -> list[dict]:
+    """One max_tokens=1 completion per DISTINCT provider/model config.
+
+    The check that would have caught the 429 incident in seconds: the
+    gateway spawned, reported alive, and never emitted because the fork
+    was sleeping 600s between 429 retries; doctor's dialect checks pass
+    that gateway because they never run a real completion. This probe does
+    exactly one, retry-free, bounded by probe_timeout_s.
+
+    ``deadline`` (monotonic) is doctor's 30s budget: configs that would
+    start after it are skipped as unverified rather than blowing the budget.
+
+    Status contract:
+      ok          completion returned
+      fail        4xx/5xx, hang, or an unresolvable provider
+      unverified  no key configured (probe skipped cleanly, reason stated)
+    """
+    out: list[dict] = []
+    cfg = _cfg()
+    venv_py = vertus_paths.venv_python()
+    if not venv_py.is_file():
+        out.append(_check("provider.health", "unverified",
+                          "probe needs the fork's venv python (missing), so no "
+                          "provider can be exercised", ""))
+        return out
+    for pc in _provider_probe_configs():
+        scope = pc["scope"]
+        provider = pc.get("provider")
+        model = pc.get("model")
+        if not provider or not model:
+            out.append(_check(
+                f"provider.health.{scope}", "unverified",
+                f"no model/provider configured in {scope}'s config.yaml — "
+                "probe skipped (the hub falls back to fork defaults the same way)",
+                ""))
+            continue
+        if deadline is not None and time.monotonic() > deadline:
+            out.append(_check(
+                f"provider.health.{scope}", "unverified",
+                "skipped: doctor's 30s budget exhausted before this probe could "
+                "run (an earlier check hung)",
+                "re-run doctor with the earlier failure fixed"))
+            continue
+        t0 = time.monotonic()
+        res = _run_probe(pc, cfg["probe_timeout_s"], cfg["probe_base_url"])
+        latency = time.monotonic() - t0
+        name = f"provider.health.{scope}"
+        if res.get("ok"):
+            out.append(_check(
+                name, "ok",
+                f"completion ok: model={res.get('model') or model} "
+                f"latency={res.get('latency_s', round(latency, 2))}s"))
+            continue
+        kind = res.get("kind")
+        if kind == "no_key":
+            out.append(_check(
+                name, "unverified",
+                f"no API key for provider {provider!r} in {pc['home'] / '.env'} "
+                f"(expected one of: {res.get('detail')}) — probe skipped",
+                "add the key to that home's .env (the hub seeds it once from "
+                "the fleet home) or configure a different provider"))
+            continue
+        if kind in ("unknown_provider", "no_key_vars", "no_base_url"):
+            out.append(_check(
+                name, "fail",
+                f"provider {provider!r} is not resolvable by the fork "
+                f"({res.get('detail') or kind})",
+                "the fork's provider registry no longer knows this provider — "
+                "switch the agent to a provider the fork resolves"))
+            continue
+        if kind == "resolve_error":
+            out.append(_check(
+                name, "unverified",
+                f"provider resolution failed in the fork venv: "
+                f"{res.get('detail')}",
+                "re-run doctor; if it persists the fork's provider machinery "
+                "is broken, not your config"))
+            continue
+        if kind == "hang":
+            out.append(_check(
+                name, "fail",
+                f"probe timed out after {cfg['probe_timeout_s']:g}s — "
+                f"{provider} did not answer for model {model} (latency {latency:.1f}s)",
+                "provider unreachable or hanging; note the fork would retry "
+                "SILENTLY for 600s per attempt, which the stall supervisor "
+                "would reap as a stall at 180s — fix the network/endpoint "
+                "before relying on this provider"))
+            continue
+        # http_error / script_error / anything else
+        status = res.get("status", "")
+        body = (res.get("body") or "").strip()
+        detail = (res.get("detail") or "").strip()
+        status_str = f" HTTP {status}" if status else ""
+        if body:
+            reason = (f"provider {provider} answered{status_str} for model "
+                      f"{model}: {body[:400]}")
+        elif detail:
+            reason = (f"provider {provider} failed for model {model}"
+                      f"{status_str}: {detail[:300]}")
+        else:
+            reason = f"provider {provider} failed for model {model}{status_str}"
+        remediation = (
+            "the provider's own message above is the remediation it wants — "
+            "if it names a billing/quota URL (FreeUsageLimitError, CreditsError), "
+            "add a payment method or top up there, or switch this agent to a "
+            "provider with working credit"
+        )
+        out.append(_check(name, "fail", reason, remediation))
+    return out
 
 
 def _rpccall(session: _HermesSession, method: str, params: dict,
@@ -1359,6 +1673,12 @@ def run(json_out: bool = False, spawner=None) -> int:
     all_checks: list[dict] = []
     all_checks += env_checks()
     all_checks += dialect_checks(spawner=spawner)
+    # Provider health last among the fork checks, under the 30s budget: the
+    # probe is fast on a healthy account (1-5s) and instant on an exhausted
+    # one (the 429 comes back in <1s), but a hanging provider could blow the
+    # budget, so remaining configs beyond the deadline are skipped as
+    # unverified instead of run late.
+    all_checks += provider_checks(deadline=started + 27.0)
     all_checks += hub_checks()
     all_checks += store_checks()
     all_checks += registry_checks()

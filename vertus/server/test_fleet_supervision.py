@@ -149,7 +149,7 @@ class SupervisedBridge(vs.AgentBridge):
                  hard: float = 3600.0, behavior: str = "silent",
                  chat_duration: float = 3600.0, spawn_fail: bool = False,
                  ignore_interrupt: bool = False, ignore_terminate: bool = False,
-                 screen_leases=None, screen_targets=None):
+                 screen_leases=None, screen_targets=None, agent_home=None):
         self._behavior = behavior
         self._chat_duration = chat_duration
         self._spawn_fail = spawn_fail
@@ -161,6 +161,8 @@ class SupervisedBridge(vs.AgentBridge):
             kwargs["stall_timeout_s"] = stall
         if hard != 3600.0:
             kwargs["hard_timeout_s"] = hard
+        if agent_home is not None:
+            kwargs["agent_home"] = agent_home
         super().__init__(
             agent_id=agent_id,
             create_session_factory=self._make,
@@ -705,3 +707,52 @@ def test_http_degraded_agent_gets_503(monkeypatch, tmp_path):
         vs.VertusHandler.fleet = None
         vs.VertusHandler.sessions = None
         vs.VertusHandler.registry = None
+
+# --------------------------------------------------------------------------
+# Stall reap names WHY: the gateway log look-back (Sept 6 incident)
+# --------------------------------------------------------------------------
+
+
+def test_stall_reap_includes_gateway_provider_error(tmp_path):
+    """A silent turn whose gateway log shows a provider retry is reaped as a
+    stall WITH the provider error in the run error — not an opaque silence.
+    This is the Sept 6 case: the fork sleeps 600s between 429 retries and
+    emits nothing, so a retrying-but-doomed agent is otherwise killed as a
+    bare stall with no clue why."""
+    store = RunStore(tmp_path / "fleet.db")
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "logs" / "agent.log").write_text(
+        "2026-09-06 16:46:39 WARNING conversation_loop: API call failed "
+        "(attempt 1/3) error_type=RateLimitError summary=HTTP 429: Rate "
+        "limit exceeded. Please try again later.\n"
+        "2026-09-06 16:46:39 WARNING conversation_loop: Retrying API call in "
+        "600s (attempt 1/3) error=Error code: 429 - {'type': 'error', "
+        "'error': {'type': 'FreeUsageLimitError', 'message': 'Rate limit "
+        "exceeded.'}}\n",
+        encoding="utf-8",
+    )
+    b = _bridge(store, stall=0.4, ignore_interrupt=True, agent_home=str(home))
+    run_id = _run(store, b, "wedged")
+    assert _wait_until(lambda: (store.get_run(run_id) or {})["state"] == "timeout")
+    run = store.get_run(run_id)
+    assert "stall timeout" in (run["error"] or ""), run
+    assert "Retrying API call in 600s" in run["error"], \
+        "the reap must name the gateway's own provider error, not silence only"
+    assert "429" in run["error"], run
+    b.close()
+    store.stop()
+
+
+def test_stall_reap_without_gateway_log_stays_plain(tmp_path):
+    """No agent.log (or no provider-error lines): the message is unchanged —
+    the enrichment is best-effort and must never fail supervision."""
+    store = RunStore(tmp_path / "fleet.db")
+    b = _bridge(store, stall=0.4, ignore_interrupt=True)
+    run_id = _run(store, b, "wedged")
+    assert _wait_until(lambda: (store.get_run(run_id) or {})["state"] == "timeout")
+    run = store.get_run(run_id)
+    assert "stall timeout" in (run["error"] or ""), run
+    assert "gateway log" not in run["error"], run
+    b.close()
+    store.stop()
