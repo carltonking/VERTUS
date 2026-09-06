@@ -60,12 +60,18 @@ try:
     from run_store import RunStore, RUN_STATES, TERMINAL_STATES  # type: ignore
     from screen_lease import ScreenLeaseManager, SCREEN_POLICY_CAVEAT  # type: ignore
     from fleet_messaging import BotMessenger, BotMessageError  # type: ignore
+    from fleet_routines import (  # type: ignore
+        RoutineManager, RoutineValidationError, parse_schedule, parse_trigger,
+    )
     from session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 except ImportError:  # pragma: no cover - only hit under package invocation
     from .agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
     from .run_store import RunStore, RUN_STATES, TERMINAL_STATES  # type: ignore
     from .screen_lease import ScreenLeaseManager, SCREEN_POLICY_CAVEAT  # type: ignore
     from .session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
+    from .fleet_routines import (  # type: ignore
+        RoutineManager, RoutineValidationError, parse_schedule, parse_trigger,
+    )
 
 VERTUS_DIR = Path.home() / ".vertus"
 TOKEN_FILE = VERTUS_DIR / "token"
@@ -1534,6 +1540,7 @@ class VertusHandler(BaseHTTPRequestHandler):
     store: RunStore = None  # type: ignore[assignment]
     fleet: FleetFan = None  # type: ignore[assignment]
     screen_leases: ScreenLeaseManager = None  # type: ignore[assignment]
+    routines: RoutineManager = None  # type: ignore[assignment]
 
     def _authed(self) -> bool:
         header = self.headers.get("Authorization", "")
@@ -1586,6 +1593,14 @@ class VertusHandler(BaseHTTPRequestHandler):
             self._handle_runs_list()
         elif path.startswith("/api/runs/"):
             self._handle_run_get(path[len("/api/runs/"):].strip("/"))
+        elif path == "/api/routines":
+            self._handle_routines_list()
+        elif path.startswith("/api/routines/"):
+            rest = path[len("/api/routines/"):].strip("/")
+            if rest.endswith("/history"):  # runs produced by one routine
+                self._handle_routine_history(rest[: -len("/history")])
+            else:
+                self._handle_routine_get(rest)
         elif path == "/api/fleet/activity":
             self._handle_fleet_activity()
         elif path == "/api/fleet/screens":
@@ -1667,6 +1682,11 @@ class VertusHandler(BaseHTTPRequestHandler):
             })
         elif route == "/api/messages":
             self._handle_message_send(payload)
+        elif route == "/api/routines":
+            self._handle_routine_create(payload)
+        elif route.startswith("/api/routines/") and route.endswith("/run"):
+            rid = route[len("/api/routines/"):-len("/run")].strip("/")
+            self._handle_routine_run_now(rid)
         elif route.startswith("/api/threads/") and route.endswith("/read"):
             self._handle_thread_read(route[len("/api/threads/"):-len("/read")].strip("/"))
         elif route == "/api/agents":
@@ -1693,9 +1713,17 @@ class VertusHandler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_PATCH(self) -> None:  # noqa: N802
-        """PATCH /api/agents/<id> — partial profile update (v2 editable fields)."""
+        """PATCH /api/agents/<id> or /api/routines/<id> — partial updates."""
         if not self._authed():
             self._json(401, {"error": "unauthorized"})
+            return
+        path = urlsplit(self.path).path
+        if path.startswith("/api/routines/"):
+            rid = path[len("/api/routines/"):].strip("/")
+            payload = self._read_body()
+            if payload is None:
+                return
+            self._handle_routine_patch(rid, payload)
             return
         agent_id = self._agent_route_id()
         if agent_id is None:
@@ -1746,9 +1774,14 @@ class VertusHandler(BaseHTTPRequestHandler):
         self._json(200, {**updated, "respawn_pending": respawn_pending})
 
     def do_DELETE(self) -> None:  # noqa: N802
-        """DELETE /api/agents/<id> — archive + tear down, or 409 when busy."""
+        """DELETE /api/agents/<id> (archive) or /api/routines/<id>."""
         if not self._authed():
             self._json(401, {"error": "unauthorized"})
+            return
+        path = urlsplit(self.path).path
+        if path.startswith("/api/routines/"):
+            rid = path[len("/api/routines/"):].strip("/")
+            self._handle_routine_delete(rid)
             return
         agent_id = self._agent_route_id()
         if agent_id is None:
@@ -1779,6 +1812,15 @@ class VertusHandler(BaseHTTPRequestHandler):
         # bridge for a registry entry that no longer exists (see
         # SessionManager.get_or_create_session's re-validation).
         self.sessions.drop(agent_id)
+        # A deleted agent's routines must never fire again — disable them so
+        # the scheduler's existence gate can't even see them.
+        if self.store is not None and self.routines is not None:
+            try:
+                n = self.store.disable_routines_for(agent_id)
+                if n:
+                    print(f"[vertus] disabled {n} routine(s) of deleted agent {agent_id}")
+            except Exception as exc:  # noqa: BLE001 — archive already succeeded
+                print(f"[vertus] routine disable for {agent_id} failed: {exc}", file=sys.stderr)
         self._json(200, {"deleted": agent_id, "archived_to": archived})
 
     def _agent_route_id(self) -> str | None:
@@ -1908,6 +1950,234 @@ class VertusHandler(BaseHTTPRequestHandler):
             return
         bridge.cancel_run(run_id, drain_queue=False)
         self._json(200, {"cancelled": run_id})
+
+    # ------------------------------------------------------------------
+    # Routines (scheduled/triggered work — fleet_routines.py)
+    # ------------------------------------------------------------------
+
+    def _routines_store(self) -> "RunStore | None":
+        """The store or None (503 already sent). Routines live in the run
+        store because they are run history first and schedule state second."""
+        store = self._history_store()
+        if store is None:
+            return None
+        if self.routines is None:
+            self._json(503, {"error": "routine scheduler unavailable"})
+            return None
+        return store
+
+    def _handle_routine_create(self, payload: dict) -> None:
+        """POST /api/routines — create one routine."""
+        store = self._routines_store()
+        if store is None:
+            return
+        agent_id = str(payload.get("agent_id") or "").strip()
+        if not agent_id:
+            self._json(400, {"error": "agent_id required"})
+            return
+        try:
+            self.registry.get_agent(agent_id)
+        except KeyError:
+            self._json(404, {"error": f"agent not found: {agent_id}"})
+            return
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            self._json(400, {"error": "name required (non-empty string)"})
+            return
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            self._json(400, {"error": "prompt required (non-empty string)"})
+            return
+        prompt = prompt.strip()
+        if len(prompt) > 8000:
+            self._json(400, {"error": "prompt too long (max 8000 chars)"})
+            return
+        try:
+            schedule = parse_schedule(payload.get("schedule"))
+            trigger = parse_trigger(payload.get("trigger"))
+        except RoutineValidationError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        if schedule is None and trigger is None:
+            self._json(400, {
+                "error": "routine needs schedule and/or trigger (both were null)"
+            })
+            return
+        enabled = bool(payload.get("enabled", True))
+        try:
+            routine = store.create_routine(
+                agent_id, name, prompt, schedule, trigger, enabled=enabled
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._json(500, {"error": str(exc)[:200]})
+            return
+        self.routines.arm(routine["routine_id"], schedule)
+        self._json(201, self._routine_wire(routine))
+
+    @staticmethod
+    def _routine_wire(row: dict | None) -> dict | None:
+        """Reparse stored schedule/trigger JSON strings into objects for the
+        wire — the client should never see the storage encoding."""
+        if row is None:
+            return None
+        row = dict(row)
+        for key in ("schedule", "trigger"):
+            raw = row.get(key)
+            if isinstance(raw, str):
+                try:
+                    row[key] = json.loads(raw)
+                except (ValueError, TypeError):
+                    row[key] = None
+        if "enabled" in row:
+            row["enabled"] = bool(row["enabled"])
+        return row
+
+    def _handle_routine_get(self, routine_id: str) -> None:
+        """GET /api/routines/<id> — one routine row."""
+        store = self._routines_store()
+        if store is None:
+            return
+        if not routine_id or "/" in routine_id:
+            self._json(404, {"error": "not found"})
+            return
+        routine = store.get_routine(routine_id)
+        if routine is None:
+            self._json(404, {"error": f"routine not found: {routine_id}"})
+            return
+        self._json(200, self._routine_wire(routine))
+
+    def _handle_routines_list(self) -> None:
+        """GET /api/routines?agent_id= — routines, optionally per agent."""
+        store = self._routines_store()
+        if store is None:
+            return
+        agent = self._query_param("agent_id").strip() or None
+        rows = [self._routine_wire(r) for r in store.list_routines(agent_id=agent)]
+        self._json(200, {"routines": rows})
+
+    def _handle_routine_patch(self, routine_id: str, payload: dict) -> None:
+        """PATCH /api/routines/<id> — partial update (name/prompt/schedule/
+        trigger/enabled). Changing the schedule re-arms next_run_at; enabling
+        clears failure history."""
+        store = self._routines_store()
+        if store is None:
+            return
+        if not routine_id or "/" in routine_id:
+            self._json(404, {"error": "not found"})
+            return
+        current = store.get_routine(routine_id)
+        if current is None:
+            self._json(404, {"error": f"routine not found: {routine_id}"})
+            return
+        allowed = {"name", "prompt", "schedule", "trigger", "enabled"}
+        unknown = set(payload) - allowed
+        if unknown:
+            self._json(400, {"error": f"unknown routine fields: {sorted(unknown)}"})
+            return
+        fields: dict = {}
+        if "name" in payload:
+            name = str(payload["name"] or "").strip()
+            if not name:
+                self._json(400, {"error": "name required (non-empty string)"})
+                return
+            fields["name"] = name
+        if "prompt" in payload:
+            prompt = payload["prompt"]
+            if not isinstance(prompt, str) or not prompt.strip():
+                self._json(400, {"error": "prompt required (non-empty string)"})
+                return
+            fields["prompt"] = prompt.strip()
+        if "schedule" in payload or "trigger" in payload:
+            # Stored rows carry schedule/trigger as JSON strings; reparse the
+            # EXISTING values before mixing with the incoming ones.
+            try:
+                cur_sched = json.loads(current["schedule"]) if current.get("schedule") else None
+                cur_trig = json.loads(current["trigger"]) if current.get("trigger") else None
+                schedule = parse_schedule(payload.get("schedule", cur_sched))
+                trigger = parse_trigger(payload.get("trigger", cur_trig))
+            except RoutineValidationError as exc:
+                self._json(400, {"error": str(exc)})
+                return
+            except (ValueError, TypeError):  # stored row corrupt — refuse, don't guess
+                self._json(500, {"error": "stored routine schedule/trigger is corrupt"})
+                return
+            if schedule is None and trigger is None:
+                self._json(400, {
+                    "error": "routine needs schedule and/or trigger (both null)"
+                })
+                return
+            if "schedule" in payload:
+                fields["schedule"] = schedule
+            if "trigger" in payload:
+                fields["trigger"] = trigger
+        if "enabled" in payload:
+            fields["enabled"] = bool(payload["enabled"])
+        try:
+            updated = store.update_routine(routine_id, **fields)
+        except Exception as exc:  # noqa: BLE001
+            self._json(500, {"error": str(exc)[:200]})
+            return
+        if "schedule" in fields:
+            self.routines.arm(routine_id, fields["schedule"])
+        self._json(200, self._routine_wire(updated))
+
+    def _handle_routine_delete(self, routine_id: str) -> None:
+        """DELETE /api/routines/<id> — remove the routine; its runs stay."""
+        store = self._routines_store()
+        if store is None:
+            return
+        if not routine_id or "/" in routine_id:
+            self._json(404, {"error": "not found"})
+            return
+        if store.get_routine(routine_id) is None:
+            self._json(404, {"error": f"routine not found: {routine_id}"})
+            return
+        store.delete_routine(routine_id)
+        self._json(200, {"deleted": routine_id})
+
+    def _handle_routine_run_now(self, routine_id: str) -> None:
+        """POST /api/routines/<id>/run — fire now, ignoring the schedule."""
+        store = self._routines_store()
+        if store is None:
+            return
+        if not routine_id or "/" in routine_id:
+            self._json(404, {"error": "not found"})
+            return
+        if store.get_routine(routine_id) is None:
+            self._json(404, {"error": f"routine not found: {routine_id}"})
+            return
+        result = self.routines.fire_now(routine_id)
+        if result.get("fired"):
+            self._json(202, {"accepted": True, **result})
+        elif result.get("reason") == "not found":
+            self._json(404, {"error": "routine not found"})
+        elif result.get("reason") == "routine disabled":
+            self._json(400, {"error": "routine is disabled"})
+        elif result.get("reason", "").startswith("already running"):
+            self._json(409, {"error": result["reason"]})
+        elif result.get("reason", "").startswith("agent degraded"):
+            self._json(503, {"error": result["reason"]})
+        elif result.get("reason", "").startswith("agent "):
+            self._json(404, {"error": result["reason"]})
+        else:
+            self._json(500, {"error": result.get("reason", "fire failed")})
+
+    def _handle_routine_history(self, routine_id: str) -> None:
+        """GET /api/routines/<id>/history — runs produced by one routine."""
+        store = self._history_store()
+        if store is None:
+            return
+        if not routine_id or "/" in routine_id:
+            self._json(404, {"error": "not found"})
+            return
+        if store.get_routine(routine_id) is None:
+            self._json(404, {"error": f"routine not found: {routine_id}"})
+            return
+        limit = self._limit_param("limit", 50, 200)
+        self._json(200, {
+            "routine_id": routine_id,
+            "runs": store.list_runs(routine_id=routine_id, limit=limit),
+        })
 
     def _sse(self, agent_id: str = DEFAULT_AGENT_ID, since: str = "",
              run_id: str = "") -> None:
@@ -2704,7 +2974,19 @@ def serve(host: str | None, port: int) -> None:
     fleet = FleetFan()
     VertusHandler.store = store
     VertusHandler.fleet = fleet
-    store.listener = fleet.publish
+    # Routine scheduler: one thread owns all fires (ticks + trigger scans), so
+    # a routine can never fire concurrently with itself and two routines can
+    # never race each other. The store's event listener composes fleet fanout
+    # with the trigger scan — the listener runs on the STORE WRITER thread, so
+    # on_event() only queues work (never blocks, never writes).
+    routines = RoutineManager(store, registry, lambda: sessions)
+    VertusHandler.routines = routines
+
+    def _composed_listener(envelope: dict) -> None:
+        fleet.publish(envelope)
+        routines.on_event(envelope)
+
+    store.listener = _composed_listener
     try:
         recovered = store.recover_interrupted()
         if recovered:
@@ -2715,6 +2997,9 @@ def serve(host: str | None, port: int) -> None:
         reaped = reap_orphaned_drivers()
         if reaped:
             print(f"[vertus] driver sweep: reaped {reaped} orphaned cua-driver(s)")
+        # Missed-fire catch-up: routines due while the hub was down fire
+        # exactly once here (see fleet_routines.MISSED-FIRE).
+        routines.catch_up()
     except Exception as exc:  # noqa: BLE001
         print(f"[vertus] run-store boot maintenance failed: {exc}", file=sys.stderr)
 
@@ -2747,6 +3032,7 @@ def serve(host: str | None, port: int) -> None:
     except KeyboardInterrupt:
         for server in servers:
             server.shutdown()
+        routines.stop()
 
 
 def main() -> None:

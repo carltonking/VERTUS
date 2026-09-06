@@ -40,7 +40,12 @@ Schema
 
 runs additionally carry bot-to-bot attribution (added by _migrate):
     from_agent, thread_id, run_kind (user|message|handoff|result),
-    parent_run_id.
+    parent_run_id, routine_id (runs produced by a routine).
+    routines(routine_id TEXT PK, agent_id, name, prompt,
+             schedule JSON|null, trigger JSON|null, enabled, created_at,
+             last_run_at, last_run_id, next_run_at, failure_count)
+    -- schedule/trigger policy lives in fleet_routines.py; the store only
+       persists state.
 
 ``events.seq`` is the fleet-wide monotonic cursor: ONE sequence across all
 agents, so ``since=`` replay on the fleet stream is a single ordered cursor.
@@ -172,6 +177,22 @@ CREATE TABLE IF NOT EXISTS approvals(
   decided_by TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_requested ON approvals(requested_at);
+CREATE TABLE IF NOT EXISTS routines(
+  routine_id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  schedule TEXT,          -- NULL (trigger-only) or JSON {"interval_s": N}
+  trigger TEXT,           -- NULL (schedule-only) or JSON {"type": ..., ...}
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at REAL NOT NULL,
+  last_run_at REAL,
+  last_run_id TEXT,
+  next_run_at REAL,
+  failure_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_routines_agent ON routines(agent_id);
+CREATE INDEX IF NOT EXISTS idx_routines_due ON routines(enabled, next_run_at);
 """
 
 
@@ -225,8 +246,13 @@ class RunStore:
             )
         if "parent_run_id" not in cols:
             conn.execute("ALTER TABLE runs ADD COLUMN parent_run_id TEXT")
+        if "routine_id" not in cols:
+            conn.execute("ALTER TABLE runs ADD COLUMN routine_id TEXT")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs(parent_run_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_routine ON runs(routine_id)"
         )
 
     # ------------------------------------------------------------------
@@ -361,7 +387,8 @@ class RunStore:
         return dict(rows[0]) if rows else None
 
     def list_runs(self, agent_id: str | None = None, state: str | None = None,
-                  limit: int | None = None, before: float | None = None) -> list[dict]:
+                  limit: int | None = None, before: float | None = None,
+                  routine_id: str | None = None) -> list[dict]:
         """Newest-first run rows; ``before`` = exclusive created_at cursor."""
         sql = "SELECT * FROM runs WHERE 1=1"
         params: list = []
@@ -371,6 +398,9 @@ class RunStore:
         if state is not None:
             sql += " AND state = ?"
             params.append(state)
+        if routine_id is not None:
+            sql += " AND routine_id = ?"
+            params.append(routine_id)
         if before is not None:
             sql += " AND created_at < ?"
             params.append(float(before))
@@ -380,6 +410,182 @@ class RunStore:
             params.append(int(limit))
         rows = self._read(lambda c: c.execute(sql, params).fetchall())
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Routines (scheduled/triggered work — see fleet_routines.py)
+    # ------------------------------------------------------------------
+
+    def create_routine(self, agent_id: str, name: str, prompt: str,
+                       schedule: dict | None, trigger: dict | None,
+                       enabled: bool = True) -> dict:
+        """Insert one routine; returns the row. next_run_at is armed by the
+        RoutineManager (it owns due/catch-up policy), not here."""
+        routine_id = uuid.uuid4().hex
+        now = time.time()
+        out: dict = {}
+
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT INTO routines(routine_id, agent_id, name, prompt, "
+                "schedule, trigger, enabled, created_at, failure_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                (routine_id, agent_id, name, prompt,
+                 json.dumps(schedule) if schedule else None,
+                 json.dumps(trigger) if trigger else None,
+                 1 if enabled else 0, now),
+            )
+
+        self._submit(op, out)
+        return self.get_routine(routine_id)
+
+    def get_routine(self, routine_id: str) -> dict | None:
+        rows = self._read(lambda c: c.execute(
+            "SELECT * FROM routines WHERE routine_id = ?", (routine_id,)
+        ).fetchall())
+        return dict(rows[0]) if rows else None
+
+    def list_routines(self, agent_id: str | None = None) -> list[dict]:
+        sql = "SELECT * FROM routines WHERE 1=1"
+        params: list = []
+        if agent_id is not None:
+            sql += " AND agent_id = ?"
+            params.append(agent_id)
+        sql += " ORDER BY created_at ASC, routine_id ASC"
+        rows = self._read(lambda c: c.execute(sql, params).fetchall())
+        return [dict(r) for r in rows]
+
+    def update_routine(self, routine_id: str, **fields) -> dict | None:
+        """Partial update; allowed keys are validated by the caller."""
+        allowed = ("name", "prompt", "schedule", "trigger", "enabled")
+        changes = {k: v for k, v in fields.items() if k in allowed}
+        if not changes:
+            return self.get_routine(routine_id)
+        sets: list[str] = []
+        params: list = []
+        for key, value in changes.items():
+            if key == "enabled":
+                sets.append("enabled = ?")
+                params.append(1 if value else 0)
+            elif key in ("schedule", "trigger"):
+                sets.append(f"{key} = ?")
+                params.append(json.dumps(value) if value else None)
+            else:
+                sets.append(f"{key} = ?")
+                params.append(value)
+        sets.append("failure_count = 0")  # a manual edit resets failure history
+        params.append(routine_id)
+
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                f"UPDATE routines SET {', '.join(sets)} WHERE routine_id = ?",
+                params,
+            )
+
+        self._submit(op, {})
+        return self.get_routine(routine_id)
+
+    def delete_routine(self, routine_id: str) -> None:
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute("DELETE FROM routines WHERE routine_id = ?", (routine_id,))
+
+        self._submit(op, {})
+
+    def disable_routines_for(self, agent_id: str) -> int:
+        """Disable every routine of an agent (agent DELETE). Returns count."""
+        out: dict = {}
+
+        def op(conn: sqlite3.Connection) -> None:
+            cur = conn.execute(
+                "UPDATE routines SET enabled = 0 WHERE agent_id = ?",
+                (agent_id,),
+            )
+            out["n"] = cur.rowcount
+
+        self._submit(op, out)
+        return out.get("n", 0)
+
+    def routines_due(self, now: float) -> list[dict]:
+        """Enabled schedule routines whose next fire time has passed."""
+        rows = self._read(lambda c: c.execute(
+            "SELECT * FROM routines WHERE enabled = 1 AND schedule IS NOT NULL "
+            "AND next_run_at IS NOT NULL AND next_run_at <= ?", (now,)
+        ).fetchall())
+        return [dict(r) for r in rows]
+
+    def active_routine_run(self, routine_id: str) -> str | None:
+        """The run_id of this routine's in-flight turn, if any.
+
+        'In flight' = queued or running. Guarantees a routine never fires
+        concurrently with itself; also the boot-recovery handshake (a run
+        left queued/running is marked interrupted at hub boot, so a stale
+        row here can never wedge a routine)."""
+        active = ",".join(f"'{s}'" for s in ("queued", "running"))
+        rows = self._read(lambda c: c.execute(
+            "SELECT run_id FROM runs WHERE routine_id = ? AND state IN "
+            f"({active}) ORDER BY created_at DESC LIMIT 1", (routine_id,)
+        ).fetchall())
+        return rows[0][0] if rows else None
+
+    def runs_for_routine(self, routine_id: str, limit: int = 50) -> list[dict]:
+        """Newest-first runs produced by one routine (routine history)."""
+        rows = self._read(lambda c: c.execute(
+            "SELECT * FROM runs WHERE routine_id = ? "
+            "ORDER BY created_at DESC, run_id DESC LIMIT ?",
+            (routine_id, int(limit)),
+        ).fetchall())
+        return [dict(r) for r in rows]
+
+    def mark_routine_fired(self, routine_id: str, run_id: str,
+                           next_run_at: float) -> None:
+        """Record a successful fire: last run id/at, next due time, and a
+        failure_count reset (success clears consecutive-failure history)."""
+
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE routines SET last_run_at = ?, last_run_id = ?, "
+                "next_run_at = ?, failure_count = 0 WHERE routine_id = ?",
+                (time.time(), run_id, next_run_at, routine_id),
+            )
+
+        self._submit(op, {})
+
+    def bump_routine_failure(self, routine_id: str) -> int:
+        """Increment consecutive-failure count; returns the new count."""
+        out: dict = {}
+
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE routines SET failure_count = failure_count + 1 "
+                "WHERE routine_id = ?",
+                (routine_id,),
+            )
+            rows = conn.execute(
+                "SELECT failure_count FROM routines WHERE routine_id = ?",
+                (routine_id,),
+            ).fetchone()
+            out["n"] = rows[0] if rows else 0
+
+        self._submit(op, out)
+        return out.get("n", 0)
+
+    def set_routine_enabled(self, routine_id: str, enabled: bool) -> None:
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE routines SET enabled = ? WHERE routine_id = ?",
+                (1 if enabled else 0, routine_id),
+            )
+
+        self._submit(op, {})
+
+    def set_routine_next(self, routine_id: str, next_run_at: float) -> None:
+        """Arm the schedule: next fire time = now + interval."""
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE routines SET next_run_at = ? WHERE routine_id = ?",
+                (next_run_at, routine_id),
+            )
+
+        self._submit(op, {})
 
     def agent_messages(self, agent_id: str, limit: int | None = None,
                        before: int | None = None) -> list[dict]:
@@ -434,11 +640,13 @@ class RunStore:
     def create_run(self, agent_id: str, prompt: str, remote: bool,
                    source: str = "", from_agent: str | None = None,
                    thread_id: str | None = None, run_kind: str = "user",
-                   parent_run_id: str | None = None) -> str:
+                   parent_run_id: str | None = None,
+                   routine_id: str | None = None) -> str:
         """Insert the run row in state=queued; returns the run_id.
 
         ``from_agent``/``thread_id``/``run_kind``/``parent_run_id`` carry
-        bot-to-bot attribution (message-driven runs, delegation chains).
+        bot-to-bot attribution (message-driven runs, delegation chains);
+        ``routine_id`` attributes the run to a routine (run_kind=routine).
         """
         run_id = uuid.uuid4().hex
         now = time.time()
@@ -447,10 +655,12 @@ class RunStore:
         def op(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "INSERT INTO runs(run_id, agent_id, prompt, remote, source, state, "
-                "created_at, from_agent, thread_id, run_kind, parent_run_id) "
-                "VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)",
+                "created_at, from_agent, thread_id, run_kind, parent_run_id, "
+                "routine_id) "
+                "VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
                 (run_id, agent_id, prompt, 1 if remote else 0, source, now,
-                 from_agent, thread_id, run_kind or "user", parent_run_id),
+                 from_agent, thread_id, run_kind or "user", parent_run_id,
+                 routine_id),
             )
 
         self._submit(op, out)
