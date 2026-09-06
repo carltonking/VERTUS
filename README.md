@@ -209,6 +209,17 @@ pytest vertus/server/` (~160 tests, no engine spawned) and `cd vertus/apps
 
 ## Running
 
+**`vertus doctor`** — `python3 vertus/server/vertus_server.py doctor [--json]`
+(exit 1 on any failed check; ~3s; read-only). It verifies what nothing else
+in the repo checks: that the forked hermes gateway still speaks the exact
+JSON-RPC dialect the bridge depends on, by spawning a THROWAWAY gateway on a
+temp HERMES_HOME and probing every RPC and the event vocabulary (no model
+turns — turn-only checks report `unverified` rather than hanging). Also
+checks the fork/venv, cua-driver + empirical TCC probes, hub health and
+code currency, store integrity/WAL/schema, agent profile schema versions,
+and the launchd agents. Safe against a live hub and with none running; it
+never writes to ~/.vertus.
+
 See [docs/FIRST_RUN.md](docs/FIRST_RUN.md) for the tested fresh-machine
 walkthrough. In short: install the two launchd plists from
 `disabled-launchagents/`, build the bundles, `launchctl bootstrap` both.

@@ -3193,11 +3193,20 @@ def main() -> None:
     p_serve.add_argument("--host", default=os.environ.get("VERTUS_HOST"))
     p_serve.add_argument("--port", type=int, default=int(os.environ.get("VERTUS_PORT", "8787")))
     sub.add_parser("token", help="print the bearer token")
+    p_doc = sub.add_parser(
+        "doctor", help="diagnose the fleet (env, gateway dialect, hub, store, registry, launchd)"
+    )
+    p_doc.add_argument("--json", action="store_true", help="machine-readable output")
     args = parser.parse_args()
     if args.command == "serve":
         serve(args.host, args.port)
     elif args.command == "token":
         print(ensure_token())
+    elif args.command == "doctor":
+        # Lazy import: doctor pulls hermes_bridge/agent_registry and must not
+        # slow the serving path. Exit code is 1 when any check failed.
+        from vertus_doctor import run
+        sys.exit(run(json_out=args.json))
 
 
 if __name__ == "__main__":
