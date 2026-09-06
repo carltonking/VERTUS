@@ -737,6 +737,54 @@ def test_bmp_decoder_1bit_variance(monkeypatch, isolated_env):
     assert vd._bmp_luminance_variance(b"not a bitmap") is None
 
 
+# -- pi bundle freshness ---------------------------------------------------
+
+def _fake_pi_tree(tmp_path: Path, src_mtime: float, bundle_mtime: float | None):
+    """A fake pi/packages tree: src files with given mtime, optional bundle."""
+    src = tmp_path / "pi" / "packages" / "coding-agent" / "src"
+    src.mkdir(parents=True)
+    f = src / "main.ts"
+    f.write_text("// x")
+    os.utime(f, (src_mtime, src_mtime))
+    if bundle_mtime is not None:
+        b = tmp_path / "pi" / "packages" / "coding-agent" / "dist" / "bundle" / "cli.js"
+        b.parent.mkdir(parents=True)
+        b.write_text("// bundle")
+        os.utime(b, (bundle_mtime, bundle_mtime))
+
+
+def _doctor_with_pi_root(monkeypatch, tmp_path):
+    """Make pi_bundle_checks resolve its repo root at tmp_path."""
+    monkeypatch.setattr(vd, "__file__",
+                        str(tmp_path / "vertus" / "server" / "vertus_doctor.py"))
+
+
+def test_pi_bundle_missing_warns(monkeypatch, isolated_env, tmp_path):
+    _fake_pi_tree(tmp_path, src_mtime=1000.0, bundle_mtime=None)
+    _doctor_with_pi_root(monkeypatch, tmp_path)
+    out = vd.pi_bundle_checks()
+    assert out[0]["name"] == "pi.bundle"
+    assert out[0]["status"] == "warn"
+    assert "missing" in out[0]["reason"]
+
+
+def test_pi_bundle_stale_warns(monkeypatch, isolated_env, tmp_path):
+    # src newer than bundle -> warn
+    _fake_pi_tree(tmp_path, src_mtime=2000.0, bundle_mtime=1000.0)
+    _doctor_with_pi_root(monkeypatch, tmp_path)
+    out = vd.pi_bundle_checks()
+    assert out[0]["name"] == "pi.bundle"
+    assert out[0]["status"] == "warn"
+    assert "OLDER" in out[0]["reason"]
+
+
+def test_pi_bundle_fresh_ok(monkeypatch, isolated_env, tmp_path):
+    _fake_pi_tree(tmp_path, src_mtime=1000.0, bundle_mtime=2000.0)
+    _doctor_with_pi_root(monkeypatch, tmp_path)
+    out = vd.pi_bundle_checks()
+    assert out[0]["name"] == "pi.bundle"
+    assert out[0]["status"] == "ok"
+
 def test_doctor_cli_subcommand_parses(monkeypatch, isolated_env, capsys):
     """vertus_server.py doctor must dispatch through argparse."""
     import vertus_server as vs

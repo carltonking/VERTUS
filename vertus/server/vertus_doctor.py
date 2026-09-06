@@ -1288,6 +1288,52 @@ def memory_checks() -> list[dict]:
     return out
 
 
+# -- pi bundle freshness ----------------------------------------------------
+
+def pi_bundle_checks() -> list[dict]:
+    """Is the built terminal bundle newer than its sources?
+
+    The terminal (and the local REPL) run the BUNDLED cli
+    (pi/packages/coding-agent/dist/bundle/cli.js), not the sources. Editing
+    src/ and forgetting to rebuild has bitten twice: the suite kept testing
+    stale code and the running binary silently diverged. This check makes
+    that visible: bundle missing → warn (nothing built); bundle older than
+    any of its sources → warn with the exact rebuild command.
+    """
+    out: list[dict] = []
+    root = Path(__file__).resolve().parents[2]
+    src_dirs = [
+        root / "pi" / "packages" / "coding-agent" / "src",
+        root / "pi" / "packages" / "ai" / "src",
+    ]
+    bundle = root / "pi" / "packages" / "coding-agent" / "dist" / "bundle" / "cli.js"
+
+    if not bundle.is_file():
+        out.append(_check("pi.bundle", "warn",
+                          f"terminal bundle missing: {bundle}",
+                          "cd pi/packages/coding-agent && npm run build — the "
+                          "local REPL and one-shot CLI run this bundle, not src/"))
+        return out
+
+    newest_src = max(
+        (p.stat().st_mtime for d in src_dirs if d.is_dir()
+         for p in d.rglob("*.*") if p.is_file()),
+        default=0.0,
+    )
+    bundle_mtime = bundle.stat().st_mtime
+    if newest_src > bundle_mtime:
+        stale_s = int(newest_src - bundle_mtime)
+        out.append(_check("pi.bundle", "warn",
+                          f"bundle is {stale_s}s OLDER than its newest source "
+                          f"(bundle {bundle.name} vs src/)",
+                          "cd pi/packages/coding-agent && npm run build — a stale "
+                          "bundle means the REPL runs code the suite no longer tests"))
+    else:
+        out.append(_check("pi.bundle", "ok",
+                          "terminal bundle is newer than its sources"))
+    return out
+
+
 # -- runner -----------------------------------------------------------------
 
 def run(json_out: bool = False, spawner=None) -> int:
@@ -1302,6 +1348,7 @@ def run(json_out: bool = False, spawner=None) -> int:
     all_checks += launchd_checks()
     all_checks += app_checks()
     all_checks += terminal_checks()
+    all_checks += pi_bundle_checks()
     runtime_s = time.monotonic() - started
     exit_code = 1 if any(c["status"] == "fail" for c in all_checks) else 0
     if json_out:
