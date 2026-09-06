@@ -9,12 +9,15 @@ struct FleetSidebarView: View {
     var onNewAgent: () -> Void
     var onEditAgent: (Agent) -> Void
     var onShowActivity: () -> Void
-    var onShowMemory: () -> Void
 
     @State private var confirmDelete: Agent?
     @State private var errorText: String?
     @State private var showScreens = false
     @State private var showThreads = false
+    /// Memory is a SHEET like Screens and Threads (Bug A5) — it moved out
+    /// of its own window once it gained the same close affordances the
+    /// other two sheets have (visible Done button + Escape).
+    @State private var showMemory = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -84,7 +87,7 @@ struct FleetSidebarView: View {
                 .foregroundStyle(.secondary)
 
                 Button {
-                    onShowMemory()
+                    showMemory = true
                     Task { await store.refreshMemory() }
                 } label: {
                     Label("Memory", systemImage: "brain")
@@ -98,6 +101,25 @@ struct FleetSidebarView: View {
             }
             .padding(10)
         }
+        // Bug A2: remove the automatic sidebar toggle — it must be attached
+        // to the SIDEBAR column (attaching to the split view left the system
+        // button in place, verified via AX: both buttons rendered). Our
+        // replacement lives in the detail toolbar (FleetRootView) so it
+        // stays on the LEFT when the sidebar collapses.
+        .vertusRemoveSidebarToggle()
+        // Bug A3: cover the sidebar/detail divider — a 2px light line at
+        // the sidebar's trailing edge (measured on screen: px 1390-1391 =
+        // #303044-ish between the #191919 sidebar and #1B1B1B detail). The
+        // cover is the sidebar's own background color, glued to the
+        // sidebar's trailing edge so it follows splitter drags. SwiftUI
+        // exposes no API to hide this separator (macOS 26 SDK has no
+        // sidebarSeparator); NSSplitView.dividerColor is read-only.
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(Color(red: 25 / 255, green: 25 / 255, blue: 25 / 255))
+                .frame(width: 2)
+                .allowsHitTesting(false)
+        }
         .sheet(isPresented: $showScreens) {
             FleetScreensSheetView()
                 .environmentObject(store)
@@ -107,6 +129,11 @@ struct FleetSidebarView: View {
             ThreadsView()
                 .environmentObject(store)
                 .frame(width: 780, height: 520)
+        }
+        .sheet(isPresented: $showMemory) {
+            MemoryView()
+                .environmentObject(store)
+                .frame(width: 900, height: 620)
         }
         .alert("Delete agent?", isPresented: Binding(
             get: { confirmDelete != nil },

@@ -94,8 +94,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var currentWidgetHeight = NotchPanelMetrics.idleHeight()
     private let expansionState = ExpansionState()
     private var mainWindow: NSWindow?
-    private var memoryWindow: NSWindow?
     private var notifier: CompletionNotifier?
+    /// Bug B9: an Escape press issued a stop while the run unwinds — the
+    /// NEXT Escape closes the panel regardless of the (still true) running
+    /// state, so two presses = stop, then close. Reset on show/hide.
+    private var escapeStopPending = false
 
     override init() {
         let config = ServerConfig.load()
@@ -323,33 +326,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
     }
 
-    /// The Memory view as its OWN window, not a sheet. Memory browsing is a
-    /// place you spend time (read, edit, search, watch bots write) — a
-    /// borderless sheet with no close control was a trap (Bug 2: the app had
-    /// to be force-quit). A titled, resizable window gives it the platform
-    /// conventions: traffic-light close, ⌘W via the Window menu, ⌘M, resize.
-    func showMemoryWindow() {
-        NSApp.activate(ignoringOtherApps: true)
-        if let window = memoryWindow {
-            window.makeKeyAndOrderFront(nil)
-            return
-        }
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 860, height: 600),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Memory"
-        window.contentView = NSHostingView(
-            rootView: MemoryView().environmentObject(store)
-        )
-        window.setFrameAutosaveName("VERTUSMemoryWindow")
-        window.isReleasedWhenClosed = false
-        memoryWindow = window
-        window.makeKeyAndOrderFront(nil)
-    }
-
     // MARK: - Show / hide transitions
 
     /// Grows the bar out of the notch: the panel shape animates from a small
@@ -358,6 +334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func showPanel() {
         guard let panel else { return }
         isHiding = false
+        escapeStopPending = false
         vertusTrace("showPanel")
 
         panel.setFrame(
@@ -390,6 +367,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func hidePanel() {
         guard let panel, panel.isVisible, !isHiding else { return }
         isHiding = true
+        escapeStopPending = false
         vertusTrace("hidePanel")
 
         withAnimation(.easeIn(duration: 0.32)) {
@@ -445,9 +423,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Local monitor: a backup in case the hotkey ever isn't consumed
         // system-wide; the Carbon handler is the primary path.
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
-            // Escape retracts the bar.
-            if event.keyCode == 53, self?.panel?.isVisible == true {
-                self?.hidePanel()
+            guard let self else { return event }
+            // Escape (Bug B9): a running turn is stopped first; a second
+            // press closes the panel; with nothing running it closes
+            // directly. See PanelEscapePolicy.
+            if event.keyCode == 53, panel?.isVisible == true {
+                handlePanelEscape()
+                return nil
+            }
+            // ⌘N (Bug B8): new session for the selected agent, identical to
+            // the top-right pencil button — only while the panel is key.
+            // (The main window's ⌘N is a deliberate no-op: CommandGroup
+            // replaces .newItem with nothing.)
+            if event.keyCode == kVK_ANSI_N,
+               event.modifierFlags.contains(.command),
+               !event.modifierFlags.contains(.shift),
+               !event.modifierFlags.contains(.option),
+               !event.modifierFlags.contains(.control),
+               panel?.isKeyWindow == true {
+                vertusTrace("⌘N while panel key — new session")
+                NotificationCenter.default.post(name: .vertusNewSession, object: nil)
                 return nil
             }
             guard event.keyCode == kVK_ANSI_J,
@@ -456,8 +451,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                   !event.modifierFlags.contains(.option),
                   !event.modifierFlags.contains(.control) else { return event }
             vertusTrace("local monitor fired (isKey=\(NSApp.keyWindow != nil))")
-            self?.togglePanel()
+            self.togglePanel()
             return nil
+        }
+    }
+
+    /// Escape in the panel: stop-then-close for an active turn, close
+    /// otherwise (Bug B9). Stopping uses the same path as the strip's stop
+    /// control (store.stopAgent), so behavior is identical everywhere.
+    private func handlePanelEscape() {
+        let id = store.selectedAgentID ?? "primary"
+        let state = store.live[id]
+        let active = state?.isRunning == true || state?.isBlocked == true
+        switch PanelEscapePolicy.nextAction(isTurnActive: active, stopPending: escapeStopPending) {
+        case .stopRun:
+            escapeStopPending = true
+            vertusTrace("Escape: stopping selected agent \(id)")
+            Task {
+                do {
+                    try await store.stopAgent(id)
+                } catch {
+                    vertusTrace("Escape stop failed: \(error.localizedDescription)")
+                }
+            }
+        case .closePanel:
+            hidePanel()
         }
     }
 
@@ -713,4 +731,5 @@ extension AppDelegate: NSWindowDelegate {
 extension Notification.Name {
     static let vertusFocusInput = Notification.Name("vertusFocusInput")
     static let vertusAppendPrompt = Notification.Name("vertusAppendPrompt")
+    static let vertusNewSession = Notification.Name("vertusNewSession")
 }

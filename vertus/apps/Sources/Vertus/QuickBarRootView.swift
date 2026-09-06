@@ -222,6 +222,11 @@ struct NotchPanelContent: View {
     /// this, so the chip→text gap stays constant for any agent name.
     @State private var chipWidth: CGFloat = 0
 
+    /// The logo spinner takes over from the static PNG once the first reply
+    /// has ever streamed, and STAYS mounted afterwards — swapping back to
+    /// the image mid-animation would cut the reassemble settle short.
+    @State private var spinnerEngaged = false
+
     /// Editor left edge: chip (its measured width) + a fixed gap. Right edge
     /// pinned at `editorRight` — a long agent name widens the chip, which
     /// narrows the editor (it never runs under or past the chip).
@@ -344,6 +349,10 @@ struct NotchPanelContent: View {
             // /token, exactly like the vertus CLI's slash menu.
             model.updateSlashSuggestions(for: prompt)
         }
+        .onChange(of: model.isStreaming) { streaming in
+            // First working moment engages the logo spinner permanently.
+            if streaming { spinnerEngaged = true }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .vertusAppendPrompt)) { note in
             guard let path = note.object as? String else { return }
             appendPath(path)
@@ -360,7 +369,9 @@ struct NotchPanelContent: View {
         ZStack(alignment: .topLeading) {
             Button(action: onPickFile) {
                 Group {
-                    if let logo {
+                    if spinnerEngaged || model.isStreaming {
+                        LogoSpinner(isBusy: model.isStreaming, size: 14)
+                    } else if let logo {
                         Image(nsImage: logo)
                             .resizable()
                             .interpolation(.high)
@@ -417,21 +428,27 @@ struct NotchPanelContent: View {
                         Image(systemName: "lock.fill")
                             .font(.system(size: 5.5))
                             .foregroundStyle(.orange)
-                    } else {
-                        Circle()
-                            .fill(busy.running ? Color.orange : Color.yellow)
-                            .frame(width: 5, height: 5)
                     }
-                    // Stop this bot's active run (its queue is preserved).
-                    Button {
-                        model.stopAgent(busy.id)
-                    } label: {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 6.5, weight: .bold))
-                            .foregroundStyle(.red.opacity(0.9))
+                    // (No busy dot: decorative — the entry's presence in
+                    // the strip already means the agent is busy.)
+                            // Stop button — the ONLY way to stop a background bot
+                    // from the panel — so it stays for every agent except
+                    // the selected one, whose run is stopped with Escape
+                    // (see BusyStripPolicy / PanelEscapePolicy). The busy
+                    // dot next to it was decorative (presence in the strip
+                    // already means busy) and is gone.
+                    if BusyStripPolicy.showsStopButton(agentID: busy.id,
+                                                       selectedAgentID: model.selectedAgentID) {
+                        Button {
+                            model.stopAgent(busy.id)
+                        } label: {
+                            Image(systemName: "stop.fill")
+                                .font(.system(size: 6.5, weight: .bold))
+                                .foregroundStyle(.red.opacity(0.9))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Stop \(busy.name)'s current run")
                     }
-                    .buttonStyle(.plain)
-                    .help("Stop \(busy.name)'s current run")
                 }
                 .help("\(busy.name) \(busy.workingFor.map { "working for \($0)" } ?? busy.blockedSummary ?? (busy.running ? "running" : "queued"))")
             }
@@ -816,7 +833,7 @@ struct NotchPanelContent: View {
                 )
             // Idle placeholder — slightly faded; hides as soon as the user types.
             if prompt.isEmpty {
-                Text("Ask Vertus anything...")
+                Text("Ask VERTUS anything...")
                     .font(.system(size: 13.4, weight: .regular))
                     .foregroundStyle(.white.opacity(0.5))
                     .frame(width: editorWidth, height: 16, alignment: .leading)
@@ -933,13 +950,22 @@ struct QuickBarRootView: View {
         .onChange(of: model.slashSuggestions) { _ in refreshWidgetHeight() }
         .onAppear {
             let args = CommandLine.arguments
-            if args.contains("--verify-output") || args.contains("--demo-output") {
+            if args.contains("--verify-spinner") {
+                vertusTrace("seeding demo spinner")
+                model.seedDemoSpinner()
+            } else if args.contains("--verify-output") || args.contains("--demo-output") {
                 vertusTrace("seeding demo output")
                 model.seedDemoOutput()
             } else if args.contains("--demo-long") || args.contains("--verify-long") {
                 vertusTrace("seeding long demo output")
                 model.seedLongOutput()
             }
+        }
+        // ⌘N while the panel is key = new session for the selected agent,
+        // exactly the top-right pencil button (Bug B8) — same code path.
+        .onReceive(NotificationCenter.default.publisher(for: .vertusNewSession)) { _ in
+            vertusTrace("new session via ⌘N")
+            model.newSession()
         }
     }
 
@@ -1180,14 +1206,20 @@ struct TranscriptBubbleView: View {
 // MARK: - Prompt editor
 
 /// Multi-line prompt field backed by NSTextView: white text that wraps to
-/// the next line (no send button to run under), capped at three visible
-/// lines — anything longer scrolls inside the strip. Return submits,
+/// the next line (no send button to run under), capped at `maxLines`
+/// visible lines — anything longer scrolls inside. Return submits,
 /// Shift+Return inserts a newline, and the editor refocuses when the bar
-/// grows out of the notch (`.vertusFocusInput`).
+/// grows out of the notch (`.vertusFocusInput`). The panel uses the 3-line
+/// defaults; the main window's composer reuses the SAME editor with
+/// maxLines 5 (Bug A6 — one shared implementation, no second editor).
 struct PromptTextEditor: NSViewRepresentable {
     @Binding var text: String
     var onSubmit: (String) -> Void
     var onLinesChange: (CGFloat) -> Void
+    /// Visible-line cap: the strip grows 1 → maxLines, then scrolls.
+    var maxLines: CGFloat = NotchPanelMetrics.promptMaxLines
+    /// The panel's font by default; the main window passes its own.
+    var fontSize: CGFloat = NotchPanelMetrics.promptFontSize
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -1203,7 +1235,7 @@ struct PromptTextEditor: NSViewRepresentable {
         textView.delegate = context.coordinator
         textView.isRichText = false
         textView.allowsUndo = true
-        textView.font = .systemFont(ofSize: NotchPanelMetrics.promptFontSize)
+        textView.font = .systemFont(ofSize: fontSize)
         textView.textColor = .white
         textView.insertionPointColor = .white
         textView.backgroundColor = .clear
@@ -1266,17 +1298,17 @@ struct PromptTextEditor: NSViewRepresentable {
         }
 
         /// Recompute the visible (wrapped) line count and publish it — this
-        /// grows/shrinks the prompt strip so it hugs the text (1 → 3 lines).
+        /// grows/shrinks the prompt strip so it hugs the text (1 → maxLines).
         func publishLines() {
             guard let tv = textView else { return }
-            parent.onLinesChange(Self.visibleLineCount(of: tv))
+            parent.onLinesChange(Self.visibleLineCount(of: tv, maxLines: parent.maxLines))
         }
 
         /// Number of visible wrapped lines in the editor, clamped to the
-        /// 3-line cap (the editor scrolls beyond that). Uses the layout
+        /// line cap (the editor scrolls beyond that). Uses the layout
         /// manager's OWN line height so the count is exact (integer), never
         /// rounding a single line up to two.
-        static func visibleLineCount(of textView: NSTextView) -> CGFloat {
+        static func visibleLineCount(of textView: NSTextView, maxLines: CGFloat) -> CGFloat {
             guard let layoutManager = textView.layoutManager,
                   let container = textView.textContainer,
                   let font = textView.font else { return 1 }
@@ -1287,7 +1319,7 @@ struct PromptTextEditor: NSViewRepresentable {
             let lh = layoutManager.defaultLineHeight(for: font)
             guard lh > 0 else { return 1 }
             let lines = (used.height / lh).rounded()
-            return min(max(lines, 1), NotchPanelMetrics.promptMaxLines)
+            return min(max(lines, 1), maxLines)
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {

@@ -32,11 +32,11 @@ final class QuickBarViewModel: ObservableObject {
     /// THIS panel view. Pure logic, unit-tested in VertusKitTests.
     private let viewCut = BarViewCut()
 
-    // Slash commands (skills) — unchanged behavior, now via VertusKit.
+    // Slash commands (skills) — mirrored from the store's per-agent
+    // catalog; refreshed whenever the selected agent changes.
     @Published var slashCommands: [SlashCommand] = []
     @Published var slashSuggestions: [SlashCommand] = []
-    private var catalogLoaded = false
-    private var catalogRetry = false
+    private var catalogAgent: String?
 
     let store: FleetStore
     private var cancellables: Set<AnyCancellable> = []
@@ -157,23 +157,22 @@ final class QuickBarViewModel: ObservableObject {
     // MARK: - Slash commands (skills)
 
     func ensureSlashCatalog() {
-        guard !catalogLoaded else { return }
-        catalogLoaded = true
+        let id = selectedAgentID
+        // Skills are per-agent: each agent home materializes its own set, so
+        // the catalog is refetched whenever the selection changes.
+        guard catalogAgent != id else { return }
+        catalogAgent = id
         Task { [weak self] in
             guard let self else { return }
-            do {
-                let cmds = try await self.store.client.slashCommands()
-                await MainActor.run {
-                    self.slashCommands = cmds
-                        .map { SlashCommand(name: $0.name, description: $0.description) }
-                        .sorted { $0.name < $1.name }
-                }
-            } catch {
-                await MainActor.run {
-                    if !self.catalogRetry {
-                        self.catalogRetry = true
-                        self.catalogLoaded = false
-                    }
+            await self.store.ensureSlashCatalog(agentID: id)
+            await MainActor.run {
+                // Mirror what the store actually holds; on a fetch failure it
+                // retries next call (catalogAgent stays unset there).
+                self.slashCommands = self.store.slashCommands
+                    .map { SlashCommand(name: $0.name, description: $0.description) }
+                    .sorted { $0.name < $1.name }
+                if self.slashCommands.isEmpty {
+                    self.catalogAgent = nil   // allow retry on next keystroke
                 }
             }
         }
@@ -220,9 +219,12 @@ final class QuickBarViewModel: ObservableObject {
         turnHasText = false
         // A switch to another agent starts an uncut view of that agent.
         viewCut.reset()
+        catalogAgent = nil            // refetch skills for the new agent
+        slashSuggestions = []
         store.selectedAgentID = id
         store.foregroundAgentID = id
         syncSelected()
+        ensureSlashCatalog()
     }
 
     // MARK: - Stop (supervision)
@@ -295,7 +297,23 @@ final class QuickBarViewModel: ObservableObject {
         syncSelected()
     }
 
-    // MARK: - Demo seeds (--demo-output / --demo-long)
+    // MARK: - Demo seeds (--demo-output / --demo-long / --verify-spinner)
+
+    /// --verify-spinner: loops the streaming flag on/off so the logo
+    /// spinner's spin → separate → reassemble cycle keeps repeating and can
+    /// be watched at any time (each cycle: ~3.5 s busy, 3 s idle at rest).
+    func seedDemoSpinner() {
+        sentAtLeastOnce = true
+        Task { [weak self] in
+            while true {
+                self?.isStreaming = true
+                self?.currentActivity = "demo spin…"
+                try? await Task.sleep(nanoseconds: 3_500_000_000)
+                self?.isStreaming = false
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+        }
+    }
 
     func seedDemoOutput() {
         sentAtLeastOnce = true

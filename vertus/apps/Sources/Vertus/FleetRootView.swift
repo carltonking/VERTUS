@@ -102,26 +102,50 @@ struct FleetRootView: View {
             FleetSidebarView(
                 onNewAgent: { editorMode = .create; showEditor = true },
                 onEditAgent: { agent in editorMode = .edit(agent); showEditor = true },
-                onShowActivity: { showActivity = true },
-                onShowMemory: { AppDelegate.shared?.showMemoryWindow() }
+                onShowActivity: { showActivity = true }
             )
             .navigationSplitViewColumnWidth(min: 220, ideal: 250)
         } detail: {
-            if let id = store.selectedAgentID, let state = store.live[id] {
-                AgentChatView(agentID: id, live: state)
-            } else {
-                VStack(spacing: 8) {
-                    Image(systemName: "person.2")
-                        .font(.system(size: 40))
-                        .foregroundStyle(.secondary)
-                    Text("No agent selected")
-                        .font(.system(size: 15, weight: .semibold))
-                    Text("Pick an agent in the roster, or create one.")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
+            // The sidebar toggle is OUR button, in the detail toolbar's
+            // leading edge (Bug A2). The system toggle, when the sidebar
+            // collapses, is relocated by AppKit to the TRAILING edge of the
+            // unified toolbar — verified empirically via AX ("Show Sidebar"
+            // jumped from x≈739 to x≈1561) — so it is removed and replaced
+            // with a fixed leading button that is on the LEFT in both
+            // states. The splitter divider line next to it is hidden by
+            // AppDelegate (NSSplitView.dividerColor = .clear).
+            Group {
+                if let id = store.selectedAgentID, let state = store.live[id] {
+                    AgentChatView(agentID: id, live: state)
+                } else {
+                    VStack(spacing: 8) {
+                        Image(systemName: "person.2")
+                            .font(.system(size: 40))
+                            .foregroundStyle(.secondary)
+                        Text("No agent selected")
+                            .font(.system(size: 15, weight: .semibold))
+                        Text("Pick an agent in the roster, or create one.")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .navigation) {
+                    Button {
+                        toggleSidebar()
+                    } label: {
+                        Image(systemName: "sidebar.leading")
+                    }
+                    .help("Toggle sidebar")
                 }
             }
         }
+        // macOS 14+: remove the automatic toggle (it jumps to the trailing
+        // edge when the sidebar collapses; our leading button replaces it).
+        // On macOS 13 the system toggle remains — the deployment target's
+        // floor, unreachable on any machine this app actually runs on.
+        .vertusRemoveSidebarToggle()
         .frame(minWidth: 900, minHeight: 560)
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showEditor) {
@@ -138,6 +162,27 @@ struct FleetRootView: View {
         }
         .onChange(of: store.selectedAgentID) { id in
             store.foregroundAgentID = id
+        }
+    }
+
+    /// Collapse/expand the sidebar through the responder chain — the
+    /// standard way to drive a NavigationSplitView's split view controller
+    /// (no public SwiftUI API exists for toggling it programmatically).
+    private func toggleSidebar() {
+        NSApp.sendAction(#selector(NSSplitViewController.toggleSidebar(_:)), to: nil, from: nil)
+    }
+}
+
+/// Wraps the macOS 14+ `toolbar(removing: .sidebarToggle)` in an
+/// availability guard so the deployment-target floor (macOS 13) still
+/// compiles; on 13 the system toggle remains.
+extension View {
+    @ViewBuilder
+    func vertusRemoveSidebarToggle() -> some View {
+        if #available(macOS 14.0, *) {
+            toolbar(removing: .sidebarToggle)
+        } else {
+            self
         }
     }
 }
