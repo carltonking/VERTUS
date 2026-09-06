@@ -1,5 +1,21 @@
 import Foundation
 
+// MARK: - Home dir (platform split)
+// macOS: the real ~ (token file + shared UI state live there). iOS: the app
+// sandbox home — the token file never exists there (Keychain holds it) and
+// the UI-state dir is per-app, which is exactly right for the phone's own
+// stream cursor. One resolver so nothing else needs an #if.
+public enum VertusHome {
+    public static var directory: URL {
+        #if os(iOS)
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .deletingLastPathComponent()  // the sandbox container root
+        #else
+        FileManager.default.homeDirectoryForCurrentUser
+        #endif
+    }
+}
+
 // MARK: - Server config
 // Token resolution order (unchanged from the old bar): UserDefaults override
 // ("vertus.token" / "vertus.baseURL"), else ~/.vertus/token.
@@ -29,7 +45,7 @@ public struct ServerConfig: Equatable {
             ?? "http://127.0.0.1:8787"
         var token = defaults.string(forKey: "vertus.token") ?? ""
         if token.isEmpty {
-            let path = FileManager.default.homeDirectoryForCurrentUser
+            let path = VertusHome.directory
                 .appendingPathComponent(".vertus/token")
             token = (try? String(contentsOf: path, encoding: .utf8))?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -52,7 +68,7 @@ public enum SharedUIState {
         if let override = ProcessInfo.processInfo.environment["VERTUS_UI_DIR"] {
             return URL(fileURLWithPath: override, isDirectory: true)
         }
-        return FileManager.default.homeDirectoryForCurrentUser
+        return VertusHome.directory
             .appendingPathComponent(".vertus/ui", isDirectory: true)
     }
 

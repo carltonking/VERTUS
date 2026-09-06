@@ -8,18 +8,33 @@
 
 /* Begin PBXBuildFile section */
 		A1FE000000001018 /* VertusPhoneApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001000 /* VertusPhoneApp.swift */; };
-		A1FE000000001019 /* VertusClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001001 /* VertusClient.swift */; };
 		A1FE00000000101A /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001002 /* ChatView.swift */; };
 		A1FE00000000101B /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001003 /* KeychainStore.swift */; };
+		A1FE00000000101C /* VertusKit in Frameworks */ = {isa = PBXBuildFile; productRef = A1FE000000001021 /* VertusKit */; };
+		A1FE000000001026 /* PhoneModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001022 /* PhoneModel.swift */; };
+		A1FE000000001027 /* MemoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001023 /* MemoryView.swift */; };
+		A1FE000000001028 /* ThreadsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001024 /* ThreadsView.swift */; };
+		A1FE000000001029 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1FE000000001025 /* SettingsView.swift */; };
 /* End PBXBuildFile section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		A1FE000000001020 /* XCLocalSwiftPackageReference "VertusApps" */ = {isa = XCLocalSwiftPackageReference; relativePath = ..; };
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A1FE000000001021 /* VertusKit */ = {isa = XCSwiftPackageProductDependency; package = A1FE000000001020 /* XCLocalSwiftPackageReference "VertusApps" */; productName = VertusKit; };
+/* End XCSwiftPackageProductDependency section */
 
 /* Begin PBXFileReference section */
 		A1FE000000001000 /* VertusPhoneApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VertusPhoneApp.swift; sourceTree = "<group>"; };
-		A1FE000000001001 /* VertusClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VertusClient.swift; sourceTree = "<group>"; };
 		A1FE000000001002 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
 		A1FE000000001003 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
 		A1FE000000001004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A1FE000000001005 /* VERTUS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VERTUS.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A1FE000000001022 /* PhoneModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneModel.swift; sourceTree = "<group>"; };
+		A1FE000000001023 /* MemoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemoryView.swift; sourceTree = "<group>"; };
+		A1FE000000001024 /* ThreadsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreadsView.swift; sourceTree = "<group>"; };
+		A1FE000000001025 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -27,6 +42,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A1FE00000000101C /* VertusKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -37,9 +53,12 @@
 			isa = PBXGroup;
 			children = (
 				A1FE000000001000 /* VertusPhoneApp.swift */,
-				A1FE000000001001 /* VertusClient.swift */,
 				A1FE000000001002 /* ChatView.swift */,
 				A1FE000000001003 /* KeychainStore.swift */,
+				A1FE000000001022 /* PhoneModel.swift */,
+				A1FE000000001023 /* MemoryView.swift */,
+				A1FE000000001024 /* ThreadsView.swift */,
+				A1FE000000001025 /* SettingsView.swift */,
 				A1FE000000001004 /* Info.plist */,
 			);
 			path = VertusPhone;
@@ -77,6 +96,9 @@
 			dependencies = (
 			);
 			name = VertusPhone;
+			packageProductDependencies = (
+				A1FE000000001021 /* VertusKit */,
+			);
 			productName = VertusPhone;
 			productReference = A1FE000000001005 /* VERTUS.app */;
 			productType = "com.apple.product-type.application";
@@ -105,6 +127,9 @@
 				Base,
 			);
 			mainGroup = A1FE000000001013;
+			packageReferences = (
+				A1FE000000001020 /* XCLocalSwiftPackageReference "VertusApps" */,
+			);
 			productRefGroup = A1FE000000001007 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -130,9 +155,12 @@
 			buildActionMask = 2147483647;
 			files = (
 				A1FE000000001018 /* VertusPhoneApp.swift in Sources */,
-				A1FE000000001019 /* VertusClient.swift in Sources */,
 				A1FE00000000101A /* ChatView.swift in Sources */,
 				A1FE00000000101B /* KeychainStore.swift in Sources */,
+				A1FE000000001026 /* PhoneModel.swift in Sources */,
+				A1FE000000001027 /* MemoryView.swift in Sources */,
+				A1FE000000001028 /* ThreadsView.swift in Sources */,
+				A1FE000000001029 /* SettingsView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
