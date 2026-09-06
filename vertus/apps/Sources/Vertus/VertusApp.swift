@@ -87,7 +87,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowCloseMonitor: Any?
     private var statusItem: NSStatusItem?
     private var menubarIcon: NSImage?
-    private var appLogo: NSImage?
     private var isHiding = false
     private var lastToggleAt = Date.distantPast
     private var heightObserver: AnyCancellable?
@@ -128,14 +127,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installWindowCloseMonitor()
         openMainWindow()
 
-        if CommandLine.arguments.contains("--verify-spinner") {
-            // Live demo (no screenshot/exit): show the panel right away so
-            // the logo spinner's spin → separate → reassemble cycle is
-            // visible without pressing ⇧⌘J. The root view's onAppear seeds
-            // the looping demo stream.
-            showPanel()
-            return
-        }
         if CommandLine.arguments.contains("--verify-nub") {
             renderPanel(progress: 0)
             return
@@ -179,7 +170,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return nil
         }
         menubarIcon = load("menubar-icon.png", size: 18)
-        appLogo = load("LOGO_DARKMODE.png", size: 14)
     }
 
     // MARK: - Panel
@@ -210,7 +200,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.acceptsMouseMovedEvents = true
 
         let host = NSHostingView(rootView: QuickBarRootView(
-            logo: appLogo,
             expansionState: expansionState,
             store: store
         ))

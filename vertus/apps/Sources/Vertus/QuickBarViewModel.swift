@@ -123,16 +123,28 @@ final class QuickBarViewModel: ObservableObject {
         transcript = state.transcript.compactMap { entry in
             guard let text = viewCut.visibleText(of: entry) else { return nil }
             // An assistant entry with no visible text yet (the reply right
-            // after a cut) shows the working bubble instead of an empty pill.
+            // after a cut) is represented by the top-left Working indicator
+            // instead of an empty pill.
             guard !text.isEmpty || entry.role == "user" else { return nil }
             return Self.map(entry, text: text)
         }
-        isStreaming = state.isRunning
-        currentActivity = state.currentActivity
-        queueDepth = state.queueDepth
-        if let last = transcript.last, last.role == "vertus", !last.text.isEmpty {
-            turnHasText = true
+        if !demoWorking {
+            isStreaming = state.isRunning
+            currentActivity = state.currentActivity
         }
+        queueDepth = state.queueDepth
+        // Derived, not accumulated: has the CURRENT run (state.lastRunID)
+        // produced visible text? A run started by another surface must not
+        // inherit "has text" from an older conversation — otherwise the
+        // top-left slot shows the plus while the agent works with nothing
+        // on screen. First delta of THIS run flips it (TopSlotPolicy).
+        let last = transcript.last
+        turnHasText = TopSlotPolicy.currentRunHasVisibleText(
+            lastEntryRunID: last?.runId,
+            currentRunID: state.lastRunID,
+            lastEntryIsReply: last?.role == "vertus",
+            lastEntryText: last?.text ?? ""
+        )
     }
 
     private func syncBusy() {
@@ -151,7 +163,8 @@ final class QuickBarViewModel: ObservableObject {
     }
 
     private static func map(_ e: VertusKit.TranscriptEntry, text: String) -> BarTranscriptEntry {
-        BarTranscriptEntry(id: e.id, role: e.role == "user" ? "you" : "vertus", text: text)
+        BarTranscriptEntry(id: e.id, role: e.role == "user" ? "you" : "vertus",
+                           text: text, runId: e.runId)
     }
 
     // MARK: - Slash commands (skills)
@@ -297,23 +310,7 @@ final class QuickBarViewModel: ObservableObject {
         syncSelected()
     }
 
-    // MARK: - Demo seeds (--demo-output / --demo-long / --verify-spinner)
-
-    /// --verify-spinner: loops the streaming flag on/off so the logo
-    /// spinner's spin → separate → reassemble cycle keeps repeating and can
-    /// be watched at any time (each cycle: ~3.5 s busy, 3 s idle at rest).
-    func seedDemoSpinner() {
-        sentAtLeastOnce = true
-        Task { [weak self] in
-            while true {
-                self?.isStreaming = true
-                self?.currentActivity = "demo spin…"
-                try? await Task.sleep(nanoseconds: 3_500_000_000)
-                self?.isStreaming = false
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-            }
-        }
-    }
+    // MARK: - Demo seeds (--demo-output / --demo-long)
 
     func seedDemoOutput() {
         sentAtLeastOnce = true
@@ -329,6 +326,23 @@ final class QuickBarViewModel: ObservableObject {
         sentAtLeastOnce = true
         let lines = (1...24).map { "Line \($0): VERTUS output row number \($0) with enough text to wrap comfortably." }
         transcript.append(BarTranscriptEntry(role: "vertus", text: lines.joined(separator: "\n")))
+    }
+
+    /// --demo-working: the top-left slot's Working state, deterministically
+    /// — streaming with no text yet (no hub involved). The slot must show
+    /// the logo spinner + "Working"; the plus returns only when a text
+    /// delta flips turnHasText or the turn ends.
+    /// While set, syncSelected leaves the streaming/activity/turnHasText
+    /// mirrors alone — otherwise live store updates (an actual run on the
+    /// hub) would immediately trample the seeded Working state.
+    private var demoWorking = false
+
+    func seedDemoWorking() {
+        demoWorking = true
+        sentAtLeastOnce = true
+        isStreaming = true
+        currentActivity = "working…"
+        turnHasText = false
     }
 
     // MARK: - Transcript helpers

@@ -203,8 +203,6 @@ struct NotchPanelShape: Shape {
 struct NotchPanelContent: View {
     var progress: CGFloat
     var widgetHeight: CGFloat
-    /// The VERTUS "A" glyph (white art) — tints white on the dark bar.
-    var logo: NSImage?
     @ObservedObject var model: QuickBarViewModel
     var onPickFile: () -> Void
     var onSend: (String) -> Void
@@ -221,11 +219,6 @@ struct NotchPanelContent: View {
     /// lands long before the first ⇧⌘J. The editor's left edge derives from
     /// this, so the chip→text gap stays constant for any agent name.
     @State private var chipWidth: CGFloat = 0
-
-    /// The logo spinner takes over from the static PNG once the first reply
-    /// has ever streamed, and STAYS mounted afterwards — swapping back to
-    /// the image mid-animation would cut the reassemble settle short.
-    @State private var spinnerEngaged = false
 
     /// Editor left edge: chip (its measured width) + a fixed gap. Right edge
     /// pinned at `editorRight` — a long agent name widens the chip, which
@@ -281,9 +274,10 @@ struct NotchPanelContent: View {
     private let unpinThreshold: CGFloat = 6
     private static let scrollSpaceName = "chatScroll"
 
-    /// Horizontal center of the logo (ZStack coords): centered between the
-    /// window's left end and the notch, so it sits in the left shoulder.
-    /// Falls back to the reference-fitted position on non-notched displays.
+    /// Horizontal center of the old logo position (ZStack coords): centered
+    /// between the window's left end and the notch, so the top-left slot
+    /// sits in the left shoulder. Falls back to the reference-fitted
+    /// position on non-notched displays.
     private var logoCenterX: CGFloat {
         guard let screen = NSScreen.main,
               let left = screen.auxiliaryTopLeftArea,
@@ -292,6 +286,20 @@ struct NotchPanelContent: View {
         let mid = (windowLeft + left.maxX) / 2
         return max(16.5, mid - windowLeft - 1)
     }
+
+    /// Left edge of the top-left slot — the old logo's left edge (its
+    /// center minus half its 14 pt frame), so the plus lands exactly where
+    /// the logo did.
+    private var logoLeft: CGFloat { logoCenterX - 7 }
+
+    /// ONE slot width for both states (the plus alone, and the
+    /// spinner + "Working" label): the swap must never shift the layout.
+    /// Fixed, so a state change can't re-measure and jitter.
+    private static let workingSlotWidth: CGFloat = 13 + 4 + ceil(
+        ("Working" as NSString).size(withAttributes: [
+            .font: NSFont.systemFont(ofSize: 10.5, weight: .medium),
+        ]).width
+    )
 
     /// Horizontal center of the new-session button (ZStack coords): mirror of
     /// the logo — centered between the window's right end and the notch.
@@ -349,10 +357,6 @@ struct NotchPanelContent: View {
             // /token, exactly like the vertus CLI's slash menu.
             model.updateSlashSuggestions(for: prompt)
         }
-        .onChange(of: model.isStreaming) { streaming in
-            // First working moment engages the logo spinner permanently.
-            if streaming { spinnerEngaged = true }
-        }
         .onReceive(NotificationCenter.default.publisher(for: .vertusAppendPrompt)) { note in
             guard let path = note.object as? String else { return }
             appendPath(path)
@@ -363,23 +367,26 @@ struct NotchPanelContent: View {
         }
     }
 
-    // MARK: Top bar — VERTUS logo (click to attach a file), white dots (right).
+    // MARK: Top bar — top-left slot (attach file / Working), new session (right).
 
     private var topBar: some View {
         ZStack(alignment: .topLeading) {
+            // Top-left slot, TWO states only (TopSlotPolicy): at rest and
+            // while output is streaming a plus; while the agent is working
+            // and no text has arrived, the logo spinner + "Working". Both
+            // states are ONE button — attach stays reachable mid-think.
+            // The frame width is the same in both states, so the swap on
+            // the first text delta never shifts the layout.
             Button(action: onPickFile) {
-                Group {
-                    if spinnerEngaged || model.isStreaming {
-                        LogoSpinner(isBusy: model.isStreaming, size: 14)
-                    } else if let logo {
-                        Image(nsImage: logo)
-                            .resizable()
-                            .interpolation(.high)
-                            .foregroundStyle(.white)
+                HStack(spacing: 4) {
+                    if model.isThinking {
+                        LogoSpinner(isBusy: true, size: 13)
+                        Text("Working")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.85))
                     } else {
-                        // Fallback: attach icon.
-                        Image(systemName: "square.and.arrow.up")
-                            .font(.system(size: 14, weight: .regular))
+                        Image(systemName: "plus")
+                            .font(.system(size: 13, weight: .semibold))
                             .symbolRenderingMode(.monochrome)
                             .foregroundStyle(.white)
                     }
@@ -387,8 +394,8 @@ struct NotchPanelContent: View {
             }
             .buttonStyle(.plain)
             .help("Attach a file")
-            .frame(width: 14, height: 14)
-            .position(x: logoCenterX, y: 12.5)
+            .frame(width: Self.workingSlotWidth, height: 14, alignment: .leading)
+            .position(x: logoLeft + Self.workingSlotWidth / 2, y: 12.5)
 
             // New session: small square with a pencil. A VIEW reset — the
             // hub keeps the agent's full transcript and run history. If a
@@ -616,9 +623,6 @@ struct NotchPanelContent: View {
                     ForEach(model.transcript) { entry in
                         TranscriptBubbleView(entry: entry).id(entry.id)
                     }
-                    if model.isThinking {
-                        thinkingBubble.id("thinking")
-                    }
                 }
                 .padding(.horizontal, 14)
                 .padding(.top, NotchPanelMetrics.chatTopPad)
@@ -691,33 +695,13 @@ struct NotchPanelContent: View {
         }
     }
 
-    /// Which bubble to keep pinned at the bottom while chatting: the thinking
-    /// bubble while waiting, otherwise the newest message entry (stable id).
+    /// Which bubble to keep pinned at the bottom while chatting: the newest
+    /// message entry (stable id).
     private func scrollAnchor() -> AnyHashable {
-        if model.isThinking {
-            return "thinking"
-        }
         if let last = model.transcript.last {
             return last.id
         }
         return ""
-    }
-
-    /// "thinking" with three animated dots while the reply is still coming.
-    private var thinkingBubble: some View {
-        HStack(spacing: 6) {
-            Text("working")
-                .font(.system(size: 12, weight: .regular))
-                .foregroundStyle(.white.opacity(0.7))
-            TypingDots()
-        }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 7)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(white: 0.22))
-        )
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: Divider — full-width 1.5 pt line at the top of the prompt bar.
@@ -893,17 +877,13 @@ struct NotchPanelContent: View {
 
 // MARK: - Root view
 
-struct QuickBarRootView: View {
-    /// The VERTUS logo shown in the top-left of the bar (click = attach file).
-    var logo: NSImage?
-    @ObservedObject var expansionState: ExpansionState
+struct QuickBarRootView: View {    @ObservedObject var expansionState: ExpansionState
 
     @StateObject private var model: QuickBarViewModel
 
     /// The merged app injects its ONE store; the panel never builds a second
     /// stream of its own.
-    init(logo: NSImage?, expansionState: ExpansionState, store: FleetStore) {
-        self.logo = logo
+    init(expansionState: ExpansionState, store: FleetStore) {
         self.expansionState = expansionState
         _model = StateObject(wrappedValue: QuickBarViewModel(store: store))
     }
@@ -915,7 +895,6 @@ struct QuickBarRootView: View {
         NotchPanelContent(
             progress: expansionState.progress,
             widgetHeight: expansionState.widgetHeight,
-            logo: logo,
             model: model,
             onPickFile: pickFile,
             onSend: { text in
@@ -950,9 +929,9 @@ struct QuickBarRootView: View {
         .onChange(of: model.slashSuggestions) { _ in refreshWidgetHeight() }
         .onAppear {
             let args = CommandLine.arguments
-            if args.contains("--verify-spinner") {
-                vertusTrace("seeding demo spinner")
-                model.seedDemoSpinner()
+            if args.contains("--demo-working") {
+                vertusTrace("seeding demo working")
+                model.seedDemoWorking()
             } else if args.contains("--verify-output") || args.contains("--demo-output") {
                 vertusTrace("seeding demo output")
                 model.seedDemoOutput()
@@ -1012,10 +991,6 @@ struct QuickBarRootView: View {
             if index > 0 { content += 8 }              // gap between bubbles
             content += bubbleHeight(for: entry.text)   // 13 pt text + padding
         }
-        if model.isThinking {
-            content += 8                               // gap before thinking
-            content += thinkingBubbleHeight
-        }
         let window = min(
             content + NotchPanelMetrics.chatTopPad + NotchPanelMetrics.outputBottomInset,
             NotchPanelMetrics.maxScrollWindowHeight
@@ -1026,11 +1001,6 @@ struct QuickBarRootView: View {
     /// AppKit line height (the iOS-only `lineHeight` doesn't exist here).
     private func lineHeight(of font: NSFont) -> CGFloat {
         font.ascender - font.descender + font.leading
-    }
-
-    /// Height of the "thinking" bubble (12 pt text + 7 pt padding each side).
-    private var thinkingBubbleHeight: CGFloat {
-        lineHeight(of: NSFont.systemFont(ofSize: 12)) + 14
     }
 
     /// Height of a 13 pt message wrapped at the bubble's text width, plus
@@ -1083,17 +1053,20 @@ struct QuickBarRootView: View {
 
 // MARK: - Transcript row
 
-/// The QuickBar's own transcript row (id/role/text). Named distinctly from
-/// VertusKit.TranscriptEntry — both are in scope in the merged module.
+/// The QuickBar's own transcript row (id/role/text/runId). Named distinctly
+/// from VertusKit.TranscriptEntry — both are in scope in the merged module.
+/// runId scopes the top-left Working indicator to the CURRENT run.
 struct BarTranscriptEntry: Identifiable {
     let id: String
     let role: String
     var text: String
+    let runId: String
 
-    init(id: String = UUID().uuidString, role: String, text: String) {
+    init(id: String = UUID().uuidString, role: String, text: String, runId: String = "") {
         self.id = id
         self.role = role
         self.text = text
+        self.runId = runId
     }
 }
 
@@ -1347,38 +1320,12 @@ struct PromptTextEditor: NSViewRepresentable {
     }
 }
 
-// MARK: - Typing indicator
-
-/// Three small dots pulsing in sequence — the classic "typing…" indicator.
-struct TypingDots: View {
-    @State private var animating = false
-
-    var body: some View {
-        HStack(spacing: 3) {
-            ForEach(0..<3) { index in
-                Circle()
-                    .fill(Color.white.opacity(0.85))
-                    .frame(width: 5, height: 5)
-                    .scaleEffect(animating ? 0.55 : 1)
-                    .animation(
-                        .easeInOut(duration: 0.45)
-                            .repeatForever(autoreverses: true)
-                            .delay(Double(index) * 0.15),
-                        value: animating
-                    )
-            }
-        }
-        .onAppear { animating = true }
-    }
-}
-
 #if DEBUG
 #Preview {
     // The merged app owns the store; the preview shows the panel chrome
     // with a bare store pointed at the default hub.
     let config = ServerConfig.load()
     QuickBarRootView(
-        logo: nil,
         expansionState: ExpansionState(),
         store: FleetStore(client: VertusHTTPClient(config: config),
                           stream: FleetStream(config: config,
