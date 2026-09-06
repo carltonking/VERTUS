@@ -128,6 +128,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installWindowCloseMonitor()
         openMainWindow()
 
+        if CommandLine.arguments.contains("--verify-spinner") {
+            // Live demo (no screenshot/exit): show the panel right away so
+            // the logo spinner's spin → separate → reassemble cycle is
+            // visible without pressing ⇧⌘J. The root view's onAppear seeds
+            // the looping demo stream.
+            showPanel()
+            return
+        }
         if CommandLine.arguments.contains("--verify-nub") {
             renderPanel(progress: 0)
             return
