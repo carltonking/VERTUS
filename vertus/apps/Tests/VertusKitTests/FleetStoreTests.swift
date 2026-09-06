@@ -295,4 +295,81 @@ final class FleetStoreTests: XCTestCase {
             XCTAssertTrue(message.contains("primary"), "message: \(message)")
         }
     }
+
+    // MARK: - 8. Cancellation (supervision)
+
+    func testCancelAgentStopsActiveRunAndSurfacesIdle409() async throws {
+        let agent = try await makeAgent("doc")
+        // A run in flight (the stub flips it running on the first text event).
+        let runID = try await store.submit(agentID: agent.id, text: "busy")
+        hub.inject(type: "text", agentID: agent.id, runID: runID, payload: ["text": "d1"])
+
+        let cancelled = try await store.stopAgent(agent.id)
+        XCTAssertEqual(cancelled, runID, "agent cancel returns the active run id")
+        // The stub emitted the cancelled event; the store must treat it as a
+        // terminal event (running cleared, no error).
+        let ok = await waitUntil {
+            self.store.live[agent.id]?.isRunning == false
+        }
+        XCTAssertTrue(ok, "cancelled event clears the running marker")
+        XCTAssertNil(store.live[agent.id]?.lastError, "cancel is not an error")
+
+        // Idle agent → typed 409 with the hub's message.
+        do {
+            _ = try await store.stopAgent(agent.id)
+            XCTFail("idle cancel should have thrown")
+        } catch let error as VertusError {
+            guard case .conflict(let message) = error else {
+                return XCTFail("expected conflict, got \(error)")
+            }
+            XCTAssertTrue(message.contains("idle"), "message: \(message)")
+        }
+    }
+
+    func testCancelRunDrainsQueue() async throws {
+        let agent = try await makeAgent("doc")
+        let run1 = try await store.submit(agentID: agent.id, text: "first")
+        hub.inject(type: "text", agentID: agent.id, runID: run1, payload: ["text": "d1"])
+        let run2 = try await store.submit(agentID: agent.id, text: "second")
+        let run3 = try await store.submit(agentID: agent.id, text: "third")
+
+        // Without drain: only the target run is cancelled.
+        _ = try await store.stopRun(run1)
+        let runs = try await store.client.runs(agentID: agent.id)
+        let state = { (rid: String) in runs.first { $0.runId == rid }?.state }
+        XCTAssertEqual(state(run1), "cancelled")
+        XCTAssertEqual(state(run2), "queued", "a plain cancel keeps the queue")
+        XCTAssertEqual(state(run3), "queued")
+
+        // With drain: everything still queued for that agent is cancelled.
+        _ = try await store.stopRun(run2, drainQueue: true)
+        let runs2 = try await store.client.runs(agentID: agent.id)
+        let state2 = { (rid: String) in runs2.first { $0.runId == rid }?.state }
+        XCTAssertEqual(state2(run2), "cancelled")
+        XCTAssertEqual(state2(run3), "cancelled", "drain_queue clears the pending queue")
+    }
+
+    func testCancelTerminalRunIsConflict() async throws {
+        let agent = try await makeAgent("doc")
+        let runID = try await store.submit(agentID: agent.id, text: "fast")
+        hub.inject(type: "done", agentID: agent.id, runID: runID)
+        do {
+            _ = try await store.stopRun(runID)
+            XCTFail("terminal cancel should have thrown")
+        } catch let error as VertusError {
+            guard case .conflict = error else {
+                return XCTFail("expected conflict, got \(error)")
+            }
+        }
+    }
+
+    func testStatusCarriesSupervisionFields() async throws {
+        let agent = try await makeAgent("doc")
+        let status = try await store.client.status(agent.id)
+        XCTAssertEqual(status.stallTimeoutS ?? 0, 180, "v4 stall limit decodes")
+        XCTAssertEqual(status.hardTimeoutS ?? 0, 3600)
+        XCTAssertNil(status.degraded)
+        XCTAssertEqual(status.silenceS ?? 0, 0)
+        XCTAssertFalse(status.isBusy)
+    }
 }

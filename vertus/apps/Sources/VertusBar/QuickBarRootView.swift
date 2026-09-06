@@ -382,6 +382,16 @@ struct NotchPanelContent: View {
                             .fill(busy.running ? Color.orange : Color.yellow)
                             .frame(width: 5, height: 5)
                     }
+                    // Stop this bot's active run (its queue is preserved).
+                    Button {
+                        model.stopAgent(busy.id)
+                    } label: {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 6.5, weight: .bold))
+                            .foregroundStyle(.red.opacity(0.9))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Stop \(busy.name)'s current run")
                 }
                 .help("\(busy.name) \(busy.blockedSummary ?? (busy.running ? "running" : "queued"))")
             }

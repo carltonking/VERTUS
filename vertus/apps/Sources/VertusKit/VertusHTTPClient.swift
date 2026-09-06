@@ -109,6 +109,26 @@ public final class VertusHTTPClient {
         try await send("DELETE", path: "/api/agents/\(escaped(id))", body: [String: Any]())
     }
 
+    /// POST /api/agents/<id>/cancel — cancel whatever the agent is doing
+    /// now (the active run only; the queue is untouched). 409 when idle.
+    /// Returns the cancelled run id.
+    public func cancelAgent(_ id: String) async throws -> String {
+        let json = try await sendJSON("POST", path: "/api/agents/\(escaped(id))/cancel",
+                                      body: [String: Any]())
+        return (json as? [String: Any])?["cancelled"] as? String ?? id
+    }
+
+    /// POST /api/runs/<run_id>/cancel. Queued → dequeued+cancelled; running
+    /// → escalation ladder (returns immediately); terminal → 409.
+    /// `drainQueue` also cancels every other run still queued for that agent.
+    public func cancelRun(_ runID: String, drainQueue: Bool = false) async throws -> (cancelled: String, drained: Bool) {
+        let body: [String: Any] = ["drain_queue": drainQueue]
+        let json = try await sendJSON("POST", path: "/api/runs/\(escaped(runID))/cancel", body: body)
+        guard let dict = json as? [String: Any] else { throw VertusError.decoding }
+        return (dict["cancelled"] as? String ?? runID,
+                dict["drain_queue"] as? Bool ?? drainQueue)
+    }
+
     // MARK: - Prompts
 
     /// POST /api/prompt. Queues the turn; the server returns immediately

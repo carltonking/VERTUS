@@ -336,13 +336,21 @@ final class StubHub {
                 }
             }
         } else if request.method == "POST" {
-            switch path {
-            case "/api/prompt":
-                response = promptResponse(request)
-            case "/api/agents":
-                response = createAgentResponse(request)
-            default:
-                break
+            if path.hasPrefix("/api/runs/"), path.hasSuffix("/cancel") {
+                let id = String(path.dropFirst("/api/runs/".count).dropLast("/cancel".count))
+                response = cancelRunResponse(id, request: request)
+            } else if path.hasPrefix("/api/agents/"), path.hasSuffix("/cancel") {
+                let id = String(path.dropFirst("/api/agents/".count).dropLast("/cancel".count))
+                response = cancelAgentResponse(id)
+            } else {
+                switch path {
+                case "/api/prompt":
+                    response = promptResponse(request)
+                case "/api/agents":
+                    response = createAgentResponse(request)
+                default:
+                    break
+                }
             }
         } else if request.method == "PATCH", path.hasPrefix("/api/agents/") {
             let id = String(path.dropFirst("/api/agents/".count))
@@ -376,6 +384,12 @@ final class StubHub {
             "queue_depth": forceQueueDepth,
             "turn_started_at": NSNull(),
             "gateway_alive": true,
+            // v4 supervision fields (mirrors the hub's /status payload).
+            "stall_timeout_s": 180.0,
+            "hard_timeout_s": 3600.0,
+            "last_event_at": NSNull(),
+            "silence_s": 0.0,
+            "degraded": NSNull(),
         ])
     }
 
@@ -533,6 +547,71 @@ final class StubHub {
         agents.removeValue(forKey: id)
         agentOrder.removeAll { $0 == id }
         return json(200, ["deleted": id, "archived_to": "/tmp/stub/.trash/\(id)-123"])
+    }
+
+    // MARK: - Cancellation (supervision)
+
+    /// Mark a run cancelled (only from a non-terminal state); emits the
+    /// ``cancelled`` wire event exactly like the hub does.
+    private func cancelRunInStore(_ runID: String) -> Bool {
+        lock.withLock {
+            guard let i = runs.firstIndex(where: { $0["run_id"] as? String == runID }),
+                  !["done", "error", "interrupted", "abandoned", "cancelled", "timeout"]
+                    .contains(runs[i]["state"] as? String) else {
+                return false
+            }
+            runs[i]["state"] = "cancelled"
+            runs[i]["ended_at"] = Date().timeIntervalSince1970
+            let agentID = runs[i]["agent_id"] as? String
+            let payload: [String: Any] = ["text": "run cancelled"]
+            Task { self.inject(type: "cancelled", agentID: agentID, runID: runID, payload: payload) }
+            return true
+        }
+    }
+
+    private func cancelAgentResponse(_ id: String) -> (Int, Data) {
+        guard agents[id] != nil else {
+            return json(404, ["error": "agent not found: \(id)"])
+        }
+        var cancelledID: String?
+        lock.withLock {
+            cancelledID = runs.first { $0["agent_id"] as? String == id
+                && !["done", "error", "interrupted", "abandoned", "cancelled", "timeout"]
+                    .contains($0["state"] as? String) }?["run_id"] as? String
+        }
+        guard let cancelledID else {
+            return json(409, ["error": "agent \(id) is idle — nothing to cancel"])
+        }
+        _ = cancelRunInStore(cancelledID)
+        return json(200, ["cancelled": cancelledID])
+    }
+
+    private func cancelRunResponse(_ id: String, request: ReceivedRequest) -> (Int, Data) {
+        let drain = (request.body?["drain_queue"] as? Bool) ?? false
+        guard runs.contains(where: { $0["run_id"] as? String == id }) else {
+            return json(404, ["error": "run not found: \(id)"])
+        }
+        let cancelled = cancelRunInStore(id)
+        guard cancelled else {
+            return json(409, ["error": "run already terminal"])
+        }
+        if drain {
+            // Mirrors the hub: every OTHER still-queued run of that agent
+            // is dequeued and cancelled too.
+            let agentID = lock.withLock { runs.first { $0["run_id"] as? String == id }?["agent_id"] as? String }
+            if let agentID {
+                let queued = lock.withLock {
+                    runs.compactMap { run -> String? in
+                        guard run["agent_id"] as? String == agentID,
+                              run["run_id"] as? String != id,
+                              run["state"] as? String == "queued" else { return nil }
+                        return run["run_id"] as? String
+                    }
+                }
+                for rid in queued { _ = cancelRunInStore(rid) }
+            }
+        }
+        return json(200, ["cancelled": id, "drain_queue": drain])
     }
 
     // MARK: - SSE

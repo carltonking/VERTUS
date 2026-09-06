@@ -205,6 +205,24 @@ final class QuickBarViewModel: ObservableObject {
         syncSelected()
     }
 
+    // MARK: - Stop (supervision)
+
+    /// Stop whatever the agent is doing now (the active run only; the
+    /// agent's queue is preserved). Surfaces errors as the busy strip's
+    /// stream label so the panel never needs a second UI surface.
+    func stopAgent(_ id: String) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.store.stopAgent(id)
+            } catch {
+                await MainActor.run {
+                    self.streamLabel = "stop failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
     // MARK: - Sending (fire and forget)
 
     /// Submit a prompt. NEVER blocks and NEVER refuses a busy agent — the

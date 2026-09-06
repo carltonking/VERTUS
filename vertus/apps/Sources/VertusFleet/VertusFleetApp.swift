@@ -29,8 +29,19 @@ struct VertusFleetApp: App {
 
 // MARK: - Delegate
 
+/// UNUserNotificationCenter.current() raises NSInternalInconsistencyException
+/// ("bundleProxyForCurrentProcess is nil") when the process has no app bundle
+/// — i.e. a bare binary launched straight from .build/ during development,
+/// which is how the smoke tests and this demo launch it. Degrade cleanly:
+/// notifications off, everything else works. The wrapped VertusFleet.app
+/// (scripts/make-fleet-app.sh) gets real banners.
+private var notificationsAvailable: Bool {
+    Bundle.main.bundleURL.pathExtension == "app"
+}
+
 final class FleetAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard notificationsAvailable else { return }
         // Local notifications need explicit permission; the Fleet window is
         // where background completions land while the user is elsewhere.
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
@@ -74,6 +85,7 @@ final class CompletionNotifier: NSObject, UNUserNotificationCenterDelegate {
     init(store: FleetStore) {
         self.store = store
         super.init()
+        guard notificationsAvailable else { return }
         UNUserNotificationCenter.current().delegate = self
         store.onBackgroundCompletion = { [weak self] agent, event in
             self?.notify(agent: agent, event: event)
@@ -82,6 +94,7 @@ final class CompletionNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     @MainActor
     private func notify(agent: Agent, event: WireEvent) {
+        guard notificationsAvailable else { return }
         let muted = SharedUIState.mutedAgentIDs().contains(agent.id)
         guard !muted else { return }
         let content = UNMutableNotificationContent()

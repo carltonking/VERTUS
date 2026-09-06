@@ -17,6 +17,10 @@ public final class AgentLiveState: ObservableObject, Identifiable {
     /// Declared screen targets this agent's turn is blocked on, each naming
     /// its holder. Empty while the agent runs or is idle.
     @Published public private(set) var blockedOnTarget: [BlockedTarget] = []
+    /// v4: readable reason while the agent's gateway is failing/thrashing.
+    @Published public private(set) var degraded: String?
+    /// v4: seconds since the engine last emitted anything (status polling).
+    @Published public private(set) var silenceS: Double = 0
 
     /// "waiting on Safari (held by doc)" — shown in the roster.
     public var blockedSummary: String? {
@@ -24,6 +28,8 @@ public final class AgentLiveState: ObservableObject, Identifiable {
     }
 
     public var isBlocked: Bool { !blockedOnTarget.isEmpty }
+
+    public var isDegraded: Bool { degraded != nil }
 
     public let agentID: String
     public var id: String { agentID }
@@ -87,6 +93,8 @@ public final class AgentLiveState: ObservableObject, Identifiable {
     func setRunning(_ running: Bool) { isRunning = running }
     func setQueueDepth(_ depth: Int) { queueDepth = depth }
     func setBlockedTargets(_ targets: [BlockedTarget]) { blockedOnTarget = targets }
+    func setDegraded(_ reason: String?) { degraded = reason }
+    func setSilence(_ seconds: Double) { silenceS = seconds }
     func setLastRun(_ runID: String?) { lastRunID = runID }
     func setError(_ message: String?) { lastError = message }
     func setHistoryLoaded() { hasLoadedHistory = true }
@@ -227,7 +235,7 @@ public final class FleetStore: ObservableObject {
             state.setRunning(true)
             state.setLastRun(runID)
             pollStatusIfNeeded()
-        case "done", "error":
+        case "done", "error", "cancelled":
             state.markKnown(runID)
             state.setRunning(false)
             state.setQueueDepth(0)
@@ -235,7 +243,9 @@ public final class FleetStore: ObservableObject {
             if event.type == "error" {
                 state.setError(event.message ?? "run failed")
             }
-            // Background completion notification + unread.
+            // Background completion notification + unread (a cancelled
+            // background run still deserves the unread marker — the user
+            // asked for it and it stopped).
             if foregroundAgentID != agentID, let agent = agent(agentID) {
                 state.bumpUnread()
                 onBackgroundCompletion?(agent, event)
@@ -342,6 +352,8 @@ public final class FleetStore: ObservableObject {
                         let status = try await self.client.status(state.agentID)
                         state.setQueueDepth(status.queueDepth)
                         state.setBlockedTargets(status.blockedOnTarget ?? [])
+                        state.setDegraded(status.degraded)
+                        state.setSilence(status.silenceS ?? 0)
                         if status.state == "running" {
                             state.setRunning(true)
                         } else if !status.isBusy {
@@ -412,5 +424,23 @@ public final class FleetStore: ObservableObject {
         }
         await refreshAgents()
         return result
+    }
+
+    // MARK: - Cancellation (supervision)
+
+    /// Stop whatever the agent is doing now (the active run). Returns the
+    /// cancelled run id; throws the hub's typed error (409 when idle).
+    @discardableResult
+    public func stopAgent(_ id: String) async throws -> String {
+        let runID = try await client.cancelAgent(id)
+        live[id]?.setRunning(false)
+        return runID
+    }
+
+    /// Cancel one run; `drainQueue` also clears the agent's pending queue.
+    @discardableResult
+    public func stopRun(_ runID: String, drainQueue: Bool = false) async throws -> String {
+        let (cancelled, _) = try await client.cancelRun(runID, drainQueue: drainQueue)
+        return cancelled
     }
 }

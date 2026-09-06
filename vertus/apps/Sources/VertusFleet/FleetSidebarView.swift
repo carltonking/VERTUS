@@ -138,7 +138,11 @@ struct FleetSidebarView: View {
                         .font(.system(size: 12.5, weight: .semibold))
                         .lineLimit(1)
                     if let state = store.live[agent.id] {
-                        if state.isBlocked {
+                        if state.isDegraded {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.red)
+                        } else if state.isBlocked {
                             Image(systemName: "lock.fill")
                                 .font(.system(size: 8))
                                 .foregroundStyle(.orange)
@@ -157,9 +161,14 @@ struct FleetSidebarView: View {
                             .background(Capsule().fill(.blue))
                     }
                 }
-                // While a run is gated on a declared screen target, show who
-                // holds it; otherwise the live activity line.
-                if let state = store.live[agent.id], state.isBlocked, let summary = state.blockedSummary {
+                // Degraded wins: the reason IS the one-liner. Then the
+                // blocked-target summary, then the live activity line.
+                if let state = store.live[agent.id], state.isDegraded, let reason = state.degraded {
+                    Text(reason)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.red)
+                        .lineLimit(1)
+                } else if let state = store.live[agent.id], state.isBlocked, let summary = state.blockedSummary {
                     Text(summary)
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.orange)

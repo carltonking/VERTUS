@@ -12,6 +12,8 @@ struct AgentChatView: View {
     @State private var submitError: String?
     @State private var runs: [RunRow] = []
     @State private var selectedRun: RunRow?
+    @State private var confirmStop = false
+    @State private var stopError: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -33,6 +35,20 @@ struct AgentChatView: View {
             Button("OK") { submitError = nil }
         } message: {
             Text(submitError ?? "")
+        }
+        .alert("Stop this run?", isPresented: $confirmStop) {
+            Button("Stop", role: .destructive) { stop() }
+            Button("Keep running", role: .cancel) { confirmStop = false }
+        } message: {
+            Text(stopMessage)
+        }
+        .alert("Couldn't stop", isPresented: Binding(
+            get: { stopError != nil },
+            set: { if !$0 { stopError = nil } }
+        )) {
+            Button("OK") { stopError = nil }
+        } message: {
+            Text(stopError ?? "")
         }
         .onAppear {
             if !live.hasLoadedHistory {
@@ -75,11 +91,24 @@ struct AgentChatView: View {
                     Text("working\(live.queueDepth > 0 ? " · \(live.queueDepth) queued" : "")")
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
+                    // v4: live engine-silence, so the user can judge before
+                    // killing a run (the stall limit is the hub's too).
+                    if live.silenceS >= 5 {
+                        Text("silent \(Int(live.silenceS))s")
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.orange)
+                    }
                 }
             } else if live.queueDepth > 0 {
                 Text("\(live.queueDepth) queued")
                     .font(.system(size: 11.5))
                     .foregroundStyle(.secondary)
+            }
+            if live.isDegraded {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.red)
+                    .help(live.degraded ?? "degraded")
             }
             if let activity = live.currentActivity, live.isRunning {
                 Text(activity)
@@ -87,9 +116,38 @@ struct AgentChatView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+            if live.isRunning {
+                Button {
+                    confirmStop = true
+                } label: {
+                    Image(systemName: "stop.circle.fill")
+                        .font(.system(size: 15))
+                        .foregroundStyle(.red)
+                }
+                .buttonStyle(.plain)
+                .help("Stop this run")
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
+    }
+
+    private var stopMessage: String {
+        let cua = (store.agent(agentID)?.computerUse ?? false)
+        return cua
+            ? "This agent can drive the desktop. Stopping mid-action may leave a window half-edited (a type or click in flight completes; the turn stops at the next action boundary)."
+            : "The run will be stopped. Queued work for this agent is kept."
+    }
+
+    private func stop() {
+        confirmStop = false
+        Task {
+            do {
+                try await store.stopAgent(agentID)
+            } catch {
+                stopError = error.localizedDescription
+            }
+        }
     }
 
     // MARK: - Transcript
@@ -193,6 +251,8 @@ struct AgentChatView: View {
         case "done": return .green
         case "running", "queued": return .orange
         case "error": return .red
+        case "cancelled": return .gray          // distinct: user-stopped
+        case "timeout": return .purple          // distinct: stall/hard limit
         default: return .gray
         }
     }

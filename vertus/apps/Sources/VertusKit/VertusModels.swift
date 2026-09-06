@@ -113,18 +113,63 @@ public struct BlockedTarget: Codable, Equatable {
 
 /// GET /api/agents/<id>/status payload. `blockedOnTarget` appears only while
 /// the agent's turn is gated on a declared screen target held by another run.
+/// v4 supervision fields: `stallTimeoutS`/`hardTimeoutS` are the per-agent
+/// limits and `silenceS` is how long the engine has emitted nothing — a
+/// slow-but-healthy turn is distinguishable from a stuck one. `degraded`
+/// carries a readable reason while the agent's gateway is failing/thrashing.
 public struct AgentStatus: Codable, Equatable {
     public var state: String          // idle | running | queued
     public var queueDepth: Int
     public var turnStartedAt: Double?
     public var gatewayAlive: Bool
     public var blockedOnTarget: [BlockedTarget]?
+    public var stallTimeoutS: Double?
+    public var hardTimeoutS: Double?
+    public var lastEventAt: Double?
+    public var silenceS: Double?
+    public var degraded: String?
 
     public var isBusy: Bool { state != "idle" || queueDepth > 0 }
 
     /// Short UI line, e.g. "waiting on Safari (held by doc)".
     public var blockedSummary: String? {
         blockedOnTarget?.first.map { "waiting on \($0.summary)" }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case state, queueDepth, turnStartedAt, gatewayAlive, blockedOnTarget
+        case stallTimeoutS, hardTimeoutS, lastEventAt, silenceS, degraded
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        state = try c.decodeIfPresent(String.self, forKey: .state) ?? "idle"
+        queueDepth = try c.decodeIfPresent(Int.self, forKey: .queueDepth) ?? 0
+        turnStartedAt = try c.decodeIfPresent(Double.self, forKey: .turnStartedAt)
+        gatewayAlive = try c.decodeIfPresent(Bool.self, forKey: .gatewayAlive) ?? false
+        blockedOnTarget = try c.decodeIfPresent([BlockedTarget].self, forKey: .blockedOnTarget)
+        stallTimeoutS = try c.decodeIfPresent(Double.self, forKey: .stallTimeoutS)
+        hardTimeoutS = try c.decodeIfPresent(Double.self, forKey: .hardTimeoutS)
+        lastEventAt = try c.decodeIfPresent(Double.self, forKey: .lastEventAt)
+        silenceS = try c.decodeIfPresent(Double.self, forKey: .silenceS)
+        degraded = try c.decodeIfPresent(String.self, forKey: .degraded)
+    }
+
+    public init(state: String, queueDepth: Int, turnStartedAt: Double?,
+                gatewayAlive: Bool, blockedOnTarget: [BlockedTarget]? = nil,
+                stallTimeoutS: Double? = nil, hardTimeoutS: Double? = nil,
+                lastEventAt: Double? = nil, silenceS: Double? = nil,
+                degraded: String? = nil) {
+        self.state = state
+        self.queueDepth = queueDepth
+        self.turnStartedAt = turnStartedAt
+        self.gatewayAlive = gatewayAlive
+        self.blockedOnTarget = blockedOnTarget
+        self.stallTimeoutS = stallTimeoutS
+        self.hardTimeoutS = hardTimeoutS
+        self.lastEventAt = lastEventAt
+        self.silenceS = silenceS
+        self.degraded = degraded
     }
 }
 
@@ -276,7 +321,9 @@ extension JSONDecoder {
 
 // MARK: - Shared UI state
 
-/// Terminal run states (mirrors RUN_STATES in the hub).
+/// Terminal run states (mirrors RUN_STATES in the hub). `cancelled` and
+/// `timeout` are first-class terminal states — distinct from error — and
+/// are surfaced distinctly in run lists and run chips.
 public enum RunState: String {
-    case queued, running, done, error, interrupted, abandoned
+    case queued, running, done, error, interrupted, abandoned, cancelled, timeout
 }
