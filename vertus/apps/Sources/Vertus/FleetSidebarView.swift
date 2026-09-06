@@ -54,7 +54,7 @@ struct FleetSidebarView: View {
             // Fleet activity + screens + connection state.
             VStack(alignment: .leading, spacing: 6) {
                 Button(action: onShowActivity) {
-                    Label("Fleet activity", systemImage: "clock.arrow.circlepath")
+                    Label("Activity", systemImage: "clock.arrow.circlepath")
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .buttonStyle(.plain)

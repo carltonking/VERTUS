@@ -864,8 +864,6 @@ def launchd_checks() -> list[dict]:
     for label, installed, repo_plist in (
         ("com.vertus.server", Path.home() / "Library" / "LaunchAgents" / "com.vertus.server.plist",
          Path(__file__).parent.parent.parent / "disabled-launchagents" / "com.vertus.server.plist"),
-        ("com.vertusbar.dev", Path.home() / "Library" / "LaunchAgents" / "com.vertusbar.dev.plist",
-         Path(__file__).parent.parent.parent / "disabled-launchagents" / "com.vertusbar.dev.plist"),
     ):
         loaded, pid = _launchd_status(label)
         if not loaded:
@@ -892,10 +890,96 @@ def launchd_checks() -> list[dict]:
     return out
 
 
+def _login_item_registered() -> bool:
+    """SMAppService registers into the Background Task Management database.
+    (sfltool dumpbtm needs no privileges and is read-only.) Also accept the
+    launchd fallback plist the app writes when SMAppService is refused."""
+    try:
+        out = subprocess.run(["sfltool", "dumpbtm"], capture_output=True,
+                             text=True, timeout=20).stdout
+        for line in out.splitlines():
+            if "com.vertus.app" in line and "Identifier:" in line:
+                return True
+    except Exception:
+        pass
+    return (Path.home() / "Library" / "LaunchAgents" / "com.vertus.app.plist").is_file()
+
+
+def _vertus_app_processes() -> list[int]:
+    """PIDs running the bundle's binary. The merge's whole point was ONE
+    process (one fleet-stream connection, one store); two of these means
+    duplicate streams and double notifications."""
+    try:
+        out = subprocess.run(["pgrep", "-f", "/Applications/VERTUS.app/Contents/MacOS/Vertus"],
+                             capture_output=True, text=True, timeout=5).stdout
+        return [int(p) for p in out.split() if p.strip()]
+    except Exception:
+        return []
+
+
+def app_checks() -> list[dict]:
+    """The macOS client is ONE bundled app: installed, correct bundle id,
+    registered to launch at login, and at most one running process.
+    Honors VERTUS_DOCTOR_SKIP_LAUNCHD like launchd_checks (client state is
+    not a failure on a headless test box; a wrong bundle id IS a failure
+    because it silently breaks SMAppService registration)."""
+    out: list[dict] = []
+    if _cfg()["skip_launchd"]:
+        out.append(_check("app.bundle", "unverified", "skipped (tests)", ""))
+        return out
+
+    app = Path(os.environ.get("VERTUS_APP_PATH", "/Applications/VERTUS.app"))
+    if not app.is_dir():
+        out.append(_check("app.installed", "warn",
+                          "/Applications/VERTUS.app missing",
+                          "cd vertus/apps && bash scripts/build-app.sh && "
+                          "cp -R dist/VERTUS.app /Applications/"))
+        return out  # nothing further is meaningful
+    out.append(_check("app.installed", "ok", "/Applications/VERTUS.app present", ""))
+
+    info = app / "Contents" / "Info.plist"
+    try:
+        import plistlib
+        with open(info, "rb") as f:
+            bundle_id = plistlib.load(f).get("CFBundleIdentifier", "")
+        if bundle_id == "com.vertus.app":
+            out.append(_check("app.bundle_id", "ok", "bundle id com.vertus.app", ""))
+        else:
+            out.append(_check("app.bundle_id", "fail",
+                              f"bundle id is {bundle_id!r}, expected com.vertus.app",
+                              "fix CFBundleIdentifier in scripts/build-app.sh and reinstall"))
+    except Exception as exc:  # pragma: no cover - plist corruption is exotic
+        out.append(_check("app.bundle_id", "fail", f"Info.plist unreadable: {exc}",
+                          "rebuild the bundle"))
+
+    if _login_item_registered():
+        out.append(_check("app.login_item", "ok", "registered to launch at login", ""))
+    else:
+        out.append(_check("app.login_item", "warn",
+                          "not registered to launch at login",
+                          "launch VERTUS once (it self-registers via SMAppService), "
+                          "or install ~/Library/LaunchAgents/com.vertus.app.plist"))
+
+    procs = _vertus_app_processes()
+    if not procs:
+        out.append(_check("app.processes", "ok", "not running (launch-at-login starts it)", ""))
+    elif len(procs) == 1:
+        out.append(_check("app.processes", "ok", "one process running", ""))
+    else:
+        out.append(_check("app.processes", "fail",
+                          f"{len(procs)} processes running: {procs} — two means two "
+                          "fleet-stream connections and double notifications",
+                          "quit the extras (they were started before the merge or manually)"))
+    return out
+
+
 # launchd labels that legitimately live on a production machine. Anything
 # else under com.vertus.* is a demo that outlived its demo (two occurrences
 # this session: com.vertus.demo.memory and an earlier one).
-_KNOWN_LAUNCHD_LABELS = {"com.vertus.server", "com.vertusbar.dev"}
+# The bar's launchd label (com.vertusbar.dev) was removed in the merge —
+# the app now registers launch-at-login itself via SMAppService (which does
+# not appear in launchctl list unless the launchd fallback plist was used).
+_KNOWN_LAUNCHD_LABELS = {"com.vertus.server"}
 
 
 def _stray_vertus_labels() -> list[str]:
@@ -958,7 +1042,7 @@ def terminal_checks() -> list[dict]:
                               "must not outlive its demo"))
         else:
             out.append(_check("terminal.launchd_strays", "ok",
-                              "only com.vertus.server and com.vertusbar.dev loaded"))
+                              "only com.vertus.server loaded"))
 
     health = _hub_health()
     if health is None:
@@ -1147,6 +1231,7 @@ def run(json_out: bool = False, spawner=None) -> int:
     all_checks += registry_checks()
     all_checks += memory_checks()
     all_checks += launchd_checks()
+    all_checks += app_checks()
     all_checks += terminal_checks()
     runtime_s = time.monotonic() - started
     exit_code = 1 if any(c["status"] == "fail" for c in all_checks) else 0

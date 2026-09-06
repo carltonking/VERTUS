@@ -14,7 +14,7 @@ struct FleetActivityView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("Fleet activity")
+                Text("Activity")
                     .font(.system(size: 14, weight: .semibold))
                 Spacer()
                 Button("Refresh") {

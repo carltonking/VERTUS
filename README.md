@@ -3,20 +3,21 @@
 A fleet of named AI agents on one Mac. Each agent has its own identity
 (persona, model), its own home and working directory, its own engine
 gateway — and they talk to each other, delegate work, run on schedules, and
-report back. You watch them from a full-window Fleet app or fire a prompt
-from a notch QuickBar; every turn is durable, replayable, and cancellable.
+report back. You watch them from the VERTUS app (one window, one notch
+QuickBar, one process) or the terminal; every turn is durable, replayable,
+and cancellable.
 
 ```
 ┌──────────────────────┐      ┌──────────────────────────────────────┐
-│  VertusFleet (macOS) │─────▶│  VERTUS Hub (Python, launchd)        │
-│  roster + chat +     │      │  per-agent gateways → hermes fork    │
-│  routines + threads  │      │  SQLite run store (WAL, one writer)  │
-├──────────────────────┤      │  SSE fleet stream (since= replay)    │
-│  VertusBar (notch)   │─────▶│  scheduler + message bus + leases    │
-├──────────────────────┤      └──────────────┬───────────────────────┘
-│  terminal REPL       │                     │ per-agent spawn
-│  (pi UI, in-process) │                     ▼
-└──────────────────────┘      ~/.hermes/hermes-agent (fork) — gateway
+│  VERTUS.app (macOS)  │─────▶│  VERTUS Hub (Python, launchd)        │
+│  one window + notch  │      │  per-agent gateways → hermes fork    │
+│  QuickBar (⇧⌘J)      │      │  SQLite run store (WAL, one writer)  │
+│  (one process)       │      │  SSE fleet stream (since= replay)    │
+├──────────────────────┤      │  scheduler + message bus + leases    │
+│  terminal REPL       │─────▶└──────────────┬───────────────────────┘
+│  (pi UI, hub mode)   │                     │ per-agent spawn
+└──────────────────────┘                     ▼
+                          ~/.hermes/hermes-agent (fork) — gateway
 ```
 
 The hub is a Python `ThreadingHTTPServer` that keeps one engine gateway per
@@ -41,13 +42,12 @@ agent. Agents are **not** sandboxes — they are identities with honest limits
 │   │   ├── screen_lease.py       # declared-target ownership policy
 │   │   ├── vertus_logging.py     # one rotating log for the whole hub
 │   │   └── test_*.py             # ~160 pytest tests, no engine spawned
-│   ├── apps/                     # one Swift Package, three targets
+│   ├── apps/                     # one Swift Package, two targets
 │   │   ├── Sources/VertusKit     # client, models, store, fleet stream
-│   │   ├── Sources/VertusFleet   # full-window fleet app
-│   │   ├── Sources/VertusBar     # notch QuickBar (⇧⌘J)
-│   │   └── scripts/build-apps.sh # ONE command → both .app bundles
+│   │   ├── Sources/Vertus        # the app: window + notch panel + menubar
+│   │   └── scripts/build-app.sh  # ONE command → dist/VERTUS.app
 │   └── extensions/               # legacy pi-era skills (pi engine path)
-├── disabled-launchagents/        # canonical launchd plists (hub, bar)
+├── disabled-launchagents/        # canonical launchd plists (hub)
 └── pi/                           # terminal UI fork (the REPL)
 ```
 
@@ -207,24 +207,26 @@ launchd. At boot the hub self-checks every subsystem — store writer
 (real round-trip probe), scheduler thread, message bus, fleet listener,
 session manager, registry — and logs one explicit line each. `GET
 /api/health` re-probes live: uptime, per-subsystem ok/failed with reasons,
-agent count, running runs, degraded agents, scheduler next fire. The Fleet
-app shows a red "Hub degraded — failing: …" banner when anything fails, so
+agent count, running runs, degraded agents, scheduler next fire. The app
+shows a red "Hub degraded — failing: …" banner when anything fails, so
 a dead scheduler is visible in the UI, not just in a log.
 
 ## Clients
 
-- **VertusFleet** (`vertus/apps/dist/VertusFleet.app`) — the full window:
-  roster with live busy indicators and "working for X", per-agent
-  transcript (history-paginated + live deltas merged without duplication),
-  run list with distinct cancelled/timeout states and parent/children
-  navigation, bot threads view, fleet activity (user / bot / routine
-  badges), bot editor (identity, computer use + targets, autonomy, and the
-  per-agent routines block), declared-screen roster, and
-  background-completion user notifications with per-agent mute.
-- **VertusBar** (`vertus/apps/dist/VertusBar.app`) — the notch QuickBar
-  (⇧⌘J): agent picker, fire-and-forget submit (closing the panel never
-  abandons a run), a compact busy strip (with Stop and "working for X"),
-  and "Open in Fleet".
+- **VERTUS** (`vertus/apps/dist/VERTUS.app`) — one app, one process, both
+  surfaces: the full window (roster with live busy indicators and
+  "working for X", per-agent transcript history-paginated + live deltas
+  merged without duplication, run list with distinct cancelled/timeout
+  states and parent/children navigation, bot threads view, activity
+  (user / bot / routine badges), bot editor (identity, computer use +
+  targets, autonomy, per-agent routines), declared-screen roster, memory
+  view, and background-completion user notifications with per-agent
+  mute) and the notch QuickBar (⇧⌘J: agent picker, fire-and-forget
+  submit — closing the panel never abandons a run — a compact busy strip
+  with Stop, and an in-process "open the window" affordance). Installed
+  to `/Applications`, launched at login via SMAppService. Closing the
+  window keeps the menubar item; quitting from the menubar quits
+  everything.
 - **Terminal REPL** — the pi UI in three engine modes (selected in code,
   `sdk.ts`; the wrapper defaults to `pi`):
   - `VERTUS_ENGINE` unset / `pi` — the native pi `AgentSession`, fully
@@ -256,14 +258,15 @@ a dead scheduler is visible in the UI, not just in a log.
 Build everything with one command:
 
 ```bash
-cd vertus/apps && bash scripts/build-apps.sh release
-# → dist/VertusFleet.app + dist/VertusBar.app
+cd vertus/apps && bash scripts/build-app.sh
+# → dist/VERTUS.app  (install: cp -R dist/VERTUS.app /Applications/)
 ```
 
 The bundle step is not cosmetic: notifications require a real bundle, and
-the bar's launchd agent points at the bundle. Test suites: `python3 -m
-pytest vertus/server/` (~160 tests, no engine spawned) and `cd vertus/apps
-&& swift test` (VertusKit against a stub hub over real sockets).
+launch-at-login is registered by the app itself via SMAppService (with a
+launchd fallback). Test suites: `python3 -m pytest vertus/server/` (~220
+tests, no engine spawned) and `cd vertus/apps && swift test` (VertusKit
+against a stub hub over real sockets).
 
 ## Running
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -473,6 +474,66 @@ def test_no_stray_launchd_labels_passes(monkeypatch, isolated_env):
     by = _by_name(vd.terminal_checks())
     assert by["terminal.launchd_strays"]["status"] == "ok"
 
+
+# -- app (VERTUS.app) ------------------------------------------------------
+
+def _write_bundle(tmp_path: Path, bundle_id: str) -> Path:
+    """A minimal but real VERTUS.app-shaped bundle with the given id."""
+    app = tmp_path / "VERTUS.app"
+    (app / "Contents" / "MacOS").mkdir(parents=True)
+    (app / "Contents" / "MacOS" / "Vertus").write_text("#! /bin/true\n")
+    os.chmod(app / "Contents" / "MacOS" / "Vertus", 0o755)
+    plist = {"CFBundleIdentifier": bundle_id, "CFBundleDisplayName": "VERTUS"}
+    (app / "Contents" / "Info.plist").write_bytes(
+        plistlib.dumps(plist))
+    return app
+
+
+def test_app_missing_warns(monkeypatch, isolated_env, tmp_path):
+    monkeypatch.setenv("VERTUS_DOCTOR_SKIP_LAUNCHD", "")
+    monkeypatch.setenv("VERTUS_APP_PATH", str(tmp_path / "nope" / "VERTUS.app"))
+    by = _by_name(vd.app_checks())
+    assert by["app.installed"]["status"] == "warn"
+    assert "VERTUS.app" in by["app.installed"]["remediation"]
+    assert len(by) == 1, "no point checking a missing app further"
+
+
+def test_app_bad_bundle_id_fails(monkeypatch, isolated_env, tmp_path):
+    """A wrong bundle id is a FAIL (it silently breaks SMAppService)."""
+    monkeypatch.setenv("VERTUS_DOCTOR_SKIP_LAUNCHD", "")
+    monkeypatch.setenv("VERTUS_APP_PATH", str(_write_bundle(tmp_path, "com.vertusbar.dev")))
+    monkeypatch.setattr(vd, "_login_item_registered", lambda: True)
+    monkeypatch.setattr(vd, "_vertus_app_processes", lambda: [])
+    by = _by_name(vd.app_checks())
+    assert by["app.bundle_id"]["status"] == "fail"
+    assert "com.vertusbar.dev" in by["app.bundle_id"]["reason"]
+
+
+def test_app_good_bundle_login_and_single_process(monkeypatch, isolated_env, tmp_path):
+    monkeypatch.setenv("VERTUS_DOCTOR_SKIP_LAUNCHD", "")
+    monkeypatch.setenv("VERTUS_APP_PATH", str(_write_bundle(tmp_path, "com.vertus.app")))
+    monkeypatch.setattr(vd, "_login_item_registered", lambda: True)
+    monkeypatch.setattr(vd, "_vertus_app_processes", lambda: [100])
+    by = _by_name(vd.app_checks())
+    assert by["app.installed"]["status"] == "ok"
+    assert by["app.bundle_id"]["status"] == "ok"
+    assert by["app.login_item"]["status"] == "ok"
+    assert by["app.processes"]["status"] == "ok"
+
+
+def test_app_two_processes_fails(monkeypatch, isolated_env, tmp_path):
+    monkeypatch.setenv("VERTUS_DOCTOR_SKIP_LAUNCHD", "")
+    monkeypatch.setenv("VERTUS_APP_PATH", str(_write_bundle(tmp_path, "com.vertus.app")))
+    monkeypatch.setattr(vd, "_login_item_registered", lambda: False)
+    monkeypatch.setattr(vd, "_vertus_app_processes", lambda: [100, 101])
+    by = _by_name(vd.app_checks())
+    assert by["app.processes"]["status"] == "fail"
+    assert by["app.login_item"]["status"] == "warn"
+
+
+def test_app_skipped_when_launchd_skipped(monkeypatch, isolated_env):
+    by = _by_name(vd.app_checks())
+    assert by["app.bundle"]["status"] == "unverified"
 
 # -- hub / exit / json ------------------------------------------------------
 

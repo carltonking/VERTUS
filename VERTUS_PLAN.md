@@ -16,14 +16,14 @@ blueprint: architecture, invariants, decisions, limits.
 
 ```
 ┌─────────────────────────┐      ┌──────────────────────────────┐
-│  VertusBar (SwiftUI)    │      │  Vertus hub (Python)         │
-│  notch panel, ⇧⌘J,      │─────▶│  vertus_server.py            │
-│  fast path only         │ HTTP │  - session manager (bridges) │
-├─────────────────────────┤ SSE  │  - run store (SQLite)        │
-│  VertusFleet (SwiftUI)  │      │  - routine scheduler         │
-│  full window: roster,   │─────▶│  - message bus               │
-│  chat, runs, routines,  │      │  - screen target registry    │
-│  approvals, activity    │      │  - approval ledger (ro)      │
+│  VERTUS.app (SwiftUI)   │      │  Vertus hub (Python)         │
+│  one process:           │─────▶│  vertus_server.py            │
+│  • notch panel, ⇧⌘J,    │ HTTP │  - session manager (bridges) │
+│    fast path only       │ SSE  │  - run store (SQLite)        │
+│  • full window: roster, │      │  - routine scheduler         │
+│    chat, runs,          │      │  - message bus               │
+│    routines, approvals, │      │  - screen target registry    │
+│    activity, memory     │      │  - approval ledger (ro)      │
 └─────────────────────────┘      └──────────────────────────────┘
                                         │ spawn (env allowlist,
                                         │ per-agent HOME)
@@ -167,7 +167,7 @@ targets, holders, waiters, and the driver-process inventory.
 `tool.start` with a tool name — never the args, never the window an agent
 actually touches. An agent can target a window it never declared and the hub
 cannot see it. This is said in the code, in the `/api/fleet/screens` payload,
-in the Fleet UI, and in README LIMITS. Per-agent screen *isolation* would
+in the app UI, and in README LIMITS. Per-agent screen *isolation* would
 require VM-per-agent or headless displays; this repo does not provide it.
 
 Approval: **no per-action GUI approval exists.** In gateway mode the fork
@@ -302,26 +302,29 @@ proves a `VERTUS_ROOT`-only boot touches nothing real.
 
 ## 9. Clients
 
-Both macOS clients are Swift Package targets under `vertus/apps/` sharing
+The macOS client is ONE app — **VERTUS** (`com.vertus.app`) — a single
+Swift Package target under `vertus/apps/Sources/Vertus` sharing
 **VertusKit** — one client implementation: auth (token file or UserDefaults),
 agent CRUD + status, prompt → 202/run_id, one fleet-stream SSE connection
 demultiplexed by agent, `since=` resume with backoff, `lagged` recovery,
-history endpoints, agent CRUD/409 typing, hub health.
+history endpoints, agent CRUD/409 typing, hub health. One process, one
+store, one fleet-stream connection, one health poll, one memory index.
 
-- **VertusFleet**: full window — roster with live busy/blocked/degraded
-  state, per-agent chat with scroll-back pagination merging live deltas,
-  run list + past-run reopening, bot editor (identity, persona, model,
-  provider, color, emoji, autonomy, computer_use toggle, cua_targets),
-  routines block (create/edit/toggle/run-now, loud disabled-by-failures),
-  bot-thread view distinct from your own chat, fleet activity with
-  user-vs-bot-vs-routine attribution, approvals view, fleet screens view
-  (with the not-a-sandbox caveat in the UI), hub-health banner, and **user
-  notifications on background completion** — the feature that makes
-  "fire it off and walk away" real, with per-agent mute and suppression for
-  the foreground agent.
-- **VertusBar**: the notch panel, ⇧⌘J, unchanged visual language — agent
-  picker (remembers last used), fire-and-forget submit, compact busy strip,
-  deep-link to Fleet.
+- **The window**: roster with live busy/blocked/degraded state, per-agent
+  chat with scroll-back pagination merging live deltas, run list +
+  past-run reopening, bot editor (identity, persona, model, provider,
+  color, emoji, autonomy, computer_use toggle, cua_targets), routines
+  block (create/edit/toggle/run-now, loud disabled-by-failures),
+  bot-thread view distinct from your own chat, activity with
+  user-vs-bot-vs-routine attribution, approvals view, screens view
+  (with the not-a-sandbox caveat in the UI), memory view, hub-health
+  banner, and **user notifications on background completion** — the
+  feature that makes "fire it off and walk away" real, with per-agent
+  mute and suppression for the foreground agent.
+- **The notch panel**: ⇧⌘J, unchanged visual language — agent picker
+  (remembers last used), fire-and-forget submit, compact busy strip,
+  in-process "open the window". Closing the window keeps the menubar
+  item; quitting from the menubar quits everything.
 
 ### Terminal REPL — hub mode (`VERTUS_ENGINE=hub`)
 
@@ -358,9 +361,9 @@ silently; each degraded feature posts a one-time or per-use visible notice:
 | abort (Esc/Ctrl-C flow) | works | hub escalation ladder via `/api/agents/<id>/cancel` |
 | transcript seed + resume | works | history renders at start; reopen continues a closed terminal's turn |
 | bot message / handoff / routine bubbles | works | `⟨message from X⟩ …` attributed user bubble |
-| thinking-level set/cycle | disabled with message | "fixed by the agent profile — change it in the Fleet app or PATCH /api/agents" |
+| thinking-level set/cycle | disabled with message | "fixed by the agent profile — change it in the VERTUS app or PATCH /api/agents" |
 | model set/cycle/picker (`setModel`, `cycleModel`, `setScopedModels`) | disabled with message | "model is owned by the agent profile; it applies on the next turn via the hub's deferred respawn" |
-| compaction (`compact`, auto-compaction toggle) | disabled with message | "gateway manages its own context; restart the agent in the Fleet app if a turn is losing the thread" |
+| compaction (`compact`, auto-compaction toggle) | disabled with message | "gateway manages its own context; restart the agent in the VERTUS app if a turn is losing the thread" |
 | session naming | disabled with message | "the agent has one identity (its fleet name), not per-terminal sessions" |
 | steering/follow-up queue modes | disabled with message | "steering is delivered straight to the live turn; follow-ups queue locally and drain as new hub turns" |
 | interactive bash (`executeBash`/`recordBashResult`) | runs locally, never reaches the model | still executes as a scratch shell + one-time notice "the hub model cannot see it (the gateway has its own sandbox shell)" |
@@ -384,14 +387,14 @@ registered) and logs one explicit line per subsystem; a subsystem that fails
 to start is **loud and visible in the API**, not just the log. `GET
 /api/health` is real: uptime, subsystem status, agent count, running runs,
 degraded agents, scheduler next-fire, store write health — while keeping the
-original `{status, time}` keys so existing clients parse it. The Fleet app
+original `{status, time}` keys so existing clients parse it. The app
 surfaces an unhealthy subsystem as a banner; that is the difference between
 "my bot didn't do the thing" and "the scheduler has been dead since Tuesday".
 
 ## 11. Limits
 
 Same honesty, stated once, in full. The README carries the short version;
-the code carries it in comments; `/api/fleet/screens` and the Fleet UI carry
+the code carries it in comments; `/api/fleet/screens` and the app UI carry
 the parts users can act on.
 
 - `cua_targets` is a **declaration, not a sandbox** — the hub gates

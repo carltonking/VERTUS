@@ -414,7 +414,7 @@ struct NotchPanelContent: View {
                     .foregroundStyle(.white.opacity(0.6))
             }
             .buttonStyle(.plain)
-            .help("Open in Fleet")
+            .help("Open VERTUS")
         }
         .frame(
             width: NotchPanelMetrics.bodyWidth,
