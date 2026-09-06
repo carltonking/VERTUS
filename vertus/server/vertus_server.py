@@ -1615,6 +1615,12 @@ class VertusHandler(BaseHTTPRequestHandler):
             self._handle_fleet_activity()
         elif path == "/api/fleet/screens":
             self._handle_fleet_screens()
+        elif path == "/api/memory":
+            self._handle_memory_list()
+        elif path.startswith("/api/memory/search"):
+            self._handle_memory_search()
+        elif path.startswith("/api/memory/"):
+            self._handle_memory_read(path[len("/api/memory/"):].strip("/"))
         else:
             self._json(404, {"error": "not found"})
 
@@ -1722,6 +1728,21 @@ class VertusHandler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"error": "not found"})
 
+    def do_PUT(self) -> None:  # noqa: N802
+        """PUT /api/memory/<scope>/<path> — human-initiated memory writes."""
+        if not self._authed():
+            self._json(401, {"error": "unauthorized"})
+            return
+        payload = self._read_body()
+        if payload is None:
+            return
+        route = urlsplit(self.path).path
+        if route.startswith("/api/memory/"):
+            self._handle_memory_write(route[len("/api/memory/"):].strip("/"),
+                                      payload)
+            return
+        self._json(404, {"error": "not found"})
+
     def do_PATCH(self) -> None:  # noqa: N802
         """PATCH /api/agents/<id> or /api/routines/<id> — partial updates."""
         if not self._authed():
@@ -1792,6 +1813,9 @@ class VertusHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/routines/"):
             rid = path[len("/api/routines/"):].strip("/")
             self._handle_routine_delete(rid)
+            return
+        if path.startswith("/api/memory/"):
+            self._handle_memory_delete(path[len("/api/memory/"):].strip("/"))
             return
         agent_id = self._agent_route_id()
         if agent_id is None:
@@ -2750,6 +2774,146 @@ class VertusHandler(BaseHTTPRequestHandler):
             {"screens": screens, "caveat": SCREEN_POLICY_CAVEAT,
              "drivers": {"owned": owned, "orphaned": orphaned}},
         )
+
+    # ------------------------------------------------------------------
+    # Fleet memory (hub-owned canonical store — see fleet_memory.py)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_memory_target(rest: str) -> tuple[str, str | None, str]:
+        """"/api/memory/shared/<path>" or "/api/memory/agent/<id>/<path>"
+        -> (scope, agent_id, relpath). Raises ValueError on a malformed
+        target; the relpath itself is validated by MemoryStore._safe_relpath."""
+        parts = rest.split("/")
+        scope = parts[0]
+        if scope == "shared":
+            return scope, None, "/".join(parts[1:])
+        if scope == "agent" and len(parts) >= 3:
+            return scope, parts[1], "/".join(parts[2:])
+        raise ValueError(f"malformed memory target: {rest!r}")
+
+    def _memory_store(self):
+        mem = getattr(self, "memory", None) or getattr(VertusHandler, "memory", None)
+        if mem is None:
+            self._json(503, {"error": "fleet memory not wired"})
+        return mem
+
+    def _require_memory_agent(self, agent_id: str | None) -> bool:
+        """Agent-scope memory requires a known agent; 404 otherwise."""
+        if agent_id is None:
+            return True
+        try:
+            self.registry.get_agent(agent_id)
+            return True
+        except KeyError:
+            self._json(404, {"error": f"agent not found: {agent_id}"})
+            return False
+
+    def _handle_memory_list(self) -> None:
+        """GET /api/memory?scope=shared|agent|all&agent_id= — index-backed."""
+        mem = self._memory_store()
+        if mem is None:
+            return
+        qs = parse_qs(urlsplit(self.path).query)
+        scope = (qs.get("scope") or ["all"])[0]
+        agent_id = (qs.get("agent_id") or [""])[0] or None
+        if scope not in ("shared", "agent", "all"):
+            self._json(400, {"error": "scope must be shared|agent|all"})
+            return
+        if scope == "agent" and agent_id is None:
+            self._json(400, {"error": "agent scope requires agent_id"})
+            return
+        if agent_id and not self._require_memory_agent(agent_id):
+            return
+        try:
+            self._json(200, {"entries": mem.list_entries(scope, agent_id=agent_id)})
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)})
+
+    def _handle_memory_search(self) -> None:
+        """GET /api/memory/search?q= — substring search across all scopes."""
+        mem = self._memory_store()
+        if mem is None:
+            return
+        q = (parse_qs(urlsplit(self.path).query).get("q") or [""])[0].strip()
+        if not q:
+            self._json(400, {"error": "q required"})
+            return
+        self._json(200, {"results": mem.search(q)})
+
+    def _handle_memory_read(self, rest: str) -> None:
+        """GET /api/memory/<scope>/<path> — one entry, content as text."""
+        mem = self._memory_store()
+        if mem is None:
+            return
+        try:
+            scope, agent_id, rel = self._parse_memory_target(rest)
+        except ValueError:
+            self._json(400, {"error": "malformed memory path"})
+            return
+        if not self._require_memory_agent(agent_id):
+            return
+        try:
+            data = mem.read(scope, agent_id, rel)
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        if data is None:
+            self._json(404, {"error": f"no such entry: {rel}"})
+            return
+        self._json(200, {
+            "scope": scope, "agent_id": agent_id or "", "path": rel,
+            "content": data.decode("utf-8", errors="replace"),
+            "size": len(data),
+        })
+
+    def _handle_memory_write(self, rest: str, payload: dict) -> None:
+        """PUT /api/memory/<scope>/<path> {content} — human-initiated write."""
+        mem = self._memory_store()
+        if mem is None:
+            return
+        try:
+            scope, agent_id, rel = self._parse_memory_target(rest)
+        except ValueError:
+            self._json(400, {"error": "malformed memory path"})
+            return
+        if not self._require_memory_agent(agent_id):
+            return
+        content = payload.get("content")
+        if not isinstance(content, str):
+            self._json(400, {"error": "content required (string)"})
+            return
+        try:
+            meta = mem.write(scope, agent_id, rel, content.encode("utf-8"),
+                             writer="human")
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        self._json(200, {"written": rel, "scope": scope,
+                         "agent_id": agent_id or "", "size": meta["size"]})
+
+    def _handle_memory_delete(self, rest: str) -> None:
+        """DELETE /api/memory/<scope>/<path>."""
+        mem = self._memory_store()
+        if mem is None:
+            return
+        try:
+            scope, agent_id, rel = self._parse_memory_target(rest)
+        except ValueError:
+            self._json(400, {"error": "malformed memory path"})
+            return
+        if not self._require_memory_agent(agent_id):
+            return
+        try:
+            ok = mem.delete(scope, agent_id, rel)
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        if not ok:
+            self._json(404, {"error": f"no such entry: {rel}"})
+            return
+        self._json(200, {"deleted": rel, "scope": scope,
+                         "agent_id": agent_id or ""})
 
     def log_message(self, fmt: str, *args) -> None:
         pass
