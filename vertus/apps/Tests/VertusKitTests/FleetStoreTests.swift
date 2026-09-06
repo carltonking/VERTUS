@@ -84,6 +84,45 @@ final class FleetStoreTests: XCTestCase {
         XCTAssertFalse(sb!.transcript.contains { $0.text.contains("A") || $0.text.contains("C") })
     }
 
+    // MARK: - 1b. Leading newline in the first streamed delta is trimmed
+    // (bug: a "\n\n" preamble from the model rendered as a blank line above
+    // the text inside every live assistant bubble; folded history rows were
+    // already normalized, so only the live path showed the gap)
+
+    func testLeadingNewlineInFirstDeltaIsTrimmed() async throws {
+        let a = try await makeAgent("alpha")
+        // The model's first delta commonly begins with a blank-line preamble.
+        hub.inject(type: "text", agentID: a.id, runID: "r-a", payload: ["text": "\n\nSir, here is the answer."])
+        hub.inject(type: "text", agentID: a.id, runID: "r-a", payload: ["text": " It continues here."])
+        hub.inject(type: "done", agentID: a.id, runID: "r-a")
+
+        let ok = await waitUntil {
+            let s = self.store.live[a.id]
+            return s?.transcriptText == "Sir, here is the answer. It continues here."
+        }
+        XCTAssertTrue(ok, "transcript: \(String(describing: store.live[a.id]?.transcriptText))")
+        // Mid-stream leading space (word separation) must survive untouched.
+        let entry = store.live[a.id]!.transcript.last!
+        XCTAssertTrue(entry.text.contains("answer. It"), "word-joining space was trimmed: \(entry.text)")
+    }
+
+    func testWhitespaceOnlyFirstDeltaOpensNoBlankEntry() async throws {
+        let a = try await makeAgent("alpha")
+        // A first delta that is entirely whitespace must not open an empty
+        // entry — the next real delta starts the bubble.
+        hub.inject(type: "text", agentID: a.id, runID: "r-a", payload: ["text": "\n\n"])
+        hub.inject(type: "text", agentID: a.id, runID: "r-a", payload: ["text": "Hi"])
+        hub.inject(type: "done", agentID: a.id, runID: "r-a")
+
+        let ok = await waitUntil {
+            let s = self.store.live[a.id]
+            return s?.transcriptText == "Hi"
+        }
+        XCTAssertTrue(ok, "transcript: \(String(describing: store.live[a.id]?.transcriptText))")
+        let entries = store.live[a.id]!.transcript.filter { $0.role == "assistant" }
+        XCTAssertEqual(entries.count, 1, "whitespace-only delta created a blank entry")
+    }
+
     // MARK: - 2. since= resume after a forced disconnect: no gap, no duplicate
 
     func testResumeAfterForcedDisconnectNoGapNoDuplicate() async throws {

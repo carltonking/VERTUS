@@ -39,14 +39,18 @@ enum NotchPanelMetrics {
     static let promptMaxLines: CGFloat = 3
     static let promptTopPad: CGFloat = 8
     static let promptBottomPad: CGFloat = 10
-    /// Prompt-bar left gutter: the agent-picker chip sits at the far left,
-    /// the editor starts right of it. Body is 316 pt wide with a 6.5 pt
-    /// chamfer inset → left edge at 6.5; chip ~66 pt + 11 pt gap → editor
-    /// at 84, ending at 320 (2.5 pt margin to the 322.5 right edge).
+    /// Prompt-bar left gutter: the agent-picker chip sits at the far left
+    /// and the editor starts just right of it. The chip's width varies with
+    /// the agent name and emoji, so the editor's left edge is DERIVED from
+    /// the chip's measured width (`chipWidth` in NotchPanelContent) plus
+    /// `chipGap` — never a fixed guess (a fixed offset is right for exactly
+    /// one name). The editor's right edge is pinned at `editorRight`
+    /// (2.5 pt margin to the body's right edge = 6.5 chamfer + 316 body),
+    /// so a wider chip narrows the editor instead of clipping it.
     static let pickerLeft: CGFloat = 9
     static let pickerChipHeight: CGFloat = 17
-    static let editorLeft: CGFloat = 84
-    static let editorWidth: CGFloat = 236
+    static let chipGap: CGFloat = 8
+    static let editorRight: CGFloat = 320
 
     /// Strip height for a given number of visible prompt lines (clamped to
     /// 1…3): one line by default — the strip only grows once the text in
@@ -210,6 +214,24 @@ struct NotchPanelContent: View {
     var onMathChange: (Bool) -> Void
 
     @State private var prompt = ""
+
+    /// Measured width of the agent-picker chip's visible capsule. Seeded 0;
+    /// the chip's GeometryReader reports the real width on first layout. The
+    /// panel window is built (hidden, nub-sized) at launch, so the measure
+    /// lands long before the first ⇧⌘J. The editor's left edge derives from
+    /// this, so the chip→text gap stays constant for any agent name.
+    @State private var chipWidth: CGFloat = 0
+
+    /// Editor left edge: chip (its measured width) + a fixed gap. Right edge
+    /// pinned at `editorRight` — a long agent name widens the chip, which
+    /// narrows the editor (it never runs under or past the chip).
+    private var editorLeft: CGFloat {
+        NotchPanelMetrics.pickerLeft + chipWidth + NotchPanelMetrics.chipGap
+    }
+
+    private var editorWidth: CGFloat {
+        max(120, NotchPanelMetrics.editorRight - editorLeft)
+    }
 
     /// When the whole prompt parses as math, this is its live result —
     /// recomputed from scratch on every keystroke so the answer appears
@@ -437,23 +459,46 @@ struct NotchPanelContent: View {
                 }
             }
         } label: {
-            HStack(spacing: 4) {
-                Text(model.agents.first { $0.id == model.selectedAgentID }?.emoji ?? "")
-                    .font(.system(size: 9.5))
-                Text(selectedAgentShortName)
-                    .font(.system(size: 10, weight: .medium))
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 6.5))
-            }
-            .foregroundStyle(.white.opacity(0.75))
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(Capsule().fill(Color(white: 0.2)))
+            chipLabel
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
         .help("Agent: \(selectedAgentShortName)")
+        // Measure the whole control's laid-out width. NOTE: the reader must
+        // sit on the Menu itself — attached to the label inside `label:` it
+        // reported 0 (SwiftUI folds Menu labels into an AppKit button cell
+        // that never lays the background out), which collapsed the editor
+        // onto the chip.
+        .background(chipWidthReader)
+    }
+
+    /// The chip's visible content: emoji, short name (truncated to 14 chars
+    /// so a long agent name caps the chip's growth), chevron, in a capsule.
+    private var chipLabel: some View {
+        HStack(spacing: 4) {
+            Text(model.agents.first { $0.id == model.selectedAgentID }?.emoji ?? "")
+                .font(.system(size: 9.5))
+            Text(selectedAgentShortName)
+                .font(.system(size: 10, weight: .medium))
+            Image(systemName: "chevron.down")
+                .font(.system(size: 6.5))
+        }
+        .foregroundStyle(.white.opacity(0.75))
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(Capsule().fill(Color(white: 0.2)))
+    }
+
+    /// Zero-size reporter behind the chip control: reports its rendered
+    /// width so the editor can start just right of it (see `editorLeft`).
+    /// Fires on first layout and whenever the agent name/emoji resizes it.
+    private var chipWidthReader: some View {
+        GeometryReader { geo in
+            Color.clear
+                .onAppear { chipWidth = geo.size.width }
+                .onChange(of: geo.size.width) { chipWidth = $0 }
+        }
     }
 
     private var selectedAgentShortName: String {
@@ -774,8 +819,8 @@ struct NotchPanelContent: View {
                 Text("Ask Vertus anything...")
                     .font(.system(size: 13.4, weight: .regular))
                     .foregroundStyle(.white.opacity(0.5))
-                    .frame(width: NotchPanelMetrics.editorWidth, height: 16, alignment: .leading)
-                    .offset(x: NotchPanelMetrics.editorLeft + 3, y: dividerY + NotchPanelMetrics.promptTopPad)
+                    .frame(width: editorWidth, height: 16, alignment: .leading)
+                    .offset(x: editorLeft + 3, y: dividerY + NotchPanelMetrics.promptTopPad)
                     .allowsHitTesting(false)
             }
             // Wrapping text editor: text goes to the line below instead of
@@ -785,11 +830,11 @@ struct NotchPanelContent: View {
                 if model.promptLines != lines { model.promptLines = lines }
             }
             .frame(
-                width: NotchPanelMetrics.editorWidth,
+                width: editorWidth,
                 height: max(model.promptLines, 1) * NotchPanelMetrics.promptLineHeight,
                 alignment: .topLeading
             )
-            .offset(x: NotchPanelMetrics.editorLeft, y: dividerY + NotchPanelMetrics.promptTopPad)
+            .offset(x: editorLeft, y: dividerY + NotchPanelMetrics.promptTopPad)
         }
     }
 

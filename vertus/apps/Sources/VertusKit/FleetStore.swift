@@ -53,8 +53,19 @@ public final class AgentLiveState: ObservableObject, Identifiable {
             last.text += text
             transcript[transcript.count - 1] = last
         } else {
+            // First delta of a reply: strip leading newlines/whitespace.
+            // Models commonly emit "\n\n" before the first sentence; kept
+            // raw it renders as a blank line above the text inside the
+            // bubble. The hub's folded history row is already normalized, so
+            // only the LIVE path shows the gap — this entry-open is the one
+            // shared build point every surface (Mac window, QuickBar, phone)
+            // reads from. Subsequent deltas append raw: mid-stream leading
+            // spaces separate words and must survive. If the whole first
+            // delta is whitespace, drop it rather than open a blank entry.
+            let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleaned.isEmpty else { return }
             transcript.append(TranscriptEntry(runId: runID, role: "assistant",
-                                              text: text, isDelta: true))
+                                              text: cleaned, isDelta: true))
         }
     }
 
