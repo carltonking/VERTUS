@@ -86,6 +86,7 @@ interface HubWireEvent {
 	message?: string;
 	steering?: string[];
 	follow_up?: string[];
+	steers?: string[];
 }
 
 function tryContentText(content: any): string {
@@ -187,6 +188,11 @@ export class HubSession extends AgentSession {
 			anyThis._emitQueueUpdate();
 			try {
 				await this.hubSteer(text);
+				// Accepted ≠ delivered: the fork injects steers at the next
+				// tool batch only, so a generation-only turn may finish with
+				// the steer never reaching the model. Say what actually
+				// happened — never imply delivery (terminal demo, Phase D).
+				this.notice(`steer queued on the hub: it is delivered at the next tool boundary; on a generation-only turn it may never arrive`);
 			} catch (error) {
 				// Steer refused (turn over / idle): carry it as a follow-up so
 				// it is never silently dropped — mirror hermes.
@@ -726,14 +732,19 @@ export class HubSession extends AgentSession {
 				break;
 			case "error":
 				p.resolve({ status: "error", error: event.message ?? "hub run failed" });
-				break;
-			case "cancelled":
+				break;			case "cancelled":
 				p.resolve({ status: "interrupted", error: "cancelled" });
+				break;
+			case "steer_undelivered":
+				// The hub inferred the turn ended without a tool boundary after
+				// our steer: it never reached the model. Make that visible
+				// instead of letting the user assume it was followed.
+				this.notice(`steer was NOT delivered: the turn ended before the next tool boundary (${(event.steers ?? []).join("; ") || ""})`);
 				break;
 			default:
 				break;
+			}
 		}
-	}
 
 	/** Events for a run this session did NOT start (bot message, routine,
 	 *  another client's prompt) — attribute from the run row and render. */

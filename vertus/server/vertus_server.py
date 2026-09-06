@@ -276,6 +276,15 @@ class AgentBridge:
         # and mirrored in the ``queue_update`` wire event; it never creates a
         # run row or a messages row. Cleared when the turn ends.
         self._pending_steers: list[str] = []
+        # Steer delivery bookkeeping (terminal demo, Phase D): the fork
+        # delivers session.steer at the NEXT TOOL BATCH, so a generation-only
+        # turn can end with an accepted-but-undelivered steer. There is no
+        # delivery ack from the fork, so the hub infers delivery: an
+        # ``activity`` event whose text starts with "running " marks a tool
+        # batch; a steer recorded AFTER the last such event was not
+        # delivered. Monotonic event seqs make cross-run staleness harmless.
+        self._last_tool_activity_seq = 0
+        self._last_steer_seq = 0
         # Bot-to-bot attribution of the current run (fleet message bus): who
         # asked for this turn (from_agent), in which thread, and with which
         # kind. ``on_run_terminal`` is the hub's BotMessenger.run_terminal —
@@ -379,8 +388,18 @@ class AgentBridge:
                 file=sys.stderr,
             )
             self._store_failure(run_id, exc)
-            return
+            return None
+        # Tool-batch marker for undelivered-steer detection: activity events
+        # whose text starts with "running " are tool boundaries (tool
+        # execution / tool-call start). "thinking…" activity is NOT a
+        # boundary. Seq comparison is monotonic across runs, so a stale value
+        # from an earlier run can never outrank a steer from this one.
+        if event.get("type") == "activity" and str(event.get("text", "")).startswith("running "):
+            with self._status_lock:
+                self._last_tool_activity_seq = max(
+                    self._last_tool_activity_seq, int(envelope.get("seq") or 0))
         self._fanout(envelope)
+        return envelope
 
     def _store_failure(self, run_id: str, exc: BaseException) -> None:
         """A store write failed: the run can't be trusted — mark it error."""
@@ -455,9 +474,20 @@ class AgentBridge:
             self._run_cancelled = None
             self._run_timeout_msg = None
         if pending_steers and run_id:
-            # The turn ended with steers still pending (they landed on a tool
-            # batch the turn never reached): tell every client the queue is
-            # empty again, attributed to the same run.
+            # The turn ended with steers still pending. Say plainly whether
+            # they were ever deliverable: the fork injects steers at the next
+            # tool batch, so a steer recorded after the last tool-boundary
+            # activity event never reached the model. There is no delivery
+            # ack from the fork, so this is an inference, not a guarantee.
+            with self._status_lock:
+                last_tool = self._last_tool_activity_seq
+                last_steer = self._last_steer_seq
+            if last_steer and last_steer > last_tool:
+                self._emit({"type": "steer_undelivered",
+                            "steers": list(pending_steers[:10])},
+                           run_id=run_id)
+            # Tell every client the queue is empty again, attributed to the
+            # same run.
             self._emit({"type": "queue_update", "steering": [],
                         "follow_up": []}, run_id=run_id)
         if not run_id or self.store is None:
@@ -1100,7 +1130,11 @@ class AgentBridge:
         with self._status_lock:
             self._pending_steers.append(text)
             pending = list(self._pending_steers)
-        self._emit({"type": "steer", "text": text}, run_id=run_id)
+        envelope = self._emit({"type": "steer", "text": text}, run_id=run_id)
+        if envelope:
+            with self._status_lock:
+                self._last_steer_seq = max(
+                    self._last_steer_seq, int(envelope.get("seq") or 0))
         self._emit({"type": "queue_update", "steering": pending,
                     "follow_up": []}, run_id=run_id)
         return run_id or ""

@@ -187,3 +187,38 @@ def test_bridge_steer_idle_raises_directly(hub):
         return
     with pytest.raises(vs.SteerNotRunningError):
         bridge.steer("nope")
+
+
+def test_undelivered_steer_is_surfaced_at_turn_end(hub):
+    """A generation-only turn (no tool batch after the steer) must end with
+    a ``steer_undelivered`` event, not a silent drop (terminal demo Phase D:
+    the fork delivers steers only at the next tool boundary)."""
+    run_id, bridge, session = _start_slow_turn(hub, delay=2.0)
+    status, resp = _req(hub["base"], "/api/steer", "POST",
+                        {"agent_id": "primary", "text": "no wait — differently"})
+    assert status == 200, resp
+    # The fake emits NO tool-boundary activity; the turn just finishes.
+    assert _wait_until(pred=lambda: bridge.status()["state"] == "idle")
+    assert hub["store"].get_run(run_id)["state"] == "done"
+    events = hub["store"].events_after(0)
+    undelivered = [e for e in events if e["type"] == "steer_undelivered"]
+    assert undelivered, [e["type"] for e in events]
+    assert undelivered[-1]["run_id"] == run_id
+    assert undelivered[-1]["steers"] == ["no wait — differently"]
+
+
+def test_delivered_steer_does_not_trigger_undelivered_event(hub):
+    """A tool boundary AFTER the steer means the fork's next-batch delivery
+    could have happened — no ``steer_undelivered`` event."""
+    run_id, bridge, session = _start_slow_turn(hub, delay=2.0)
+    status, resp = _req(hub["base"], "/api/steer", "POST",
+                        {"agent_id": "primary", "text": "tweak"})
+    assert status == 200, resp
+    # Tool batch after the steer: the bridge's activity passthrough marks a
+    # boundary (text starts with "running ").
+    session.bridge._on_pi_event({"type": "activity", "text": "running bash…"})
+    assert _wait_until(pred=lambda: bridge.status()["state"] == "idle")
+    events = hub["store"].events_after(0)
+    undelivered = [e for e in events if e["type"] == "steer_undelivered"]
+    assert undelivered == [], [e["type"] for e in events]
+    assert hub["store"].get_run(run_id)["state"] == "done"
