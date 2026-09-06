@@ -433,11 +433,20 @@ class AgentRegistry:
     def shared_memory_dir(self) -> Path:
         """Fleet-wide notes directory every bot reads/writes.
 
-        ``VERTUS_SHARED_MEMORY_DIR`` overrides; default ``~/.vertus/memory/shared``
-        (sibling of the legacy single-agent ``~/.vertus/memory`` store).
+        ``VERTUS_SHARED_MEMORY_DIR`` overrides; falls back to
+        ``VERTUS_MEMORY_DIR/shared``; default ``~/.vertus/memory/shared``.
+        Must agree with ``fleet_memory.shared_dir`` — a hub with only
+        ``VERTUS_MEMORY_DIR`` set would otherwise materialize skills pointing
+        at the real ``~/.vertus`` while the store writes to the temp root,
+        sending bots at the user's actual memory.
         """
         env = os.environ.get("VERTUS_SHARED_MEMORY_DIR", "").strip()
-        return Path(env).expanduser() if env else Path.home() / ".vertus" / "memory" / "shared"
+        if env:
+            return Path(env).expanduser()
+        mem_env = os.environ.get("VERTUS_MEMORY_DIR", "").strip()
+        if mem_env:
+            return Path(mem_env).expanduser() / "shared"
+        return Path.home() / ".vertus" / "memory" / "shared"
 
     def ensure_memory_dirs(self, agent_id: str) -> tuple[Path, Path]:
         """Create (if missing) and return ``(agent_memory, shared_memory)``."""

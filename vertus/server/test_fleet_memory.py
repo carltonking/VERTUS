@@ -117,6 +117,29 @@ def test_rematerialization_never_clobbers_fork_memory(mem_env, tmp_path):
     assert (tmp_path / "agents" / "alpha" / "memory").is_dir()
 
 
+def test_skill_injection_follows_memory_dir_env(mem_env, tmp_path):
+    """Regression: the materialized memory skill must point at the env-
+    configured memory root, never the real ~/.vertus. A hub with only
+    VERTUS_MEMORY_DIR set used to materialize skills pointing at the real
+    shared memory (agent_registry fell back to a hardcoded path while
+    fleet_memory honored the env), which sent demo agents at the user's
+    actual profile.md."""
+    # mem_env sets VERTUS_MEMORY_DIR but deliberately NOT
+    # VERTUS_SHARED_MEMORY_DIR: the fallback is what's under test.
+    registry = AgentRegistry()
+    agent = registry.create_agent("alpha", persona="You are Alpha.")
+    skill = tmp_path / "agents" / "alpha" / "home" / "skills" / "vertus-memory" / "SKILL.md"
+    assert skill.is_file()
+    text = skill.read_text()
+    assert str(tmp_path / "memory" / "shared") in text
+    assert str(Path.home() / ".vertus" / "memory" / "shared") not in text
+    # And the two modules must agree with each other.
+    import agent_registry
+
+    assert str(agent_registry.AgentRegistry().shared_memory_dir()) == \
+        str(fm.shared_dir())
+
+
 def test_mirror_conflict_is_staged_not_destroyed(mem_env, tmp_path):
     store = _make_store(tmp_path, start=True)
     home_mem = tmp_path / "agents" / "alpha" / "home" / "memories"
