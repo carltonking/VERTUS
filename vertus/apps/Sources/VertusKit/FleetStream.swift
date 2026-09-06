@@ -36,6 +36,13 @@ public final class FleetStream: NSObject, ObservableObject {
     private let maxBackoffSeconds: UInt64 = 10
     private let baseBackoffMilliseconds: UInt64 = 500
 
+    /// Connection lifecycle is visible to the operator (this surfaced the
+    /// phone's reconnect behavior in simulator testing): every state change
+    /// and every connect with its since= cursor goes to os_log.
+    private func log(_ message: String) {
+        NSLog("[vertus-stream] %@", message)
+    }
+
     public init(config: ServerConfig, cursor: StreamCursor) {
         self.config = config
         self.cursor = cursor
@@ -111,6 +118,9 @@ public final class FleetStream: NSObject, ObservableObject {
         // client; transcripts rebuild from the messages endpoint instead.
         if cursor.hasSeenEvents {
             urlComps.queryItems = [URLQueryItem(name: "since", value: String(cursor.lastSeq))]
+            log("connect since=\(cursor.lastSeq)")
+        } else {
+            log("connect (first launch, no since)")
         }
         guard let url = urlComps.url else { throw URLError(.badURL) }
 
@@ -124,11 +134,13 @@ public final class FleetStream: NSObject, ObservableObject {
             (bytes, resp) = try await URLSession.shared.bytes(for: req)
         } catch {
             if Task.isCancelled || stopped { throw CancellationError() }
+            log("connect threw: \(error.localizedDescription)")
             throw error
         }
         guard let http = resp as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         guard http.statusCode == 200 else { throw URLError(.badServerResponse) }
 
+        log("connected, draining from seq \(cursor.lastSeq)")
         await MainActor.run { self.connectionState = .connected }
 
         // Process lines until EOF/error/cancel.
@@ -153,6 +165,8 @@ public final class FleetStream: NSObject, ObservableObject {
 
     private func handle(_ event: WireEvent) {
         if event.type == "lagged" {
+            log("lagged marker (seq \(event.seq ?? -1)) — forcing reconnect")
+
             // The marker's seq is the OVERFLOWED event — never delivered —
             // so the cursor must NOT advance past it. Reconnect immediately
             // with since=<cursor>: the replay covers (cursor, ∞) including

@@ -13,15 +13,26 @@ import VertusKit
 // sandbox file fallback in ServerConfig.load never exists on iOS).
 
 enum PhoneConfig {
+    /// Token precedence mirrors the Mac's ServerConfig: a UserDefaults
+    /// override first ("vertus.token" — how the simulator/CI injects a
+    /// token via `simctl spawn defaults write`, since the Keychain cannot be
+    /// seeded from outside the app), then the Keychain. The Settings screen
+    /// always writes the Keychain and clears the override.
     static func load() -> ServerConfig {
-        let base = UserDefaults.standard.string(forKey: "vertus.baseURL")
+        let defaults = UserDefaults.standard
+        let base = defaults.string(forKey: "vertus.baseURL")
             ?? "http://127.0.0.1:8787"
-        return ServerConfig(baseURL: base, token: KeychainStore.load() ?? "")
+        let token = defaults.string(forKey: "vertus.token")
+            ?? KeychainStore.load()
+            ?? ""
+        return ServerConfig(baseURL: base, token: token)
     }
 
     static func save(baseURL: String, token: String) {
         UserDefaults.standard.set(baseURL, forKey: "vertus.baseURL")
         if token.isEmpty { KeychainStore.clear() } else { KeychainStore.save(token) }
+        // The override exists only for external injection; a real save wins.
+        UserDefaults.standard.removeObject(forKey: "vertus.token")
     }
 }
 

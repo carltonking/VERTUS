@@ -120,7 +120,15 @@ public final class StreamCursor {
 
     public init(processName: String) {
         url = SharedUIState.uiDir.appendingPathComponent("cursor-\(processName).json")
-        value = (try? Int(String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespaces))) ?? 0
+        do {
+            let raw = try String(contentsOf: url, encoding: .utf8)
+            value = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        } catch {
+            value = 0
+            NSLog("[vertus-stream] cursor read failed for %@: %@", url.path,
+                  (error as NSError).localizedDescription)
+        }
+        NSLog("[vertus-stream] cursor url=%@ value=%d", url.path, value)
     }
 
     /// Last seq the consuming process has fully applied (0 = never saw one).
