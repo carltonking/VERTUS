@@ -248,7 +248,7 @@ Decisions:
 
 The scheduler lives **in the hub**, not launchd: the hub is already under
 launchd KeepAlive, and a second scheduling layer is a second failure mode —
-one that failed *silently* once (a logging split), which is what §9
+one that failed *silently* once (a logging split), which is what §10
 exists to prevent.
 
 ## 7. Spawn isolation
@@ -263,7 +263,44 @@ on the queue item and passed at spawn, never via process-global mutation —
 the `VERTUS_REMOTE` `os.environ` write is gone, and the whole repo is free of
 module-level per-turn/per-agent mutable state (grep-verified).
 
-## 8. Clients
+## 8. Memory
+
+Memory became hub-owned in this phase (`fleet_memory.py`) after discovery
+proved the memory system had never actually run (the real fleet.db had zero
+runs; the skills were real plumbing, never exercised). One canonical store,
+files stay the model's interface:
+
+```
+~/.vertus/memory/shared/              CANONICAL — fleet-wide
+~/.vertus/agents/<id>/memory/         CANONICAL — per-bot private
+~/.vertus/agents/<id>/home/memories/  FORK-OWNED MIRROR ({USER.md, MEMORY.md})
+```
+
+**Mirror sync rule:** the fork's `home/memories/` pair is a one-way mirror
+into the agent's canonical `memory/` — a fork write propagates to canonical
+and is never destroyed by re-materialization (SOUL.md/config.yaml/skills
+are derived identity and are clobbered, which is correct). Canonical writes
+never flow back into the fork home, and a canonical move between mirrors
+stages the fork's version as `*.conflict-<ts>` rather than overwriting — no
+write is ever silently lost. **Concurrency:** per-file `fcntl` advisory
+lock + temp-file + `os.replace` (atomic-or-absent) for hub writers; the
+fork's `memory_tool` has its own `.lock` sidecars for its two files.
+**Change detection:** a 2s watcher polls canonical dirs and every fork
+mirror, then emits `memory_changed` fleet events with writer attribution
+(agent id | `human` | `external`). The index (`memory/.hub-index.json`) is
+hub-maintained — the old model-maintained `index.json` expectation was
+removed from the skill. Legacy pre-fleet memory was backed up, folded into
+`shared/` byte-for-byte with symlinks at the old paths, and marked
+`.migrated_v1` (idempotent, conflict-refusing).
+
+`vertus_paths.py` (added in this phase) is the ONE resolver for every path
+root — concept env var → `VERTUS_ROOT` → production default — after an
+env-divergence bug sent a temp hub's materialized skills at the real
+`~/.vertus/memory`. The doctor's `memory.skill_path` check verifies each
+materialized skill points at the resolved root; the hermeticity suite
+proves a `VERTUS_ROOT`-only boot touches nothing real.
+
+## 9. Clients
 
 Both macOS clients are Swift Package targets under `vertus/apps/` sharing
 **VertusKit** — one client implementation: auth (token file or UserDefaults),
@@ -291,7 +328,7 @@ history endpoints, agent CRUD/409 typing, hub health.
   (env > UserDefaults > 127.0.0.1:8787) points dev builds at a temp hub.
 - VertusPhone is untouched by the fleet work and remains a separate client.
 
-## 9. Observability
+## 10. Observability
 
 One logging path for the whole hub (`vertus_logging.py`): every subsystem —
 the hub's print sites, scheduler, messenger, bridges — through one logger to
@@ -306,7 +343,7 @@ original `{status, time}` keys so existing clients parse it. The Fleet app
 surfaces an unhealthy subsystem as a banner; that is the difference between
 "my bot didn't do the thing" and "the scheduler has been dead since Tuesday".
 
-## 10. Limits
+## 11. Limits
 
 Same honesty, stated once, in full. The README carries the short version;
 the code carries it in comments; `/api/fleet/screens` and the Fleet UI carry
@@ -334,7 +371,7 @@ the parts users can act on.
 
 ---
 
-## 11. Build history (branch `fleet/per-agent-identity`)
+## 12. Build history (branch `fleet/per-agent-identity`)
 
 The fleet was built in ordered, individually-testable commits. The lineage,
 oldest to newest: identity/spawn isolation → HTTP surface + status + lock

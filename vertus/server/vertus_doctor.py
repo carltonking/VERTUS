@@ -892,6 +892,135 @@ def launchd_checks() -> list[dict]:
     return out
 
 
+def memory_checks() -> list[dict]:
+    """Hub-owned memory (fleet_memory.py): canonical dirs, migration marker,
+    index health, fork-mirror consistency, pending conflicts, and — the one
+    that matters — that each materialized skill points at the SAME shared
+    root the hub resolves. The last one is the exact check that would have
+    caught the env-divergence bug that sent a temp hub's agents at the REAL
+    ~/.vertus/memory."""
+    out: list[dict] = []
+    from fleet_memory import (_MIGRATION_MARKER, _FORK_MEMORY_FILES, _sha256)
+
+    root = vertus_paths.memory_root()
+    shared = vertus_paths.shared_memory_dir()
+    agents = vertus_paths.agents_dir()
+    if not shared.is_dir():
+        out.append(_check("memory.canonical", "warn",
+                          f"shared memory dir missing at {shared}",
+                          "the hub creates it at first boot; start the hub once"))
+        return out
+    out.append(_check("memory.canonical", "ok", f"{shared} present"))
+
+    marker = root / _MIGRATION_MARKER
+    if marker.is_file():
+        out.append(_check("memory.migration", "ok",
+                          f"legacy migration marker at {marker.name} (idempotent)"))
+    else:
+        out.append(_check("memory.migration", "warn",
+                          "no migration marker — legacy memory never folded in",
+                          "start the hub once; it backs up + migrates + marks"))
+
+    # Index health + freshness: every canonical file should have an index
+    # entry whose sha matches (the watcher catches up on its next poll, so
+    # staleness is a warn, not a fail).
+    index_file = root / ".hub-index.json"
+    index: dict = {}
+    if not index_file.is_file():
+        out.append(_check("memory.index", "warn",
+                          "no hub index yet (created on first write)",
+                          "the watcher creates it; nothing to fix"))
+    else:
+        try:
+            parsed = json.loads(index_file.read_text(encoding="utf-8"))
+            index = parsed if isinstance(parsed, dict) else {}
+        except Exception as exc:
+            out.append(_check("memory.index", "fail",
+                              f"index unreadable: {exc}",
+                              "delete it and let the hub rebuild (it is derived state)"))
+            index = {}
+        if not index:
+            out.append(_check("memory.index", "warn",
+                              "index exists but is empty — nothing indexed yet",
+                              "the watcher populates it; nothing to fix"))
+        else:
+            stale = []
+            for p in sorted(shared.rglob("*")):
+                if not p.is_file() or p.name.startswith("."):
+                    continue
+                key = f"shared/{p.relative_to(shared)}"
+                meta = index.get(key)
+                if not meta or meta.get("sha") != _sha256(p):
+                    stale.append(str(p.relative_to(shared)))
+            if stale:
+                out.append(_check("memory.index", "warn",
+                                  f"index stale for {len(stale)} shared file(s): "
+                                  f"{', '.join(stale[:3])}",
+                                  "the hub watcher catches up on its next poll (2s)"))
+            else:
+                out.append(_check("memory.index", "ok",
+                                  f"index current ({len(index)} entries)"))
+
+    # Pending conflicts: staged <name>.conflict-<ts> files, never destroyed.
+    conflicts = sorted(agents.glob("*/memory/*.conflict-*")) if agents.is_dir() else []
+    if conflicts:
+        names = ", ".join(str(c.relative_to(agents)) for c in conflicts[:3])
+        out.append(_check("memory.conflicts", "warn",
+                          f"{len(conflicts)} staged conflict(s): {names}",
+                          "both sides were preserved; merge by hand and delete the "
+                          ".conflict-* file"))
+    else:
+        out.append(_check("memory.conflicts", "ok", "no pending conflicts"))
+
+    # Fork mirror consistency: a fork-side file with no canonical counterpart
+    # (or a different sha) has not propagated yet. Self-healing via the
+    # watcher, so warn only.
+    pending = []
+    if agents.is_dir():
+        for home_mem in sorted(agents.glob("*/home/memories/*")):
+            if not home_mem.is_file():
+                continue
+            agent = home_mem.parent.parent.parent.name
+            if home_mem.name not in _FORK_MEMORY_FILES:
+                continue
+            dst = agents / agent / "memory" / home_mem.name
+            if not dst.is_file() or _sha256(dst) != _sha256(home_mem):
+                pending.append(f"{agent}/{home_mem.name}")
+    if pending:
+        out.append(_check("memory.mirror", "warn",
+                          f"{len(pending)} fork write(s) not yet mirrored: "
+                          f"{', '.join(pending)}",
+                          "the hub watcher propagates fork writes into canonical "
+                          "(one-way, never destroyed) on its next poll"))
+    else:
+        out.append(_check("memory.mirror", "ok", "fork mirrors consistent"))
+
+    # THE check: materialized skills must point at the hub's resolved root.
+    expected = str(shared)
+    bad: list[str] = []
+    if agents.is_dir():
+        for skill in sorted(agents.glob("*/home/skills/vertus-memory/SKILL.md")):
+            agent = skill.parent.parent.parent.parent.name
+            try:
+                text = skill.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if expected not in text:
+                bad.append(agent)
+    if bad:
+        out.append(_check("memory.skill_path", "fail",
+                          f"{len(bad)} agent(s) have materialized skills pointing "
+                          f"at a DIFFERENT shared root than the hub resolves "
+                          f"({expected}): {', '.join(bad)}",
+                          "re-materialize: restart the hub, or PATCH each agent "
+                          "(the skill path is derived state, rewritten on every "
+                          "profile write)"))
+    else:
+        out.append(_check("memory.skill_path", "ok",
+                          "all materialized skills point at the resolved shared root"))
+    return out
+
+
 # -- runner -----------------------------------------------------------------
 
 def run(json_out: bool = False, spawner=None) -> int:
@@ -902,6 +1031,7 @@ def run(json_out: bool = False, spawner=None) -> int:
     all_checks += hub_checks()
     all_checks += store_checks()
     all_checks += registry_checks()
+    all_checks += memory_checks()
     all_checks += launchd_checks()
     runtime_s = time.monotonic() - started
     exit_code = 1 if any(c["status"] == "fail" for c in all_checks) else 0

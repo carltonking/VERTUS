@@ -85,6 +85,44 @@ updated_at, is_primary, sandbox_path, home_path, schema_version`.
 - Two agents run fully in parallel (own queue + worker + gateway each).
   Within one agent, prompts serialize in submission order.
 
+## Memory
+
+Memory is a **hub-owned resource with one source of truth**; files remain
+the model's interface (bots read and write them by tool call — nothing
+changes there). The hub owns, indexes, and broadcasts them.
+
+```
+~/.vertus/memory/shared/              CANONICAL — fleet-wide, every agent reads/writes
+~/.vertus/agents/<id>/memory/         CANONICAL — private to that agent
+~/.vertus/agents/<id>/home/memories/  FORK-OWNED MIRROR ({USER.md, MEMORY.md})
+~/.vertus/memory/.hub-index.json     hub-maintained index (never model-written)
+```
+
+- **Mirror sync rule (one direction, fork → canonical):** a fork write to
+  `home/memories/` propagates into the agent's canonical `memory/` and is
+  never destroyed by re-materialization — only SOUL.md, config.yaml and the
+  skills are derived identity and get clobbered on PATCH, which is correct
+  behavior. If canonical moved since the hub last mirrored (a human edit),
+  the fork's version is staged as `*.conflict-<ts>` — both sides survive.
+- **Concurrency:** shared memory is written with a per-file `fcntl` advisory
+  lock plus temp-file + `os.replace`, so two agents (or a bot and a human)
+  writing the same file can never interleave or truncate — a write is
+  atomic or absent. The fork's own `memory_tool` additionally locks its two
+  files with its own `.lock` sidecars.
+- **Change detection:** a hub watcher polls canonical dirs and every agent's
+  `home/memories/` pair every 2s, mirrors fork writes, and emits a
+  `memory_changed` fleet event (writer-attributed: the agent id, `human`,
+  or `external`) — every connected surface updates live, whether the change
+  came from a bot's tool call or a human edit in the UI.
+- **Migration:** legacy pre-fleet memory (`~/.vertus/memory/*`,
+  `~/.hermes/memories/USER.md`) was backed up to `~/.vertus/backups/`,
+  folded into `shared/` byte-for-byte, and the legacy paths replaced with
+  symlinks; the migration is idempotent (marker `.migrated_v1`) and refuses
+  to overwrite divergent canonical content.
+- **`home/memories/` is fork-owned.** Hand-edits inside `home/` are derived
+  state and are destroyed on re-materialization; the canonical locations
+  above are the only places to edit memory directly.
+
 ## Run store and replay
 
 Every event of every run is committed to SQLite (`~/.vertus/fleet.db`,
@@ -253,10 +291,16 @@ All bearer-guarded; unknown agents 404; degraded agents 503 on prompt.
 | `POST /api/routines/<id>/run` · `GET /api/routines/<id>/history` | fire now / runs produced |
 | `GET /api/fleet/activity?limit=` | newest runs across all agents |
 | `GET /api/fleet/screens` | declared targets, holders, waiters, driver inventory |
+| `GET /api/memory?scope=shared\|agent\|all&agent_id=` | index-backed listing |
+| `GET /api/memory/search?q=` | substring search across all scopes |
+| `GET /api/memory/<scope>/<path>` | read one entry (content as text) |
+| `PUT /api/memory/<scope>/<path>` | write one entry, human-initiated |
+| `DELETE /api/memory/<scope>/<path>` | delete one entry |
 
 Wire events: `text`, `activity`, `done`, `error`, `cancelled`, `lagged`,
 `bot_message`, `routine_fired`, `routine_skipped`, `routine_disabled`,
-`approval_request` — every event carries `agent_id`, `run_id`, `seq`, `ts`.
+`approval_request`, `memory_changed` (no run_id; carries `scope`, `path`,
+`writer`) — run-scoped events carry `agent_id`, `run_id`, `seq`, `ts`.
 
 ## Configuration knobs
 

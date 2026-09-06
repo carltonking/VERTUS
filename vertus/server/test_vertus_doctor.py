@@ -116,6 +116,8 @@ def isolated_env(monkeypatch, tmp_path):
     monkeypatch.setenv("VERTUS_AGENTS_DIR", str(agents))
     monkeypatch.setenv("VERTUS_DB_PATH", str(tmp_path / "fleet.db"))
     monkeypatch.setenv("VERTUS_TOKEN_PATH", str(tmp_path / "token"))
+    monkeypatch.setenv("VERTUS_MEMORY_DIR", str(tmp_path / "memory"))
+    monkeypatch.setenv("VERTUS_SHARED_MEMORY_DIR", str(tmp_path / "memory" / "shared"))
     monkeypatch.setenv("VERTUS_DOCTOR_SKIP_LAUNCHD", "1")
     monkeypatch.setenv("VERTUS_PORT", "59999")  # nothing listens here
     return tmp_path
@@ -280,6 +282,103 @@ def test_current_profiles_pass(monkeypatch, isolated_env, tmp_path):
     _make_profile(tmp_path / "agents", "newbot", SCHEMA_VERSION)
     results = vd.registry_checks()
     assert _status(results, "registry.profiles") == "ok"
+
+
+# -- memory checks (Addition B) --------------------------------------------
+
+def _materialized_skill(agents_dir: Path, agent_id: str, shared: str) -> Path:
+    """Write an agent home the way the materializer would, with the given
+    shared root injected into the memory skill."""
+    skill = agents_dir / agent_id / "home" / "skills" / "vertus-memory" / "SKILL.md"
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text(
+        "# Vertus Memory\n"
+        f"- **Fleet-shared memory** — `{shared}/`: read before every turn.\n",
+        encoding="utf-8")
+    return skill
+
+
+def test_memory_missing_canonical_warns(monkeypatch, isolated_env):
+    results = vd.memory_checks()
+    assert _status(results, "memory.canonical") == "warn"
+
+
+def test_memory_migration_marker_ok(monkeypatch, isolated_env, tmp_path):
+    shared = tmp_path / "memory" / "shared"
+    shared.mkdir(parents=True)
+    (tmp_path / "memory" / ".migrated_v1").touch()
+    results = vd.memory_checks()
+    assert _status(results, "memory.canonical") == "ok"
+    assert _status(results, "memory.migration") == "ok"
+
+
+def test_memory_index_stale_warns(monkeypatch, isolated_env, tmp_path):
+    shared = tmp_path / "memory" / "shared"
+    shared.mkdir(parents=True)
+    (tmp_path / "memory" / ".migrated_v1").touch()
+    (shared / "profile.md").write_text("the user is Carlton", encoding="utf-8")
+    # Index exists but is stale (empty) -> warn, not fail (watcher self-heals).
+    (tmp_path / "memory" / ".hub-index.json").write_text("{}", encoding="utf-8")
+    results = vd.memory_checks()
+    assert _status(results, "memory.index") == "warn"
+    # Fresh index with the right sha -> ok.
+    from fleet_memory import _sha256
+    p = shared / "profile.md"
+    (tmp_path / "memory" / ".hub-index.json").write_text(json.dumps({
+        "shared/profile.md": {"sha": _sha256(p), "size": p.stat().st_size},
+    }), encoding="utf-8")
+    results = vd.memory_checks()
+    assert _status(results, "memory.index") == "ok"
+
+
+def test_memory_conflicts_warn(monkeypatch, isolated_env, tmp_path):
+    shared = tmp_path / "memory" / "shared"
+    shared.mkdir(parents=True)
+    (tmp_path / "memory" / ".migrated_v1").touch()
+    agent_mem = tmp_path / "agents" / "alpha" / "memory"
+    agent_mem.mkdir(parents=True)
+    (agent_mem / "USER.md.conflict-1725000000").write_text("both sides",
+                                                           encoding="utf-8")
+    results = vd.memory_checks()
+    assert _status(results, "memory.conflicts") == "warn"
+
+
+def test_memory_skill_path_fails_on_divergence(monkeypatch, isolated_env,
+                                               tmp_path):
+    """The check that would have caught the env-divergence bug: a materialized
+    skill pointing at a different shared root than the hub resolves must fail
+    with a re-materialization remediation."""
+    shared = tmp_path / "memory" / "shared"
+    shared.mkdir(parents=True)
+    (tmp_path / "memory" / ".migrated_v1").touch()
+    wrong = tmp_path / "elsewhere" / "shared"
+    _materialized_skill(tmp_path / "agents", "alpha", str(wrong))
+    results = vd.memory_checks()
+    assert _status(results, "memory.skill_path") == "fail", results
+    assert "alpha" in _by_name(results)["memory.skill_path"]["reason"]
+    assert _by_name(results)["memory.skill_path"]["remediation"]
+    # Correct the skill to the resolved root -> ok.
+    _materialized_skill(tmp_path / "agents", "alpha", str(shared))
+    results = vd.memory_checks()
+    assert _status(results, "memory.skill_path") == "ok"
+
+
+def test_memory_mirror_pending_warns(monkeypatch, isolated_env, tmp_path):
+    shared = tmp_path / "memory" / "shared"
+    shared.mkdir(parents=True)
+    (tmp_path / "memory" / ".migrated_v1").touch()
+    # A fork-side USER.md with no canonical counterpart: watcher will mirror.
+    fork_mem = tmp_path / "agents" / "alpha" / "home" / "memories"
+    fork_mem.mkdir(parents=True)
+    (fork_mem / "USER.md").write_text("fork learned this", encoding="utf-8")
+    results = vd.memory_checks()
+    assert _status(results, "memory.mirror") == "warn"
+    # Mirrored (canonical copy exists, same bytes) -> ok.
+    canon = tmp_path / "agents" / "alpha" / "memory"
+    canon.mkdir(parents=True)
+    (canon / "USER.md").write_text("fork learned this", encoding="utf-8")
+    results = vd.memory_checks()
+    assert _status(results, "memory.mirror") == "ok"
 
 
 # -- hub / exit / json ------------------------------------------------------
