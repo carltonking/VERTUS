@@ -372,7 +372,13 @@ struct NotchPanelContent: View {
                 HStack(spacing: 2) {
                     Text(busy.emoji)
                         .font(.system(size: 8.5))
-                    if busy.blockedSummary != nil {
+                    if busy.workingFor != nil {
+                        // Bot-initiated work: this agent is doing another
+                        // bot's turn, not the user's.
+                        Image(systemName: "arrow.turn.down.right")
+                            .font(.system(size: 5.5))
+                            .foregroundStyle(.blue)
+                    } else if busy.blockedSummary != nil {
                         // Waiting on a screen target another agent holds.
                         Image(systemName: "lock.fill")
                             .font(.system(size: 5.5))
@@ -393,7 +399,7 @@ struct NotchPanelContent: View {
                     .buttonStyle(.plain)
                     .help("Stop \(busy.name)'s current run")
                 }
-                .help("\(busy.name) \(busy.blockedSummary ?? (busy.running ? "running" : "queued"))")
+                .help("\(busy.name) \(busy.workingFor.map { "working for \($0)" } ?? busy.blockedSummary ?? (busy.running ? "running" : "queued"))")
             }
             if model.queueDepth > 0 {
                 Text("\(model.queueDepth) queued")

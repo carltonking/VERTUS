@@ -229,6 +229,12 @@ struct AgentChatView: View {
                 Circle()
                     .fill(stateColor(run.state))
                     .frame(width: 6, height: 6)
+                if run.isBotInitiated {
+                    Image(systemName: "arrow.turn.down.right")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.blue)
+                        .help("bot-initiated")
+                }
                 Text(run.prompt.prefix(34))
                     .font(.system(size: 11))
                     .lineLimit(1)
@@ -346,51 +352,149 @@ struct FleetBubbleView: View {
 // MARK: - Past run viewer
 
 struct PastRunView: View {
-    let run: RunRow
-    @EnvironmentObject private var store: FleetStore
-    @State private var messages: [MessageRow] = []
+    @State private var runID: String
+    @State private var detail: RunDetail?
     @State private var loaded = false
+    @State private var loadError: String?
+    @EnvironmentObject private var store: FleetStore
+
+    init(run: RunRow) {
+        _runID = State(initialValue: run.runId)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Run · \(run.state)")
+                Text("Run · \(detail?.run.state ?? "…")")
                     .font(.system(size: 13, weight: .semibold))
+                if let d = detail {
+                    if d.run.isBotInitiated, let from = d.run.fromAgent {
+                        Text("for \(store.displayName(for: from))")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(.blue)
+                    }
+                    if let kind = d.run.runKind, kind != "user" {
+                        Text(kind.uppercased())
+                            .font(.system(size: 9, weight: .semibold))
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Color.blue.opacity(0.18)))
+                            .foregroundStyle(.blue)
+                    }
+                }
                 Spacer()
-                Text(promptPreview)
+                Text(detail?.run.prompt.prefix(60) ?? "")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             .padding(12)
             Divider()
+            // Delegation tree: who asked (parent) and who was asked (children)
+            if let detail {
+                delegationTree(detail)
+                Divider()
+            }
             if loaded {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(messages, id: \.id) { msg in
-                            FleetBubbleView(entry: TranscriptEntry(runId: msg.runId,
-                                                                   role: msg.role,
-                                                                   text: msg.text,
-                                                                   messageID: msg.id))
+                if let detail {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            ForEach(detail.messages, id: \.id) { msg in
+                                FleetBubbleView(entry: TranscriptEntry(runId: msg.runId,
+                                                                       role: msg.role,
+                                                                       text: msg.text,
+                                                                       messageID: msg.id))
+                            }
                         }
+                        .padding(14)
                     }
-                    .padding(14)
                 }
             } else {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .onAppear {
-            Task {
-                if let (_, msgs) = try? await store.client.runDetail(run.runId) {
-                    messages = msgs
+        .onAppear { Task { await load(runID) } }
+    }
+
+    /// Parent + children as navigable chips: clicking one loads that run's
+    /// detail in place, so a delegation chain is traceable end to end.
+    @ViewBuilder
+    private func delegationTree(_ detail: RunDetail) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            if let parent = detail.parent {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.up.left")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                    Text("delegated by")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    treeChip(run: parent)
                 }
-                loaded = true
             }
+            if !detail.children.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.down.right")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                    Text("delegated to")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    ForEach(detail.children) { child in
+                        treeChip(run: child)
+                    }
+                }
+            }
+            if detail.parent == nil && detail.children.isEmpty {
+                Text("Not part of a delegation chain.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+    }
+
+    private func treeChip(run: RunRow) -> some View {
+        Button {
+            Task { await load(run.runId) }
+        } label: {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(stateColor(run.state))
+                    .frame(width: 5, height: 5)
+                Text("\(store.displayName(for: run.agentId)) · \(run.state)")
+                    .font(.system(size: 10.5))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color(white: 0.16)))
+        }
+        .buttonStyle(.plain)
+        .help(run.prompt)
+    }
+
+    private func stateColor(_ state: String) -> Color {
+        switch state {
+        case "done": return .green
+        case "running", "queued": return .orange
+        case "error": return .red
+        case "cancelled": return .gray
+        case "timeout": return .purple
+        default: return .gray
         }
     }
 
-    private var promptPreview: String {
-        String(run.prompt.prefix(60))
+    private func load(_ id: String) async {
+        runID = id
+        loaded = false
+        loadError = nil
+        do {
+            detail = try await store.client.runDetail(id)
+        } catch {
+            loadError = error.localizedDescription
+        }
+        loaded = true
     }
 }

@@ -126,6 +126,11 @@ public final class FleetStore: ObservableObject {
     @Published public private(set) var lastSyncError: String?
     /// Declared-target roster from GET /api/fleet/screens (refreshScreens).
     @Published public private(set) var screens: FleetScreensResponse?
+    /// Bot-to-bot thread list from GET /api/threads (refreshThreads).
+    @Published public private(set) var threads: [BotThread] = []
+    /// Newest runs across all agents (refreshActivity) — drives the
+    /// "working for X" roster line and user-vs-bot activity badges.
+    @Published public private(set) var activity: [FleetActivityItem] = []
     /// Agent currently displayed in the foreground window (drives unread +
     /// notification suppression; written to the shared UI file too).
     @Published public var foregroundAgentID: String? {
@@ -172,6 +177,8 @@ public final class FleetStore: ObservableObject {
         pollStatusIfNeeded()
         Task { await refreshAgents() }
         Task { await refreshScreens() }
+        Task { await refreshThreads() }
+        Task { await refreshActivity() }
     }
 
     /// GET /api/fleet/screens (called on start, on status-poll cycles, and
@@ -182,6 +189,52 @@ public final class FleetStore: ObservableObject {
         } catch {
             // Keep the last known roster; never surface noise for a busy UI.
         }
+    }
+
+    /// GET /api/threads — refreshed on start, on bot_message events, and on
+    /// demand (thread view appears / marks read). Best-effort.
+    public func refreshThreads() async {
+        do {
+            threads = try await client.threads()
+        } catch {
+            // Keep the last known list; never surface noise for a busy UI.
+        }
+    }
+
+    /// GET /api/fleet/activity — newest runs across ALL agents. Refreshed
+    /// on start and alongside status polling so "working for X" stays live.
+    public func refreshActivity() async {
+        do {
+            activity = try await client.fleetActivity(limit: 30)
+        } catch {
+            // Keep the last known list.
+        }
+    }
+
+    /// "working for <agent>" when the agent's active run was bot-initiated
+    /// (a handoff/message from another bot) — nil for user-initiated work.
+    public func workingFor(_ agentID: String) -> String? {
+        guard let run = activity.first(where: {
+            $0.agentId == agentID && ($0.state == "running" || $0.state == "queued")
+        }) else { return nil }
+        guard let from = run.fromAgent, !from.isEmpty else { return nil }
+        return displayName(for: from)
+    }
+
+    /// Messages of one thread (newest-first; the view reverses for display).
+    public func botMessages(threadID: String) async throws -> [BotMessage] {
+        try await client.botMessages(threadID: threadID)
+    }
+
+    /// Mark a thread read and refresh the unread counts.
+    public func markThreadRead(_ threadID: String) async {
+        _ = try? await client.markThreadRead(threadID)
+        await refreshThreads()
+    }
+
+    /// One run + its delegation tree (parent/children), for run detail.
+    public func runDetail(_ runID: String) async throws -> RunDetail {
+        try await client.runDetail(runID)
     }
 
     public func stop() {
@@ -252,6 +305,10 @@ public final class FleetStore: ObservableObject {
             }
         case "lagged":
             break // FleetStream reconnects; the replay covers the gap
+        case "bot_message":
+            // Bot-to-bot traffic landed; refresh the thread list so the UI
+            // sees it live (the open conversation re-fetches on appear).
+            Task { await self.refreshThreads() }
         default:
             break
         }
@@ -365,6 +422,7 @@ public final class FleetStore: ObservableObject {
                     }
                 }
                 await self.refreshScreens()
+                await self.refreshActivity()
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
             self?.statusPolling = false

@@ -176,18 +176,46 @@ public final class VertusHTTPClient {
         return try await get([RunRow].self, path: "/api/runs", key: "runs", query: q)
     }
 
-    /// GET /api/runs/<run_id> — the run row plus its chronological messages.
-    public func runDetail(_ runID: String) async throws -> (RunRow, [MessageRow]) {
-        let decoder = JSONDecoder.vertus()
+    /// GET /api/runs/<run_id> — the run row, its chronological messages,
+    /// and the delegation tree (parent + children), all navigable.
+    public func runDetail(_ runID: String) async throws -> RunDetail {
         let json = try await sendJSON("GET", path: "/api/runs/\(escaped(runID))", body: nil)
-        guard let data = try? JSONSerialization.data(withJSONObject: json),
-              let run = try? decoder.decode(RunRow.self, from: data),
-              let msgs = (json as? [String: Any])?["messages"] as? [[String: Any]],
-              let messagesData = try? JSONSerialization.data(withJSONObject: msgs),
-              let messages = try? decoder.decode([MessageRow].self, from: messagesData) else {
+        guard let data = try? JSONSerialization.data(withJSONObject: json) else {
             throw VertusError.decoding
         }
-        return (run, messages)
+        do {
+            return try JSONDecoder.vertus().decode(RunDetail.self, from: data)
+        } catch {
+            throw VertusError.decoding
+        }
+    }
+
+    // MARK: - Message bus (bot-to-bot)
+
+    /// GET /api/threads — thread list with unread counts.
+    public func threads(limit: Int = 50) async throws -> [BotThread] {
+        try await get([BotThread].self, path: "/api/threads", key: "threads",
+                      query: [URLQueryItem(name: "limit", value: String(limit))])
+    }
+
+    /// GET /api/messages — newest-first; optional involvement/thread/unread
+    /// filters; `before` is an exclusive created_at cursor.
+    public func botMessages(threadID: String? = nil, agentID: String? = nil,
+                            unread: Bool = false, limit: Int = 100,
+                            before: Double? = nil) async throws -> [BotMessage] {
+        var q = [URLQueryItem(name: "limit", value: String(limit))]
+        if let threadID { q.append(URLQueryItem(name: "thread_id", value: threadID)) }
+        if let agentID { q.append(URLQueryItem(name: "agent_id", value: agentID)) }
+        if unread { q.append(URLQueryItem(name: "unread", value: "1")) }
+        if let before { q.append(URLQueryItem(name: "before", value: String(before))) }
+        return try await get([BotMessage].self, path: "/api/messages", key: "messages", query: q)
+    }
+
+    /// POST /api/threads/<id>/read — mark a thread's messages read.
+    public func markThreadRead(_ threadID: String) async throws -> Int {
+        let json = try await sendJSON("POST", path: "/api/threads/\(escaped(threadID))/read",
+                                      body: [String: Any]())
+        return (json as? [String: Any])?["marked"] as? Int ?? 0
     }
 
     public func fleetActivity(limit: Int = 20) async throws -> [FleetActivityItem] {

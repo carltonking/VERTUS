@@ -40,6 +40,10 @@ final class StubHub {
     private var runSeq = 0
     private var messageSeq = 0
 
+    // Bot-to-bot messaging (mirror of bot_messages/threads).
+    private var botThreads: [[String: Any]] = []
+    private var botMessages: [[String: Any]] = []
+
     // Event log: global seq → envelope (type/agent_id/run_id/ts + payload).
     private var eventLog: [Int: [String: Any]] = [:]
     private var liveSeq = 0
@@ -55,6 +59,23 @@ final class StubHub {
     private var running = false
     private let lock = NSLock()
     private var threads: [Thread] = []
+
+    // MARK: - Test seeds (message bus + runs)
+
+    func addBotThread(_ thread: [String: Any]) {
+        lock.lock(); defer { lock.unlock() }
+        botThreads.append(thread)
+    }
+
+    func addBotMessage(_ msg: [String: Any]) {
+        lock.lock(); defer { lock.unlock() }
+        botMessages.append(msg)
+    }
+
+    func addRun(_ run: [String: Any]) {
+        lock.lock(); defer { lock.unlock() }
+        runs.append(run)
+    }
 
     deinit { stop() }
 
@@ -316,6 +337,10 @@ final class StubHub {
                 }])
             case "/api/fleet/activity":
                 response = json(200, ["activity": runs])
+            case "/api/threads":
+                response = json(200, ["threads": botThreads])
+            case "/api/messages":
+                response = json(200, ["messages": botMessages])
             case "/api/runs":
                 response = json(200, ["runs": runs])
             default:
@@ -336,7 +361,23 @@ final class StubHub {
                 }
             }
         } else if request.method == "POST" {
-            if path.hasPrefix("/api/runs/"), path.hasSuffix("/cancel") {
+            if path.hasPrefix("/api/threads/"), path.hasSuffix("/read") {
+                // Mirror the hub: mark every message in the thread read.
+                let tid = String(path.dropFirst("/api/threads/".count).dropLast("/read".count))
+                var marked = 0
+                lock.lock()
+                for i in botMessages.indices where botMessages[i]["thread_id"] as? String == tid {
+                    if botMessages[i]["read_at"] == nil {
+                        botMessages[i]["read_at"] = Date().timeIntervalSince1970
+                        marked += 1
+                    }
+                }
+                for i in botThreads.indices where botThreads[i]["thread_id"] as? String == tid {
+                    botThreads[i]["unread"] = 0
+                }
+                lock.unlock()
+                response = json(200, ["marked": marked])
+            } else if path.hasPrefix("/api/runs/"), path.hasSuffix("/cancel") {
                 let id = String(path.dropFirst("/api/runs/".count).dropLast("/cancel".count))
                 response = cancelRunResponse(id, request: request)
             } else if path.hasPrefix("/api/agents/"), path.hasSuffix("/cancel") {
@@ -436,7 +477,11 @@ final class StubHub {
         }
         let msgs = messages.filter { $0["run_id"] as? String == id }
             .sorted { ($0["id"] as! Int) < ($1["id"] as! Int) }
-        return json(200, ["run": run, "messages": msgs])
+        // Delegation tree: parent + children (v4 wire surface).
+        let parent = runs.first { $0["run_id"] as? String == run["parent_run_id"] as? String }
+        let children = runs.filter { $0["parent_run_id"] as? String == id }
+        return json(200, ["run": run, "messages": msgs,
+                          "parent": parent as Any, "children": children])
     }
 
     private func promptResponse(_ request: ReceivedRequest) -> (Int, Data) {

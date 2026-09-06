@@ -62,10 +62,21 @@ struct FleetActivityView: View {
                 .font(.system(size: 12, weight: .semibold))
                 .lineLimit(1)
                 .frame(width: 110, alignment: .leading)
+            if item.isBotInitiated {
+                Image(systemName: "arrow.turn.down.right")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.blue)
+                    .help("bot-initiated")
+            }
             Text(item.prompt)
                 .font(.system(size: 12))
                 .lineLimit(1)
             Spacer()
+            if item.isBotInitiated, let from = item.fromAgent, !from.isEmpty {
+                Text("for \(names[from] ?? from)")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.blue)
+            }
             if item.state == "running" || item.state == "queued" {
                 Text(item.state)
                     .font(.system(size: 10.5))

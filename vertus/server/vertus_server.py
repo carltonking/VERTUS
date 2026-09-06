@@ -2270,6 +2270,9 @@ class VertusHandler(BaseHTTPRequestHandler):
                 "started_at": r["started_at"],
                 "ended_at": r["ended_at"],
                 "gateway_respawns": r["gateway_respawns"],
+                "from_agent": r.get("from_agent"),
+                "run_kind": r.get("run_kind"),
+                "parent_run_id": r.get("parent_run_id"),
             }
             for r in rows
         ]

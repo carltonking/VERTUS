@@ -13,6 +13,7 @@ struct FleetSidebarView: View {
     @State private var confirmDelete: Agent?
     @State private var errorText: String?
     @State private var showScreens = false
+    @State private var showThreads = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -49,6 +50,17 @@ struct FleetSidebarView: View {
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.secondary)
 
+                Button {
+                    showThreads = true
+                    Task { await store.refreshThreads() }
+                } label: {
+                    Label("Bot threads", systemImage: "bubble.left.and.bubble.right")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+
                 connectionRow
             }
             .padding(10)
@@ -57,6 +69,11 @@ struct FleetSidebarView: View {
             FleetScreensSheetView()
                 .environmentObject(store)
                 .frame(width: 560, height: 460)
+        }
+        .sheet(isPresented: $showThreads) {
+            ThreadsView()
+                .environmentObject(store)
+                .frame(width: 780, height: 520)
         }
         .alert("Delete agent?", isPresented: Binding(
             get: { confirmDelete != nil },
@@ -162,7 +179,8 @@ struct FleetSidebarView: View {
                     }
                 }
                 // Degraded wins: the reason IS the one-liner. Then the
-                // blocked-target summary, then the live activity line.
+                // blocked-target summary, then "working for X" (bot-initiated
+                // turn), then the live activity line.
                 if let state = store.live[agent.id], state.isDegraded, let reason = state.degraded {
                     Text(reason)
                         .font(.system(size: 11, weight: .medium))
@@ -173,6 +191,16 @@ struct FleetSidebarView: View {
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.orange)
                         .lineLimit(1)
+                } else if let boss = store.workingFor(agent.id) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.turn.down.right")
+                            .font(.system(size: 8))
+                            .foregroundStyle(.blue)
+                        Text("working for \(boss)")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.blue)
+                            .lineLimit(1)
+                    }
                 } else if let activity = store.latestActivityText(for: agent.id) {
                     Text(activity)
                         .font(.system(size: 11))

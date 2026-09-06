@@ -47,6 +47,9 @@ final class QuickBarViewModel: ObservableObject {
         /// "waiting on <target> (held by <agent>)" while this agent's turn is
         /// gated on a declared screen target another run holds; nil otherwise.
         let blockedSummary: String?
+        /// Name of the bot this agent is working FOR (bot-initiated run), or
+        /// nil for user-initiated work — shown as a marker in the strip.
+        let workingFor: String?
     }
 
     init(config: ServerConfig = ServerConfig.load()) {
@@ -127,7 +130,8 @@ final class QuickBarViewModel: ObservableObject {
                                      emoji: agent?.emoji ?? "",
                                      name: agent?.displayName ?? id,
                                      running: state.isRunning,
-                                     blockedSummary: state.blockedSummary)
+                                     blockedSummary: state.blockedSummary,
+                                     workingFor: store.workingFor(id))
             }
             .sorted { $0.name < $1.name }
     }

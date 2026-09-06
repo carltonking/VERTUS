@@ -372,4 +372,98 @@ final class FleetStoreTests: XCTestCase {
         XCTAssertEqual(status.silenceS ?? 0, 0)
         XCTAssertFalse(status.isBusy)
     }
+
+    // MARK: - 11. Message bus wire surface (threads, messages, run tree)
+
+    func testThreadsAndMessagesDecodeAndMarkRead() async throws {
+        let a = try await makeAgent("alpha")
+        let b = try await makeAgent("beta")
+        hub.addBotThread([
+            "thread_id": "t-1", "subject": "delegation",
+            "participants": [a.id, b.id],
+            "created_at": 100.0, "last_message_at": 200.0, "unread": 2,
+        ])
+        hub.addBotMessage([
+            "msg_id": "m-1", "from_agent": a.id, "to_agent": b.id,
+            "thread_id": "t-1", "body": "do the thing", "kind": "handoff",
+            "depth": 1, "status": "delivered", "run_id": "r-child",
+            "created_at": 200.0, "read_at": nil as Any? ?? NSNull(),
+        ])
+        await store.refreshThreads()
+        XCTAssertEqual(store.threads.count, 1)
+        let thread = store.threads[0]
+        XCTAssertEqual(thread.subject, "delegation")
+        XCTAssertEqual(thread.participants.sorted(), [a.id, b.id].sorted())
+        XCTAssertEqual(thread.unread, 2)
+
+        let msgs = try await store.botMessages(threadID: "t-1")
+        XCTAssertEqual(msgs.count, 1)
+        XCTAssertEqual(msgs[0].kind, "handoff")
+        XCTAssertEqual(msgs[0].depth, 1)
+        XCTAssertEqual(msgs[0].fromAgent, a.id)
+
+        await store.markThreadRead("t-1")
+        XCTAssertEqual(store.threads[0].unread, 0, "mark-read refreshes the list")
+    }
+
+    func testRunDetailDecodesDelegationTree() async throws {
+        let a = try await makeAgent("alpha")
+        let b = try await makeAgent("beta")
+        let parentRun: [String: Any] = [
+            "run_id": "r-parent", "agent_id": a.id, "prompt": "do it",
+            "remote": 0, "source": "local", "state": "done",
+            "created_at": 1.0, "started_at": 1.0, "ended_at": 2.0,
+            "error": nil as Any?, "gateway_respawns": 0,
+            "from_agent": nil as Any?, "run_kind": "user",
+        ]
+        let childRun: [String: Any] = [
+            "run_id": "r-child", "agent_id": b.id, "prompt": "the task",
+            "remote": 0, "source": "bot:\(a.id)", "state": "done",
+            "created_at": 2.0, "started_at": 2.0, "ended_at": 3.0,
+            "error": nil as Any?, "gateway_respawns": 0,
+            "from_agent": a.id, "thread_id": "t-1", "run_kind": "handoff",
+            "parent_run_id": "r-parent",
+        ]
+        hub.addRun(parentRun)
+        hub.addRun(childRun)
+
+        let child = try await store.runDetail("r-child")
+        XCTAssertEqual(child.run.runKind, "handoff")
+        XCTAssertTrue(child.run.isBotInitiated)
+        XCTAssertEqual(child.parent?.runId, "r-parent")
+        XCTAssertTrue(child.children.isEmpty)
+
+        let parent = try await store.runDetail("r-parent")
+        XCTAssertEqual(parent.children.count, 1)
+        XCTAssertEqual(parent.children[0].runId, "r-child")
+        XCTAssertNil(parent.parent)
+    }
+
+    func testWorkingForDerivesFromActivity() async throws {
+        let a = try await makeAgent("alpha")
+        let b = try await makeAgent("beta")
+        // B is mid-turn on a handoff from A.
+        hub.addRun([
+            "run_id": "r-live", "agent_id": b.id, "prompt": "task",
+            "remote": false, "source": "bot:\(a.id)", "state": "running",
+            "created_at": 5.0, "started_at": 5.0, "ended_at": nil as Any?,
+            "error": nil as Any?, "gateway_respawns": 0,
+            "from_agent": a.id, "thread_id": "t-1", "run_kind": "handoff",
+            "parent_run_id": nil as Any?,
+        ])
+        await store.refreshActivity()
+        XCTAssertEqual(store.workingFor(b.id), "alpha", "busy bot-initiated run names the boss")
+        XCTAssertNil(store.workingFor(a.id), "user-initiated/idle agents have no boss")
+        // A run for another agent that is NOT busy must not mask the marker.
+        hub.addRun([
+            "run_id": "r-stale", "agent_id": b.id, "prompt": "old",
+            "remote": false, "source": "local", "state": "done",
+            "created_at": 4.0, "started_at": 4.0, "ended_at": 5.0,
+            "error": nil as Any?, "gateway_respawns": 0,
+            "from_agent": nil as Any?, "run_kind": "user",
+            "parent_run_id": nil as Any?,
+        ])
+        await store.refreshActivity()
+        XCTAssertEqual(store.workingFor(b.id), "alpha")
+    }
 }

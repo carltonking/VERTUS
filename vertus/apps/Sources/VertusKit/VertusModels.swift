@@ -220,25 +220,38 @@ public struct MessageRow: Codable, Identifiable, Equatable {
     public var createdAt: Double
 }
 
-/// One run row (runs table).
+/// One run row (runs table). v4 attribution fields: `fromAgent` (who asked
+/// for this turn — a bot id when message-driven), `threadId`, `runKind`
+/// (user|message|handoff|result), `parentRunId` (the delegator's live run
+/// for handoffs) — all optional and tolerated when absent.
 public struct RunRow: Codable, Identifiable, Equatable {
     public var runId: String
     public var agentId: String
     public var prompt: String
     public var remote: Int
     public var source: String
-    public var state: String       // queued|running|done|error|interrupted|abandoned
+    public var state: String       // queued|running|done|error|interrupted|abandoned|cancelled|timeout
     public var createdAt: Double
     public var startedAt: Double?
     public var endedAt: Double?
     public var error: String?
     public var gatewayRespawns: Int?
+    public var fromAgent: String?
+    public var threadId: String?
+    public var runKind: String?
+    public var parentRunId: String?
 
     public var id: String { runId }
 
     public var duration: TimeInterval? {
         guard let startedAt, let endedAt else { return nil }
         return endedAt - startedAt
+    }
+
+    /// True when a BOT asked for this turn (delegation or messaging).
+    public var isBotInitiated: Bool {
+        guard let fromAgent, !fromAgent.isEmpty else { return false }
+        return true
     }
 }
 
@@ -254,8 +267,56 @@ public struct FleetActivityItem: Codable, Identifiable, Equatable {
     public var startedAt: Double?
     public var endedAt: Double?
     public var gatewayRespawns: Int?
+    public var fromAgent: String?
+    public var runKind: String?
+    public var parentRunId: String?
 
     public var id: String { runId }
+
+    /// True when a BOT asked for this turn (delegation or messaging).
+    public var isBotInitiated: Bool {
+        guard let fromAgent, !fromAgent.isEmpty else { return false }
+        return true
+    }
+}
+
+// MARK: - Message bus (bot-to-bot)
+
+/// One bot-message row (bot_messages table).
+public struct BotMessage: Codable, Identifiable, Equatable {
+    public var msgId: String
+    public var fromAgent: String
+    public var toAgent: String
+    public var threadId: String
+    public var body: String
+    public var kind: String        // message | handoff | result
+    public var depth: Int
+    public var status: String      // delivered | dropped_depth | dropped_rate
+    public var runId: String?
+    public var createdAt: Double
+    public var readAt: Double?
+
+    public var id: String { msgId }
+}
+
+/// One thread row (threads table). `participants` is already parsed.
+public struct BotThread: Codable, Identifiable, Equatable {
+    public var threadId: String
+    public var subject: String
+    public var participants: [String]
+    public var createdAt: Double
+    public var lastMessageAt: Double
+    public var unread: Int
+
+    public var id: String { threadId }
+}
+
+/// GET /api/runs/<id> — the run, its messages, and the delegation tree.
+public struct RunDetail: Codable, Equatable {
+    public var run: RunRow
+    public var messages: [MessageRow]
+    public var parent: RunRow?
+    public var children: [RunRow]
 }
 
 /// A single SSE envelope, decoded from the flat JSON line.
