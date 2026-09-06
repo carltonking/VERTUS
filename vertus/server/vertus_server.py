@@ -66,6 +66,7 @@ try:
     from fleet_routines import (  # type: ignore
         RoutineManager, RoutineValidationError, parse_schedule, parse_trigger,
     )
+    from fleet_memory import MemoryStore, migrate_legacy_memory  # type: ignore
     from vertus_logging import setup_logging  # type: ignore
     from session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 except ImportError:  # pragma: no cover - only hit under package invocation
@@ -76,6 +77,7 @@ except ImportError:  # pragma: no cover - only hit under package invocation
     from .fleet_routines import (  # type: ignore
         RoutineManager, RoutineValidationError, parse_schedule, parse_trigger,
     )
+    from .fleet_memory import MemoryStore, migrate_legacy_memory  # type: ignore
     from .vertus_logging import setup_logging  # type: ignore
 
 VERTUS_DIR = Path.home() / ".vertus"
@@ -3046,6 +3048,17 @@ def subsystem_checks(store, routines, messenger, sessions, registry) -> dict:
             checks["registry"] = {"ok": True, "reason": "agent registry live"}
         except Exception as exc:  # noqa: BLE001
             checks["registry"] = {"ok": False, "reason": str(exc)[:200]}
+    memory = getattr(VertusHandler, "memory", None)
+    if memory is not None:
+        thr = getattr(memory, "_thread", None)
+        alive = thr is not None and thr.is_alive()
+        checks["memory"] = {
+            "ok": alive,
+            "reason": "memory watcher thread alive" if alive
+            else "memory watcher thread dead",
+        }
+    else:
+        checks["memory"] = {"ok": False, "reason": "fleet memory not wired"}
     return checks
 
 
@@ -3116,6 +3129,36 @@ def serve(host: str | None, port: int) -> None:
     # session manager lazily (mirrors BotMessenger's construction pattern).
     routines = RoutineManager(lambda: store, registry, lambda: sessions)
     VertusHandler.routines = routines
+    # Fleet memory: hub-owned canonical store + fork mirror + index + watcher
+    # (fleet_memory.py). Boot migration is idempotent (legacy pre-fleet
+    # memory folds into shared/ once; see .migrated_v1 marker). Events ride
+    # the store's writer -> fleet fanout path like every other wire event, so
+    # memory_changed reaches subscribers durably, store-before-fanout.
+    try:
+        migrated = migrate_legacy_memory()
+        if migrated.get("backup_path"):
+            print(f"[vertus] memory migration: backup at {migrated['backup_path']} "
+                  f"entries={migrated.get('entries')}")
+        elif migrated.get("skipped"):
+            print("[vertus] memory migration: already migrated, skipping")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vertus] memory migration failed: {exc}", file=sys.stderr)
+
+    def _running_agent_ids() -> set[str]:
+        """Writer attribution for poll-detected memory changes: the agents
+        currently mid-turn (never instantiates a bridge)."""
+        try:
+            return {a for a in sessions.live_ids()
+                    if (sessions.status(a) or {}).get("state") == "running"}
+        except Exception:
+            return set()
+
+    memory = MemoryStore(
+        emit=lambda agent_id, event: store.record_event(agent_id, "", event),
+        running_agents=_running_agent_ids,
+    )
+    memory.start()
+    VertusHandler.memory = memory
 
     def _composed_listener(envelope: dict) -> None:
         fleet.publish(envelope)
@@ -3184,6 +3227,10 @@ def serve(host: str | None, port: int) -> None:
         for server in servers:
             server.shutdown()
         routines.stop()
+        try:
+            memory.stop()
+        except Exception:
+            pass
 
 
 def main() -> None:

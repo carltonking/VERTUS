@@ -42,6 +42,15 @@ def hub(monkeypatch, tmp_path):
     vs.VertusHandler.store = store
     vs.VertusHandler.routines = routines
     vs.VertusHandler.messenger = messenger
+    # Fleet memory wired like serve(): events ride the store writer. Pointed
+    # at temp dirs so the health tests never touch the real ~/.vertus.
+    monkeypatch.setenv("VERTUS_MEMORY_DIR", str(tmp_path / "memory"))
+    memory = vs.MemoryStore(
+        emit=lambda aid, e: store.record_event(aid, "", e),
+        running_agents=lambda: set(),
+    )
+    memory.start()
+    vs.VertusHandler.memory = memory
     vs.VertusHandler.health_snapshot = vs.subsystem_checks(
         store, routines, messenger, mgr, registry
     )
@@ -52,6 +61,7 @@ def hub(monkeypatch, tmp_path):
     yield {"base": base, "store": store, "routines": routines, "mgr": mgr}
     server.shutdown()
     routines.stop()
+    memory.stop()
     # RESTORE the class attrs this fixture owns: a stopped store leaked onto
     # VertusHandler would 503 every later fixture's /api/prompt (store path
     # fails fast) and its stopped scheduler would report degraded — the
@@ -59,6 +69,7 @@ def hub(monkeypatch, tmp_path):
     vs.VertusHandler.store = None
     vs.VertusHandler.routines = None
     vs.VertusHandler.messenger = None
+    vs.VertusHandler.memory = None
     vs.VertusHandler.health_snapshot = {}
     vs.VertusHandler.fleet = None
 

@@ -561,7 +561,14 @@ class AgentRegistry:
             encoding="utf-8",
         )
 
-        # Engine-side memories dir (USER.md / MEMORY.md are engine-managed).
+        # Canonical memory dirs (hub-owned): the agent's private notes dir
+        # plus the fleet-shared dir. Home materialization must NEVER write
+        # or delete anything under home/memories/ — those two files
+        # (USER.md / MEMORY.md) are FORK-owned and mirror ONE-WAY into the
+        # canonical store (see fleet_memory._mirror_home_memories); touching
+        # them here would destroy fork writes. This mkdir is the ONLY
+        # interaction with that dir, and it is content-free.
+        self.ensure_memory_dirs(agent_id)
         (home / "memories").mkdir(parents=True, exist_ok=True)
 
         # Templated VERTUS skills with this agent's paths injected (the skill
