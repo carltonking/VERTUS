@@ -12,6 +12,7 @@ struct AgentChatView: View {
     @State private var submitError: String?
     @State private var runs: [RunRow] = []
     @State private var selectedRun: RunRow?
+    @State private var showHistory = false
     @State private var confirmStop = false
     @State private var stopError: String?
 
@@ -21,12 +22,14 @@ struct AgentChatView: View {
             Divider()
             transcript
             Divider()
-            runList
             composer
         }
         .sheet(item: $selectedRun) { run in
             PastRunView(run: run)
                 .frame(width: 680, height: 520)
+        }
+        .sheet(isPresented: $showHistory) {
+            historySheet
         }
         .alert("Couldn't send", isPresented: Binding(
             get: { submitError != nil },
@@ -127,6 +130,15 @@ struct AgentChatView: View {
                 .buttonStyle(.plain)
                 .help("Stop this run")
             }
+            Button {
+                showHistory = true
+            } label: {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Run history for \(store.agent(agentID)?.displayName ?? agentID)")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -200,61 +212,85 @@ struct AgentChatView: View {
         }
     }
 
-    // MARK: - Runs
+    // MARK: - Run history
 
-    private var runList: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Runs")
-                .font(.system(size: 10.5, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 12)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(runs) { run in
-                        runChip(run)
-                    }
+    /// The old horizontal chip strip above the composer is gone (Bug 3).
+    /// History lives behind the header's History button: a proper list,
+    /// newest-first, each row opening PastRunView (parent/children tree).
+    private var historySheet: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Run history")
+                    .font(.system(size: 14, weight: .semibold))
+                Spacer()
+                Button("Refresh") {
+                    Task { await loadRuns() }
                 }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 6)
+                Button("Close") { showHistory = false }
+                    .keyboardShortcut(.cancelAction)
             }
-        }
-        .padding(.top, 6)
-    }
-
-    private func runChip(_ run: RunRow) -> some View {
-        Button {
-            selectedRun = run
-        } label: {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(stateColor(run.state))
-                    .frame(width: 6, height: 6)
-                if run.isBotInitiated {
-                    Image(systemName: "arrow.turn.down.right")
-                        .font(.system(size: 8))
-                        .foregroundStyle(.blue)
-                        .help("bot-initiated")
-                } else if run.isRoutine {
+            .padding(12)
+            Divider()
+            if runs.isEmpty {
+                VStack(spacing: 8) {
                     Image(systemName: "clock.arrow.circlepath")
-                        .font(.system(size: 8))
-                        .foregroundStyle(.purple)
-                        .help("routine-initiated")
-                }
-                Text(run.prompt.prefix(34))
-                    .font(.system(size: 11))
-                    .lineLimit(1)
-                if let d = run.duration {
-                    Text(String(format: "%.0fs", d))
-                        .font(.system(size: 10))
+                        .font(.system(size: 30))
+                        .foregroundStyle(.secondary)
+                    Text("No runs yet for this agent.")
+                        .font(.system(size: 13))
                         .foregroundStyle(.secondary)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(runs) { run in
+                    Button {
+                        openHistory(run)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(stateColor(run.state))
+                                .frame(width: 7, height: 7)
+                            if run.isBotInitiated {
+                                Image(systemName: "arrow.turn.down.right")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.blue)
+                                    .help("bot-initiated")
+                            } else if run.isRoutine {
+                                Image(systemName: "clock.arrow.circlepath")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.purple)
+                                    .help("routine-initiated")
+                            }
+                            Text(run.prompt)
+                                .font(.system(size: 12))
+                                .lineLimit(1)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Text(run.state)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                            if let d = run.duration {
+                                Text(String(format: "%.0fs", d))
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(RoundedRectangle(cornerRadius: 7).fill(Color(white: 0.15)))
         }
-        .buttonStyle(.plain)
-        .help(run.prompt)
+        .frame(width: 560, height: 420)
+    }
+
+    /// Dismiss the history list, then present the run detail sheet on the
+    /// parent (two sheets on one view cannot overlap; the tick lets the
+    /// dismissal settle first).
+    private func openHistory(_ run: RunRow) {
+        showHistory = false
+        Task {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            selectedRun = run
+        }
     }
 
     private func stateColor(_ state: String) -> Color {
