@@ -44,6 +44,7 @@ import { join } from "node:path";
 import { contentText, type Model } from "@earendil-works/pi-ai";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { AgentSession, type AgentSessionConfig, type ModelMutationOptions } from "./agent-session.ts";
+import type { BashResult } from "./bash-executor.ts";
 import { getAgentDir } from "../config.ts";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8787";
@@ -250,6 +251,38 @@ export class HubSession extends AgentSession {
 
 	override async setModel(model: Model<any>, options: ModelMutationOptions = {}): Promise<void> {
 		this.noticeOnce("models", "hub mode: the model is owned by the agent profile (PATCH /api/agents/<id> {model}); it applies on the next turn via the hub's deferred respawn");
+	}
+
+	override async cycleModel(
+		direction: "forward" | "backward" = "forward",
+		options: ModelMutationOptions = {},
+	): Promise<any> {
+		this.noticeOnce("models", "hub mode: the model is owned by the agent profile — cycling is disabled here; change it in the Fleet app (bot editor) or PATCH /api/agents/<id>");
+		return undefined;
+	}
+
+	override setSteeringMode(mode: "all" | "one-at-a-time"): void {
+		this.noticeOnce("steering-mode", "hub mode: steering is delivered straight to the live turn on the hub — the local steering-mode setting has no effect");
+	}
+
+	override setFollowUpMode(mode: "all" | "one-at-a-time"): void {
+		this.noticeOnce("followup-mode", "hub mode: follow-ups queue in the terminal and drain as new hub turns — the local follow-up-mode setting has no effect");
+	}
+
+	override setAutoCompactionEnabled(enabled: boolean): void {
+		this.noticeOnce("compaction", "hub mode: compaction is unavailable — the agent's gateway manages its own context; restart the agent in the Fleet app if a turn is losing the thread");
+	}
+
+	override async executeBash(
+		command: string,
+		onChunk?: (chunk: string) => void,
+		options?: { excludeFromContext?: boolean; id?: string },
+	): Promise<BashResult> {
+		// Still run locally — it is a harmless scratch shell — but say plainly
+		// that the hub model never sees the output (the gateway has its own
+		// sandbox shell, so recordBashResult context injection is local-only).
+		this.noticeOnce("bash", "hub mode: interactive bash output stays local — the hub model cannot see it (the agent's gateway has its own sandbox shell)");
+		return super.executeBash(command, onChunk, options);
 	}
 
 	override async compact(customInstructions?: string): Promise<any> {
