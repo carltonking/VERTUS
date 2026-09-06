@@ -287,20 +287,6 @@ struct NotchPanelContent: View {
         return max(16.5, mid - windowLeft - 1)
     }
 
-    /// Left edge of the top-left slot — the old logo's left edge (its
-    /// center minus half its 14 pt frame), so the plus lands exactly where
-    /// the logo did.
-    private var logoLeft: CGFloat { logoCenterX - 7 }
-
-    /// ONE slot width for both states (the plus alone, and the
-    /// spinner + "Working" label): the swap must never shift the layout.
-    /// Fixed, so a state change can't re-measure and jitter.
-    private static let workingSlotWidth: CGFloat = 13 + 4 + ceil(
-        ("Working" as NSString).size(withAttributes: [
-            .font: NSFont.systemFont(ofSize: 10.5, weight: .medium),
-        ]).width
-    )
-
     /// Horizontal center of the new-session button (ZStack coords): mirror of
     /// the logo — centered between the window's right end and the notch.
     private var pencilCenterX: CGFloat {
@@ -367,35 +353,23 @@ struct NotchPanelContent: View {
         }
     }
 
-    // MARK: Top bar — top-left slot (attach file / Working), new session (right).
+    // MARK: Top bar — plus (attach file, always), new session (right).
 
     private var topBar: some View {
         ZStack(alignment: .topLeading) {
-            // Top-left slot, TWO states only (TopSlotPolicy): at rest and
-            // while output is streaming a plus; while the agent is working
-            // and no text has arrived, the logo spinner + "Working". Both
-            // states are ONE button — attach stays reachable mid-think.
-            // The frame width is the same in both states, so the swap on
-            // the first text delta never shifts the layout.
+            // Top-left slot: ALWAYS the plus / attach-file. The Working
+            // indicator lives in the session window (the transcript area,
+            // in the position the reply will occupy) — never here.
             Button(action: onPickFile) {
-                HStack(spacing: 4) {
-                    if model.isThinking {
-                        LogoSpinner(isBusy: true, size: 13)
-                        Text("Working")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.85))
-                    } else {
-                        Image(systemName: "plus")
-                            .font(.system(size: 13, weight: .semibold))
-                            .symbolRenderingMode(.monochrome)
-                            .foregroundStyle(.white)
-                    }
-                }
+                Image(systemName: "plus")
+                    .font(.system(size: 13, weight: .semibold))
+                    .symbolRenderingMode(.monochrome)
+                    .foregroundStyle(.white)
             }
             .buttonStyle(.plain)
             .help("Attach a file")
-            .frame(width: Self.workingSlotWidth, height: 14, alignment: .leading)
-            .position(x: logoLeft + Self.workingSlotWidth / 2, y: 12.5)
+            .frame(width: 14, height: 14)
+            .position(x: logoCenterX, y: 12.5)
 
             // New session: small square with a pencil. A VIEW reset — the
             // hub keeps the agent's full transcript and run history. If a
@@ -542,6 +516,11 @@ struct NotchPanelContent: View {
                 pendingMathPane         // mid-expression: keep the window
             } else if !model.transcript.isEmpty {
                 chatPane
+            } else if model.isThinking {
+                // Fresh view (new-session cut), reply not started: the
+                // Working indicator sits in the session window, in the
+                // position the reply will occupy.
+                thinkingBubble
             } else {
                 Color.clear
             }
@@ -623,6 +602,9 @@ struct NotchPanelContent: View {
                     ForEach(model.transcript) { entry in
                         TranscriptBubbleView(entry: entry).id(entry.id)
                     }
+                    if model.isThinking {
+                        thinkingBubble.id("thinking")
+                    }
                 }
                 .padding(.horizontal, 14)
                 .padding(.top, NotchPanelMetrics.chatTopPad)
@@ -695,13 +677,37 @@ struct NotchPanelContent: View {
         }
     }
 
-    /// Which bubble to keep pinned at the bottom while chatting: the newest
-    /// message entry (stable id).
+    /// Which bubble to keep pinned at the bottom while chatting: the Working
+    /// indicator while the reply is pending, otherwise the newest message
+    /// entry (stable id).
     private func scrollAnchor() -> AnyHashable {
+        if model.isThinking {
+            return "thinking"
+        }
         if let last = model.transcript.last {
             return last.id
         }
         return ""
+    }
+
+    /// "Working" — the logo spinner plus the label, in the session window
+    /// in the position the reply will occupy. Shown while the agent is
+    /// working and no text has arrived for the current view; the first text
+    /// delta replaces it in place.
+    private var thinkingBubble: some View {
+        HStack(spacing: 6) {
+            LogoSpinner(isBusy: true, size: 13)
+            Text("Working")
+                .font(.system(size: 12, weight: .regular))
+                .foregroundStyle(.white.opacity(0.7))
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(white: 0.22))
+        )
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: Divider — full-width 1.5 pt line at the top of the prompt bar.
@@ -991,6 +997,10 @@ struct QuickBarRootView: View {    @ObservedObject var expansionState: Expansion
             if index > 0 { content += 8 }              // gap between bubbles
             content += bubbleHeight(for: entry.text)   // 13 pt text + padding
         }
+        if model.isThinking {
+            content += 8                               // gap before the indicator
+            content += thinkingBubbleHeight
+        }
         let window = min(
             content + NotchPanelMetrics.chatTopPad + NotchPanelMetrics.outputBottomInset,
             NotchPanelMetrics.maxScrollWindowHeight
@@ -1001,6 +1011,12 @@ struct QuickBarRootView: View {    @ObservedObject var expansionState: Expansion
     /// AppKit line height (the iOS-only `lineHeight` doesn't exist here).
     private func lineHeight(of font: NSFont) -> CGFloat {
         font.ascender - font.descender + font.leading
+    }
+
+    /// Height of the in-window Working indicator (12 pt text + 7 pt padding
+    /// each side).
+    private var thinkingBubbleHeight: CGFloat {
+        lineHeight(of: NSFont.systemFont(ofSize: 12)) + 14
     }
 
     /// Height of a 13 pt message wrapped at the bubble's text width, plus

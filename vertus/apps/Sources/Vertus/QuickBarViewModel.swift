@@ -66,6 +66,17 @@ final class QuickBarViewModel: ObservableObject {
         store.selectedAgentID = selectedAgentID
         store.foregroundAgentID = selectedAgentID
         rewire()
+        // Arm the demo BEFORE store.start(): the store's first syncs can
+        // fire before the view's onAppear, and with demoWorking still false
+        // they would overwrite the seeded streaming state (the Working
+        // indicator would never show).
+        if CommandLine.arguments.contains("--demo-working") {
+            demoWorking = true
+            isStreaming = true
+            currentActivity = "working…"
+            turnHasText = false
+            sentAtLeastOnce = true
+        }
         store.start()
     }
 
@@ -117,17 +128,14 @@ final class QuickBarViewModel: ObservableObject {
     private func syncSelected() {
         guard let state = store.live[selectedAgentID] else { return }
         selectedLive = state
-        // Mirror with the new-session cut applied: hidden entries drop out,
-        // and the re-anchored in-flight reply is truncated to the text that
-        // streamed after the cut (still growing in place, same id).
-        transcript = state.transcript.compactMap { entry in
-            guard let text = viewCut.visibleText(of: entry) else { return nil }
-            // An assistant entry with no visible text yet (the reply right
-            // after a cut) is represented by the top-left Working indicator
-            // instead of an empty pill.
-            guard !text.isEmpty || entry.role == "user" else { return nil }
-            return Self.map(entry, text: text)
-        }
+        // Mirror with the new-session cut applied (PanelMirrorPolicy — the
+        // exact filter is unit-tested in VertusKitTests): hidden entries
+        // drop out, and the re-anchored in-flight reply is truncated to the
+        // text that streamed after the cut (still growing in place, same
+        // id). An assistant entry with no visible text yet is represented
+        // by the in-window Working indicator instead of an empty pill.
+        transcript = PanelMirrorPolicy.visible(entries: state.transcript, cut: viewCut)
+            .map { Self.map($0.source, text: $0.text) }
         if !demoWorking {
             isStreaming = state.isRunning
             currentActivity = state.currentActivity
@@ -136,10 +144,11 @@ final class QuickBarViewModel: ObservableObject {
         // Derived, not accumulated: has the CURRENT run (state.lastRunID)
         // produced visible text? A run started by another surface must not
         // inherit "has text" from an older conversation — otherwise the
-        // top-left slot shows the plus while the agent works with nothing
-        // on screen. First delta of THIS run flips it (TopSlotPolicy).
+        // in-window Working indicator would hide while the agent works with
+        // nothing on screen. First delta of THIS run flips it
+        // (WorkingIndicatorPolicy).
         let last = transcript.last
-        turnHasText = TopSlotPolicy.currentRunHasVisibleText(
+        turnHasText = WorkingIndicatorPolicy.currentRunHasVisibleText(
             lastEntryRunID: last?.runId,
             currentRunID: state.lastRunID,
             lastEntryIsReply: last?.role == "vertus",
@@ -328,10 +337,10 @@ final class QuickBarViewModel: ObservableObject {
         transcript.append(BarTranscriptEntry(role: "vertus", text: lines.joined(separator: "\n")))
     }
 
-    /// --demo-working: the top-left slot's Working state, deterministically
-    /// — streaming with no text yet (no hub involved). The slot must show
-    /// the logo spinner + "Working"; the plus returns only when a text
-    /// delta flips turnHasText or the turn ends.
+    /// --demo-working: the in-window Working indicator, deterministically
+    /// — streaming with no text yet (no hub involved). The session window
+    /// must show the logo spinner + "Working"; it is replaced in place by
+    /// the reply on the first text delta (or disappears at turn end).
     /// While set, syncSelected leaves the streaming/activity/turnHasText
     /// mirrors alone — otherwise live store updates (an actual run on the
     /// hub) would immediately trample the seeded Working state.
