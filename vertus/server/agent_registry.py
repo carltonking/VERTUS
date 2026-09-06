@@ -505,14 +505,61 @@ class AgentRegistry:
             cfg.pop("computer_use", None)
         (home / "config.yaml").write_text(_yaml_dump(cfg), encoding="utf-8")
 
-        # SOUL.md — the bot's persona. Empty persona removes any stale file so
-        # the tree stays derived (the engine re-seeds its default identity).
+        # SOUL.md — the bot's persona, plus a hub-generated fleet-context
+        # block appended at the end. The block is ALWAYS present (even for an
+        # empty persona — previously an empty persona removed SOUL.md so the
+        # engine re-seeded its default identity; the fleet block now always
+        # carries the identity line, so an empty persona still yields a valid
+        # persona file). It tells the bot which fleet it belongs to and where
+        # the delegation protocol lives — delegation is a persona+convention
+        # mechanism (no hub-side tool exists; the fork is off-limits), so
+        # this text IS the wiring. See fleet_messaging.py for the hub side.
+        fleet_block = (
+            "\n---\n"
+            "FLEET CONTEXT (hub-generated): you are agent `" + agent_id + "` "
+            "in the VERTUS fleet"
+            + (f" (\"{profile.get('name') or agent_id}\")" if profile.get("name") else "")
+            + ". Other bots exist and can do work for you. "
+            "Read FLEET.md in your home directory before messaging or "
+            "delegating to another bot — it documents the message API, the "
+            "handoff convention, and how results come back."
+        )
         soul = home / "SOUL.md"
         persona = str(profile.get("persona") or "").strip()
-        if persona:
-            soul.write_text(persona + "\n", encoding="utf-8")
-        elif soul.exists():
-            soul.unlink()
+        soul.write_text((persona + "\n" if persona else "# " + str(profile.get("name") or agent_id) + "\n") + fleet_block + "\n", encoding="utf-8")
+
+        # FLEET.md — the inter-bot protocol for THIS bot, spelled out so the
+        # model can follow it with curl. Derived state: rewritten on every
+        # profile write, so the self-identity can never drift from profile.json.
+        hub_url = os.environ.get("VERTUS_HUB_URL", "http://127.0.0.1:8787").strip().rstrip("/")
+        (home / "FLEET.md").write_text(
+            "# VERTUS Fleet — inter-bot protocol (hub-generated; derived state)\n\n"
+            f"You are agent `{agent_id}` (\"{profile.get('name') or agent_id}\") in the VERTUS fleet.\n"
+            f"The hub is at `{hub_url}` (override with the VERTUS_HUB_URL env var).\n"
+            "Your bearer token is the first line of `~/.vertus/token`.\n\n"
+            "## Sending a message\n"
+            "```bash\n"
+            f"curl -s -X POST {hub_url}/api/messages \\\n"
+            '  -H "Authorization: Bearer $(cat ~/.vertus/token)" \\\n'
+            '  -H "Content-Type: application/json" \\\n'
+            f'  -d \'{{"from": "{agent_id}", "to": "<target>", "body": "...", "kind": "message"}}\'\n'
+            "```\n"
+            "- `kind: message` — ordinary bot-to-bot message; creates a turn on the recipient.\n"
+            "- `kind: handoff` — DELEGATION. The recipient runs the task; its result comes "
+            "back to you automatically as a `kind=result` message in the same thread. "
+            "The response includes `run_id` — the handle of the child run.\n"
+            "- `kind: result` — returned by the hub; never send manually.\n"
+            "Pass the same `thread_id` to group a conversation; omit it to start a new thread.\n"
+            "After a handoff, poll the thread until the worker's `kind=result` arrives "
+            "(the hub wakes you with a turn of your own if you are idle):\n"
+            "```bash\n"
+            f"curl -s {hub_url}/api/messages?thread_id=<thread_id> \\\n"
+            '  -H "Authorization: Bearer $(cat ~/.vertus/token)"\n'
+            "```\n"
+            "Depth limit: message chains are capped at 5 hops; deeper messages are stored "
+            "with `status: dropped_depth` and never delivered.\n",
+            encoding="utf-8",
+        )
 
         # Engine-side memories dir (USER.md / MEMORY.md are engine-managed).
         (home / "memories").mkdir(parents=True, exist_ok=True)

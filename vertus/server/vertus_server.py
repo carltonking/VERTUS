@@ -59,6 +59,7 @@ try:
     from agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
     from run_store import RunStore, RUN_STATES, TERMINAL_STATES  # type: ignore
     from screen_lease import ScreenLeaseManager, SCREEN_POLICY_CAVEAT  # type: ignore
+    from fleet_messaging import BotMessenger, BotMessageError  # type: ignore
     from session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 except ImportError:  # pragma: no cover - only hit under package invocation
     from .agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
@@ -176,7 +177,7 @@ class AgentBridge:
     subscribers only.
     """
 
-    def __init__(self, agent_id: str = DEFAULT_AGENT_ID, create_session_factory=None, cwd: str | None = None, session_kwargs: dict | None = None, store=None, screen_leases=None, screen_targets=None) -> None:
+    def __init__(self, agent_id: str = DEFAULT_AGENT_ID, create_session_factory=None, cwd: str | None = None, session_kwargs: dict | None = None, store=None, screen_leases=None, screen_targets=None, on_run_terminal=None) -> None:
         self.agent_id = agent_id
         # Per-window computer-use ownership (Step: screen leases). ``None``
         # disables the gate (legacy / unit-test bridges). ``screen_targets``
@@ -243,6 +244,15 @@ class AgentBridge:
         # Events emitted by the engine's reader thread while the worker is
         # inside a turn are attributed to the run the worker is processing.
         self._current_run_id: str | None = None
+        # Bot-to-bot attribution of the current run (fleet message bus): who
+        # asked for this turn (from_agent), in which thread, and with which
+        # kind. ``on_run_terminal`` is the hub's BotMessenger.run_terminal —
+        # fired from _end_run so a delegated run reports its result back
+        # deterministically (never model-dependent).
+        self._run_from_agent: str | None = None
+        self._run_thread_id: str | None = None
+        self._run_kind: str = "user"
+        self._on_run_terminal = on_run_terminal
         self._run_buffer: list[str] | None = None   # folded at turn end
         self._run_respawns = 0
         self._run_had_error = False
@@ -399,7 +409,13 @@ class AgentBridge:
             self._emit({"type": "error", "message": msg[:500]})
         with self._status_lock:
             run_id = self._current_run_id
+            from_agent = self._run_from_agent
+            thread_id = self._run_thread_id
+            run_kind = self._run_kind
             self._current_run_id = None
+            self._run_from_agent = None
+            self._run_thread_id = None
+            self._run_kind = "user"
             self._run_buffer = None
             self._run_error_message = ""
             self._run_cancelled = None
@@ -414,6 +430,12 @@ class AgentBridge:
                     store.add_message(run_id, self.agent_id, "assistant", text)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[vertus] assistant message fold failed: {exc}", file=sys.stderr)
+        state = (
+            "cancelled" if cancelled == "cancelled"
+            else "timeout" if cancelled
+            else "error" if had_error
+            else "done"
+        )
         try:
             if cancelled == "cancelled":
                 store.finish_run(run_id, "cancelled", gateway_respawns=respawns)
@@ -433,6 +455,27 @@ class AgentBridge:
                 )
         except Exception as exc:  # noqa: BLE001
             print(f"[vertus] finish_run failed ({run_id}): {exc}", file=sys.stderr)
+        # Fleet message bus: a bot-driven run reports its result back to
+        # whoever asked (kind=result message in the same thread). Fired
+        # AFTER the terminal state is set, from the worker thread, outside
+        # every lock; the messenger never raises here (see run_terminal).
+        cb = self._on_run_terminal
+        if (
+            cb is not None
+            and run_id
+            and store is not None
+            and from_agent
+            and run_kind in ("message", "handoff")
+        ):
+            try:
+                summary = "".join(buffer).strip()[:400] if buffer else ""
+                cb(run_id, self.agent_id, from_agent, thread_id,
+                   run_kind, state, summary)
+            except Exception as exc:  # noqa: BLE001 — never break the worker
+                print(
+                    f"[vertus] run-terminal callback failed ({run_id}): {exc}",
+                    file=sys.stderr,
+                )
 
     def _load_pi(self):
         """Load the agent bridge: forked hermes engine by default, pi fallback.
@@ -537,8 +580,20 @@ class AgentBridge:
             # os.environ["VERTUS_REMOTE"] write was process-global — two
             # agents running concurrently overwrote each other's flag).
             # ``run_id`` is the store row created at enqueue time — the run
-            # context that stamps every event of this turn.
-            text, remote, run_id = item
+            # context that stamps every event of this turn. Items are dicts
+            # (prompt() packs them); the legacy 3-tuple shape is tolerated
+            # for tests.
+            if isinstance(item, dict):
+                text = item.get("text", "")
+                remote = bool(item.get("remote", False))
+                run_id = item.get("run_id")
+                from_agent = item.get("from_agent")
+                thread_id = item.get("thread_id")
+                run_kind = item.get("run_kind", "user")
+            else:
+                text, remote, run_id = item
+                from_agent = thread_id = None
+                run_kind = "user"
             # Run context is established HERE, at pop time (not in
             # _begin_run): a cancel can arrive while the turn waits on the
             # screen-lease gate, and from the pop onward it must address
@@ -546,6 +601,9 @@ class AgentBridge:
             # _cancelled_runs and folded into the flag the same way.
             with self._status_lock:
                 self._current_run_id = run_id
+                self._run_from_agent = from_agent
+                self._run_thread_id = thread_id
+                self._run_kind = run_kind
                 self._run_buffer = []
                 self._run_respawns = 0
                 self._run_had_error = False
@@ -948,16 +1006,25 @@ class AgentBridge:
         except Exception as exc:  # noqa: BLE001
             return {"commands": [], "skillCount": 0, "error": str(exc)[:200]}
 
-    def prompt(self, text: str, remote: bool, run_id: str | None = None) -> None:
+    def prompt(self, text: str, remote: bool, run_id: str | None = None,
+               from_agent: str | None = None, thread_id: str | None = None,
+               run_kind: str = "user") -> None:
         """Queue one turn. Raises RuntimeError after close() (hub → 409).
 
         ``run_id`` links every event of this turn to the store row created at
         enqueue time; None keeps the legacy (un-stored) path used by tests.
+        ``from_agent``/``thread_id``/``run_kind`` carry bot-to-bot
+        attribution (message bus / delegation): the worker tracks them so
+        _end_run can report the result back to the delegator.
         """
         with self._status_lock:
             if self._closed:
                 raise RuntimeError(f"agent {self.agent_id} is closed")
-        self._queue.put((text, remote, run_id))
+        self._queue.put({
+            "text": text, "remote": remote, "run_id": run_id,
+            "from_agent": from_agent, "thread_id": thread_id,
+            "run_kind": run_kind,
+        })
 
     # ------------------------------------------------------------------
     # Step A: turn introspection + lifecycle (reconfigure / close)
@@ -1024,6 +1091,16 @@ class AgentBridge:
             # holder named), not idle — and never as running.
             out["blocked_on_target"] = [dict(b) for b in waiting]
         return out
+
+    @property
+    def current_run_id(self) -> str | None:
+        """The run id of the turn in progress (None when idle).
+
+        The message bus uses it as the PARENT of a handoff child run, so the
+        delegation graph is a tree. Pure read under the status lock.
+        """
+        with self._status_lock:
+            return self._current_run_id
 
     @property
     def gateway_pgid(self) -> int | None:
@@ -1193,7 +1270,11 @@ class AgentBridge:
                 item = self._queue.get_nowait()
             except Empty:
                 break
-            _text, _remote, rid = item
+            # Items are dicts (prompt()); tolerate the legacy 3-tuple.
+            if isinstance(item, dict):
+                rid = item.get("run_id")
+            else:
+                _text, _remote, rid = item
             if rid is not None and (cancel is None or rid in cancel):
                 dropped.append(rid)
             else:
@@ -1495,6 +1576,10 @@ class VertusHandler(BaseHTTPRequestHandler):
                 since=self._query_param("since"),
                 run_id=self._query_param("run_id"),
             )
+        elif path == "/api/messages":
+            self._handle_messages_list()
+        elif path == "/api/threads":
+            self._handle_threads_list()
         elif path == "/api/approvals":
             self._handle_approvals_list()
         elif path == "/api/runs":
@@ -1580,6 +1665,10 @@ class VertusHandler(BaseHTTPRequestHandler):
                 "run_id": run_id,
                 "sandbox_path": sandbox_path,
             })
+        elif route == "/api/messages":
+            self._handle_message_send(payload)
+        elif route.startswith("/api/threads/") and route.endswith("/read"):
+            self._handle_thread_read(route[len("/api/threads/"):-len("/read")].strip("/"))
         elif route == "/api/agents":
             raw_name = payload.get("name")
             if not isinstance(raw_name, str) or not raw_name.strip():
@@ -1984,6 +2073,15 @@ class VertusHandler(BaseHTTPRequestHandler):
             return default
         return max(1, min(value, cap))
 
+    def _float_param(self, name: str) -> float | None:
+        raw = self._query_param(name)
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
     def _handle_agent_messages(self, agent_id: str) -> None:
         """GET /api/agents/<id>/messages — paginated folded messages."""
         if not agent_id:
@@ -2028,10 +2126,13 @@ class VertusHandler(BaseHTTPRequestHandler):
         self._json(200, {"runs": rows})
 
     def _handle_run_get(self, run_id: str) -> None:
-        """GET /api/runs/<run_id> — one run + its folded messages.
+        """GET /api/runs/<run_id> — one run + messages + delegation tree.
 
-        Works for deleted agents too: run history is the record of what the
-        bot did and is deliberately NOT removed by DELETE /api/agents.
+        ``parent`` is the run that delegated this one (if any) and
+        ``children`` are the runs this one spawned — so a delegation chain
+        is navigable end to end. Works for deleted agents too: run history
+        is the record of what the bot did and is deliberately NOT removed by
+        DELETE /api/agents.
         """
         store = self._history_store()
         if store is None:
@@ -2043,7 +2144,96 @@ class VertusHandler(BaseHTTPRequestHandler):
         if run is None:
             self._json(404, {"error": f"run not found: {run_id}"})
             return
-        self._json(200, {"run": run, "messages": store.run_messages(run_id)})
+        parent = None
+        if run.get("parent_run_id"):
+            parent = store.get_run(run["parent_run_id"])
+        self._json(200, {
+            "run": run,
+            "messages": store.run_messages(run_id),
+            "parent": parent,
+            "children": store.children_of(run_id),
+        })
+
+    def _handle_message_send(self, payload: dict) -> None:
+        """POST /api/messages — send one bot-to-bot message (or handoff).
+
+        Delivered messages become turns on the recipient (kind=result never
+        spawns a run; kind=handoff records the delegator's live run as
+        parent). Depth/rate-capped messages are STORED with a dropped status
+        and returned as such — never silently discarded, never raising.
+        """
+        messenger = self.messenger
+        if messenger is None:
+            self._json(503, {"error": "message bus unavailable"})
+            return
+        from_agent = str(payload.get("from") or "").strip()
+        to_agent = str(payload.get("to") or "").strip()
+        body = payload.get("body")
+        thread_id = payload.get("thread_id")
+        kind = str(payload.get("kind") or "message")
+        try:
+            result = messenger.send(
+                from_agent, to_agent, str(body or ""),
+                thread_id=thread_id, kind=kind,
+            )
+        except BotMessageError as exc:
+            self._json(exc.status, {"error": str(exc)})
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._json(503, {"error": str(exc)[:200]})
+            return
+        self._json(202 if result["status"] == "delivered" else 200, result)
+
+    def _handle_messages_list(self) -> None:
+        """GET /api/messages?agent_id=&thread_id=&unread=&limit=&before="""
+        messenger = self.messenger
+        if messenger is None:
+            self._json(503, {"error": "message bus unavailable"})
+            return
+        agent_id = self._query_param("agent_id") or None
+        thread_id = self._query_param("thread_id") or None
+        unread = self._query_param("unread") == "1"
+        limit = self._limit_param("limit", 50, 200)
+        before = self._float_param("before")
+        try:
+            rows = messenger.list_messages(
+                agent_id=agent_id, thread_id=thread_id, unread=unread,
+                limit=limit, before=before,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._json(503, {"error": str(exc)[:200]})
+            return
+        self._json(200, {"messages": rows})
+
+    def _handle_threads_list(self) -> None:
+        """GET /api/threads — thread list with unread counts."""
+        messenger = self.messenger
+        if messenger is None:
+            self._json(503, {"error": "message bus unavailable"})
+            return
+        limit = self._limit_param("limit", 50, 200)
+        try:
+            rows = messenger.list_threads(limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            self._json(503, {"error": str(exc)[:200]})
+            return
+        self._json(200, {"threads": rows})
+
+    def _handle_thread_read(self, thread_id: str) -> None:
+        """POST /api/threads/<id>/read — mark a thread's messages read."""
+        messenger = self.messenger
+        if messenger is None:
+            self._json(503, {"error": "message bus unavailable"})
+            return
+        if not thread_id:
+            self._json(404, {"error": "not found"})
+            return
+        try:
+            marked = messenger.mark_thread_read(thread_id)
+        except Exception as exc:  # noqa: BLE001
+            self._json(503, {"error": str(exc)[:200]})
+            return
+        self._json(200, {"marked": marked, "thread_id": thread_id})
 
     def _handle_approvals_list(self) -> None:
         """GET /api/approvals?state= — read-only approval ledger.
@@ -2342,7 +2532,8 @@ def resolve_session_kwargs(registry: AgentRegistry, agent_id: str) -> dict:
 
 
 def build_session_manager(registry: AgentRegistry, factory=None,
-                          screen_leases: ScreenLeaseManager | None = None) -> SessionManager:
+                          screen_leases: ScreenLeaseManager | None = None,
+                          on_run_terminal=None) -> SessionManager:
     """One SessionManager for the hub: primary prewarmed, others lazy.
 
     Each bridge is created with its agent's sandbox dir as the session cwd
@@ -2361,12 +2552,20 @@ def build_session_manager(registry: AgentRegistry, factory=None,
         # lease kwargs are passed ONLY when a manager is actually wired so
         # test harnesses that monkeypatch ``AgentBridge`` with fakes (which
         # accept the historical 3-kwarg signature) keep working unchanged.
+        # ``on_run_terminal`` is added to the AgentBridge call ONLY when a
+        # messenger is actually wired (serve() passes one; test harnesses
+        # monkeypatch AgentBridge with fakes that accept the historical
+        # 3-kwarg signature — same rule as the lease kwargs above).
+        terminal_kwargs = {} if on_run_terminal is None else {
+            "on_run_terminal": on_run_terminal,
+        }
         if screen_leases is None:
             def factory(agent_id: str):
                 return AgentBridge(
                     agent_id=agent_id,
                     cwd=resolve_sandbox_cwd(registry, agent_id),
                     session_kwargs=resolve_session_kwargs(registry, agent_id),
+                    **terminal_kwargs,
                 )
         else:
             def factory(agent_id: str):
@@ -2385,6 +2584,7 @@ def build_session_manager(registry: AgentRegistry, factory=None,
                     session_kwargs=resolve_session_kwargs(registry, agent_id),
                     screen_leases=screen_leases,
                     screen_targets=targets_resolver,
+                    **terminal_kwargs,
                 )
     return SessionManager(
         registry,
@@ -2472,7 +2672,19 @@ def serve(host: str | None, port: int) -> None:
     try:
         primary = registry.ensure_primary()
         print(f"[vertus] agents root: {registry.root} (primary: {primary['id']})")
-        sessions = build_session_manager(registry, screen_leases=screen_leases)
+        # Fleet message bus: store-backed bot-to-bot messaging + delegation.
+        # Built BEFORE the session manager so every bridge's on_run_terminal
+        # callback is the messenger's; its store/session providers are
+        # lambdas over locals assigned in later serve() steps (resolved at
+        # call time, so construction order stays irrelevant).
+        messenger = BotMessenger(
+            lambda: store, lambda: sessions, registry
+        )
+        VertusHandler.messenger = messenger
+        sessions = build_session_manager(
+            registry, screen_leases=screen_leases,
+            on_run_terminal=messenger.run_terminal,
+        )
         VertusHandler.sessions = sessions
         print("[vertus] agent session prewarm starting (primary)…", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001

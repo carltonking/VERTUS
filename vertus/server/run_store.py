@@ -31,6 +31,16 @@ Schema
            type TEXT, payload TEXT)   -- type: text|activity|done|error|cancelled
     messages(id INTEGER PK AUTOINCREMENT, run_id, agent_id, role TEXT,
              text TEXT, created_at REAL)     -- role: user|assistant
+    bot_messages(msg_id TEXT PK, from_agent, to_agent, thread_id, body,
+                 kind, depth INT, status, run_id, created_at, read_at)
+                 kind in: message | handoff | result
+                 status in: delivered | dropped_depth | dropped_rate
+    threads(thread_id TEXT PK, subject, participants JSON, created_at,
+            last_message_at)
+
+runs additionally carry bot-to-bot attribution (added by _migrate):
+    from_agent, thread_id, run_kind (user|message|handoff|result),
+    parent_run_id.
 
 ``events.seq`` is the fleet-wide monotonic cursor: ONE sequence across all
 agents, so ``since=`` replay on the fleet stream is a single ordered cursor.
@@ -125,6 +135,31 @@ CREATE INDEX IF NOT EXISTS idx_events_run_seq  ON events(run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_agent_created ON messages(agent_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_created ON runs(created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_agent_state ON runs(agent_id, state);
+CREATE TABLE IF NOT EXISTS bot_messages(
+  msg_id TEXT PRIMARY KEY,
+  from_agent TEXT NOT NULL,
+  to_agent TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  body TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'message',
+  depth INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'delivered',
+  run_id TEXT,
+  created_at REAL NOT NULL,
+  read_at REAL
+);
+CREATE TABLE IF NOT EXISTS threads(
+  thread_id TEXT PRIMARY KEY,
+  subject TEXT NOT NULL DEFAULT '',
+  participants TEXT NOT NULL DEFAULT '[]',
+  created_at REAL NOT NULL,
+  last_message_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bot_messages_thread ON bot_messages(thread_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_bot_messages_to ON bot_messages(to_agent, created_at);
+CREATE INDEX IF NOT EXISTS idx_bot_messages_thread_read ON bot_messages(thread_id, read_at);
+CREATE INDEX IF NOT EXISTS idx_threads_last ON threads(last_message_at);
+CREATE INDEX IF NOT EXISTS idx_bot_messages_run ON bot_messages(run_id);
 CREATE TABLE IF NOT EXISTS approvals(
   approval_id TEXT PRIMARY KEY,
   run_id TEXT,
@@ -154,6 +189,7 @@ class RunStore:
             conn.execute("PRAGMA busy_timeout=5000")
             conn.execute("PRAGMA wal_autocheckpoint=1000")
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
         finally:
             conn.close()
         self._queue: queue.Queue = queue.Queue()
@@ -166,6 +202,32 @@ class RunStore:
         # committed (never under the caller's lock). The hub uses it to push
         # committed envelopes to fleet-stream subscriber queues.
         self.listener: Optional[Callable[[dict], None]] = None
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Idempotent column/index migrations for PRE-EXISTING databases.
+
+        ``_SCHEMA`` uses CREATE TABLE IF NOT EXISTS, which never adds
+        columns to an existing runs table, so the bot-to-bot attribution
+        columns must be ALTERed in here (SQLite has no IF NOT EXISTS for
+        columns; PRAGMA table_info guards each one). Fresh databases are
+        created by _SCHEMA without these columns and pick them up here too
+        — the two paths must stay in lockstep with create_run().
+        """
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+        if "from_agent" not in cols:
+            conn.execute("ALTER TABLE runs ADD COLUMN from_agent TEXT")
+        if "thread_id" not in cols:
+            conn.execute("ALTER TABLE runs ADD COLUMN thread_id TEXT")
+        if "run_kind" not in cols:
+            conn.execute(
+                "ALTER TABLE runs ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'user'"
+            )
+        if "parent_run_id" not in cols:
+            conn.execute("ALTER TABLE runs ADD COLUMN parent_run_id TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs(parent_run_id)"
+        )
 
     # ------------------------------------------------------------------
     # Writer plumbing
@@ -370,8 +432,14 @@ class RunStore:
     # ------------------------------------------------------------------
 
     def create_run(self, agent_id: str, prompt: str, remote: bool,
-                   source: str = "") -> str:
-        """Insert the run row in state=queued; returns the run_id."""
+                   source: str = "", from_agent: str | None = None,
+                   thread_id: str | None = None, run_kind: str = "user",
+                   parent_run_id: str | None = None) -> str:
+        """Insert the run row in state=queued; returns the run_id.
+
+        ``from_agent``/``thread_id``/``run_kind``/``parent_run_id`` carry
+        bot-to-bot attribution (message-driven runs, delegation chains).
+        """
         run_id = uuid.uuid4().hex
         now = time.time()
         out: dict = {}
@@ -379,8 +447,10 @@ class RunStore:
         def op(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "INSERT INTO runs(run_id, agent_id, prompt, remote, source, state, "
-                "created_at) VALUES (?, ?, ?, ?, ?, 'queued', ?)",
-                (run_id, agent_id, prompt, 1 if remote else 0, source, now),
+                "created_at, from_agent, thread_id, run_kind, parent_run_id) "
+                "VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)",
+                (run_id, agent_id, prompt, 1 if remote else 0, source, now,
+                 from_agent, thread_id, run_kind or "user", parent_run_id),
             )
 
         self._submit(op, out)
@@ -442,6 +512,170 @@ class RunStore:
             )
 
         self._submit(op, out)
+
+    # ------------------------------------------------------------------
+    # Bot-to-bot messaging (fleet message bus)
+    # ------------------------------------------------------------------
+
+    def store_bot_message(self, from_agent: str, to_agent: str, body: str,
+                          thread_id: str, kind: str, depth: int,
+                          status: str = "delivered",
+                          run_id: str | None = None) -> dict:
+        """Insert one bot message + upsert its thread; returns the row dict.
+
+        The thread upsert runs in the SAME writer op as the message insert,
+        so participants/ordering can never diverge. ``status`` is decided by
+        the hub BEFORE this call (delivered | dropped_depth | dropped_rate);
+        a dropped message is still stored — it is the record of the attempt.
+        """
+        msg_id = uuid.uuid4().hex
+        now = time.time()
+        out: dict = {}
+
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT INTO bot_messages(msg_id, from_agent, to_agent, "
+                "thread_id, body, kind, depth, status, run_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (msg_id, from_agent, to_agent, thread_id, body, kind, depth,
+                 status, run_id, now),
+            )
+            # Upsert the thread: subject is set on FIRST sight only;
+            # participants and last_message_at update on every message.
+            row = conn.execute(
+                "SELECT participants FROM threads WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            if row is None:
+                participants = sorted(set([from_agent, to_agent]))
+                conn.execute(
+                    "INSERT INTO threads(thread_id, subject, participants, "
+                    "created_at, last_message_at) VALUES (?, ?, ?, ?, ?)",
+                    (thread_id, body[:80], json.dumps(participants), now, now),
+                )
+            else:
+                participants = sorted(set(json.loads(row[0]) + [from_agent, to_agent]))
+                conn.execute(
+                    "UPDATE threads SET participants = ?, last_message_at = ? "
+                    "WHERE thread_id = ?",
+                    (json.dumps(participants), now, thread_id),
+                )
+            out["row"] = {
+                "msg_id": msg_id, "from_agent": from_agent, "to_agent": to_agent,
+                "thread_id": thread_id, "body": body, "kind": kind,
+                "depth": depth, "status": status, "run_id": run_id,
+                "created_at": now, "read_at": None,
+            }
+
+        self._submit(op, out)
+        return dict(out["row"])
+
+    def set_bot_message_run(self, msg_id: str, run_id: str) -> None:
+        """Link a delivered message to the run it created (delegation handle)."""
+        out: dict = {}
+
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE bot_messages SET run_id = ? WHERE msg_id = ?",
+                (run_id, msg_id),
+            )
+
+        self._submit(op, out)
+
+    def bot_message_depth(self, from_agent: str, thread_id: str) -> int:
+        """Depth of the latest message FROM ``from_agent`` in the thread.
+
+        The hub computes a bot's next depth as this + 1; result replies
+        reuse the depth of the message that triggered them instead (the hub
+        passes it explicitly), so results never inflate a chain.
+        """
+        rows = self._read(lambda c: c.execute(
+            "SELECT depth FROM bot_messages WHERE from_agent = ? AND thread_id = ? "
+            "ORDER BY created_at DESC, msg_id DESC LIMIT 1",
+            (from_agent, thread_id),
+        ).fetchall())
+        return int(rows[0]["depth"]) if rows else 0
+
+    def message_run_depth(self, run_id: str) -> int:
+        """Depth of the bot message that created ``run_id`` (0 when none).
+
+        Used for auto-generated kind=result replies: the result keeps the
+        depth of the handoff/message that triggered it so chains count hops
+        exactly once.
+        """
+        rows = self._read(lambda c: c.execute(
+            "SELECT depth FROM bot_messages WHERE run_id = ? LIMIT 1", (run_id,)
+        ).fetchall())
+        return int(rows[0]["depth"]) if rows else 0
+
+    def list_bot_messages(self, agent_id: str | None = None,
+                          thread_id: str | None = None, unread: bool = False,
+                          limit: int = 100, before: float | None = None) -> list[dict]:
+        """Newest-first bot messages, optional involvement/thread/unread filters.
+
+        ``agent_id`` filters to messages the agent sent OR received;
+        ``unread`` filters to read_at IS NULL. ``before`` is an exclusive
+        created_at cursor for pagination.
+        """
+        sql = "SELECT * FROM bot_messages WHERE 1=1"
+        params: list = []
+        if agent_id is not None:
+            sql += " AND (from_agent = ? OR to_agent = ?)"
+            params += [agent_id, agent_id]
+        if thread_id is not None:
+            sql += " AND thread_id = ?"
+            params.append(thread_id)
+        if unread:
+            sql += " AND read_at IS NULL"
+        if before is not None:
+            sql += " AND created_at < ?"
+            params.append(float(before))
+        sql += " ORDER BY created_at DESC, msg_id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        rows = self._read(lambda c: c.execute(sql, params).fetchall())
+        return [dict(r) for r in rows]
+
+    def list_threads(self, limit: int = 100) -> list[dict]:
+        """Newest-first threads with unread counts (read_at IS NULL)."""
+        rows = self._read(lambda c: c.execute(
+            "SELECT t.*, (SELECT COUNT(*) FROM bot_messages m "
+            "WHERE m.thread_id = t.thread_id AND m.read_at IS NULL) AS unread "
+            "FROM threads t ORDER BY t.last_message_at DESC LIMIT ?", (int(limit),)
+        ).fetchall())
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["participants"] = json.loads(d["participants"])
+            except (TypeError, ValueError):
+                d["participants"] = []
+            out.append(d)
+        return out
+
+    def mark_thread_read(self, thread_id: str) -> int:
+        """Mark every message in the thread read; returns how many."""
+        out: dict = {}
+
+        def op(conn: sqlite3.Connection) -> None:
+            cur = conn.execute(
+                "UPDATE bot_messages SET read_at = ? "
+                "WHERE thread_id = ? AND read_at IS NULL",
+                (time.time(), thread_id),
+            )
+            out["count"] = cur.rowcount
+
+        self._submit(op, out)
+        return int(out.get("count", 0))
+
+    def children_of(self, run_id: str) -> list[dict]:
+        """Runs whose parent is ``run_id`` (delegation children), newest first."""
+        rows = self._read(lambda c: c.execute(
+            "SELECT * FROM runs WHERE parent_run_id = ? "
+            "ORDER BY created_at DESC, run_id DESC", (run_id,)
+        ).fetchall())
+        return [dict(r) for r in rows]
 
     def finish_run(self, run_id: str, state: str, error: str | None = None,
                    gateway_respawns: int | None = None) -> bool:

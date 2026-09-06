@@ -452,6 +452,7 @@ _ENGINE_ENV_ALLOWLIST = (
     "HERMES_IGNORE_RULES",
     "HERMES_CUA_DRIVER_CMD",  # computer-use driver (fleet default)
     "HERMES_COMPUTER_USE_BACKEND",  # per-agent CUA kill switch ("noop")
+    "VERTUS_HUB_URL",          # fleet hub base URL (FLEET.md convention)
 
     "PATH",
     "HOME",
