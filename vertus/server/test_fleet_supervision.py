@@ -43,7 +43,7 @@ from screen_lease import ScreenLeaseManager  # noqa: E402
 TARGET = "com.apple.TextEdit"
 
 
-def _wait_until(pred, timeout=10.0, step=0.02):
+def _wait_until(pred, timeout=30.0, step=0.02):
     deadline = time.time() + timeout
     while time.time() < deadline:
         if pred():

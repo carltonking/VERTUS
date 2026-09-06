@@ -6,6 +6,12 @@ inventory attributes drivers to gateways via process group.
 These tests use REAL processes (a fake gateway group leader + a fake driver
 child) because the reaping is group-signal based — a fake session object
 would not exercise killpg. Each test cleans up its own processes.
+
+All of them are marked ``serial``: they spawn real subprocesses that
+compete with the rest of the suite for process slots and CPU, and their
+deadlines are generous (15-30s) precisely because under full-suite load a
+SIGKILLed child can take a while to be reaped. ``-m 'not serial'`` skips
+them for a quick non-process smoke pass.
 """
 
 from __future__ import annotations
@@ -20,6 +26,9 @@ import pytest
 
 from hermes_bridge import _HermesSession
 from vertus_server import VertusHandler, reap_orphaned_drivers
+
+# Every test in this file spawns real processes; see the module docstring.
+pytestmark = pytest.mark.serial
 
 # Fake gateway leader: spawns one "driver" child (a long sleep with a
 # cua-driver-looking argv) then sleeps itself.
@@ -68,7 +77,7 @@ def _alive(pid: int) -> bool:
         return False
 
 
-def _wait_gone(pids: list[int], timeout: float = 5.0) -> bool:
+def _wait_gone(pids: list[int], timeout: float = 30.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not any(_alive(p) for p in pids):
@@ -88,7 +97,7 @@ def _killpg(pgid: int) -> None:
 def gateway_group():
     leader = _spawn_gateway_group()
     # The driver child must exist before we assert on it.
-    deadline = time.time() + 5
+    deadline = time.time() + 15
     while time.time() < deadline and len(_group_members(leader.pid)) < 2:
         time.sleep(0.05)
     yield leader
@@ -124,13 +133,16 @@ def test_natural_exit_reaps_driver_child(gateway_group):
     leader = gateway_group
     members = _group_members(leader.pid)
     assert len(members) == 2, members
+    driver = members[1] if members[1] != leader.pid else members[0]
     os.kill(leader.pid, signal.SIGKILL)
-    leader.wait(timeout=5)
+    leader.wait(timeout=15)
     # Leader gone; the driver survives in the group (the old leak).
-    assert _alive(members[1] if members[1] != leader.pid else members[0])
+    assert _alive(driver)
     session = _raw_session(leader)
     session._reap_group(grace=0.2)
-    assert _wait_gone([leader.pid]), "driver still alive after reap"
+    # The point of the test: the reap killed the DRIVER, not just the leader
+    # (the old code reaped the already-dead leader and left the driver).
+    assert _wait_gone([driver]), "driver still alive after reap"
 
 
 def test_reap_group_idempotent_when_empty():
@@ -138,7 +150,7 @@ def test_reap_group_idempotent_when_empty():
     leader = _spawn_gateway_group()
     try:
         _killpg(leader.pid)
-        leader.wait(timeout=5)
+        leader.wait(timeout=15)
         session = _raw_session(leader)
         session._reap_group(grace=0.2)  # must not raise
         session._reap_group(grace=0.2)
@@ -162,9 +174,9 @@ def _spawn_orphan(argv_tail: list[str]) -> int:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    parent.wait(timeout=5)
+    parent.wait(timeout=15)
     marker = argv_tail[-1]
-    deadline = time.time() + 5
+    deadline = time.time() + 15
     while time.time() < deadline:
         for pid, ppid, _gid, cmd in _ps_rows():
             if ppid == 1 and marker in cmd:
