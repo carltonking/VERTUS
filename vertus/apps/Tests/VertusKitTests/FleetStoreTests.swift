@@ -466,4 +466,27 @@ final class FleetStoreTests: XCTestCase {
         await store.refreshActivity()
         XCTAssertEqual(store.workingFor(b.id), "alpha")
     }
+
+    // MARK: VERTUS_HUB_URL precedence (VERTUS_HUB_URL > UserDefaults > default)
+
+    func testHubURLPrecedence() throws {
+        let defaults = UserDefaults.standard
+        let prior = defaults.string(forKey: "vertus.baseURL")
+        defer { if let prior { defaults.set(prior, forKey: "vertus.baseURL") } else { defaults.removeObject(forKey: "vertus.baseURL") } }
+
+        defaults.set("http://defaults-host:1111", forKey: "vertus.baseURL")
+
+        // Env wins over defaults.
+        let env = ServerConfig.load(environment: ["VERTUS_HUB_URL": "http://env-host:2222"])
+        XCTAssertEqual(env.baseURL, "http://env-host:2222")
+
+        // Defaults win over the built-in default.
+        let defs = ServerConfig.load(environment: [:])
+        XCTAssertEqual(defs.baseURL, "http://defaults-host:1111")
+
+        // Neither present -> built-in default.
+        defaults.removeObject(forKey: "vertus.baseURL")
+        let fallback = ServerConfig.load(environment: [:])
+        XCTAssertEqual(fallback.baseURL, "http://127.0.0.1:8787")
+    }
 }

@@ -13,9 +13,20 @@ public struct ServerConfig: Equatable {
         self.token = token
     }
 
+    /// Base URL resolution precedence: VERTUS_HUB_URL (env, dev builds and
+    /// launchd-smoke runs point at a temp hub) > UserDefaults "vertus.baseURL"
+    /// > http://127.0.0.1:8787. Token resolution is unchanged below.
     public static func load() -> ServerConfig {
+        load(environment: ProcessInfo.processInfo.environment)
+    }
+
+    /// Testable core: the env dictionary is injectable so the precedence chain
+    /// can be asserted without mutating the real process environment.
+    static func load(environment: [String: String]) -> ServerConfig {
         let defaults = UserDefaults.standard
-        let base = defaults.string(forKey: "vertus.baseURL") ?? "http://127.0.0.1:8787"
+        let base = environment["VERTUS_HUB_URL"]
+            ?? defaults.string(forKey: "vertus.baseURL")
+            ?? "http://127.0.0.1:8787"
         var token = defaults.string(forKey: "vertus.token") ?? ""
         if token.isEmpty {
             let path = FileManager.default.homeDirectoryForCurrentUser
