@@ -773,4 +773,48 @@ final class FleetStoreTests: XCTestCase {
             XCTAssertFalse(live.isRunning, "memory events must not touch run state")
         }
     }
+
+    // MARK: - Skills (C4)
+
+    /// The hub returns {"commands": [...]} (NOT a bare array — the
+    /// pre-fix client decoded an array and always failed, so the panel's
+    /// dropdown was permanently empty). Decode must unwrap, and the fetch
+    /// must name the agent (skills are per-agent).
+    func testSlashCatalogDecodesWrappedDictAndCarriesAgent() async throws {
+        let alpha = try await makeAgent("alpha")
+        let cmds = try await store.client.slashCommands(agentID: alpha.id)
+        XCTAssertEqual(cmds.count, 3)
+        XCTAssertEqual(cmds[0].name, "/skill:web")
+        XCTAssertEqual(cmds[0].description, "Web search skill")
+        XCTAssertTrue(hub.received.contains {
+            $0.method == "GET" && $0.rawPath.contains("/api/skills?agent_id=\(alpha.id)")
+        }, "catalog fetch must name the selected agent")
+    }
+
+    /// Store-level catalog: idempotent per agent, refetches on switch, and
+    /// the suggestion filter matches the panel's dropdown rules.
+    func testSlashSuggestionsFilterAndPerAgentRefetch() async throws {
+        let alpha = try await makeAgent("alpha")
+        await store.ensureSlashCatalog(agentID: alpha.id)
+        XCTAssertEqual(store.slashCommands.count, 3)
+        XCTAssertEqual(store.slashCatalogAgent, alpha.id)
+
+        // Bare "/" suggests everything; prefix and substring match; plain
+        // text suggests nothing.
+        XCTAssertEqual(store.slashSuggestions(for: "/").count, 3)
+        XCTAssertEqual(store.slashSuggestions(for: "/skill").map(\.name), ["/skill:web"])
+        XCTAssertEqual(store.slashSuggestions(for: "/alias").map(\.name), ["/alias:p"])
+        XCTAssertEqual(store.slashSuggestions(for: "hi").count, 0)
+
+        // Same agent: idempotent — no second fetch.
+        await store.ensureSlashCatalog(agentID: alpha.id)
+        XCTAssertEqual(store.slashCatalogAgent, alpha.id)
+
+        // Different agent: refetches (marker moves, a second request fires).
+        let beta = try await makeAgent("beta")
+        await store.ensureSlashCatalog(agentID: beta.id)
+        XCTAssertEqual(store.slashCatalogAgent, beta.id)
+        let agentCalls = hub.received.filter { $0.rawPath.contains("/api/skills") }
+        XCTAssertEqual(agentCalls.count, 2, "one fetch per agent, no more")
+    }
 }

@@ -147,6 +147,12 @@ public final class FleetStore: ObservableObject {
     /// Hub memory index across all scopes (refreshMemory) — drives the
     /// memory view; refreshed live on every memory_changed fleet event.
     @Published public private(set) var memoryEntries: [MemoryEntry] = []
+    /// Slash-command + skill catalog for the SELECTED agent (ensureSlash-
+    /// Catalog). Skills are per-agent — each agent home materializes its own
+    /// set — so the catalog is refetched whenever the selection changes.
+    @Published public private(set) var slashCommands: [SlashCommandInfo] = []
+    /// Agent id the catalog currently reflects (nil = never loaded).
+    public private(set) var slashCatalogAgent: String?
     /// Real hub health (refreshHealth) — nil until the first probe answers.
     @Published public private(set) var hubHealth: HubHealth?
 
@@ -276,6 +282,40 @@ public final class FleetStore: ObservableObject {
     }
 
     /// Re-fetch the roster (after CRUD, on connect, on demand).
+    // MARK: - Slash catalog (skills; shared by the panel and the main window)
+
+    /// Load (or refresh) the slash catalog for one agent. Idempotent per
+    /// agent: once loaded for a given id it does not refetch, so switching
+    /// agents is cheap and transient failures retry on the next call.
+    public func ensureSlashCatalog(agentID: String) async {
+        if slashCatalogAgent == agentID { return }
+        do {
+            slashCommands = try await client.slashCommands(agentID: agentID)
+            slashCatalogAgent = agentID
+        } catch {
+            // Leave the previous catalog (if any) and the agent marker
+            // unchanged: the next call retries. The hub is down → empty
+            // suggestions; the surfaces degrade to plain text prompts,
+            // which the hub still expands server-side.
+            lastSyncError = error.localizedDescription
+        }
+    }
+
+    /// Suggestions for a prompt while it is a bare /token (or "/"):
+    /// name-prefix or substring match, sorted by name. Pure — unit-tested.
+    public func slashSuggestions(for prompt: String) -> [SlashCommandInfo] {
+        let trimmed = prompt.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix("/"), !prompt.contains(" ") else { return [] }
+        let query = String(trimmed.dropFirst()).lowercased()
+        guard !slashCommands.isEmpty || query.isEmpty else { return [] }
+        return slashCommands
+            .filter { cmd in
+                let bare = cmd.name.dropFirst().lowercased()
+                return query.isEmpty || bare.hasPrefix(query) || bare.contains(query)
+            }
+            .sorted { $0.name < $1.name }
+    }
+
     public func refreshAgents() async {
         do {
             agents = try await client.listAgents()

@@ -365,6 +365,15 @@ final class StubHub {
                 response = json(200, ["runs": runs])
             case "/api/routines":
                 response = json(200, ["routines": routines])
+            case "/api/skills":
+                // Mirrors the real hub: {"commands": [...]} — NOT a bare
+                // array (the client must unwrap; regression for the panel's
+                // permanently-empty dropdown).
+                response = json(200, ["commands": [
+                    ["name": "/skill:web", "description": "Web search skill"],
+                    ["name": "/quick:summary", "description": "Summarize the thread"],
+                    ["name": "/alias:p", "description": "Alias for primary"],
+                ], "skillCount": 3])
             default:
                 if path.hasPrefix("/api/memory") {
                     response = memoryGet(path: path, rawPath: request.rawPath)

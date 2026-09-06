@@ -342,12 +342,24 @@ public final class VertusHTTPClient {
         return d
     }
 
-    // MARK: - Skills (QuickBar autocomplete)
+    // MARK: - Skills (slash autocomplete, panel + main window)
 
-    public func slashCommands() async throws -> [SlashCommandInfo] {
+    /// Fetch the slash-command + skill catalog for ONE agent. The hub
+    /// resolves it through the gateway's `commands.catalog`, which reflects
+    /// that agent's own home (its materialized skills, registry entries,
+    /// quick commands) — so the catalog is per-agent and the caller must
+    /// pass the selected agent. The response shape is
+    /// `{"commands": [{name, description}], "skillCount": N}` — NOT a bare
+    /// array (the pre-fix client decoded an array and always failed, so the
+    /// panel's dropdown was permanently empty).
+    public func slashCommands(agentID: String? = nil) async throws -> [SlashCommandInfo] {
         let decoder = JSONDecoder.vertus()
-        let json = try await sendJSON("GET", path: "/api/skills", body: nil)
-        guard let data = try? JSONSerialization.data(withJSONObject: json),
+        var query: [URLQueryItem]?
+        if let agentID { query = [URLQueryItem(name: "agent_id", value: agentID)] }
+        let json = try await sendJSON("GET", path: "/api/skills", body: nil, query: query)
+        guard let dict = json as? [String: Any],
+              let list = dict["commands"] as? [[String: Any]],
+              let data = try? JSONSerialization.data(withJSONObject: list),
               let commands = try? decoder.decode([SlashCommandInfo].self, from: data) else {
             throw VertusError.decoding
         }
