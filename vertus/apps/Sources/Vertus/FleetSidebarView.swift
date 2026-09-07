@@ -9,6 +9,10 @@ struct FleetSidebarView: View {
     var onNewAgent: () -> Void
     var onEditAgent: (Agent) -> Void
     var onShowActivity: () -> Void
+    /// Called when the user picks an agent in the roster list. In the multi-
+    /// window app this opens (or focuses) a session window for that agent
+    /// rather than swapping the calling window's detail.
+    var onSelectAgent: (Agent) -> Void
 
     @State private var confirmDelete: Agent?
     @State private var errorText: String?
@@ -18,14 +22,26 @@ struct FleetSidebarView: View {
     /// of its own window once it gained the same close affordances the
     /// other two sheets have (visible Done button + Escape).
     @State private var showMemory = false
+    /// Rename-state for the session-name editor inside a row's session menu.
+    @State private var renameTarget: FleetStore.WindowSession?
+    @State private var renameText: String = ""
 
     var body: some View {
         VStack(spacing: 0) {
             List(selection: $store.selectedAgentID) {
-                Section("Agents") {
+                Section {
                     ForEach(store.agents) { agent in
                         rosterRow(agent)
                             .tag(agent.id)
+                    }
+                } header: {
+                    // Add-agent lives in the header row, top-right of the
+                    // sidebar — same line as "Agents" (the window toolbar
+                    // no longer carries it).
+                    HStack(spacing: 4) {
+                        Text("Agents")
+                        Spacer()
+                        newAgentButton
                     }
                 }
             }
@@ -152,18 +168,36 @@ struct FleetSidebarView: View {
         } message: {
             Text(errorText ?? "")
         }
-        .toolbar {
-            ToolbarItemGroup {
-                Button {
-                    onNewAgent()
-                } label: {
-                    Label("New agent", systemImage: "plus")
-                }
-            }
+        .alert("Rename session", isPresented: Binding(
+            get: { renameTarget != nil },
+            set: { if !$0 { renameTarget = nil; renameText = "" } }
+        )) {
+            TextField("Session name", text: $renameText)
+                .onSubmit { commitRename() }
+            Button("Rename", action: commitRename)
+            Button("Cancel", role: .cancel) { renameTarget = nil; renameText = "" }
+        } message: {
+            Text("Give this session window a name. It becomes the window title.")
         }
         .onAppear {
             Task { await store.refreshAgents() }
         }
+    }
+
+    /// Compact add-agent control for the "Agents" header row: small enough
+    /// to sit on the same line as the header text.
+    private var newAgentButton: some View {
+        Button {
+            onNewAgent()
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 10, weight: .semibold))
+                .frame(width: 16, height: 16)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help("New agent")
     }
 
     private var connectionRow: some View {
@@ -197,6 +231,14 @@ struct FleetSidebarView: View {
         case .failed(let m): return "offline: \(m)"
         case .idle: return "stream idle"
         }
+    }
+
+    /// Sessions for one agent, ordered newest-first (the dropdown lists them
+    /// in display order, oldest at top so the most recent is at the thumb).
+    /// `agent` is the row's agent, set by the view builder that calls this.
+    private func sessionsForAgent(_ agent: Agent) -> ([FleetStore.WindowSession], String) {
+        let s = store.sessions(for: agent.id)
+        return (s.reversed(), s.isEmpty ? "No sessions" : "\(s.count) session\(s.count == 1 ? "" : "s")")
     }
 
     private func rosterRow(_ agent: Agent) -> some View {
@@ -275,11 +317,14 @@ struct FleetSidebarView: View {
                     SharedUIState.setMuted(!SharedUIState.mutedAgentIDs().contains(agent.id), agentID: agent.id)
                 }
                 Divider()
+                sessionMenuItems(for: agent)
+                Divider()
                 Button("Delete…", role: .destructive) { confirmDelete = agent }
             } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                Text("⋯")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 2)
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
@@ -292,6 +337,77 @@ struct FleetSidebarView: View {
         }
     }
 
+    /// The per-agent session submenu: lists each open session window for this
+    /// agent, lets the user switch to it, open another, rename it, or close it.
+    @ViewBuilder
+    private func sessionMenuItems(for agent: Agent) -> some View {
+        let (sessions, summary) = sessionsForAgent(agent)
+        if sessions.isEmpty {
+            Button("Open session →") {
+                onSelectAgent(agent)
+            }
+            .disabled(false)
+        } else {
+            Text(summary).foregroundStyle(.secondary)
+            ForEach(sessions) { session in
+                Button {
+                    focusSession(session)
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(session.title)
+                            .lineLimit(1)
+                        if session.id == store.foregroundSessionID {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.green)
+                        }
+                        Spacer()
+                        Text(session.agentID)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Divider()
+            Button("New session") {
+                onSelectAgent(agent)
+            }
+            Divider()
+            Button("Rename session…") {
+                renameTarget = sessions.first
+                renameText = sessions.first?.title ?? agent.displayName
+            }
+            .disabled(sessions.isEmpty)
+            Button("Close session", role: .destructive) {
+                if let s = sessions.first {
+                    store.closeSession(s.id)
+                }
+            }
+            .disabled(sessions.count <= 1)
+        }
+    }
+
+    /// Focus an existing session window (bring it frontmost). If this window
+    /// is the one being focused, sync its session binding.
+    private func focusSession(_ session: FleetStore.WindowSession) {
+        store.foregroundSessionID = session.id
+        if session.id == store.foregroundSessionID {
+            // This window is now the frontmost one — keep its detail in sync.
+        }
+    }
+
+    /// Commit a rename: update the session title (which is also the window
+    /// title, set by the delegate when the window opens).
+    private func commitRename() {
+        guard let target = renameTarget else { return }
+        let t = renameText.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty else { return }
+        store.renameSession(target.id, title: t)
+        renameTarget = nil
+        renameText = ""
+    }
+
+
     private func busyDot(color: Color) -> some View {
         Circle()
             .fill(color)
@@ -302,7 +418,9 @@ struct FleetSidebarView: View {
     private func color(for agent: Agent) -> Color {
         guard let hex = agent.color?.trimmingCharacters(in: CharacterSet(charactersIn: "#")),
               hex.count == 6, let value = UInt32(hex, radix: 16) else {
-            return Color(white: 0.2)
+            // No color configured: render white instead of a black-looking
+            // dot on the dark sidebar (agents default to color: None).
+            return .white
         }
         return Color(red: Double((value >> 16) & 0xFF) / 255,
                      green: Double((value >> 8) & 0xFF) / 255,

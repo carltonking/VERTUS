@@ -585,12 +585,12 @@ def test_no_stray_launchd_labels_passes(monkeypatch, isolated_env):
 # -- app (VERTUS.app) ------------------------------------------------------
 
 def _write_bundle(tmp_path: Path, bundle_id: str) -> Path:
-    """A minimal but real VERTUS.app-shaped bundle with the given id."""
-    app = tmp_path / "VERTUS.app"
+    """A minimal but real Vertus.app-shaped bundle with the given id."""
+    app = tmp_path / "Vertus.app"
     (app / "Contents" / "MacOS").mkdir(parents=True)
     (app / "Contents" / "MacOS" / "Vertus").write_text("#! /bin/true\n")
     os.chmod(app / "Contents" / "MacOS" / "Vertus", 0o755)
-    plist = {"CFBundleIdentifier": bundle_id, "CFBundleDisplayName": "VERTUS"}
+    plist = {"CFBundleIdentifier": bundle_id, "CFBundleDisplayName": "Vertus"}
     (app / "Contents" / "Info.plist").write_bytes(
         plistlib.dumps(plist))
     return app
@@ -598,10 +598,10 @@ def _write_bundle(tmp_path: Path, bundle_id: str) -> Path:
 
 def test_app_missing_warns(monkeypatch, isolated_env, tmp_path):
     monkeypatch.setenv("VERTUS_DOCTOR_SKIP_LAUNCHD", "")
-    monkeypatch.setenv("VERTUS_APP_PATH", str(tmp_path / "nope" / "VERTUS.app"))
+    monkeypatch.setenv("VERTUS_APP_PATH", str(tmp_path / "nope" / "Vertus.app"))
     by = _by_name(vd.app_checks())
     assert by["app.installed"]["status"] == "warn"
-    assert "VERTUS.app" in by["app.installed"]["remediation"]
+    assert "Vertus.app" in by["app.installed"]["remediation"]
     assert len(by) == 1, "no point checking a missing app further"
 
 

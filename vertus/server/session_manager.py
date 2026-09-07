@@ -55,9 +55,14 @@ class SessionManager:
         self,
         registry,
         factory: Callable[[str], object],
+        unattended_factory: Callable[[str], object] | None = None,
         seed_agent_id: str = DEFAULT_AGENT_ID,
     ) -> None:
         """``factory(agent_id)`` builds the bridge for one agent.
+
+        ``unattended_factory(agent_id)`` builds the bridge for one agent with
+        unattended mode (suppressed approval prompts). When None, falls back
+        to ``factory``.
 
         ``seed_agent_id`` is created eagerly at construction (the hub then
         prewarms it) so the default/primary flow behaves like the old
@@ -65,6 +70,7 @@ class SessionManager:
         """
         self.registry = registry
         self._factory = factory
+        self._unattended_factory = unattended_factory or factory
         self._lock = threading.Lock()
         self._sessions: dict[str, object] = {}
         self._sessions[seed_agent_id] = factory(seed_agent_id)
@@ -96,6 +102,34 @@ class SessionManager:
                 # agent that no longer exists.
                 self.registry.get_agent(agent_id)
                 bridge = self._factory(agent_id)
+                self._sessions[agent_id] = bridge
+            return bridge
+
+    def get_or_create_unattended_session(self, agent_id: str):
+        """Return the live bridge for ``agent_id``, creating it unattended on first use.
+
+        Like ``get_or_create_session``, but when creating a new bridge it uses
+        ``resolve_session_kwargs(..., unattended=True)`` so the gateway suppresses
+        approval prompts for unattended routine work. Existing bridges are reused
+        (they may have been created with different settings).
+
+        Raises KeyError when the registry doesn't know the agent (hub → 404).
+        """
+        agent_id = str(agent_id or DEFAULT_AGENT_ID).strip() or DEFAULT_AGENT_ID
+        with self._lock:
+            bridge = self._sessions.get(agent_id)
+            if bridge is not None:
+                return bridge
+        # Validate outside the map lock; registry has its own lock. Unknown
+        # ids raise KeyError before we ever build a bridge for them.
+        self.registry.get_agent(agent_id)
+        with self._lock:
+            bridge = self._sessions.get(agent_id)
+            if bridge is None:  # re-check: another thread may have won
+                self.registry.get_agent(agent_id)
+                # Create with unattended=True - uses a factory that resolves
+                # session kwargs with the unattended flag.
+                bridge = self._unattended_factory(agent_id)
                 self._sessions[agent_id] = bridge
             return bridge
 

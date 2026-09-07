@@ -300,6 +300,59 @@ env-divergence bug sent a temp hub's materialized skills at the real
 materialized skill points at the resolved root; the hermeticity suite
 proves a `VERTUS_ROOT`-only boot touches nothing real.
 
+### Automatic capture and recall (qm-style, this phase)
+
+Memory capture is now **core-driven, not model-disciplined** — the design
+borrowed from yc-software/qm's memory service, reimplemented over the
+file-based store (see the comparison in the phase write-up):
+
+```
+~/.vertus/agents/<id>/memory/facts.md   CANONICAL — hub-owned capture file
+~/.vertus/memory/shared/facts.md        CANONICAL — hub-owned, fleet-wide facts
+~/.vertus/agents/<id>/home/memory-digest.md   DERIVED — recall digest
+```
+
+- **Capture pipeline (`memory_capture.py`)**: AgentBridge fires
+  `on_run_done` for every terminal run (the messenger's `on_run_terminal`
+  only sees bot-driven runs; capture sees user, routine, and bot turns
+  alike). A burst buffer batches runs per (agent, from_agent, thread) —
+  3-minute quiet window, 10-turn cap, qm's defaults — then a background
+  thread fetches the folded user/assistant messages from the run store and
+  runs ONE one-shot extraction completion through the fork's own venv
+  (`fork_probe.py`, extracted from the doctor's `_PROBE_SCRIPT`): the
+  agent's own model/provider/key from its materialized home config and
+  `.env`, retry-free, bounded. The extraction prompt is ported from qm's
+  `MEMORY_EXTRACTION_PROMPT` (third-person durable facts, provenance rules:
+  a fact is valid only when the USER's own message states it; secrets,
+  one-off trivia, and system mechanics are excluded) plus an autonomous
+  addendum for bot/handoff/routine runs (operational facts only) and a
+  `SHARED:` routing prefix for fleet-wide facts.
+- **Folding (`fleet_memory.fold_facts`)**: port of qm's `foldCapture` —
+  normalize, dedupe against existing bullets, date-stamp
+  `- (YYYY-MM-DD) fact`, cap at 300 facts (oldest dropped). Writes go
+  through `MemoryStore.capture_facts` (atomic, indexed, `memory_changed`
+  broadcast) under the store lock so read-modify-write cannot interleave
+  between hub writers.
+- **Policy**: profile schema v5 adds `memory_capture: automatic|off`
+  (default automatic; `off` is the per-agent cost/safety switch);
+  `VERTUS_MEMORY_CAPTURE=0` disables capture hub-wide. Best-effort by
+  design — extraction failure logs and skips, never touches the run's event
+  stream, never blocks the run worker.
+- **Recall digest (`MemoryStore.build_digest/refresh_digest`)**: per agent,
+  a capped (6,000-char) file in `home/` (derived state — never the
+  fork-owned `memories/` dir, so the mirror rules are untouched): agent
+  facts first, then fleet facts, profile, recent notes; trailing sections
+  drop before the cap trims. Refreshed at hub boot, on agent creation, and
+  debounced (5s) after every memory change — the digest is the hub's
+  guarantee that memory reaches the model (the skill tells every bot to
+  read it at session start), vs. qm's mid-context injection which vertus
+  cannot do without a fork change. The doctor's `memory.digest` check
+  warns when an agent home lacks its digest.
+
+Deliberately NOT ported: Postgres revision history (vertus has SQLite;
+files + hub index suffice), per-scope provider routing, and LLM
+consolidation passes (a future routine, not this phase).
+
 ## 9. Clients
 
 The macOS client is ONE app — **VERTUS** (`com.vertus.app`) — a single

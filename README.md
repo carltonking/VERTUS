@@ -45,7 +45,7 @@ agent. Agents are **not** sandboxes — they are identities with honest limits
 │   ├── apps/                     # one Swift Package, two targets
 │   │   ├── Sources/VertusKit     # client, models, store, fleet stream
 │   │   ├── Sources/Vertus        # the app: window + notch panel + menubar
-│   │   └── scripts/build-app.sh  # ONE command → dist/VERTUS.app
+│   │   └── scripts/build-app.sh  # ONE command → dist/Vertus.app
 │   └── extensions/               # legacy pi-era skills (pi engine path)
 ├── disabled-launchagents/        # canonical launchd plists (hub)
 └── pi/                           # terminal UI fork (the REPL)
@@ -60,7 +60,7 @@ JSON-RPC. The terminal UI is a fork of earendil-works/pi.
 Every agent is a directory under `~/.vertus/agents/<id>/`:
 
 ```
-profile.json          # schema v4 — the SINGLE SOURCE OF TRUTH
+profile.json          # schema v5 — the SINGLE SOURCE OF TRUTH
 sandbox/              # the agent's working directory (session cwd)
 memory/               # this bot's own notes
 home/                 # per-agent engine root (HERMES_HOME):
@@ -73,8 +73,9 @@ home/                 # per-agent engine root (HERMES_HOME):
 re-materialized on every profile update. Older profiles migrate in place
 (idempotent, unknown keys preserved). Profile fields: `id, name, title,
 description, persona, model, provider, color, emoji, autonomy (ask|trusted),
-computer_use, cua_targets, stall_timeout_s, hard_timeout_s, created_at,
-updated_at, is_primary, sandbox_path, home_path, schema_version`.
+computer_use, cua_targets, stall_timeout_s, hard_timeout_s,
+memory_capture (automatic|off), created_at, updated_at, is_primary,
+sandbox_path, home_path, schema_version`.
 
 - `id` is the directory name and never changes; `name` is display-only.
   `primary` is auto-created at boot and cannot be deleted.
@@ -95,8 +96,33 @@ changes there). The hub owns, indexes, and broadcasts them.
 ~/.vertus/memory/shared/              CANONICAL — fleet-wide, every agent reads/writes
 ~/.vertus/agents/<id>/memory/         CANONICAL — private to that agent
 ~/.vertus/agents/<id>/home/memories/  FORK-OWNED MIRROR ({USER.md, MEMORY.md})
+~/.vertus/agents/<id>/home/memory-digest.md   hub-generated recall digest (derived state)
 ~/.vertus/memory/.hub-index.json     hub-maintained index (never model-written)
 ```
+
+**Automatic capture (`facts.md`).** The hub captures durable facts itself at
+turn end — it does not trust the model to remember to write notes (qm-style;
+see VERTUS_PLAN §8). After a run completes, the hub batches the run's folded
+user/assistant messages (per agent/thread, 3-minute quiet window, 10-turn
+cap), runs a one-shot extraction completion through the fork's own venv with
+the agent's own model/provider and keys (the same machinery the doctor
+probes), and folds the facts into `facts.md` in the agent's memory dir (or
+`shared/facts.md` for `SHARED:`-prefixed facts) with deterministic dedupe,
+`- (YYYY-MM-DD)` date stamps, and a 300-fact cap. `facts.md` is hub-owned —
+models read it, never edit it; every write is atomic, indexed, and broadcast
+as a `memory_changed` event. Best-effort by design: a provider failure just
+means nothing is captured that turn. Per-agent switch: `memory_capture`
+profile field (`automatic` default, `off` disables); hub-wide
+`VERTUS_MEMORY_CAPTURE=0` kills it globally. Autonomous turns (bot messages,
+handoffs, routines) capture operational facts only, never preferences.
+
+**Recall digest (`memory-digest.md`).** The hub regenerates a capped (6,000
+char) digest per agent — its facts, fleet facts, profile, and recent notes —
+at boot, on agent creation, and debounced after every memory change. The
+memory skill tells each bot to read it at session start, so the hub
+*guarantees* memory reaches the model instead of hoping the bot remembers to
+look. The digest is derived state inside `home/` (never the fork-owned
+`memories/` dir) and is safe to clobber.
 
 - **Mirror sync rule (one direction, fork → canonical):** a fork write to
   `home/memories/` propagates into the agent's canonical `memory/` and is
@@ -213,7 +239,7 @@ a dead scheduler is visible in the UI, not just in a log.
 
 ## Clients
 
-- **VERTUS** (`vertus/apps/dist/VERTUS.app`) — one app, one process, both
+- **VERTUS** (`vertus/apps/dist/Vertus.app`) — one app, one process, both
   surfaces: the full window (roster with live busy indicators and
   "working for X", per-agent transcript history-paginated + live deltas
   merged without duplication, run list with distinct cancelled/timeout
@@ -259,7 +285,7 @@ Build everything with one command:
 
 ```bash
 cd vertus/apps && bash scripts/build-app.sh
-# → dist/VERTUS.app  (install: cp -R dist/VERTUS.app /Applications/)
+# → dist/Vertus.app  (install: cp -R dist/Vertus.app /Applications/)
 ```
 
 The bundle step is not cosmetic: notifications require a real bundle, and

@@ -30,7 +30,11 @@ public enum VertusError: Error, Equatable {
 /// bearer-authed; errors carry the hub's message text so 409s can be shown
 /// to the user as sentences, not status codes.
 public final class VertusHTTPClient {
-    public let config: ServerConfig
+    /// Mutable so FleetStore.reloadHubConfig can adopt a corrected hub
+    /// config mid-run: a launch-time URL can go stale (dev hub moved,
+    /// defaults fixed on disk) while the process keeps dialing the dead
+    /// port. Every request reads it fresh.
+    public var config: ServerConfig
     private let session: URLSession
 
     public init(config: ServerConfig, session: URLSession = .shared) {
@@ -143,7 +147,17 @@ public final class VertusHTTPClient {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(sourceLabel, forHTTPHeaderField: "X-Vertus-Client")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, resp) = try await session.data(for: req)
+        let data: Data
+        let resp: URLResponse
+        do {
+            (data, resp) = try await session.data(for: req)
+        } catch {
+            // Map to the typed transport error like every other endpoint —
+            // the raw URLError used to leak straight out of submit and
+            // surface as the system "Could not connect to the server."
+            // bubble in the QuickBar.
+            throw VertusError.transport(error.localizedDescription)
+        }
         guard let http = resp as? HTTPURLResponse else { throw VertusError.transport("Not an HTTP response") }
         guard http.statusCode == 202 else {
             throw Self.error(from: http, data: data)

@@ -3,6 +3,13 @@ import SwiftUI
 import UserNotifications
 import VertusKit
 
+/// One row in the per-agent session dropdown (the ⋯ menu on each sidebar row).
+struct SessionMenuItem: Identifiable {
+    let id: String
+    let session: FleetStore.WindowSession
+    let agentName: String
+}
+
 /// UNUserNotificationCenter.current() raises NSInternalInconsistencyException
 /// ("bundleProxyForCurrentProcess is nil") when the process has no app bundle
 /// — i.e. a bare binary launched straight from .build/ during development.
@@ -38,8 +45,8 @@ final class CompletionNotifier: NSObject, UNUserNotificationCenterDelegate {
         let muted = SharedUIState.mutedAgentIDs().contains(agent.id)
         guard !muted else { return }
         let content = UNMutableNotificationContent()
-        content.title = "\(agent.rosterLabel) finished"
-        content.subtitle = event.type == "error" ? "Error" : "Done"
+        content.title = "Vertus has finished"
+        content.subtitle = event.type == "error" ? "Error" : agent.rosterLabel
         if event.type == "error" {
             content.body = event.message ?? "run failed"
         } else {
@@ -85,6 +92,14 @@ struct FleetRootView: View {
     @State private var showEditor = false
     @State private var showActivity = false
     @State private var editorMode: EditorMode = .create
+    /// The window's own session. Each window is one session (one agent + one
+    /// view). Passed at window construction; SwiftUI keeps the initial value
+    /// for the life of this view instance (it is not recomputed while mounted).
+    @State private var sessionID: String?
+
+    init(sessionID: String? = nil) {
+        self._sessionID = State(initialValue: sessionID)
+    }
 
     enum EditorMode: Identifiable {
         case create
@@ -102,49 +117,21 @@ struct FleetRootView: View {
             FleetSidebarView(
                 onNewAgent: { editorMode = .create; showEditor = true },
                 onEditAgent: { agent in editorMode = .edit(agent); showEditor = true },
-                onShowActivity: { showActivity = true }
+                onShowActivity: { showActivity = true },
+                onSelectAgent: { agent in selectAgentInSidebar(agent) }
             )
             .navigationSplitViewColumnWidth(min: 220, ideal: 250)
         } detail: {
-            // The sidebar toggle is OUR button, in the detail toolbar's
-            // leading edge (Bug A2). The system toggle, when the sidebar
-            // collapses, is relocated by AppKit to the TRAILING edge of the
-            // unified toolbar — verified empirically via AX ("Show Sidebar"
-            // jumped from x≈739 to x≈1561) — so it is removed and replaced
-            // with a fixed leading button that is on the LEFT in both
-            // states. The splitter divider line next to it is hidden by
-            // AppDelegate (NSSplitView.dividerColor = .clear).
-            Group {
-                if let id = store.selectedAgentID, let state = store.live[id] {
-                    AgentChatView(agentID: id, live: state)
-                } else {
-                    VStack(spacing: 8) {
-                        Image(systemName: "person.2")
-                            .font(.system(size: 40))
-                            .foregroundStyle(.secondary)
-                        Text("No agent selected")
-                            .font(.system(size: 15, weight: .semibold))
-                        Text("Pick an agent in the roster, or create one.")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
+            sessionDetail
+                .toolbar {
+                    ToolbarItem(placement: .navigation) {
+                        Button { toggleSidebar() } label: {
+                            Image(systemName: "sidebar.leading")
+                        }
+                        .help("Toggle sidebar")
                     }
                 }
-            }
-            .toolbar {
-                ToolbarItem(placement: .navigation) {
-                    Button {
-                        toggleSidebar()
-                    } label: {
-                        Image(systemName: "sidebar.leading")
-                    }
-                    .help("Toggle sidebar")
-                }
-            }
         }
-        // macOS 14+: remove the automatic toggle (it jumps to the trailing
-        // edge when the sidebar collapses; our leading button replaces it).
-        // On macOS 13 the system toggle remains — the deployment target's
-        // floor, unreachable on any machine this app actually runs on.
         .vertusRemoveSidebarToggle()
         .frame(minWidth: 900, minHeight: 560)
         .preferredColorScheme(.dark)
@@ -159,11 +146,106 @@ struct FleetRootView: View {
             if notifier == nil { notifier = CompletionNotifier(store: store) }
             store.start()
             store.foregroundAgentID = store.selectedAgentID
+            store.foregroundSessionID = sessionID
         }
-        .onChange(of: store.selectedAgentID) { id in
-            store.foregroundAgentID = id
+        .onChange(of: sessionID) { id in
+            store.foregroundSessionID = id
+        }
+        .onChange(of: store.selectedAgentID) { _ in
+            // The sidebar selection is global (the QuickBar reads it too).
+            // This window's detail stays bound to its own session, so changing
+            // the sidebar selection here opens/focuses the right session
+            // window rather than swapping this window's agent.
+            Task { @MainActor in await tryOpenOrFocusSessionForSelectedAgent() }
         }
     }
+
+    /// The detail for this window's session. Multiple windows can be open;
+    /// each shows its own session's agent regardless of the global sidebar
+    /// selection.
+    @ViewBuilder
+    private var sessionDetail: some View {
+        if let id = sessionID, let session = store.sessions.first(where: { $0.id == id }) {
+            if let state = store.live[session.agentID] {
+                AgentChatView(agentID: session.agentID, live: state)
+            } else {
+                waitingView(for: session)
+            }
+        } else {
+            fallbackDetail
+        }
+    }
+
+    private var fallbackDetail: some View {
+        Group {
+            if let id = store.selectedAgentID, let state = store.live[id] {
+                AgentChatView(agentID: id, live: state)
+            } else {
+                VStack(spacing: 8) {
+                    Image(systemName: "person.2")
+                        .font(.system(size: 40))
+                        .foregroundStyle(.secondary)
+                    Text("No agent selected")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text("Pick an agent in the roster, or create one.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func waitingView(for session: FleetStore.WindowSession) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: "person.2")
+                .font(.system(size: 40))
+                .foregroundStyle(.secondary)
+            Text(session.title)
+                .font(.system(size: 15, weight: .semibold))
+            Text("loading agent…")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// When the sidebar's agent selection changes, open a new session window
+    /// for that agent (or focus an existing one) — this window keeps its own
+    /// session. Called from the sidebar's onSelectAgent callback and from the
+    /// global selectedAgentID onChange.
+    private func selectAgentInSidebar(_ agent: Agent) {
+        Task { @MainActor in
+            let existing = store.sessions(for: agent.id).last
+            let sid: String
+            if let e = existing {
+                sid = e.id
+            } else {
+                sid = (try? await store.openSession(agentID: agent.id)) ?? UUID().uuidString
+            }
+            store.foregroundSessionID = sid
+            // If this window is the one we just opened/focused, sync its detail.
+            sessionID = sid
+            store.selectedAgentID = agent.id
+        }
+    }
+
+    /// Try to open or focus a session for whatever agent the sidebar now
+    /// selects. Best-effort: if store.openSession throws (hub down) we still
+    /// keep the selection.
+    private func tryOpenOrFocusSessionForSelectedAgent() async {
+        guard let agentID = store.selectedAgentID else { return }
+        let existing = store.sessions(for: agentID).last
+        let sid: String
+        if let e = existing {
+            sid = e.id
+        } else {
+            sid = (try? await store.openSession(agentID: agentID)) ?? UUID().uuidString
+        }
+        await MainActor.run {
+            store.foregroundSessionID = sid
+            sessionID = sid
+        }
+    }
+
 
     /// Collapse/expand the sidebar through the responder chain — the
     /// standard way to drive a NavigationSplitView's split view controller

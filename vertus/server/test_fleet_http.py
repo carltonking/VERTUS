@@ -244,9 +244,9 @@ def test_post_full_field_set_round_trips(hub):
     for key, value in payload.items():
         if key != "name":
             assert body[key] == value, f"{key} round-trip failed"
-    assert body["schema_version"] == 4
+    assert body["schema_version"] == 5
     assert body["is_primary"] is False
-    # GET returns the identical v3 profile.
+    # GET returns the identical profile.
     status, fetched = _req(base, "/api/agents/sage")
     assert status == 200 and fetched == body
     # The derived home was materialized from the create fields, not the defaults.
@@ -258,12 +258,13 @@ def test_post_full_field_set_round_trips(hub):
     # host: permission mode must degrade safely to standard (bounded needs a
     # manifest the fork/driver only accept when valid — see registry docs).
     assert "permission_mode: standard" in cfg
-    # Every listed agent is v3-shaped after all of the above.
+    # Every listed agent is v5-shaped after all of the above.
     _, listed = _req(base, "/api/agents")
     for agent in listed["agents"]:
-        assert agent["schema_version"] == 4
+        assert agent["schema_version"] == 5
         assert "title" in agent and "autonomy" in agent and "home_path" in agent
         assert agent["computer_use"] is False or "computer_use" in agent
+        assert agent["memory_capture"] in ("automatic", "off")
 
 
 def test_post_validation(hub):

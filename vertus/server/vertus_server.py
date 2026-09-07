@@ -60,7 +60,9 @@ from urllib.parse import parse_qs, urlsplit
 # fall back to a package-relative import for `python -m vertus.server.vertus_server`.
 try:
     import vertus_paths  # type: ignore
-    from agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
+    from agent_registry import (  # type: ignore
+        AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES, MEMORY_CAPTURE_VALUES,
+    )
     from run_store import RunStore, RUN_STATES, TERMINAL_STATES  # type: ignore
     from screen_lease import ScreenLeaseManager, SCREEN_POLICY_CAVEAT  # type: ignore
     from fleet_messaging import BotMessenger, BotMessageError  # type: ignore
@@ -68,11 +70,14 @@ try:
         RoutineManager, RoutineValidationError, parse_schedule, parse_trigger,
     )
     from fleet_memory import MemoryStore, migrate_legacy_memory  # type: ignore
+    from memory_capture import MemoryCapturer  # type: ignore
     from vertus_logging import setup_logging  # type: ignore
     from session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 except ImportError:  # pragma: no cover - only hit under package invocation
     from . import vertus_paths  # type: ignore
-    from .agent_registry import AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES  # type: ignore
+    from .agent_registry import (  # type: ignore
+        AgentRegistry, EDITABLE_FIELDS, AUTONOMY_VALUES, MEMORY_CAPTURE_VALUES,
+    )
     from .run_store import RunStore, RUN_STATES, TERMINAL_STATES  # type: ignore
     from .screen_lease import ScreenLeaseManager, SCREEN_POLICY_CAVEAT  # type: ignore
     from .session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
@@ -80,6 +85,7 @@ except ImportError:  # pragma: no cover - only hit under package invocation
         RoutineManager, RoutineValidationError, parse_schedule, parse_trigger,
     )
     from .fleet_memory import MemoryStore, migrate_legacy_memory  # type: ignore
+    from .memory_capture import MemoryCapturer  # type: ignore
     from .vertus_logging import setup_logging  # type: ignore
 
 # Token path resolution lives in vertus_paths.token_path (VERTUS_TOKEN_PATH
@@ -203,7 +209,7 @@ class AgentBridge:
     subscribers only.
     """
 
-    def __init__(self, agent_id: str = DEFAULT_AGENT_ID, create_session_factory=None, cwd: str | None = None, session_kwargs: dict | None = None, store=None, screen_leases=None, screen_targets=None, on_run_terminal=None) -> None:
+    def __init__(self, agent_id: str = DEFAULT_AGENT_ID, create_session_factory=None, cwd: str | None = None, session_kwargs: dict | None = None, store=None, screen_leases=None, screen_targets=None, on_run_terminal=None, on_run_done=None) -> None:
         self.agent_id = agent_id
         # Per-window computer-use ownership (Step: screen leases). ``None``
         # disables the gate (legacy / unit-test bridges). ``screen_targets``
@@ -294,6 +300,11 @@ class AgentBridge:
         self._run_thread_id: str | None = None
         self._run_kind: str = "user"
         self._on_run_terminal = on_run_terminal
+        # ``on_run_done`` is the hub's MemoryCapturer.on_run_done — fired from
+        # _end_run for EVERY terminal run (the messenger callback above only
+        # fires for bot-driven runs), so automatic fact capture sees user,
+        # routine, and bot-message turns alike.
+        self._on_run_done = on_run_done
         self._run_buffer: list[str] | None = None   # folded at turn end
         self._run_respawns = 0
         self._run_had_error = False
@@ -544,6 +555,19 @@ class AgentBridge:
             except Exception as exc:  # noqa: BLE001 — never break the worker
                 print(
                     f"[vertus] run-terminal callback failed ({run_id}): {exc}",
+                    file=sys.stderr,
+                )
+        # Automatic memory capture (MemoryCapturer.on_run_done): every
+        # terminal run, all run kinds, fired AFTER the terminal state is set,
+        # outside every lock, best-effort (the capturer never raises here).
+        cb2 = self._on_run_done
+        if cb2 is not None and run_id and store is not None:
+            try:
+                cb2(run_id, self.agent_id, from_agent, thread_id,
+                    run_kind, state)
+            except Exception as exc:  # noqa: BLE001 — never break the worker
+                print(
+                    f"[vertus] run-done callback failed ({run_id}): {exc}",
                     file=sys.stderr,
                 )
 
@@ -1845,9 +1869,19 @@ class VertusHandler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(exc)})
                 return
             try:
-                self._json(201, self.registry.create_agent(raw_name.strip(), **fields))
+                agent = self.registry.create_agent(raw_name.strip(), **fields)
             except (TypeError, ValueError) as exc:  # registry backstop
                 self._json(400, {"error": str(exc)[:200]})
+                return
+            # The new agent's recall digest is derived state: write it once
+            # now so the first session-start read finds it (best-effort).
+            try:
+                if self.memory is not None:
+                    self.memory.refresh_digest(agent["id"])
+            except Exception as exc:  # noqa: BLE001
+                print(f"[vertus] memory digest refresh failed for "
+                      f"{agent['id']}: {exc}", file=sys.stderr)
+            self._json(201, agent)
         elif route.startswith("/api/agents/") and route.endswith("/cancel"):
             agent_id = route[len("/api/agents/"):-len("/cancel")].strip("/")
             self._handle_agent_cancel(agent_id)
@@ -3081,7 +3115,7 @@ class VertusHandler(BaseHTTPRequestHandler):
 
 
 def _validate_profile_payload(payload: dict, *, allow_name: bool) -> dict:
-    """Validate a POST/PATCH agent body against the v4 editable schema.
+    """Validate a POST/PATCH agent body against the v5 editable schema.
 
     Returns the registry field dict (``name`` is handled by the caller).
     Raises ValueError with a client-facing message for any 400 condition:
@@ -3101,6 +3135,12 @@ def _validate_profile_payload(payload: dict, *, allow_name: bool) -> dict:
         if key == "autonomy":
             if value not in AUTONOMY_VALUES:
                 raise ValueError(f"autonomy must be one of {AUTONOMY_VALUES}")
+            fields[key] = value
+            continue
+        if key == "memory_capture":
+            if value not in MEMORY_CAPTURE_VALUES:
+                raise ValueError(
+                    f"memory_capture must be one of {MEMORY_CAPTURE_VALUES}")
             fields[key] = value
             continue
         if key == "computer_use":
@@ -3157,8 +3197,27 @@ def resolve_sandbox_cwd(registry: AgentRegistry, agent_id: str) -> str:
     return str(Path(sandbox).expanduser().resolve())
 
 
-def resolve_session_kwargs(registry: AgentRegistry, agent_id: str) -> dict:
-    """Per-agent identity kwargs for engine session creation (Step 3).
+def resolve_session_kwargs(registry: AgentRegistry, agent_id: str, unattended: bool = False) -> dict:
+    """Build per-agent spawn kwargs from the agent's profile + registry config.
+
+    These are consumed by AgentBridge._spawn_session (the single funnel for
+    prewarm and the lazy prompt path) and by the session manager's factory.
+    They MUST NOT contain hub-side supervision policy (stall/hard timeouts)
+    — those are popped by AgentBridge.__init__ / reconfigure so they never
+    reach create_agent_session.
+
+    ``unattended``, when True, is carried as ``extra_env.VERTUS_UNAUTHORIZED = "1"``
+    so the hermes gateway and the pi engine both suppress approval prompts and
+    UI dialogs for the lifetime of the spawned gateway. Unattended runs still
+    emit errors when a tool cannot proceed without user input — the agent reads
+    the error and decides how to continue rather than blocking on a dialog.
+
+    ``unattended``, when True, is carried as ``extra_env.VERTUS_UNAUTHORIZED = "1"``
+    so the hermes gateway and the pi engine both suppress approval prompts and
+    UI dialogs for the lifetime of the spawned gateway. Unattended runs still
+    emit errors when a tool cannot proceed without user input — the agent reads
+    the error and decides how to continue rather than blocking on a dialog.
+    """"""Per-agent identity kwargs for engine session creation (Step 3).
 
     Returns {} when the agent carries no per-agent identity (legacy profiles
     or the pi fallback bridge), and otherwise forwards exactly what the
@@ -3203,6 +3262,12 @@ def resolve_session_kwargs(registry: AgentRegistry, agent_id: str) -> dict:
         # fork resolves the backend name from process env on first use
         # (tools/computer_use/tool.py) — noop never spawns cua-driver.
         extra["HERMES_COMPUTER_USE_BACKEND"] = "noop"
+    if unattended:
+        # Unattended runs: suppress approval prompts and UI dialogs.
+        # The agent reads errors and decides how to continue rather than
+        # blocking on a dialog. This is carry as extra_env so it reaches
+        # both the hermes gateway and the pi engine.
+        extra["VERTUS_UNAUTHORIZED"] = "1"
     if extra:
         kwargs["extra_env"] = extra
     return kwargs
@@ -3210,7 +3275,7 @@ def resolve_session_kwargs(registry: AgentRegistry, agent_id: str) -> dict:
 
 def build_session_manager(registry: AgentRegistry, factory=None,
                           screen_leases: ScreenLeaseManager | None = None,
-                          on_run_terminal=None) -> SessionManager:
+                          on_run_terminal=None, on_run_done=None) -> SessionManager:
     """One SessionManager for the hub: primary prewarmed, others lazy.
 
     Each bridge is created with its agent's sandbox dir as the session cwd
@@ -3229,19 +3294,28 @@ def build_session_manager(registry: AgentRegistry, factory=None,
         # lease kwargs are passed ONLY when a manager is actually wired so
         # test harnesses that monkeypatch ``AgentBridge`` with fakes (which
         # accept the historical 3-kwarg signature) keep working unchanged.
-        # ``on_run_terminal`` is added to the AgentBridge call ONLY when a
-        # messenger is actually wired (serve() passes one; test harnesses
+        # ``on_run_terminal``/``on_run_done`` are added to the AgentBridge
+        # call ONLY when wired (serve() passes them; test harnesses
         # monkeypatch AgentBridge with fakes that accept the historical
         # 3-kwarg signature — same rule as the lease kwargs above).
-        terminal_kwargs = {} if on_run_terminal is None else {
-            "on_run_terminal": on_run_terminal,
-        }
+        terminal_kwargs = {}
+        if on_run_terminal is not None:
+            terminal_kwargs["on_run_terminal"] = on_run_terminal
+        if on_run_done is not None:
+            terminal_kwargs["on_run_done"] = on_run_done
         if screen_leases is None:
             def factory(agent_id: str):
                 return AgentBridge(
                     agent_id=agent_id,
                     cwd=resolve_sandbox_cwd(registry, agent_id),
                     session_kwargs=resolve_session_kwargs(registry, agent_id),
+                    **terminal_kwargs,
+                )
+            def unattended_factory(agent_id: str):
+                return AgentBridge(
+                    agent_id=agent_id,
+                    cwd=resolve_sandbox_cwd(registry, agent_id),
+                    session_kwargs=resolve_session_kwargs(registry, agent_id, unattended=True),
                     **terminal_kwargs,
                 )
         else:
@@ -3263,9 +3337,28 @@ def build_session_manager(registry: AgentRegistry, factory=None,
                     screen_targets=targets_resolver,
                     **terminal_kwargs,
                 )
+            def unattended_factory(agent_id: str):
+                def targets_resolver(aid: str):
+                    try:
+                        agent = registry.get_agent(aid)
+                    except KeyError:
+                        return None
+                    if not bool(agent.get("computer_use")):
+                        return None
+                    return agent.get("cua_targets") or None
+
+                return AgentBridge(
+                    agent_id=agent_id,
+                    cwd=resolve_sandbox_cwd(registry, agent_id),
+                    session_kwargs=resolve_session_kwargs(registry, agent_id, unattended=True),
+                    screen_leases=screen_leases,
+                    screen_targets=targets_resolver,
+                    **terminal_kwargs,
+                )
     return SessionManager(
         registry,
         factory=factory,
+        unattended_factory=unattended_factory,
         seed_agent_id=DEFAULT_AGENT_ID,
     )
 
@@ -3425,9 +3518,24 @@ def serve(host: str | None, port: int) -> None:
             lambda: store, lambda: sessions, registry
         )
         VertusHandler.messenger = messenger
+        # Automatic memory capture (memory_capture.py): burst-buffered fact
+        # extraction at run end, folded into hub-owned facts.md. Store and
+        # memory are resolved lazily at flush time (both locals are assigned
+        # in later serve() steps) — construction order stays irrelevant, same
+        # pattern as BotMessenger above.
+        capturer = MemoryCapturer(
+            store_provider=lambda: store,
+            # Resolved via the handler attr so a flush that races boot (e.g.
+            # routines.catch_up firing before memory.start()) never hits an
+            # unassigned local — it just skips, best-effort.
+            memory_provider=lambda: getattr(VertusHandler, "memory", None),
+            registry=registry,
+        )
+        VertusHandler.capturer = capturer
         sessions = build_session_manager(
             registry, screen_leases=screen_leases,
             on_run_terminal=messenger.run_terminal,
+            on_run_done=capturer.on_run_done,
         )
         VertusHandler.sessions = sessions
         print("[vertus] agent session prewarm starting (primary)…", file=sys.stderr)
@@ -3484,6 +3592,19 @@ def serve(host: str | None, port: int) -> None:
     )
     memory.start()
     VertusHandler.memory = memory
+    # Recall digests: every existing agent's home/memory-digest.md is written
+    # at boot (then kept fresh debounced by the watcher after every memory
+    # change). Best-effort — a failed digest never blocks serving.
+    try:
+        for agent in registry.list_agents():
+            try:
+                memory.refresh_digest(agent["id"])
+            except Exception as exc:  # noqa: BLE001
+                print(f"[vertus] memory digest refresh failed for "
+                      f"{agent['id']}: {exc}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vertus] memory digest boot refresh failed: {exc}",
+              file=sys.stderr)
 
     def _composed_listener(envelope: dict) -> None:
         fleet.publish(envelope)

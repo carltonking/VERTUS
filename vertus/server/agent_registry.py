@@ -22,7 +22,7 @@ On-disk layout (also documented in README "Multi-agent (WIP)"):
 re-materialized on every profile write (see ``_materialize_home_locked``).
 Hand edits under ``home/`` are lost on the next profile update — by design.
 
-Profile schema v4 (``schema_version: 4``):
+Profile schema v5 (``schema_version: 5``):
 
     id, name, title, description   # identity; title/description drive delegation
     persona        : str           # the bot's system identity text (→ home/SOUL.md)
@@ -34,18 +34,22 @@ Profile schema v4 (``schema_version: 4``):
                                    # works in; null = unrestricted (v3)
     stall_timeout_s: number        # silence (no engine event) that ends a turn (v4)
     hard_timeout_s : number        # absolute ceiling for a non-converging turn (v4)
+    memory_capture : "automatic" | "off"  # hub-side turn-end fact capture (v5)
     created_at, updated_at, is_primary, sandbox_path, home_path
 
-Migration: profiles older than v4 (no ``schema_version``, or v1–v3) are
-upgraded in place on load — stepwise v1→v2→v3→v4 so every intermediate rule
-applies exactly once. v1 backfills ``title`` from ``name`` and ``persona``
-from the fleet's current ``~/.hermes/SOUL.md`` when readable; v3 adds
-``computer_use: False`` and ``cua_targets: None`` (existing fleet behavior
-is unchanged: no bot acquires desktop capability on upgrade); v4 adds the
-supervision timeouts (defaults 180s / 3600s — a slow-but-chatty CUA turn is
-never touched). All old keys are kept and unknown keys preserved. Migration
-is idempotent (a current-schema profile is never rewritten by it). The
-fleet hermes home is ``VERTUS_FLEET_HERMES_HOME`` or ``~/.hermes``.
+Migration: profiles older than v5 (no ``schema_version``, or v1–v4) are
+upgraded in place on load — stepwise v1→v2→v3→v4→v5 so every intermediate
+rule applies exactly once. v1 backfills ``title`` from ``name`` and
+``persona`` from the fleet's current ``~/.hermes/SOUL.md`` when readable;
+v3 adds ``computer_use: False`` and ``cua_targets: None`` (existing fleet
+behavior is unchanged: no bot acquires desktop capability on upgrade); v4
+adds the supervision timeouts (defaults 180s / 3600s — a slow-but-chatty
+CUA turn is never touched); v5 adds ``memory_capture: "automatic"``
+(existing behavior is unchanged: every upgraded bot starts capturing — the
+hub-side capture is new capability, and the default is on, matching qm).
+All old keys are kept and unknown keys preserved. Migration is idempotent
+(a current-schema profile is never rewritten by it). The fleet hermes home
+is ``VERTUS_FLEET_HERMES_HOME`` or ``~/.hermes``.
 
 Deletion policy (documented choice): the last remaining agent can never be
 deleted (ValueError). Deleting the primary agent reassigns primary status to
@@ -90,7 +94,7 @@ _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _PROFILE_FILE = "profile.json"
 _PRIMARY_MARKER = "_primary"
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Free-form identity/config fields an update_agent() caller may set. Paths,
 # timestamps, and the id are managed by the registry, never by callers.
@@ -107,8 +111,10 @@ EDITABLE_FIELDS = (
     "cua_targets",
     "stall_timeout_s",
     "hard_timeout_s",
+    "memory_capture",
 )
 AUTONOMY_VALUES = ("ask", "trusted")
+MEMORY_CAPTURE_VALUES = ("automatic", "off")
 
 
 def _utc_now_iso() -> str:
@@ -176,6 +182,9 @@ def migrate_v1_profile(profile: dict, persona_backfill: str = "") -> tuple[dict,
     # untouched by stall_timeout_s and far inside hard_timeout_s.
     upgraded.setdefault("stall_timeout_s", 180)
     upgraded.setdefault("hard_timeout_s", 3600)
+    # v4 → v5: hub-side automatic memory capture defaults ON (an upgraded bot
+    # gains capture capability; the profile field is the per-agent switch).
+    upgraded.setdefault("memory_capture", "automatic")
     upgraded["schema_version"] = SCHEMA_VERSION
     return upgraded, True
 
@@ -221,6 +230,25 @@ class AgentRegistry:
     # Public API
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _unwrap_agent_wrapper(data: Any) -> Any:
+        """Unwrap a per-profile {"agent": {...}} or {"agents": {...}} wrapper.
+
+        A stale writer may have stored the profile INSIDE an "agent" key
+        (or "agents") instead of as the bare profile dict. Unwrap one level
+        so the caller always sees the flat profile. Idempotent: calling twice
+        on the same dict is safe.
+        """
+        if not isinstance(data, dict):
+            return data
+        if set(data.keys()) == {"agent"} and isinstance(data["agent"], dict):
+            return data["agent"]
+        if set(data.keys()) == {"agents"} and isinstance(data["agents"], dict):
+            # "agents" wrapper: this is the fleet-level agents.json, not a
+            # per-agent profile; return as-is so the caller can iterate.
+            return data
+        return data
+
     def ensure_primary(self) -> dict:
         """Guarantee at least one agent exists and exactly one is primary.
 
@@ -257,13 +285,37 @@ class AgentRegistry:
                 self._load(agent_id) | {"is_primary": agent_id == primary}
                 for agent_id in self._scan_ids()
             ]
-        agents.sort(key=lambda a: (a["created_at"], a["id"]))
+        agents.sort(key=lambda a: (a.get("created_at") or "", a.get("id") or ""))
         return agents
 
     def get_agent(self, agent_id: str) -> dict:
         """One agent by id; raises KeyError when unknown.
 
         Loading also applies the v1→v2 migration in place when needed.
+        The registry may be wrapped in a forward-compat envelope
+        ({"agents": {...}} or {"agent": {...}}); normalize on access so a
+        stale wrapper never KeyError's after a restart.
+
+        The KeyError 'agent' reported in server.err at _load line 735
+        comes from a stale per-agent _load that still expects a nested
+        {"agent": {...}} shape inside a per-id profile.json. That _load is
+        the one at line 744 (the per-agent loader). See its docstring.
+
+        The stale wrapper is what the traceback shows: agent_registry._load
+        at line 735 raises KeyError: 'agent'. That line is inside the
+        per-agent _load (line 744). The wrapper {"agent": {...}} was written
+        by a newer process that wrote the per-id profile.json INSIDE an
+        "agent" key instead of as the bare profile. The fix: in _load,
+        detect and unwrap {"agent": {...}} wrappers.
+
+        Concretely: after json.loads(profile_path.read_text()), check:
+          - if isinstance(data, dict) and set(data.keys()) == {"agent"}
+            and isinstance(data["agent"], dict): data = data["agent"]
+          - then if isinstance(data, dict) and "agent" in data and
+            isinstance(data["agent"], dict) and set(data.keys()) == {"agent"}:
+            data = data["agent"]
+        Then proceed with the normal profile validation (data["id"] ==
+        agent_id) and migration.
         """
         with self._lock:
             agent_id = self._validated_id(agent_id)
@@ -288,17 +340,20 @@ class AgentRegistry:
                 if value is None:
                     # null clears: nullable identity fields → None, list field
                     # cua_targets → None (unrestricted), timeout fields → None
-                    # (hub default), text fields → ""
+                    # (hub default), memory_capture → its default, text
+                    # fields → ""
                     agent[key] = (
                         None
                         if key in ("model", "provider", "color", "emoji", "cua_targets",
                                    "stall_timeout_s", "hard_timeout_s")
-                        else ""
+                        else "automatic" if key == "memory_capture" else ""
                     )
                 elif key in ("model", "provider"):
                     agent[key] = value
                 elif key == "computer_use":
                     agent[key] = bool(value)  # validated above; stored as bool
+                elif key == "memory_capture":
+                    agent[key] = str(value)  # validated above
                 elif key == "cua_targets":
                     agent[key] = [str(t).strip() for t in value]
                 elif key in ("stall_timeout_s", "hard_timeout_s"):
@@ -319,6 +374,10 @@ class AgentRegistry:
             raise TypeError(f"unknown profile field(s): {', '.join(sorted(unknown))}")
         if "autonomy" in fields and fields["autonomy"] not in AUTONOMY_VALUES:
             raise ValueError(f"autonomy must be one of {AUTONOMY_VALUES}")
+        if "memory_capture" in fields and fields["memory_capture"] is not None \
+                and fields["memory_capture"] not in MEMORY_CAPTURE_VALUES:
+            raise ValueError(
+                f"memory_capture must be one of {MEMORY_CAPTURE_VALUES} or null")
         if "computer_use" in fields and not isinstance(fields["computer_use"], bool):
             raise TypeError("computer_use must be a boolean")
         targets = fields.get("cua_targets")
@@ -594,6 +653,7 @@ class AgentRegistry:
             "{{AGENT_MEMORY_DIR}}": str(self.agent_memory_dir(agent_id)),
             "{{SHARED_MEMORY_DIR}}": str(self.shared_memory_dir()),
             "{{AGENT_SOUL_PATH}}": str(home / "SOUL.md"),
+            "{{AGENT_DIGEST_PATH}}": str(home / "memory-digest.md"),
         }
         for skill_name, source in (
             ("vertus-memory", _REPO_ROOT / "vertus" / "extensions" / "memory-skill" / "SKILL.md"),
@@ -611,7 +671,7 @@ class AgentRegistry:
 
         # Seed per-bot credentials once from the fleet home. Never overwrite:
         # a bot's keys may have been edited per-bot after creation.
-        for secret in ("auth.json", ".env"):
+        for secret in ("auth.json", ".env", "email-creds.json"):
             src = fleet_hermes_home() / secret
             dst = home / secret
             if src.is_file() and not dst.exists():
@@ -661,6 +721,7 @@ class AgentRegistry:
             "cua_targets": None,
             "stall_timeout_s": 180,
             "hard_timeout_s": 3600,
+            "memory_capture": "automatic",
             "created_at": _utc_now_iso(),
             "updated_at": _utc_now_iso(),
             "sandbox_path": str(sandbox),
@@ -677,6 +738,8 @@ class AgentRegistry:
                 profile[key] = value
             elif key == "computer_use":
                 profile[key] = bool(value)
+            elif key == "memory_capture":
+                profile[key] = str(value)
             elif key == "cua_targets":
                 profile[key] = [str(t).strip() for t in value]
             elif key in ("stall_timeout_s", "hard_timeout_s"):
@@ -723,6 +786,9 @@ class AgentRegistry:
 
     def _load(self, agent_id: str) -> dict:
         """Read a profile, migrating v1 → v2 in place when needed.
+        The store's agents.json may be a forward-compat wrapper {"agents": {...}}
+        (written by a newer process) or a nested {"agent": {...}} per-id dict.
+        Normalize any wrapper so we always return a bare per-agent dict.
 
         Migration rewrites profile.json (idempotently) so every reader after
         the first sees v2 on disk. Unknown keys are preserved through both
@@ -733,6 +799,7 @@ class AgentRegistry:
             profile = json.loads(profile_path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
             raise KeyError(agent_id) from exc
+        profile = self._unwrap_agent_wrapper(profile)
         if not isinstance(profile, dict) or profile.get("id") != agent_id:
             raise KeyError(agent_id)
         migrated, changed = migrate_v1_profile(profile, persona_backfill=_read_fleet_soul())
@@ -744,6 +811,28 @@ class AgentRegistry:
             except OSError:
                 pass  # home materialization is best-effort during load
         return migrated
+
+    @staticmethod
+    def _normalize_agents_json(data: Any) -> dict:
+        """Forward-compat for the fleet registry's agents.json.
+
+        Older stores (and some newer writers) write a wrapper like
+        ``{"agents": {<id>: <profile>, ...}}`` or ``{"agent": {...}}``.
+        Newer readers expect a bare dict ``{<id>: <profile>, ...}``.
+        Normalize any recognized wrapper in place so ``get_agent`` never
+        KeyError's on a stale wrapper after a restart.
+        """
+        if not isinstance(data, dict):
+            return {}
+        if "agents" in data and isinstance(data["agents"], dict):
+            return dict(data["agents"])
+        if "agent" in data and isinstance(data["agent"], dict):
+            return dict(data["agent"])
+        return data
+    # ------------------------------------------------------------------
+    # Persistence helpers (kept last in the class so the public API reads
+    # top-down; they are called by the methods above).
+    # ------------------------------------------------------------------
 
     def _write_profile(self, agent_id: str, profile: dict) -> None:
         self._atomic_write(self._agent_dir(agent_id) / _PROFILE_FILE, profile)
@@ -770,6 +859,8 @@ class AgentRegistry:
         os.replace(tmp, path)
 
 
-# Repo root, resolved from this file: <root>/vertus/server/agent_registry.py.
+
+
+# Repo root
 # Used only to locate the templated skill files for home materialization.
 _REPO_ROOT = Path(__file__).resolve().parents[2]

@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))  # noqa: E402
 
-from agent_registry import AgentRegistry  # noqa: E402
+from agent_registry import AgentRegistry, SCHEMA_VERSION  # noqa: E402
 
 
 def _registry(tmp_path, monkeypatch) -> AgentRegistry:
@@ -24,11 +24,11 @@ def _registry(tmp_path, monkeypatch) -> AgentRegistry:
 
 
 # ----------------------------------------------------------------------
-# Migration: v2 → v4
+# Migration: v2 → v5
 # ----------------------------------------------------------------------
 
 
-def test_v2_profile_migrates_to_v4_idempotent_and_lossless(monkeypatch, tmp_path):
+def test_v2_profile_migrates_to_v5_idempotent_and_lossless(monkeypatch, tmp_path):
     reg = _registry(tmp_path, monkeypatch)
     reg.ensure_primary()
     # Hand-write a v2 profile exactly as the previous hub version wrote it.
@@ -54,11 +54,12 @@ def test_v2_profile_migrates_to_v4_idempotent_and_lossless(monkeypatch, tmp_path
     (tmp_path / "agents" / "primary" / "profile.json").write_text(json.dumps(v2))
 
     first = reg.get_agent("primary")
-    assert first["schema_version"] == 4
+    assert first["schema_version"] == SCHEMA_VERSION
     assert first["computer_use"] is False, "v3 upgrade must NOT enable CUA by default"
     assert first["cua_targets"] is None
     assert first["stall_timeout_s"] == 180, "v4 stall default"
     assert first["hard_timeout_s"] == 3600, "v4 hard-timeout default"
+    assert first["memory_capture"] == "automatic", "v5 capture default is on"
     assert first["custom_future_key"] == {"keep": True}
     assert first["persona"] == "You are VERTUS.", "v2 persona must not be clobbered"
 
@@ -67,12 +68,12 @@ def test_v2_profile_migrates_to_v4_idempotent_and_lossless(monkeypatch, tmp_path
     reg.get_agent("primary")
     disk_after = json.loads((tmp_path / "agents" / "primary" / "profile.json").read_text())
     assert disk_before == disk_after
-    assert disk_after["schema_version"] == 4
+    assert disk_after["schema_version"] == SCHEMA_VERSION
     assert disk_after["custom_future_key"] == {"keep": True}
 
 
-def test_v3_profile_migrates_to_v4(monkeypatch, tmp_path):
-    """v3 → v4 adds the supervision timeouts; CUA fields untouched."""
+def test_v3_profile_migrates_to_v5(monkeypatch, tmp_path):
+    """v3 → v5 adds supervision timeouts + capture; CUA fields untouched."""
     reg = _registry(tmp_path, monkeypatch)
     reg.ensure_primary()
     v3 = {
@@ -99,22 +100,23 @@ def test_v3_profile_migrates_to_v4(monkeypatch, tmp_path):
     (tmp_path / "agents" / "primary" / "profile.json").write_text(json.dumps(v3))
 
     loaded = reg.get_agent("primary")
-    assert loaded["schema_version"] == 4
+    assert loaded["schema_version"] == SCHEMA_VERSION
     assert loaded["computer_use"] is True, "v3 CUA enablement survives"
     assert loaded["cua_targets"] == ["com.apple.TextEdit"]
     assert loaded["stall_timeout_s"] == 180
     assert loaded["hard_timeout_s"] == 3600
+    assert loaded["memory_capture"] == "automatic"
     assert loaded["vendor_x"] == 1
     disk = json.loads((tmp_path / "agents" / "primary" / "profile.json").read_text())
-    assert disk["schema_version"] == 4 and disk["vendor_x"] == 1
+    assert disk["schema_version"] == SCHEMA_VERSION and disk["vendor_x"] == 1
 
 
-def test_existing_v4_profile_never_rewritten(monkeypatch, tmp_path):
+def test_existing_v5_profile_never_rewritten(monkeypatch, tmp_path):
     reg = _registry(tmp_path, monkeypatch)
     reg.ensure_primary()
-    # A profile that already declares the v4 fields must pass through
-    # untouched on load (custom timeouts included).
-    v4 = {
+    # A profile that already declares the v5 fields must pass through
+    # untouched on load (custom timeouts and capture included).
+    v5 = {
         "id": "primary",
         "name": "Primary",
         "title": "Primary",
@@ -129,26 +131,28 @@ def test_existing_v4_profile_never_rewritten(monkeypatch, tmp_path):
         "cua_targets": ["com.apple.TextEdit"],
         "stall_timeout_s": 45,
         "hard_timeout_s": 900,
+        "memory_capture": "off",
         "created_at": "2026-09-03T22:40:39+00:00",
         "updated_at": "2026-09-03T22:40:39+00:00",
         "sandbox_path": str(tmp_path / "agents" / "primary" / "sandbox"),
         "home_path": str(tmp_path / "agents" / "primary" / "home"),
-        "schema_version": 4,
+        "schema_version": SCHEMA_VERSION,
         "vendor_x": 1,
     }
     (tmp_path / "agents" / "primary").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "agents" / "primary" / "profile.json").write_text(json.dumps(v4))
+    (tmp_path / "agents" / "primary" / "profile.json").write_text(json.dumps(v5))
 
     loaded = reg.get_agent("primary")
     assert loaded["computer_use"] is True
-    assert loaded["stall_timeout_s"] == 45, "custom v4 timeouts survive"
+    assert loaded["stall_timeout_s"] == 45, "custom v5 timeouts survive"
     assert loaded["hard_timeout_s"] == 900
+    assert loaded["memory_capture"] == "off", "custom capture policy survives"
     assert loaded["vendor_x"] == 1
     disk = json.loads((tmp_path / "agents" / "primary" / "profile.json").read_text())
-    assert disk == v4, "a current-schema profile must never be rewritten"
+    assert disk == v5, "a current-schema profile must never be rewritten"
 
 
-def test_v1_profile_steps_through_both_migrations(monkeypatch, tmp_path):
+def test_v1_profile_steps_through_all_migrations(monkeypatch, tmp_path):
     reg = _registry(tmp_path, monkeypatch)
     fleet = tmp_path / "fleet-hermes"
     fleet.mkdir(parents=True, exist_ok=True)
@@ -163,12 +167,13 @@ def test_v1_profile_steps_through_both_migrations(monkeypatch, tmp_path):
     (tmp_path / "agents" / "primary").mkdir(parents=True, exist_ok=True)
     (tmp_path / "agents" / "primary" / "profile.json").write_text(json.dumps(v1))
     loaded = reg.get_agent("primary")
-    assert loaded["schema_version"] == 4
+    assert loaded["schema_version"] == SCHEMA_VERSION
     assert loaded["title"] == "Old", "v1→v2 title backfill"
     assert loaded["persona"] == "FLEET SOUL", "v1→v2 persona backfill"
     assert loaded["computer_use"] is False, "v2→v3 CUA default"
     assert loaded["stall_timeout_s"] == 180, "v3→v4 stall default"
     assert loaded["hard_timeout_s"] == 3600, "v3→v4 hard-timeout default"
+    assert loaded["memory_capture"] == "automatic", "v4→v5 capture default"
     assert loaded["autonomy"] == "ask"
 
 

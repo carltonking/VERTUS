@@ -168,6 +168,9 @@ public final class FleetStore: ObservableObject {
     }
     /// Agent currently displayed in the foreground window (drives unread +
     /// notification suppression; written to the shared UI file too).
+    /// Legacy single-window name: today it mirrors the foreground session's
+    /// agent id. Kept because the QuickBar and phone surfaces read it as the
+    /// single "foreground agent".
     @Published public var foregroundAgentID: String? {
         didSet { SharedUIState.setForegroundAgentID(foregroundAgentID) }
     }
@@ -178,21 +181,73 @@ public final class FleetStore: ObservableObject {
         }
     }
 
+    /// Keep the legacy single-agent foreground mirror in sync with the
+    /// foreground session, so the QuickBar and phone surfaces (which read
+    /// `foregroundAgentID` as the single foreground agent) continue to work.
+    private func syncForegroundAgentID() {
+        foregroundAgentID = foregroundSession?.agentID
+    }
+
+    /// A session = one agent window. Multiple sessions per agent can be open;
+    /// each is its own macOS window with its own title (renameable) and view.
+    /// The Mac app is window-per-session; the QuickBar and phone surfaces stay
+    /// single-view and are unaffected.
+    public struct WindowSession: Identifiable, Equatable {
+        public let id: String
+        /// Agent this window is viewing.
+        public var agentID: String
+        /// User-visible window title (renameable). Defaults to the agent's
+        /// displayName; the user can give each session its own name.
+        public var title: String
+        /// Creation time, for session-list ordering (newest first in the UI).
+        public let createdAt: Date
+        public init(id: String, agentID: String, title: String, createdAt: Date = Date()) {
+            self.id = id; self.agentID = agentID; self.title = title; self.createdAt = createdAt
+        }
+    }
+
     public let client: VertusHTTPClient
     public let stream: FleetStream
 
     @Published public private(set) var live: [String: AgentLiveState] = [:]
-    /// Fired when a background run reaches a terminal state (any agent that
-    /// is not foregrounded). Fleet app wires this to User Notifications.
+    /// Open session windows. Each session is one agent + one macOS window.
+    @Published public private(set) var sessions: [WindowSession] = []
+    /// ID of the session whose window is currently frontmost / focused.
+    @Published public var foregroundSessionID: String? {
+        didSet { syncForegroundAgentID() }
+    }
+    /// Fired when a run reaches a terminal state for an agent whose session
+    /// window is NOT the foreground session (legacy single-window semantics).
+    /// The Mac main window notifies every terminal run directly, so this is
+    /// the fallback path for other surfaces (QuickBar, phone).
     public var onBackgroundCompletion: ((Agent, WireEvent) -> Void)?
 
     private var statusPollTask: Task<Void, Never>?
     private var statusPolling = false
     private var latestByAgent: [String: WireEvent] = [:]
+    private var configReloadCancellable: AnyCancellable?
+    private let autoReloadConfig: Bool
+    private let configLoader: () -> ServerConfig
 
-    public init(client: VertusHTTPClient, stream: FleetStream) {
+    /// - Parameters:
+    ///   - autoReloadConfig: when true, a failing stream or a failed submit
+    ///     re-resolves the hub config (configLoader) and adopts it. A
+    ///     launch-time URL can go stale while the process runs (the hub
+    ///     restarted on another port, defaults were corrected on disk), and
+    ///     the old code never re-read it — the app dialed the dead port
+    ///     forever, surfacing "Could not connect to the server." in the
+    ///     QuickBar. Off by default so the hermetic tests (which build their
+    ///     own config and must not read UserDefaults/env) are unaffected.
+    ///   - configLoader: where a reload re-resolves the config from. Defaults
+    ///     to ServerConfig.load() (Mac); the phone passes PhoneConfig.load
+    ///     so its Keychain token is re-read instead of the Mac-only file.
+    public init(client: VertusHTTPClient, stream: FleetStream,
+                autoReloadConfig: Bool = false,
+                configLoader: @escaping () -> ServerConfig = { ServerConfig.load() }) {
         self.client = client
         self.stream = stream
+        self.autoReloadConfig = autoReloadConfig
+        self.configLoader = configLoader
         stream.onEvent = { [weak self] event in
             Task { @MainActor in self?.handle(event) }
         }
@@ -203,6 +258,40 @@ public final class FleetStore: ObservableObject {
         stream.$connectionState
             .receive(on: RunLoop.main)
             .assign(to: &$connectionState)
+        if autoReloadConfig {
+            // A stream stuck in reconnecting may be failing because its
+            // launch-time config is stale (the hub moved). Re-resolve and
+            // adopt on every reconnect attempt; the adoption forces the
+            // immediate reconnect that makes it effective, and once adopted
+            // the config matches so later attempts no-op.
+            configReloadCancellable = stream.$connectionState
+                .receive(on: RunLoop.main)
+                .sink { [weak self] state in
+                    MainActor.assumeIsolated {
+                        switch state {
+                        case .reconnecting, .failed:
+                            self?.reloadHubConfig()
+                        default:
+                            break
+                        }
+                    }
+                }
+        }
+    }
+
+    /// Re-resolve the hub config (configLoader) and adopt it if it changed:
+    /// the client starts using it on the next request and the stream forces
+    /// an immediate reconnect with the new URL/token (the cursor carries
+    /// over, so the since= replay still covers the gap).
+    /// Returns true when a change was adopted.
+    @discardableResult
+    public func reloadHubConfig() -> Bool {
+        let fresh = configLoader()
+        guard fresh != client.config else { return false }
+        client.config = fresh
+        stream.apply(fresh)
+        NSLog("[vertus] hub config reloaded: %@", fresh.baseURL)
+        return true
     }
 
     // MARK: - Lifecycle
@@ -322,7 +411,8 @@ public final class FleetStore: ObservableObject {
             // Seed live state for every roster agent (cheap, never spawns a
             // bridge on the hub: it's a plain registry read).
             for agent in agents where live[agent.id] == nil {
-                live[agent.id] = AgentLiveState(agentID: agent.id)
+                let s = AgentLiveState(agentID: agent.id)
+                live[agent.id] = s
             }
             if selectedAgentID == nil { selectedAgentID = agents.first?.id }
             lastSyncError = nil
@@ -379,7 +469,11 @@ public final class FleetStore: ObservableObject {
             // Background completion notification + unread (a cancelled
             // background run still deserves the unread marker — the user
             // asked for it and it stopped).
-            if foregroundAgentID != agentID, let agent = agent(agentID) {
+            // "Background" = the agent has no frontmost session window (the Mac
+            // app notifies every terminal run directly; this path is for the
+            // QuickBar/phone surfaces that have no session concept).
+            let agentHasForegroundSession = sessions.contains { $0.agentID == agentID && $0.id == foregroundSessionID }
+            if foregroundAgentID != agentID, !agentHasForegroundSession, let agent = agent(agentID) {
                 state.bumpUnread()
                 onBackgroundCompletion?(agent, event)
             }
@@ -431,8 +525,25 @@ public final class FleetStore: ObservableObject {
     @discardableResult
     public func submit(agentID: String, text: String,
                        sourceLabel: String = "local") async throws -> String {
-        let acceptance = try await client.prompt(agentID: agentID, text: text,
-                                                 sourceLabel: sourceLabel)
+        do {
+            let acceptance = try await client.prompt(agentID: agentID, text: text,
+                                                     sourceLabel: sourceLabel)
+            return accept(acceptance, agentID: agentID, text: text)
+        } catch {
+            // The launch-time config can be stale (the hub moved ports while
+            // this process was up). Re-resolve once and retry; the retry
+            // only happens when a different config was actually adopted, so
+            // a genuinely dead hub still fails exactly once.
+            if autoReloadConfig, reloadHubConfig() {
+                let acceptance = try await client.prompt(agentID: agentID, text: text,
+                                                         sourceLabel: sourceLabel)
+                return accept(acceptance, agentID: agentID, text: text)
+            }
+            throw error
+        }
+    }
+
+    private func accept(_ acceptance: PromptAcceptance, agentID: String, text: String) -> String {
         let state = liveState(for: agentID)
         state.appendLocalUserEntry(runID: acceptance.runId, text: text)
         state.setRunning(true)
@@ -644,6 +755,67 @@ public final class FleetStore: ObservableObject {
         let runID = try await client.runRoutineNow(id)
         await refreshRoutines()
         return runID
+    }
+
+    // MARK: - Session windows
+
+    /// Open a new session window for one agent. Returns the new session id;
+    /// if the agent is not yet in the roster it is fetched first (best-effort).
+    /// A session for the same agent can be opened many times — each is its own
+    /// window with its own title.
+    @discardableResult
+    public func openSession(agentID: String, title: String? = nil) async throws -> String {
+        let agent = try? await client.agent(agentID)
+        let displayName = agent?.displayName ?? agentID
+        let finalTitle = title ?? displayName
+        let session = WindowSession(
+            id: UUID().uuidString,
+            agentID: agentID,
+            title: finalTitle
+        )
+        var updated = sessions
+        updated.append(session)
+        sessions = updated
+        return session.id
+    }
+
+    /// Close one session window (its NSWindow delegate calls this). If no
+    /// sessions remain, the app does NOT quit (the menubar + panel stay).
+    public func closeSession(_ sessionID: String) {
+        var updated = sessions.filter { $0.id != sessionID }
+        sessions = updated
+        if foregroundSessionID == sessionID {
+            foregroundSessionID = updated.last?.id
+        }
+    }
+
+    /// Rename a session's window title.
+    public func renameSession(_ sessionID: String, title: String) {
+        var updated = sessions
+        if let i = updated.firstIndex(where: { $0.id == sessionID }) {
+            updated[i].title = title
+        }
+        sessions = updated
+    }
+
+    /// All open sessions for one agent (the sidebar dropdown lists these).
+    public func sessions(for agentID: String) -> [WindowSession] {
+        sessions.filter { $0.agentID == agentID }
+    }
+
+    /// The session currently frontmost, or nil.
+    public var foregroundSession: WindowSession? {
+        guard let id = foregroundSessionID else { return nil }
+        return sessions.first { $0.id == id }
+    }
+
+    /// Internal: append a session (sync path used by the app delegate when it
+    /// can't await openSession). Public so the app delegate can call it from
+    /// its own module without friendship.
+    public func _appendSession(_ session: WindowSession) {
+        var updated = sessions
+        updated.append(session)
+        sessions = updated
     }
 
     // MARK: - Cancellation (supervision)

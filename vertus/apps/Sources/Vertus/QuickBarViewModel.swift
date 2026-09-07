@@ -83,17 +83,26 @@ final class QuickBarViewModel: ObservableObject {
     // MARK: - Store → published mirrors
 
     private func rewire() {
-        cancellables.removeAll()
         store.$agents
             .sink { [weak self] agents in
                 self?.agents = agents
                 self?.syncBusy()
             }
             .store(in: &cancellables)
+        // NOTE (bar-mirror bug): @Published delivers the NEW value to
+        // subscribers BEFORE committing it to the property — a sink that
+        // re-reads store.live sees the STALE (pre-mutation) dict and would
+        // never subscribe to the freshly-seeded AgentLiveState instances
+        // (the bar showed nothing while the window, which re-reads store.live
+        // at SwiftUI body evaluation, worked fine). Use the received value,
+        // and hop to the main actor so any store re-reads see the commit.
         store.$live
-            .sink { [weak self] _ in
-                self?.rewireStates()
-                self?.syncBusy()
+            .sink { [weak self] live in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.rewireStates(live)
+                    self.syncBusy()
+                }
             }
             .store(in: &cancellables)
         store.$connectionState
@@ -111,9 +120,11 @@ final class QuickBarViewModel: ObservableObject {
 
     /// Subscribe to every live state's objectWillChange so ANY agent's
     /// activity updates the busy strip, and the selected agent's updates the
-    /// transcript.
-    private func rewireStates() {
-        for (id, state) in store.live where stateSubs[id] == nil {
+    /// transcript. Iterates the dict DELIVERED by the publisher (see the
+    /// rewire() note) — reading store.live here would see the pre-mutation
+    /// value and skip every newly-seeded state.
+    private func rewireStates(_ live: [String: AgentLiveState]) {
+        for (id, state) in live where stateSubs[id] == nil {
             stateSubs[id] = state.objectWillChange
                 .sink { [weak self] _ in
                     Task { @MainActor in
@@ -303,22 +314,15 @@ final class QuickBarViewModel: ObservableObject {
         sentAtLeastOnce = false
     }
 
-    /// New session — a VIEW reset, never a server-side reset. The hub has no
-    /// per-agent session to clear: an agent owns one continuous transcript
-    /// and run history, which stay intact (the main window shows it all).
-    /// Everything currently on screen is hidden. If a reply is mid-stream
-    /// it is NOT discarded: the run keeps going and the reply is re-anchored
-    /// so only the text streamed after this click shows (and keeps growing)
-    /// in the fresh view.
+    /// New session — in the multi-window app this opens a new session WINDOW
+    /// for the selected agent (via the app delegate), so each session is its own
+    /// macOS window with its own view. The bar's own view keeps its transcript;
+    /// the new window starts fresh. If the user wants a bare view reset without
+    /// a new window they can use the bar's pencil/⌘N while only one window is
+    /// open — but the intended path now is: one window per session.
     func newSession() {
-        guard let state = store.live[selectedAgentID] else {
-            viewCut.reset()
-            reset()
-            return
-        }
-        viewCut.cut(entries: state.transcript, isRunning: state.isRunning)
-        reset()
-        syncSelected()
+        let id = selectedAgentID
+        AppDelegate.shared?.openSessionWindow(agentID: id)
     }
 
     // MARK: - Demo seeds (--demo-output / --demo-long)

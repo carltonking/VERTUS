@@ -8,7 +8,7 @@
 # The bundle step is not cosmetic: UNUserNotificationCenter requires a real
 # bundle, SMAppService (login item) requires a bundle, and the app gets a
 # stable bundle id (com.vertus.app) for UserDefaults.
-# Output: vertus/apps/dist/VERTUS.app
+# Output: vertus/apps/dist/Vertus.app
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -23,7 +23,9 @@ fi
 
 BIN=".build/${CONFIG}/Vertus"
 DIST="dist"
-APP="${DIST}/VERTUS.app"
+# Bundle folder name matches the display name (Finder shows the file name;
+# a VERTUS.app folder with a "Vertus" plist reads as two different apps).
+APP="${DIST}/Vertus.app"
 
 if [[ ! -x "${BIN}" ]]; then
     echo "error: ${BIN} not found — run 'swift build${CONFIG:+ -c ${CONFIG}}' first" >&2
@@ -47,9 +49,9 @@ cat > "${APP}/Contents/Info.plist" <<'PLIST'
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>VERTUS</string>
+    <string>Vertus</string>
     <key>CFBundleDisplayName</key>
-    <string>VERTUS</string>
+    <string>Vertus</string>
     <key>CFBundleIdentifier</key>
     <string>com.vertus.app</string>
     <key>CFBundleVersion</key>
@@ -78,4 +80,4 @@ codesign --force --sign - "${APP}" 2>/dev/null || true
 
 echo "app bundled:"
 echo "  ${APP}"
-echo "bundle id: com.vertus.app (display name VERTUS)"
+echo "bundle id: com.vertus.app (display name Vertus)"

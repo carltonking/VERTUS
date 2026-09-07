@@ -51,6 +51,10 @@ class FakeSessions:
     def get_or_create_session(self, agent_id):
         return self.bridges.setdefault(agent_id, FakeBridge(agent_id))
 
+    def get_or_create_unattended_session(self, agent_id):
+        # In tests, unattended sessions are the same as regular sessions
+        return self.bridges.setdefault(agent_id, FakeBridge(agent_id))
+
     def __getitem__(self, agent_id):
         return self.get_or_create_session(agent_id)
 

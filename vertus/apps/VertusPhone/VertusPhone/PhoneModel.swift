@@ -57,7 +57,13 @@ final class PhoneAppModel: ObservableObject {
     private static func makeStore(config: ServerConfig) -> FleetStore {
         let client = VertusHTTPClient(config: config)
         let stream = FleetStream(config: config, cursor: StreamCursor(processName: "phone"))
-        return FleetStore(client: client, stream: stream)
+        return FleetStore(client: client, stream: stream,
+                          // Re-resolve from the phone's own config chain
+                          // (UserDefaults + Keychain) when the stream or a
+                          // submit fails — the settings screen may have been
+                          // corrected while this store was alive.
+                          autoReloadConfig: true,
+                          configLoader: { PhoneConfig.load() })
     }
 
     /// Rebuild the client/stream/store after a settings change.

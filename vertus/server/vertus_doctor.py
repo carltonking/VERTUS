@@ -92,109 +92,9 @@ def _cfg() -> dict:
 #
 # The script runs under the fork's venv so base_url + key env-var names come
 # from the fork's OWN provider definitions (never hardcoded in this repo):
-#   - base_url: get_provider(name).base_url (allow_network=False — offline)
-#   - key vars: hermes_cli.auth.PROVIDER_REGISTRY first (matches what the
-#     runtime credential pool actually uses — get_provider's merged
-#     api_key_env_vars is the models.dev overlay and disagrees with it for
-#     opencode-zen), get_provider().api_key_env_vars as fallback.
-#
-# The key itself is read from the scope's .env (fleet home or agent home —
-# the same file the hub seeds each gateway with), never from the hub env.
-_PROBE_SCRIPT = r'''
-import json, os, sys, time
-
-def _load_env_file(path):
-    if not path:
-        return
-    try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, _, v = line.partition("=")
-                os.environ.setdefault(k.strip(), v.strip())
-    except OSError:
-        pass
-
-_load_env_file(os.environ.get("VERTUS_PROBE_ENV_FILE", ""))
-provider = os.environ.get("VERTUS_PROBE_PROVIDER", "")
-model = os.environ.get("VERTUS_PROBE_MODEL", "")
-base_url = os.environ.get("VERTUS_PROBE_BASE_URL", "")
-key_vars: list = []
-try:
-    from hermes_cli.auth import PROVIDER_REGISTRY
-    p = PROVIDER_REGISTRY.get(provider)
-    if p is not None and getattr(p, "api_key_env_vars", None):
-        key_vars = list(p.api_key_env_vars)
-except Exception:
-    pass
-pdef = None
-try:
-    from hermes_cli.providers import get_provider
-    pdef = get_provider(provider, allow_network=False)
-except Exception as exc:
-    print(json.dumps({"ok": False, "kind": "resolve_error",
-                      "detail": str(exc)[:200]}))
-    sys.exit(2)
-if not base_url:
-    base_url = (pdef.base_url if pdef is not None else "") or ""
-if not key_vars and pdef is not None:
-    key_vars = list(pdef.api_key_env_vars or ())
-if pdef is None and not key_vars:
-    print(json.dumps({"ok": False, "kind": "unknown_provider",
-                      "detail": provider}))
-    sys.exit(2)
-key = None
-for var in key_vars:
-    if os.environ.get(var):
-        key = os.environ[var]
-        break
-if not key:
-    print(json.dumps({"ok": False, "kind": "no_key",
-                      "detail": ",".join(key_vars)}))
-    sys.exit(2)
-if not base_url:
-    print(json.dumps({"ok": False, "kind": "no_base_url",
-                      "detail": provider}))
-    sys.exit(2)
-import openai
-try:
-    client = openai.OpenAI(
-        api_key=key, base_url=base_url,
-        timeout=float(os.environ.get("VERTUS_PROBE_TIMEOUT_S", "8")),
-        max_retries=0,
-    )
-    t0 = time.monotonic()
-    resp = client.chat.completions.create(
-        model=model, max_tokens=1,
-        messages=[{"role": "user", "content": "ping"}],
-    )
-    print(json.dumps({"ok": True,
-                      "model": getattr(resp, "model", None) or model,
-                      "latency_s": round(time.monotonic() - t0, 2)}))
-except openai.APITimeoutError as exc:
-    print(json.dumps({"ok": False, "kind": "hang",
-                      "detail": str(exc)[:200]}))
-    sys.exit(1)
-except Exception as exc:
-    status = ""
-    body = ""
-    if hasattr(exc, "response"):
-        r = exc.response
-        try:
-            status = str(getattr(r, "status_code", ""))
-        except Exception:
-            pass
-        try:
-            body = (getattr(r, "text", "") or "")[:600]
-        except Exception:
-            pass
-    print(json.dumps({"ok": False, "kind": "http_error",
-                      "status": status, "body": body,
-                      "detail": str(exc)[:300]}))
-    sys.exit(1)
-'''
+# The one-shot completion itself lives in fork_probe.py (shared with the
+# hub's automatic memory capture); provider resolution, key lookup from the
+# scope's .env, retry-free bounded calls — one implementation, two users.
 
 
 # The event types the bridge's _handle_event actually parses. All but
@@ -633,7 +533,7 @@ def _spawn_throwaway_gateway(log) -> tuple[_HermesSession, Path, Path]:
     # Seed auth.json / .env from the fleet home like the materializer does —
     # read-only source, temp destination.
     fleet_home = _fleet_home()
-    for name in ("auth.json", ".env"):
+    for name in ("auth.json", ".env", "email-creds.json"):
         src = fleet_home / name
         if src.is_file():
             try:
@@ -728,37 +628,11 @@ def _provider_probe_configs() -> list[dict]:
 def _run_probe(cfg: dict, timeout_s: float, base_url_override: str = "") -> dict:
     """One minimal completion against one config, through the fork's venv.
 
-    The subprocess timeout is probe timeout + 10s of import slack; the
-    probe's OWN client timeout (max_retries=0) is what actually bounds the
-    call — the fork's 600s retry sleep can never leak in because retries
-    are disabled at the client.
+    Delegates to fork_probe.run_completion (the module memory capture also
+    uses) with the doctor's historical max_tokens=1 "ping" defaults.
     """
-    venv_py = vertus_paths.venv_python()
-    fork = vertus_paths.fork_repo()
-    env = dict(os.environ)
-    env.update({
-        "VERTUS_PROBE_PROVIDER": cfg.get("provider") or "",
-        "VERTUS_PROBE_MODEL": cfg.get("model") or "",
-        "VERTUS_PROBE_ENV_FILE": str(cfg["home"] / ".env"),
-        "VERTUS_PROBE_TIMEOUT_S": str(timeout_s),
-        "VERTUS_PROBE_BASE_URL": base_url_override,
-    })
-    try:
-        r = subprocess.run(
-            [str(venv_py), "-u", "-c", _PROBE_SCRIPT],
-            cwd=str(fork), env=env, capture_output=True, text=True,
-            timeout=timeout_s + 10, check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "kind": "hang",
-                "detail": f"probe subprocess exceeded {timeout_s + 10:.0f}s"}
-    except Exception as exc:
-        return {"ok": False, "kind": "script_error", "detail": str(exc)[:200]}
-    try:
-        return json.loads(r.stdout.strip().splitlines()[-1] or "{}")
-    except Exception:
-        return {"ok": False, "kind": "script_error",
-                "detail": (r.stderr or r.stdout).strip()[-200:]}
+    from fork_probe import run_completion
+    return run_completion(cfg, timeout_s, base_url_override=base_url_override)
 
 
 def provider_checks(deadline: float | None = None) -> list[dict]:
@@ -1311,7 +1185,7 @@ def _vertus_app_processes() -> list[int]:
     process (one fleet-stream connection, one store); two of these means
     duplicate streams and double notifications."""
     try:
-        out = subprocess.run(["pgrep", "-f", "/Applications/VERTUS.app/Contents/MacOS/Vertus"],
+        out = subprocess.run(["pgrep", "-f", "/Applications/Vertus.app/Contents/MacOS/Vertus"],
                              capture_output=True, text=True, timeout=5).stdout
         return [int(p) for p in out.split() if p.strip()]
     except Exception:
@@ -1329,14 +1203,14 @@ def app_checks() -> list[dict]:
         out.append(_check("app.bundle", "unverified", "skipped (tests)", ""))
         return out
 
-    app = Path(os.environ.get("VERTUS_APP_PATH", "/Applications/VERTUS.app"))
+    app = Path(os.environ.get("VERTUS_APP_PATH", "/Applications/Vertus.app"))
     if not app.is_dir():
         out.append(_check("app.installed", "warn",
-                          "/Applications/VERTUS.app missing",
+                          "/Applications/Vertus.app missing",
                           "cd vertus/apps && bash scripts/build-app.sh && "
-                          "cp -R dist/VERTUS.app /Applications/"))
+                          "cp -R dist/Vertus.app /Applications/"))
         return out  # nothing further is meaningful
-    out.append(_check("app.installed", "ok", "/Applications/VERTUS.app present", ""))
+    out.append(_check("app.installed", "ok", "/Applications/Vertus.app present", ""))
 
     info = app / "Contents" / "Info.plist"
     try:
@@ -1617,6 +1491,26 @@ def memory_checks() -> list[dict]:
     else:
         out.append(_check("memory.skill_path", "ok",
                           "all materialized skills point at the resolved shared root"))
+
+    # Recall digests: every agent home should carry a hub-generated
+    # memory-digest.md (written at boot and refreshed debounced after every
+    # memory change). Missing = the hub has not booted since the upgrade — a
+    # warn, not a fail (agents still work; they just lack the digest).
+    missing_digests = []
+    if agents.is_dir():
+        for home in sorted(agents.glob("*/home")):
+            if not (home / "memory-digest.md").is_file():
+                missing_digests.append(home.parent.name)
+    if missing_digests:
+        out.append(_check(
+            "memory.digest", "warn",
+            f"{len(missing_digests)} agent(s) missing a recall digest: "
+            f"{', '.join(missing_digests)}",
+            "the hub writes memory-digest.md at boot and refreshes it on "
+            "every memory change — restart the hub"))
+    else:
+        out.append(_check("memory.digest", "ok",
+                          "every agent home has a recall digest"))
     return out
 
 

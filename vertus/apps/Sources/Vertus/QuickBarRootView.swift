@@ -819,7 +819,7 @@ struct NotchPanelContent: View {
                 )
             // Idle placeholder — slightly faded; hides as soon as the user types.
             if prompt.isEmpty {
-                Text("Ask VERTUS anything...")
+                Text("Ask Vertus anything...")
                     .font(.system(size: 13.4, weight: .regular))
                     .foregroundStyle(.white.opacity(0.5))
                     .frame(width: editorWidth, height: 16, alignment: .leading)

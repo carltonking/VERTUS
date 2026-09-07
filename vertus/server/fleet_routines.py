@@ -288,7 +288,9 @@ class RoutineManager:
 
         # DEGRADED: skip + failure_count (the run would 503 anyway).
         try:
-            bridge = self._sessions().get_or_create_session(aid)
+            # Use unattended session for routines - they are scheduled work
+            # that should not block on user input.
+            bridge = self._sessions().get_or_create_unattended_session(aid)
             st = getattr(bridge, "status", lambda: {})()
         except KeyError:
             self._disable(rid, f"agent {aid} no longer exists")
@@ -305,6 +307,10 @@ class RoutineManager:
             )
             store.add_message(run_id, aid, "user", prompt)
             bridge.store = store
+            # Routines run unattended by default: they are scheduled work that
+            # should not block on user input. The bridge's session kwargs are
+            # resolved with unattended=True so the gateway suppresses approval
+            # prompts for this turn's session.
             bridge.prompt(prompt, remote=False, run_id=run_id, run_kind="routine")
         except RuntimeError as exc:  # bridge closed mid-DELETE
             try:

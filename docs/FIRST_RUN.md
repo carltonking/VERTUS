@@ -48,7 +48,7 @@ curl -s -H "Authorization: Bearer $(cat ~/.vertus/token)" \
 
 The `primary` agent is auto-created at boot (its home, sandbox, and persona
 are materialized under `~/.vertus/agents/primary/`). Create more agents and
-routines in the VERTUS app (`open /Applications/VERTUS.app`), or via
+routines in the VERTUS app (`open /Applications/Vertus.app`), or via
 `POST /api/agents` and `POST /api/routines`.
 
 Everything survives reboot (both agents are installed in

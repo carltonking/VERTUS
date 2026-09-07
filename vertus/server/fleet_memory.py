@@ -48,6 +48,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -146,6 +147,113 @@ def _safe_relpath(rel: str) -> str:
     if not rel or rel in (".", "..") or ".." in rel.split("/"):
         raise ValueError(f"invalid memory path: {rel!r}")
     return rel
+
+
+# ---------------------------------------------------------------------------
+# Automatic capture (facts.md) + recall digest — qm notebook semantics,
+# file-based store. The hub captures durable facts at run end (memory_capture.py)
+# and folds them HERE: deterministic dedupe, dated bullets, hard caps. The
+# digest is the hub's recall lever — a capped, regenerated view every agent
+# is told to read at session start (see the memory skill).
+# ---------------------------------------------------------------------------
+
+# The hub-owned capture file per scope (agent memory dir / shared dir). The
+# model never maintains it by hand — the skill says read-only — but the file
+# is an ordinary indexed entry like any other, visible to search and the UI.
+FACTS_FILE = "facts.md"
+FACTS_HEADER = "# Facts (hub-maintained — read me, do not edit)"
+
+# The hub-generated recall digest inside each agent's engine home. Derived
+# state (like SOUL.md/config.yaml): refreshed at boot, on agent creation, and
+# debounced after every memory change. NOT under home/memories/ — that dir is
+# fork-owned mirror scope; the digest is a separate hub-written file.
+DIGEST_FILE = "memory-digest.md"
+DIGEST_MAX_CHARS = 6_000   # qm's recall cap: the whole digest fits one prompt
+
+MAX_FACTS = 300            # qm notebook cap: oldest bullets drop first
+
+
+def _date_str(at: float | None = None) -> str:
+    """UTC YYYY-MM-DD (qm dates facts with the capture day; UTC keeps tests
+    and the sort order deterministic across timezones)."""
+    return time.strftime("%Y-%m-%d", time.gmtime(at or time.time()))
+
+
+def _is_bullet(line: str) -> bool:
+    t = line.strip()
+    return t.startswith("- ") or t.startswith("* ")
+
+
+def _bullet_text(line: str) -> str:
+    """Strip ONE leading bullet marker (qm's ``^[-*] [whitespace]*``), so
+    text like ``**bold**`` keeps its own stars."""
+    return re.sub(r"^[-*]\s*", "", line.strip())
+
+
+def _normalize_bullet(line: str) -> str:
+    """Canonical key for dedupe: strip bullet, leading (YYYY-MM-DD) date,
+    collapse whitespace, lowercase (mirrors qm's normalize)."""
+    text = _bullet_text(line)
+    if text.startswith("(") and ")" in text:
+        text = text.split(")", 1)[1]
+    return " ".join(text.split()).lower()
+
+
+def _bullets(body: str) -> list[str]:
+    return [line for line in body.split("\n") if _is_bullet(line)]
+
+
+def _cap_tail(text: str, max_chars: int) -> str:
+    """Keep the NEWEST tail (facts append at the bottom, so the tail is the
+    freshest) — same semantics as qm's capTail."""
+    return text if len(text) <= max_chars else text[-max_chars:]
+
+
+def fold_facts(existing: str, facts: list[str], at: float | None = None) -> tuple[str, int]:
+    """Fold new facts into an existing facts body: normalize, dedupe against
+    current bullets, date-stamp as ``- (YYYY-MM-DD) fact``, cap at MAX_FACTS
+    (oldest first). Returns ``(body, added)`` — body unchanged when nothing
+    was new. Port of qm's foldCapture (memory/memory-service.ts)."""
+    clean: list[str] = []
+    for f in facts:
+        text = " ".join(str(f).split())  # collapse whitespace
+        text = text.lstrip("-* ").strip()
+        # Strip an incoming (YYYY-MM-DD) marker so the fold re-stamps with
+        # the capture date instead of double-dating (qm does the same).
+        text = re.sub(r"^\(\d{4}-\d\d-\d\d\)\s*", "", text).strip()
+        if text:
+            clean.append(text)
+    if not clean:
+        return existing, 0
+    seen = {_normalize_bullet(line) for line in _bullets(existing)}
+    date = _date_str(at)
+    added: list[str] = []
+    for f in clean:
+        key = _normalize_bullet(f"- {f}")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        added.append(f"- ({date}) {f}")
+    if not added:
+        return existing, 0
+    body = (existing.rstrip() + "\n" + "\n".join(added)) if existing.strip() \
+        else f"{FACTS_HEADER}\n\n" + "\n".join(added)
+    lines = body.split("\n")
+    bullet_idx = [i for i, line in enumerate(lines) if _is_bullet(line)]
+    overflow = len(bullet_idx) - MAX_FACTS
+    if overflow > 0:
+        drop = set(bullet_idx[:overflow])
+        body = "\n".join(line for i, line in enumerate(lines) if i not in drop)
+    return body, len(added)
+
+
+def parse_facts_text(text: str) -> list[str]:
+    """Parse the model's extraction output: bullets only, NONE → [] (mirrors
+    qm's parseFacts)."""
+    trimmed = (text or "").strip()
+    if not trimmed or trimmed.lower() == "none":
+        return []
+    return [b for b in (_bullet_text(line) for line in trimmed.split("\n") if _is_bullet(line)) if b]
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +377,8 @@ class MemoryStore:
     """
 
     def __init__(self, emit=None, running_agents=None, poll_s: float = 2.0,
-                 index_file: Path | None = None):
+                 index_file: Path | None = None,
+                 digest_debounce_s: float = 5.0):
         self._emit = emit  # callable(agent_id: str, event: dict)
         self._running_agents = running_agents  # callable() -> set[str]
         self._poll_s = poll_s
@@ -278,6 +387,12 @@ class MemoryStore:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._index: dict[str, dict] = {}
+        # Debounced recall-digest refresh: after a memory change, rewrite the
+        # agent's home/memory-digest.md within digest_debounce_s. Shared-scope
+        # changes refresh EVERY agent (all digests include shared facts).
+        # In-memory by design — a hub restart just refreshes at boot.
+        self._digest_debounce_s = digest_debounce_s
+        self._digest_timers: dict[str, threading.Timer] = {}
         # Per-mirrored-file state: {key: {"src_mtime", "src_size", "dst_sha"}}
         # — what the fork source looked like and what WE last wrote to
         # canonical. In-memory by design: after a crash the next poll simply
@@ -439,14 +554,138 @@ class MemoryStore:
 
     def _changed(self, scope: str, agent_id: str | None, rel: str,
                  action: str, writer: str) -> None:
-        if self._emit is None:
+        if self._emit is not None:
+            try:
+                self._emit(agent_id or "", {
+                    "type": "memory_changed", "scope": scope,
+                    "agent_id": agent_id or "", "path": rel, "action": action,
+                    "writer": writer,
+                })
+            except Exception:
+                pass
+        # Any change makes every affected agent's recall digest stale.
+        try:
+            if scope == "agent" and agent_id:
+                self._schedule_digest(agent_id)
+            elif scope == "shared":
+                self._schedule_digest(None)  # all agents
+        except Exception:
+            pass
+
+    # -- automatic capture + recall digest ---------------------------------
+
+    def capture_facts(self, scope: str, agent_id: str | None, facts: list[str],
+                      writer: str, at: float | None = None) -> int:
+        """Fold facts into ``<scope>/facts.md`` (dedupe, dated, capped) and
+        write through the canonical path: atomic, indexed, broadcast.
+        Returns the number of facts actually added (0 = all duplicates)."""
+        with self._lock:  # serialize read-modify-write across hub writers
+            existing = self.read(scope, agent_id, FACTS_FILE) or b""
+            body, added = fold_facts(
+                existing.decode("utf-8", errors="replace"), facts, at)
+            if not added:
+                return 0
+            self.write(scope, agent_id, FACTS_FILE, body.encode("utf-8") + b"\n",
+                       writer=writer)
+            return added
+
+    def build_digest(self, agent_id: str,
+                     max_chars: int = DIGEST_MAX_CHARS) -> str:
+        """The recall digest for one agent: its facts first, then fleet facts,
+        profile, and recent notes — every section tail-capped, then trailing
+        sections dropped until the total fits ``max_chars`` (facts are never
+        the first thing cut). Mirrors qm's capped recall body."""
+        agent_mem = agent_memory_dir(agent_id)
+        shared = shared_dir()
+
+        def _read(path: Path) -> str:
+            try:
+                return path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return ""
+
+        sections: list[tuple[str, str]] = []
+        facts = _read(agent_mem / FACTS_FILE).strip()
+        if facts:
+            sections.append(("Your facts", _cap_tail(facts, 3000)))
+        fleet = _read(shared / FACTS_FILE).strip()
+        if fleet:
+            sections.append(("Fleet facts", _cap_tail(fleet, 2000)))
+        profile = _read(agent_mem / "profile.md").strip()
+        if profile:
+            sections.append(("Profile", _cap_tail(profile, 1500)))
+        notes: list[str] = []
+        notes_dir = agent_mem / "notes"
+        if notes_dir.is_dir():
+            files = sorted(
+                (p for p in notes_dir.glob("*.md") if p.is_file()),
+                key=lambda p: p.stat().st_mtime, reverse=True,
+            )[:3]
+            for p in files:
+                body = _read(p).strip()
+                if body:
+                    notes.append(f"[{p.name}]\n{_cap_tail(body, 800)}")
+        if notes:
+            sections.append(("Recent notes", "\n\n".join(notes)))
+
+        header = f"# Memory digest for {agent_id} (hub-generated — do not edit)\n"
+        chunks = [f"## {title}\n\n{content}" for title, content in sections]
+        body = header + "\n\n".join(chunks)
+        while len(chunks) > 1 and len(header + "\n\n".join(chunks)) > max_chars:
+            chunks.pop()  # notes go before profile, profile before fleet facts
+        body = header + "\n\n".join(chunks)
+        if len(body) > max_chars and chunks:
+            excess = len(body) - max_chars
+            chunks[-1] = _cap_tail(chunks[-1], max(1, len(chunks[-1]) - excess))
+            body = header + "\n\n".join(chunks)
+        return body
+
+    def refresh_digest(self, agent_id: str) -> Path:
+        """Rewrite one agent's home/memory-digest.md (derived state, atomic
+        write, never under the fork-owned memories/ dir). Returns the path."""
+        home = agents_dir() / agent_id / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        path = home / DIGEST_FILE
+        self._locked_atomic_write(path, self.build_digest(agent_id).encode("utf-8"))
+        return path
+
+    def _schedule_digest(self, agent_id: str | None) -> None:
+        """Debounced digest refresh. ``agent_id`` None = every agent (a
+        shared-scope change is in every digest). Timer threads are daemon so
+        a hub exit never hangs on a pending refresh."""
+        if agent_id is None:
+            try:
+                root = agents_dir()
+                if root.is_dir():
+                    for p in sorted(root.iterdir()):
+                        if p.is_dir() and not p.name.startswith(".") \
+                                and (p / "home").is_dir():
+                            self._schedule_digest(p.name)
+            except Exception:
+                pass
             return
         try:
-            self._emit(agent_id or "", {
-                "type": "memory_changed", "scope": scope,
-                "agent_id": agent_id or "", "path": rel, "action": action,
-                "writer": writer,
-            })
+            with self._lock:
+                old = self._digest_timers.get(agent_id)
+                if old is not None:
+                    old.cancel()
+                timer = threading.Timer(self._digest_debounce_s,
+                                        self._refresh_digest_safe,
+                                        args=(agent_id,))
+                timer.daemon = True
+                self._digest_timers[agent_id] = timer
+                timer.start()
+        except Exception:
+            pass
+
+    def _refresh_digest_safe(self, agent_id: str) -> None:
+        try:
+            with self._lock:
+                self._digest_timers.pop(agent_id, None)
+        except Exception:
+            pass
+        try:
+            self.refresh_digest(agent_id)
         except Exception:
             pass
 

@@ -24,7 +24,9 @@ public final class FleetStream: NSObject, ObservableObject {
 
     @Published public private(set) var connectionState: ConnectionState = .idle
 
-    public let config: ServerConfig
+    /// Current hub config. Mutable only through apply(_:) so a config
+    /// adoption always forces the reconnect that makes it effective.
+    public private(set) var config: ServerConfig
     public let cursor: StreamCursor
     /// Called for every envelope, in order, exactly once.
     public var onEvent: ((WireEvent) -> Void)?
@@ -75,6 +77,17 @@ public final class FleetStream: NSObject, ObservableObject {
         task = Task { [weak self] in
             await self?.runLoop()
         }
+    }
+
+    /// Adopt a new hub config (the launch-time one went stale — e.g. the
+    /// app came up pointed at a port the hub no longer serves). Forces an
+    /// immediate reconnect so the new URL/token takes effect now; the
+    /// cursor carries over, so the since= replay still covers the gap.
+    public func apply(_ newConfig: ServerConfig) {
+        guard newConfig != config else { return }
+        log("config adopted: \(newConfig.baseURL)")
+        config = newConfig
+        reconnectNow()
     }
 
     // MARK: - Connection loop

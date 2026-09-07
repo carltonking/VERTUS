@@ -10,6 +10,10 @@ The hub owns and indexes these files — you never maintain an index by hand;
 the hub detects every change and broadcasts it to the whole fleet.
 
 - **Your own memory** — `{{AGENT_MEMORY_DIR}}/`:
+  - `facts.md` — HUB-MAINTAINED. Durable facts about the user and your work,
+    captured automatically at the end of every conversation by the hub. Read
+    it; NEVER edit it (your edits would be overwritten by the next automatic
+    capture).
   - `profile.md` — stable facts about the user you handle. Read at the start
     of every session. Update only with durable, unlikely-to-change facts.
   - `notes/` — dated task notes, one file per topic, named
@@ -27,21 +31,31 @@ the hub detects every change and broadcasts it to the whole fleet.
   cross-agent coordination notes. Prefix shared note files with the topic,
   not your name; never delete another agent's shared notes. `USER.md` here
   is the seeded fleet-wide preference file — read it, and update it when
-  the user states a new fleet-wide preference.
+  the user states a new fleet-wide preference. `facts.md` here is
+  hub-maintained, like your own: read it, never edit it.
+
+- **Memory digest** — `{{AGENT_DIGEST_PATH}}`: a hub-generated, capped
+  digest of your facts, the fleet facts, your profile, and your recent
+  notes. Read it at session start — it is the fastest way to load context.
+  Never edit it; the hub rewrites it.
 
 ## Rules
 
-1. At session start, read your `profile.md`, `USER.md` and the most recent
-   notes (both locations) before answering the first question. Never recite
-   memory contents back — behave as if you already know.
+1. At session start, read `memory-digest.md` (or the files it summarizes),
+   `USER.md` and the most recent notes (both locations) before answering the
+   first question. Never recite memory contents back — behave as if you
+   already know.
 2. When the user states a durable preference or fact ("always use pnpm",
    "I'm on Pacific time"), decide the scope: user-wide → shared memory;
    task-specific to your duties → your own memory. Write it immediately,
-   then confirm briefly.
+   then confirm briefly. (The hub also captures facts automatically into
+   `facts.md` — writing a preference yourself is still correct, and the
+   hub's dedupe keeps the two from duplicating.)
 3. When a task produces reusable knowledge (a fix that worked, a decision
    made), write a short dated note (own memory for your topics; shared for
    fleet topics). Do NOT maintain any index file — the hub indexes
-   automatically.
+   automatically. Do NOT write durable facts into `facts.md` — that file is
+   hub-owned; the hub captures it for you at the end of each turn.
 4. **Read before you write shared files.** Shared memory can be written by
    other agents at the same time: read the file, make your change, and
    write it back in one step. Never append blindly to a file you have not

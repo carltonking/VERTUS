@@ -506,6 +506,124 @@ final class FleetStoreTests: XCTestCase {
         XCTAssertEqual(store.workingFor(b.id), "alpha")
     }
 
+    // MARK: Hub config reload (stale launch-time URL self-heal)
+
+    /// A config that will never accept connections (the discard port). The
+    /// reload tests point a store at it to simulate a stale launch-time URL
+    /// whose hub moved away.
+    private var deadConfig: ServerConfig {
+        ServerConfig(baseURL: "http://127.0.0.1:9", token: "test-token")
+    }
+
+    /// reloadHubConfig must adopt a re-resolved config: the client uses it
+    /// for the next request AND the stream reconnects there (the cursor
+    /// carries over). An unchanged config must no-op.
+    func testReloadHubConfigAdoptsNewConfigAndReconnectsStream() async throws {
+        let hub2 = StubHub()
+        try hub2.start()
+        defer { hub2.stop() }
+        let live2 = "http://127.0.0.1:\(hub2.port)"
+
+        // A second store whose loader resolves to hub2 while its client and
+        // stream were built for hub.
+        let store2 = FleetStore(
+            client: VertusHTTPClient(config: ServerConfig(baseURL: "http://127.0.0.1:\(hub.port)", token: "test-token")),
+            stream: FleetStream(config: ServerConfig(baseURL: "http://127.0.0.1:\(hub.port)", token: "test-token"),
+                                cursor: StreamCursor(processName: "test-reload-\(UUID().uuidString)")),
+            autoReloadConfig: true,
+            configLoader: { ServerConfig(baseURL: live2, token: "test-token") })
+        store2.start()
+        defer { store2.stop() }
+
+        let adopted = store2.reloadHubConfig()
+        XCTAssertTrue(adopted, "a changed config must be adopted")
+        XCTAssertEqual(store2.client.config.baseURL, live2)
+        XCTAssertEqual(store2.stream.config.baseURL, live2)
+
+        // The stream must be live on hub2: an agent created there (through
+        // the adopted client) streams into store2's transcript.
+        let a2 = try await store2.createAgent(name: "bravo")
+        hub2.inject(type: "text", agentID: a2.id, runID: "r2", payload: ["text": "on hub2"])
+        let ok = await waitUntil {
+            store2.live[a2.id]?.transcriptText == "on hub2"
+        }
+        XCTAssertTrue(ok, "stream should deliver from the adopted hub; state=\(store2.connectionState)")
+
+        // Unchanged config: a second reload must no-op.
+        XCTAssertFalse(store2.reloadHubConfig())
+    }
+
+    /// End-to-end self-heal: a store started against a dead port re-resolves
+    /// on stream failure and reconnects to the corrected hub with no restart
+    /// (the app-side fix for "⚠️ Could not connect to the server.").
+    func testFailingStreamAutoReloadsToCorrectHub() async throws {
+        let a = try await makeAgent("alpha")   // exists on the REAL hub
+
+        // A second store whose config is a dead port but whose loader
+        // resolves to the real hub.
+        let store2 = FleetStore(
+            client: VertusHTTPClient(config: deadConfig),
+            stream: FleetStream(config: deadConfig,
+                                cursor: StreamCursor(processName: "test-auto-\(UUID().uuidString)")),
+            autoReloadConfig: true,
+            configLoader: { ServerConfig(baseURL: "http://127.0.0.1:\(self.hub.port)", token: "test-token") })
+        store2.start()
+        defer { store2.stop() }
+
+        // The stream fails against the dead port, adopts the reloaded
+        // config, reconnects to the real hub, and delivers events there.
+        hub.inject(type: "text", agentID: a.id, runID: "r1", payload: ["text": "self-healed"])
+        let ok = await waitUntil(timeout: 8) {
+            store2.live[a.id]?.transcriptText == "self-healed"
+                && store2.stream.config.baseURL == "http://127.0.0.1:\(self.hub.port)"
+        }
+        XCTAssertTrue(ok, "stream should self-heal to the reloaded hub; state=\(store2.connectionState)")
+    }
+
+    /// A submit against a stale URL must retry once against the reloaded
+    /// config and succeed — the QuickBar "Could not connect" path.
+    func testSubmitRetriesOnceAgainstReloadedConfig() async throws {
+        let a = try await makeAgent("alpha")
+        let store2 = FleetStore(
+            client: VertusHTTPClient(config: deadConfig),
+            stream: FleetStream(config: deadConfig,
+                                cursor: StreamCursor(processName: "test-retry-\(UUID().uuidString)")),
+            autoReloadConfig: true,
+            configLoader: { ServerConfig(baseURL: "http://127.0.0.1:\(self.hub.port)", token: "test-token") })
+        store2.start()
+        defer { store2.stop() }
+
+        let runID = try await store2.submit(agentID: a.id, text: "hello after reload")
+        XCTAssertFalse(runID.isEmpty)
+        XCTAssertEqual(store2.live[a.id]?.transcript.last?.text, "hello after reload")
+        XCTAssertEqual(store2.client.config.baseURL, "http://127.0.0.1:\(hub.port)")
+        // Exactly one prompt POST landed on the hub: the first attempt was
+        // refused, the reload fixed the URL, the retry succeeded.
+        let prompts = hub.received.filter { $0.method == "POST" && $0.path == "/api/prompt" }
+        XCTAssertEqual(prompts.count, 1)
+    }
+
+    /// Without auto-reload (the hermetic-test default) the failure still
+    /// surfaces as a transport error — no behavior change for existing users
+    /// of the default init.
+    func testSubmitWithoutAutoReloadStillThrows() async throws {
+        let a = try await makeAgent("alpha")
+        let store2 = FleetStore(
+            client: VertusHTTPClient(config: deadConfig),
+            stream: FleetStream(config: deadConfig,
+                                cursor: StreamCursor(processName: "test-noreload-\(UUID().uuidString)")))
+        store2.start()
+        defer { store2.stop() }
+        do {
+            _ = try await store2.submit(agentID: a.id, text: "x")
+            XCTFail("submit against a dead hub must throw")
+        } catch let error as VertusError {
+            guard case .transport = error else {
+                return XCTFail("expected transport error, got \(error)")
+            }
+        }
+    }
+
     // MARK: VERTUS_HUB_URL precedence (VERTUS_HUB_URL > UserDefaults > default)
 
     func testHubURLPrecedence() throws {

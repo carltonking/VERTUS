@@ -42,8 +42,8 @@ struct VertusApp: App {
             .commands {
                 // Replacing .newItem keeps ⌘N out (no second window concept).
                 CommandGroup(replacing: .newItem) { }
-                CommandMenu("VERTUS") {
-                    Button("Open VERTUS Window") {
+                CommandMenu("Vertus") {
+                    Button("Open Vertus Window") {
                         AppDelegate.shared?.openMainWindow()
                     }
                     .keyboardShortcut("o", modifiers: [.command])
@@ -104,7 +104,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.store = FleetStore(
             client: VertusHTTPClient(config: config),
             stream: FleetStream(config: config,
-                                cursor: StreamCursor(processName: "vertus"))
+                                cursor: StreamCursor(processName: "vertus")),
+            // Re-resolve the hub config when the stream or a submit fails:
+            // a launch-time URL can go stale while the app is up (the hub
+            // restarted on another port) — the app then self-heals instead
+            // of dialing the dead port forever.
+            autoReloadConfig: true
         )
         super.init()
     }
@@ -125,7 +130,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installNotifications()
         installPanelQuitMonitor()
         installWindowCloseMonitor()
+        vertusTrace("launch: about to openMainWindow")
         openMainWindow()
+        vertusTrace("launch: openMainWindow returned; sessions=\(store.sessions.count) selectedSession=\(store.foregroundSessionID?.prefix(8) ?? "nil")")
 
         if CommandLine.arguments.contains("--verify-nub") {
             renderPanel(progress: 0)
@@ -297,30 +304,149 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Main window (owned by the delegate, so "Open in Fleet" is an
     // in-process activation, never a second process)
 
-    /// Open (or bring forward) the main VERTUS window. Closing it hides it —
-    /// the menubar item and ⇧⌘J keep working; Quit from the menubar quits
-    /// everything.
-    @objc func openMainWindow() {
-        NSApp.activate(ignoringOtherApps: true)
-        if let window = mainWindow {
-            window.makeKeyAndOrderFront(nil)
-            return
+    // MARK: - Session windows
+
+    /// A window that belongs to one session. The delegate holds the session id
+    /// so we can close the session (and its store entry) when the window closes,
+    /// and so we can keep the window title in sync with the session title.
+    private final class SessionWindowDelegate: NSObject, NSWindowDelegate {
+        let sessionID: String
+        weak var store: FleetStore?
+        weak var app: AppDelegate?
+        private var cancellable: AnyCancellable?
+        weak var window: NSWindow?
+
+        init(sessionID: String, store: FleetStore, app: AppDelegate, window: NSWindow) {
+            self.sessionID = sessionID
+            self.store = store
+            self.app = app
+            self.window = window
+            super.init()
+            Task { @MainActor in subscribeToSessionTitle() }
         }
+
+        @MainActor private func subscribeToSessionTitle() {
+            cancellable = store?.$sessions
+                .map { sessions -> String? in
+                    sessions.first(where: { $0.id == self.sessionID })?.title
+                }
+                .removeDuplicates()
+                .sink { [weak self] title in
+                    self?.window?.title = title ?? "Vertus"
+                }
+        }
+
+        func windowShouldClose(_ sender: NSWindow) -> Bool {
+            sender.orderOut(nil)
+            return false
+        }
+
+        func windowWillClose(_ notification: Notification) {
+            store?.closeSession(sessionID)
+            app?.sessionWindows[sessionID] = nil
+        }
+    }
+
+    /// Open (or bring forward) a session window for one agent. If a session
+    /// window for that agent is already open, bring the newest one forward;
+    /// otherwise create a new session (and window). Closing a window hides it
+    /// and removes its session from the store; the menubar + panel stay.
+    /// Synchronous: the first-time store session is created best-effort from the
+    /// in-memory roster (the async finalize is a no-op if the roster isn't there
+    /// yet — the user can rename the window title to fix it).
+    func openSessionWindow(agentID: String, title: String? = nil) {
+        NSApp.activate(ignoringOtherApps: true)
+        let agent = store.agent(agentID)
+        let displayName = agent?.displayName ?? agentID
+        let initialTitle = title ?? displayName
+
+        // Reuse an existing session window for this agent if one exists.
+        let existing = store.sessions(for: agentID).last
+        let sessionID: String
+        if let e = existing {
+            sessionID = e.id
+            sessionWindows[sessionID]?.makeKeyAndOrderFront(nil)
+        } else {
+            // Open the store session SYNCHRONOUSLY first so the session id is
+            // stable before we build the window. openSession is async only
+            // because it fetches the agent displayName best-effort; if the hub
+            // is unreachable we still create the session with a provisional
+            // title and retry the displayName shortly after.
+            let sid = openSessionSync(agentID: agentID, title: initialTitle)
+            sessionID = sid
+            let w = makeSessionWindow(sessionID: sid)
+            w.title = initialTitle
+            sessionWindows[sid] = w
+            w.makeKeyAndOrderFront(nil)
+            store.selectedAgentID = agentID
+            // Best-effort: refresh the session title from the hub once it's
+            // reachable (so the window title reflects the agent displayName even
+            // if we fell back to a provisional title above).
+            Task { @MainActor in
+                try? await refreshSessionTitle(sessionID: sid, agentID: agentID)
+            }
+        }
+        store.foregroundSessionID = sessionID
+    }
+
+    /// Synchronous session creation: use a provisional title when the hub is
+    /// unreachable; the async refresh above corrects it once the hub is back.
+    /// Uses the store's own append path (openSessionSync mirrors the behaviour
+    /// of openSession but without the async hub fetch).
+    private func openSessionSync(agentID: String, title: String) -> String {
+        let sid = UUID().uuidString
+        let session = FleetStore.WindowSession(id: sid, agentID: agentID, title: title)
+        store._appendSession(session)
+        return sid
+    }
+
+    /// Best-effort refresh of a session's title from the hub agent profile.
+    private func refreshSessionTitle(sessionID: String, agentID: String) async {
+        guard let agent = try? await store.client.agent(agentID) else { return }
+        store.renameSession(sessionID, title: agent.displayName)
+    }
+
+    /// Build one session window. Each window is its own NavigationSplitView
+    /// whose detail is bound to its session's agent.
+    private func makeSessionWindow(sessionID: String) -> NSWindow {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1180, height: 760),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
-        window.title = "VERTUS"
-        window.contentView = NSHostingView(
-            rootView: FleetRootView().environmentObject(store)
-        )
-        window.setFrameAutosaveName("VERTUSMainWindow")
         window.center()
-        window.delegate = self
-        mainWindow = window
-        window.makeKeyAndOrderFront(nil)
+        let root = FleetRootView(sessionID: sessionID)
+            .environmentObject(store)
+        window.contentView = NSHostingView(rootView: root)
+        window.setFrameAutosaveName("VERTUSMainWindow")
+        let delegate = SessionWindowDelegate(sessionID: sessionID, store: store, app: self, window: window)
+        window.delegate = delegate
+        return window
+    }
+
+    /// Windows keyed by their session id. Cleared when the window closes.
+    var sessionWindows: [String: NSWindow] = [:]
+
+    // MARK: - Main window (legacy single-window path)
+
+    /// Legacy helper kept for the menubar "Open Vertus Window" item and the
+    /// first-launch path: open a session window for the first known agent (or
+    /// primary). With multiple windows now supported, this just opens/creates
+    /// a session the same way as openSessionWindow.
+    @objc func openMainWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        // First session: the primary agent, or the first in the roster.
+        let agentID: String
+        if let primary = store.agents.first(where: { $0.isPrimary }) {
+            agentID = primary.id
+        } else if let first = store.agents.first {
+            agentID = first.id
+        } else {
+            // No agents yet — open for a placeholder; the user can create one.
+            agentID = "primary"
+        }
+        openSessionWindow(agentID: agentID)
     }
 
     // MARK: - Show / hide transitions
@@ -515,15 +641,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
             button.image = menubarIcon
-            button.toolTip = "VERTUS (⇧⌘J)"
+            button.toolTip = "Vertus (⇧⌘J)"
         }
         let menu = NSMenu()
-        menu.addItem(withTitle: "Toggle VERTUS (⇧⌘J)", action: #selector(togglePanel), keyEquivalent: "j")
+        menu.addItem(withTitle: "Toggle Vertus (⇧⌘J)", action: #selector(togglePanel), keyEquivalent: "j")
             .target = self
-        menu.addItem(withTitle: "Open VERTUS Window", action: #selector(openMainWindow), keyEquivalent: "o")
+        menu.addItem(withTitle: "Open Vertus Window", action: #selector(openMainWindow), keyEquivalent: "o")
             .target = self
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit VERTUS", action: #selector(quitApp), keyEquivalent: "q").target = self
+        menu.addItem(withTitle: "Quit Vertus", action: #selector(quitApp), keyEquivalent: "q").target = self
         item.menu = menu
         statusItem = item
     }

@@ -15,7 +15,7 @@
 //
 // Build:          swift build                    (debug)
 //                 swift build -c release         (production)
-// Bundle:         scripts/build-app.sh           -> dist/VERTUS.app
+// Bundle:         scripts/build-app.sh           -> dist/Vertus.app
 // Phone:          cd VertusPhone && xcodebuild -project VertusPhone.xcodeproj \
 //                   -scheme VertusPhone -sdk iphonesimulator build
 // Run the tests:  swift test

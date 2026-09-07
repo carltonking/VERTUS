@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VERTUS logo animation — burst · tumble · dock</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    flex-direction: column; font-family: -apple-system, system-ui, sans-serif;
+  }
+  svg { width: min(70vmin, 560px); height: min(70vmin, 560px); display: block; }
+  #phase {
+    margin-top: 30px; color: rgba(255,255,255,0.45);
+    font-size: 15px; letter-spacing: 0.12em; text-transform: uppercase;
+    font-variant-numeric: tabular-nums;
+  }
+  #note {
+    margin-top: 10px; color: rgba(255,255,255,0.25);
+    font-size: 12px; letter-spacing: 0.06em;
+  }
+</style>
+</head>
+<body>
+<!--
+  VERTUS logo animation — "burst · tumble · dock" using the no-triangle
+  logo's line-art mark (hexagon Λ, dashed triangle edges, bottom V),
+  measured from WHITE LOGO - NO TRIANGLE.png (white plate removed for
+  dark backgrounds).
+
+  Three line-art pieces, one burst:
+    - top Λ    (hexagon's upper edges)      flies UP
+    - left ∠   (triangle edge + bottom V)   flies LEFT
+    - right ∠  (triangle edge + bottom V)   flies RIGHT
+  Each tumbles 90° about its own centroid, floats, then docks back one at a
+  time with a damped-spring landing (velocity-continuous, no glitches).
+    - burst: 0.80 s ease-out, travel 0.32·R (R = half the plate height)
+    - float: 0.35 s, plate breathes 3%
+    - dock:  damped spring (response 0.50 s, damping 0.78), staggered 0.14 s
+    - rest:  1.20 s, then repeat
+-->
+<svg id="logo" viewBox="0 0 206 203" aria-label="VERTUS logo animation">
+  <g id="rotor">
+    <!-- Top piece: hexagon's upper Λ -->
+    <g id="g-top">
+      <path id="p-t1" d="M 16.70 51.66 L 102.77 1.88" fill="none" stroke="#E0E0E0" stroke-width="0.75" stroke-linecap="round"/>
+      <path id="p-t2" d="M 102.77 1.88 L 188.94 51.66" fill="none" stroke="#E0E0E0" stroke-width="0.75" stroke-linecap="round"/>
+    </g>
+    <!-- Left piece: dashed triangle edge + bottom-V edge -->
+    <g id="g-left">
+      <path id="p-l1" d="M 102.77 1.88 L 16.70 151.22" fill="none" stroke="#E0E0E0" stroke-width="0.75" stroke-linecap="round" stroke-dasharray="3.0 2.4"/>
+      <path id="p-l2" d="M 16.70 151.22 L 102.77 200.99" fill="none" stroke="#E0E0E0" stroke-width="0.75" stroke-linecap="round"/>
+    </g>
+    <!-- Right piece: dashed triangle edge + bottom-V edge -->
+    <g id="g-right">
+      <path id="p-r1" d="M 102.77 1.88 L 188.94 151.22" fill="none" stroke="#E0E0E0" stroke-width="0.75" stroke-linecap="round" stroke-dasharray="3.0 2.4"/>
+      <path id="p-r2" d="M 188.94 151.22 L 102.77 200.99" fill="none" stroke="#E0E0E0" stroke-width="0.75" stroke-linecap="round"/>
+    </g>
+  </g>
+</svg>
+<div id="phase">burst…</div>
+<div id="note">burst apart → tumble → dock back, one at a time (loops)</div>
+
+<script>
+"use strict";
+// Phase timing (unchanged from the approved choreography).
+const T_BURST = 0.80;
+const T_HOLD  = 0.35;
+const STAG    = 0.14;
+const REST_T  = 1.20;
+const T_DOCK_CURVE = 1.0;
+const MAXSEP  = 0.32;   // apex travel, fraction of R (R = half plate height)
+const TUMBLE  = 90;     // degrees each piece rotates about its own centroid
+const BREATH  = 0.03;   // whole-logo scale pulse at the apex
+const R = 100;          // half the plate height (viewBox units)
+
+// Damped spring for the landing.
+const RESP = 0.50, DAMP = 0.78;
+const SPRING_K = Math.pow(2 * Math.PI / RESP, 2);
+const SPRING_C = 2 * DAMP * Math.sqrt(SPRING_K);
+
+const rotor   = document.getElementById("rotor");
+const phaseEl = document.getElementById("phase");
+
+// Pieces: their groups, radial axes, and centroids (base coords).
+const pieces = [
+  { id: "g-top",   name: "top",    axis: [ 0, -1], cx: 102.80, cy: 35.07 },
+  { id: "g-left",  name: "left",   axis: [-1,  0], cx:  74.08, cy: 118.03 },
+  { id: "g-right", name: "right",  axis: [ 1,  0], cx: 131.49, cy: 118.03 },
+];
+
+const now = () => performance.now() / 1000;
+
+function clamp01(x) { return Math.min(Math.max(x, 0), 1); }
+function easeOutCubic(u)  { return 1 - Math.pow(1 - u, 3); }
+function easeInOutCubic(u){ return u < 0.5 ? 4*u*u*u : 1 - Math.pow(-2*u + 2, 3) / 2; }
+
+// Per-piece dock spring state (fraction 1 → 0).
+const dock = pieces.map(() => ({ started: false, x: 0, v: 0 }));
+
+let mode = "burst";
+let modeStart = now();
+let lastT = now();
+
+function frame() {
+  const t = now();
+  const dt = Math.min(t - lastT, 0.05);
+  lastT = t;
+  const mt = t - modeStart;
+
+  const sepFrac = [0, 0, 0];
+  const rot = [0, 0, 0];
+  let scale = 1;
+  let label;
+
+  if (mode === "burst") {
+    const u = clamp01(mt / T_BURST);
+    const f = easeOutCubic(u);
+    for (let i = 0; i < 3; i++) { sepFrac[i] = f; rot[i] = TUMBLE * f; }
+    label = "burst…";
+    if (mt >= T_BURST) { mode = "hold"; modeStart = t; }
+  } else if (mode === "hold") {
+    const u = clamp01(mt / T_HOLD);
+    for (let i = 0; i < 3; i++) { sepFrac[i] = 1; rot[i] = TUMBLE; }
+    scale = 1 + BREATH * Math.sin(Math.PI * u);
+    label = "float…";
+    if (mt >= T_HOLD) {
+      mode = "dock";
+      modeStart = t;
+      for (const s of dock) { s.started = false; s.x = 1; s.v = 0; }
+    }
+  } else if (mode === "dock") {
+    const tD = mt;
+    for (let k = 0; k < 3; k++) {
+      const i = k;   // dock order: top → left → right
+      const startAt = k * STAG;
+      const s = dock[i];
+      if (!s.started && tD >= startAt) { s.started = true; s.x = 1; s.v = 0; }
+      if (s.started) {
+        const a = -SPRING_K * s.x - SPRING_C * s.v;
+        s.v += a * dt;
+        s.x += s.v * dt;
+        sepFrac[i] = s.x;
+      }
+      rot[i] = TUMBLE * (1 - easeInOutCubic(clamp01((tD - startAt) / T_DOCK_CURVE)));
+    }
+    label = "dock…";
+    if (dock.every(s => s.started && Math.abs(s.x) < 0.005 && Math.abs(s.v) < 0.02)) {
+      mode = "rest";
+      modeStart = t;
+    }
+  } else {
+    label = "resting";
+    if (mt >= REST_T) {
+      mode = "burst";
+      modeStart = t;
+      for (const s of dock) { s.started = false; s.x = 0; s.v = 0; }
+    }
+  }
+
+  // Render pieces: fly along the radial axis while tumbling about the
+  // piece's own centroid (rotate first, then translate).
+  const d = MAXSEP * R;
+  for (let i = 0; i < pieces.length; i++) {
+    const el = document.getElementById(pieces[i].id);
+    if (Math.abs(sepFrac[i]) > 0.001) {
+      const dx = sepFrac[i] * d * pieces[i].axis[0];
+      const dy = sepFrac[i] * d * pieces[i].axis[1];
+      el.setAttribute("transform",
+        `translate(${dx.toFixed(3)} ${dy.toFixed(3)}) ` +
+        `rotate(${rot[i].toFixed(3)} ${pieces[i].cx} ${pieces[i].cy})`);
+    } else {
+      el.removeAttribute("transform");
+    }
+  }
+  if (scale !== 1) {
+    rotor.setAttribute("transform",
+      `translate(102.88 101.1) scale(${scale.toFixed(5)}) translate(-102.88 -101.1)`);
+  } else {
+    rotor.removeAttribute("transform");
+  }
+  phaseEl.textContent = label;
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
