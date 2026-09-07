@@ -690,10 +690,10 @@ struct NotchPanelContent: View {
         return ""
     }
 
-    /// "Working" — the logo spinner plus the label, in the session window
-    /// in the position the reply will occupy. Shown while the agent is
-    /// working and no text has arrived for the current view; the first text
-    /// delta replaces it in place.
+    /// "Working" — the logo spinner plus the label, bare (no bubble chrome),
+    /// in the session window in the position the reply will occupy. Shown
+    /// while the agent is working and no text has arrived for the current
+    /// view; the first text delta replaces it in place.
     private var thinkingBubble: some View {
         HStack(spacing: 6) {
             LogoSpinner(isBusy: true, size: 13)
@@ -703,10 +703,6 @@ struct NotchPanelContent: View {
         }
         .padding(.horizontal, 11)
         .padding(.vertical, 7)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(white: 0.22))
-        )
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 

@@ -139,21 +139,23 @@ final class QuickBarViewModel: ObservableObject {
         if !demoWorking {
             isStreaming = state.isRunning
             currentActivity = state.currentActivity
+            // Derived, not accumulated: has the CURRENT run (state.lastRunID)
+            // produced visible text? A run started by another surface must not
+            // inherit "has text" from an older conversation — otherwise the
+            // in-window Working indicator would hide while the agent works
+            // with nothing on screen. First delta of THIS run flips it
+            // (WorkingIndicatorPolicy). Skipped in demo mode: the seed owns
+            // the indicator state (turnHasText = false) so the --demo-working
+            // capture is deterministic regardless of live hub state.
+            let last = transcript.last
+            turnHasText = WorkingIndicatorPolicy.currentRunHasVisibleText(
+                lastEntryRunID: last?.runId,
+                currentRunID: state.lastRunID,
+                lastEntryIsReply: last?.role == "vertus",
+                lastEntryText: last?.text ?? ""
+            )
         }
         queueDepth = state.queueDepth
-        // Derived, not accumulated: has the CURRENT run (state.lastRunID)
-        // produced visible text? A run started by another surface must not
-        // inherit "has text" from an older conversation — otherwise the
-        // in-window Working indicator would hide while the agent works with
-        // nothing on screen. First delta of THIS run flips it
-        // (WorkingIndicatorPolicy).
-        let last = transcript.last
-        turnHasText = WorkingIndicatorPolicy.currentRunHasVisibleText(
-            lastEntryRunID: last?.runId,
-            currentRunID: state.lastRunID,
-            lastEntryIsReply: last?.role == "vertus",
-            lastEntryText: last?.text ?? ""
-        )
     }
 
     private func syncBusy() {
