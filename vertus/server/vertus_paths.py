@@ -154,6 +154,14 @@ def venv_python() -> Path:
     return managed[-1] if managed else legacy
 
 
+def hermes_skills_override() -> str | None:
+    """VERTUS_HERMES_SKILLS — which Hermes-shipped skills agents get, or None
+    when unset (the hub default). Unset and empty differ: an empty value is
+    an explicit choice, so it reaches the parser instead of meaning "default"."""
+    value = os.environ.get("VERTUS_HERMES_SKILLS")
+    return None if value is None else value.strip()
+
+
 def cua_manifest_override() -> str:
     """VERTUS_CUA_MANIFEST — the per-agent capability-manifest source, or \"\"."""
     return _env("VERTUS_CUA_MANIFEST")
