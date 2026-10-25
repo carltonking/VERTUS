@@ -49,6 +49,7 @@ class _Hub:
         vs.VertusHandler.sessions = self.mgr
         vs.VertusHandler.registry = registry
         vs.VertusHandler.token = "test-token"
+        vs.VertusHandler.approver_token = "approver-test"
         vs.VertusHandler.store = self.store
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), vs.VertusHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -190,11 +191,12 @@ def test_requests_the_hub_cannot_show_are_declined_at_once():
 
 # --- HTTP: answering routes to the waiting agent and settles the ledger ---
 
-def _post(base: str, path: str, body: dict, token: str = "test-token"):
-    req = urllib.request.Request(base + path, data=json.dumps(body).encode(), method="POST",
-                                 headers={"Authorization": f"Bearer {token}",
-                                          "Content-Type": "application/json",
-                                          "X-Vertus-Client": "island"})
+def _post(base: str, path: str, body: dict, token: str = "test-token", approver: str | None = "approver-test"):
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+               "X-Vertus-Client": "island"}
+    if approver is not None:
+        headers["X-Vertus-Approver"] = approver
+    req = urllib.request.Request(base + path, data=json.dumps(body).encode(), method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, json.loads(resp.read())
@@ -283,3 +285,89 @@ def test_always_allow_answers_survive_rematerialization(hub):
     again = agent_registry._yaml_load(cfg_path.read_text(encoding="utf-8"))
     assert again["command_allowlist"] == ["delete in root path"]
     assert again["approvals"]["mode"] == "manual"
+
+
+def test_the_bearer_token_alone_cannot_answer(hub):
+    # Every agent can read the hub's bearer token; answering also needs the
+    # approver credential, which agents are never given.
+    bridge = hub.mgr.get_or_create_session("primary")
+    bridge.store = hub.store
+    answered: list = []
+
+    class _Engine:
+        def respond_approval(self, approval_id, choice):
+            answered.append(choice)
+            return True
+
+    bridge._session = _Engine()
+    bridge._on_pi_event({"type": "approval_request", "approval_id": "a5", "command": "git push"})
+    assert _wait(lambda: hub.store.get_approval("a5") is not None)
+    assert _post(hub.base, "/api/approvals/a5", {"choice": "once"}, approver=None)[0] == 403
+    assert _post(hub.base, "/api/approvals/a5", {"choice": "once"}, approver="guess")[0] == 403
+    assert answered == [] and hub.store.get_approval("a5")["decision"] is None
+
+
+def test_a_losing_second_answer_learns_what_actually_happened(hub):
+    bridge = hub.mgr.get_or_create_session("primary")
+    bridge.store = hub.store
+
+    class _Engine:
+        def respond_approval(self, approval_id, choice):
+            return False                      # the first answer already won
+
+        def settled_approval(self, approval_id):
+            return "once"
+
+    bridge._session = _Engine()
+    bridge._on_pi_event({"type": "approval_request", "approval_id": "a6", "command": "git push"})
+    assert _wait(lambda: hub.store.get_approval("a6") is not None)
+    status, body = _post(hub.base, "/api/approvals/a6", {"choice": "deny"})
+    assert status == 409 and body["error"].endswith("settled: once")
+    # The loser does not overwrite the ledger: the winner's event settles it.
+    assert hub.store.get_approval("a6")["decision"] is None
+    bridge._on_pi_event({"type": "approval_resolved", "approval_id": "a6", "decision": "once"})
+    assert _wait(lambda: hub.store.get_approval("a6")["decision"] == "once")
+
+
+def test_bridge_refuses_an_answer_the_engine_did_not_offer():
+    gateway, session, events = _bridge_session()
+    gateway.send({"jsonrpc": "2.0", "id": "srv-4", "method": "approval", "params": {
+        "session_id": "s", "request_id": "req-4", "command": "rm -rf /", "choices": ["once", "deny"]}})
+    assert _wait(lambda: any(e["type"] == "approval_request" for e in events))
+    with pytest.raises(ValueError):
+        session.respond_approval("req-4", "always")
+    assert session.respond_approval("req-4", "deny") is True
+    assert session.settled_approval("req-4") == "deny"
+
+
+def test_approvals_left_open_are_withdrawn_not_offered_forever(tmp_path):
+    store = RunStore(tmp_path / "fleet.db")
+    try:
+        store.record_approval_request("x1", None, "primary", "a", "")
+        store.record_approval_request("x2", None, "primary", "b", "")
+        store.record_approval_request("x3", None, "primary", "c", "")
+        assert store.withdraw_pending_approvals(["x1"]) == 1          # a turn ended
+        assert store.get_approval("x1")["decision"] == "withdrawn"
+        assert store.withdraw_pending_approvals(decided_by="hub restart") == 2   # boot
+        assert store.list_approvals(state="pending") == []
+    finally:
+        store.stop()
+
+
+def test_an_agents_own_settings_survive_rematerialization(hub):
+    import agent_registry
+    home = hub.registry.agent_home("primary")
+    cfg_path = home / "config.yaml"
+    cfg = agent_registry._yaml_load(cfg_path.read_text(encoding="utf-8"))
+    cfg["mcp_servers"] = {"linear": {"url": "https://mcp.linear.app"}}
+    cfg_path.write_text(agent_registry._yaml_dump(cfg), encoding="utf-8")
+    assert hub.registry.rematerialize_all() == []
+    again = agent_registry._yaml_load(cfg_path.read_text(encoding="utf-8"))
+    assert again["mcp_servers"] == {"linear": {"url": "https://mcp.linear.app"}}
+
+
+def test_no_gateway_runs_with_the_approval_bypass(hub, monkeypatch):
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    for unattended in (False, True):
+        kwargs = vs.resolve_session_kwargs(hub.registry, "primary", unattended=unattended)
+        assert kwargs["extra_env"]["HERMES_YOLO_MODE"] == "0"

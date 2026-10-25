@@ -2,114 +2,229 @@
 
 The rule the user set (Oct 2026): VERTUS acts on its own, but it asks before
 anything that leaves the Mac or cannot be taken back — sending, posting,
-spending, deleting. Modeled on open-instinct's policy (capabilities default to
-"ask" for money and outbound messages, deny beats ask beats allow), cut down to
-what this agent can actually do: it has no payment tool, so "spend" is
-recognized by intent (checkout/buy/pay actions in a browser or a command), not
-by an amount.
+spending, deleting. Modeled on open-instinct's policy (outbound and
+irreversible capabilities default to "ask"), cut down to what this agent can
+actually do and what a tool call's arguments actually reveal.
 
 Pure: ``decide(tool_name, args)`` reads nothing and changes nothing, so the
 plugin hook stays trivial and every rule is pinned by a test.
 
-Hermes's own dangerous-command detection still runs for terminal commands and
-asks on its own; this layer adds the categories it does not consider
-dangerous (an outgoing email, a ``git push``, a POST). A command the engine
-will already ask about is left to it (``engine_asks``), so one action never
-raises two approval cards. Read-only actions never match.
+How a shell command is judged: it is split into the commands it runs (lines,
+``;``, ``&&``, ``||``, pipes, ``$(…)``, backticks), and each is judged by the
+program it starts — after ``sudo``/``env``/``xargs``/``nohup`` and path
+prefixes — never by words appearing anywhere in the text. ``echo "rm"`` and
+``grep -rn purchase`` are reading; ``/bin/rm``, ``xargs rm`` and an ``rm`` on
+line two are deleting.
+
+What the guard deliberately leaves to the engine: Hermes's own
+dangerous-command gate (``engine_asks``) and its whole-script gate on
+``execute_code``, which with approvals on already asks before every script.
+Asking again would show one action twice.
+
+What it cannot see, stated plainly: a browser click carries only an element
+reference (``@e12``), not the button's label, so a purchase or a post made by
+clicking through a website is not recognized. Scripts run inside a page are
+checked for form submits and requests that send data.
+
+The approval channel itself is out of bounds: any call that touches the
+hub's approvals endpoint or the approver credential is blocked outright, so an
+agent cannot approve its own (or another agent's) request.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
+import shlex
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 
 @dataclass(frozen=True)
 class Verdict:
-    category: str          # send | post | spend | delete
-    reason: str            # what the approval card says
+    category: str          # send | post | delete | approval-channel
+    reason: str            # what the approval card (or the block) says
     rule_key: str          # the grain an "always allow" remembers
+    block: bool = False    # refuse outright instead of asking
 
 
-# Tool names whose every call goes outward. send_message is Hermes's
-# cross-platform messenger (Telegram, Discord, email, SMS…).
+# --- the approval channel ---------------------------------------------------
+
+_APPROVAL_CHANNEL = re.compile(r"api/approvals|approver[-_]token|X-Vertus-Approver", re.IGNORECASE)
+
+# --- tools whose every call goes outward -------------------------------------
+
+# send_message is Hermes's cross-platform messenger (reachable through MCP and
+# platform plugins); react_to_message posts a reaction someone else sees.
 _ALWAYS_ASK_TOOLS: dict[str, tuple[str, str]] = {
     "send_message": ("send", "send a message"),
+    "react_to_message": ("send", "react to a message"),
 }
 
-_COMMAND_RULES: list[tuple[str, str, str, re.Pattern[str]]] = [
-    # (category, rule name, reason, pattern) — matched against a shell
-    # command or code body, case-insensitively.
-    ("send", "applescript-send", "send a message or email from Mail/Messages",
-     re.compile(r"\bosascript\b[\s\S]*\b(send|reply|forward)\b")),
-    ("send", "cli-mail", "send an email",
-     re.compile(r"\b(sendmail|msmtp|mutt)\b|\bmail\s+-s\b|\bhimalaya\b[\s\S]*\b(send|reply|forward)\b")),
-    ("post", "git-push", "push to a remote repository",
-     re.compile(r"\bgit\s+push\b")),
-    ("post", "github-write", "post to GitHub",
-     re.compile(r"\bgh\s+(pr\s+(create|merge|close|comment|review)|issue\s+(create|close|comment)"
-                r"|release\s+create|repo\s+(create|delete))\b")),
-    ("post", "publish", "publish a package",
-     re.compile(r"\b(npm|pnpm|yarn)\s+publish\b|\btwine\s+upload\b|\bcargo\s+publish\b")),
-    ("post", "http-write", "send data to a web service",
-     re.compile(r"\bcurl\b[\s\S]*(\s-X\s*(POST|PUT|PATCH|DELETE)\b|\s--data(-raw|-binary)?\b|\s-d\s|\s-F\s)",
-                re.IGNORECASE)),
-    ("delete", "remove-files", "delete files",
-     re.compile(r"(^|[;&|`('\"]\s*|\bsudo\s+)(rm|rmdir|srm|shred|trash)\b|\bfind\b[\s\S]*\s-delete\b"
-                r"|\bunlink\s+\S|\b(os\.(remove|unlink|rmdir|removedirs)|shutil\.rmtree|send2trash)\s*\(")),
-    ("delete", "git-discard", "discard git work",
-     re.compile(r"\bgit\s+(reset\s+--hard|clean\s+-\w*f|branch\s+-D|stash\s+(drop|clear)"
-                r"|push\s+[\s\S]*--force)\b")),
-    ("delete", "applescript-delete", "delete items through AppleScript",
-     re.compile(r"\bosascript\b[\s\S]*\bdelete\b")),
-    ("spend", "purchase-command", "make a purchase",
-     re.compile(r"\b(purchase|place[\s_-]?order|buy[\s_-]?now|pay[\s_-]?now)\b", re.IGNORECASE)),
-]
+# Tools that run a shell command, and the argument keys that carry it.
+_SHELL_TOOLS = {"terminal", "process", "process_manage"}
+_SHELL_KEYS = ("command", "cmd", "data", "script")
+# Tools whose arguments are code: scanned only for the approval channel and,
+# for page scripts, for requests that send data. execute_code is gated by the
+# engine as a whole script.
+_CODE_TOOLS = {"execute_code"}
+_PAGE_SCRIPT_TOOLS = {"browser_cdp", "browser_console"}
 
-# Words on a control a browser action is about to press or fill that mean the
-# click commits something: money, a message, a post.
-_BROWSER_COMMIT = [
-    ("spend", "browser-purchase", "complete a purchase or payment",
-     re.compile(r"\b(buy|purchase|pay|checkout|check\s+out|place\s+(your\s+)?order|confirm\s+(order|payment|booking)"
-                r"|book\s+now|subscribe|complete\s+(order|purchase|booking))\b", re.IGNORECASE)),
-    ("send", "browser-send", "send a message from a website",
-     re.compile(r"\b(send|reply|forward)\b", re.IGNORECASE)),
-    ("post", "browser-post", "post or publish on a website",
-     re.compile(r"\b(post|publish|tweet)\b", re.IGNORECASE)),
-    ("delete", "browser-delete", "delete something on a website",
-     re.compile(r"\b(delete|remove|cancel\s+(subscription|account|order))\b", re.IGNORECASE)),
-]
+# --- shell commands -----------------------------------------------------------
 
-_COMMAND_TOOLS = {"terminal", "execute_code", "process"}
-# Browser actions that commit a page: a click, a key press, a form submit,
-# or script run in it. Typing into a field commits nothing, and reading,
-# scrolling and screenshots never ask.
-_BROWSER_ACTING = re.compile(r"(click|press|submit|exec)", re.IGNORECASE)
+_SEPARATORS = re.compile(r"\n|;|&&|\|\||\||\$\(|`|\)")
+# Words that run the next word as the real command.
+_PREFIXES = {"sudo", "env", "xargs", "nohup", "time", "command", "exec", "nice", "caffeinate", "doas"}
+_DELETE_PROGRAMS = {"rm", "rmdir", "srm", "shred", "trash", "unlink"}
+_MAIL_PROGRAMS = {"sendmail", "msmtp", "mutt", "neomutt"}
+_HTTP_WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
-def _command_text(args: dict) -> str:
-    for key in ("command", "code", "cmd", "script"):
-        value = args.get(key)
-        if isinstance(value, str) and value.strip():
-            return value
-    return ""
+def _words(segment: str) -> list[str]:
+    try:
+        return shlex.split(segment, posix=True)
+    except ValueError:  # an unbalanced quote: fall back to whitespace
+        return segment.split()
 
 
-def _browser_text(args: dict) -> str:
-    """Everything an acting browser call names: selector, label, text, code."""
+def _program(words: list[str]) -> tuple[str, list[str]]:
+    """The program a command really starts, and its arguments."""
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if _ASSIGNMENT.match(word):  # FOO=bar before the command (or after env)
+            i += 1
+            continue
+        base = word.rsplit("/", 1)[-1]
+        if base in _PREFIXES:
+            i += 1
+            # skip the prefix's own flags (sudo -u x, xargs -0, nice -n 5)
+            while i < len(words) and words[i].startswith("-"):
+                i += 2 if words[i] in ("-u", "-n", "-g", "-I") else 1
+            continue
+        return base, words[i + 1:]
+    return "", []
+
+
+def _segments(command: str) -> list[str]:
+    return [s.strip() for s in _SEPARATORS.split(command) if s.strip()]
+
+
+def _shell_verdict(segment: str) -> tuple[str, str, str] | None:
+    """(category, rule, what) for one simple command, or None."""
+    program, args = _program(_words(segment))
+    if not program:
+        return None
+    lowered = [a.lower() for a in args]
+
+    if program in _DELETE_PROGRAMS:
+        return ("delete", "remove-files", "delete files")
+    if program == "find" and ("-delete" in args or any(a in ("rm", "/bin/rm") for a in args)):
+        return ("delete", "find-delete", "delete files")
+    if program == "osascript":
+        text = " ".join(lowered)
+        if re.search(r"\b(send|reply|forward)\b", text):
+            return ("send", "applescript-send", "send a message or email from Mail/Messages")
+        if re.search(r"\bdelete\b", text):
+            return ("delete", "applescript-delete", "delete items through AppleScript")
+        return None
+    if program in _MAIL_PROGRAMS or (program == "mail" and "-s" in args):
+        return ("send", "cli-mail", "send an email")
+    if program == "himalaya" and any(a in ("send", "reply", "forward", "write") for a in lowered):
+        return ("send", "cli-mail", "send an email")
+    if program == "git" and args:
+        sub = lowered[0]
+        if sub == "push":
+            if any(a in ("--force", "-f", "--force-with-lease") for a in lowered):
+                return ("delete", "git-force-push", "force-push over a remote branch")
+            return ("post", "git-push", "push to a remote repository")
+        if sub == "rm":
+            return ("delete", "git-rm", "delete tracked files")
+        if (sub == "reset" and "--hard" in lowered) or (sub == "clean" and any(
+                a.startswith("-") and "f" in a for a in lowered[1:])) \
+                or (sub == "branch" and any(a in ("-d", "--delete") for a in lowered)) \
+                or (sub == "stash" and len(lowered) > 1 and lowered[1] in ("drop", "clear")):
+            return ("delete", "git-discard", "discard git work")
+        return None
+    if program == "gh" and args:
+        sub = lowered[0]
+        rest = lowered[1:]
+        if sub == "api":
+            method = next((rest[i + 1].upper() for i, a in enumerate(rest[:-1])
+                           if a in ("-x", "--method")), "")
+            writes = any(a in ("-f", "--field", "--raw-field", "--input") for a in rest)
+            if method in _HTTP_WRITE_METHODS or (writes and method != "GET"):
+                return ("post", "github-write", "write to GitHub")
+            return None
+        if (sub in ("pr", "issue") and rest and rest[0] in (
+                "create", "merge", "close", "comment", "review", "edit", "reopen", "delete")) \
+                or (sub == "release" and rest and rest[0] in ("create", "delete", "upload", "edit")) \
+                or (sub == "repo" and rest and rest[0] in ("create", "delete", "archive", "edit", "rename")) \
+                or (sub == "gist" and rest and rest[0] in ("create", "delete", "edit")):
+            return ("post", "github-write", "write to GitHub")
+        return None
+    if program in ("npm", "pnpm", "yarn", "cargo", "gem") and "publish" in lowered \
+            or program == "twine" and "upload" in lowered:
+        return ("post", "publish", "publish a package")
+    if program == "curl":
+        method = next((args[i + 1].upper() for i, a in enumerate(args[:-1]) if a in ("-X", "--request")), "")
+        method = method or next((a[2:].upper() for a in args if a.startswith("-X") and len(a) > 2), "")
+        sends = any(a in ("--data", "--data-raw", "--data-binary", "--data-urlencode", "--json",
+                          "--form", "-T", "--upload-file")
+                    or a.startswith(("-d", "-F", "--data=", "--json=", "--form="))
+                    for a in args)
+        if method in _HTTP_WRITE_METHODS or (sends and method != "GET"):
+            return ("post", "http-write", "send data to a web service")
+        return None
+    if program == "wget" and any(a.startswith(("--post-data", "--post-file", "--body-data", "--body-file"))
+                                 or a.startswith("--method") for a in args):
+        return ("post", "http-write", "send data to a web service")
+    if program == "aws" and len(lowered) >= 2 and lowered[0] == "s3" and lowered[1] in ("rm", "rb"):
+        return ("delete", "cloud-delete", "delete cloud storage")
+    if program == "docker" and lowered and (lowered[0] in ("rm", "rmi") or
+                                            (len(lowered) > 1 and lowered[1] in ("rm", "prune"))):
+        return ("delete", "docker-delete", "delete containers, images or volumes")
+    return None
+
+
+# Code that sends data over HTTP, wherever it appears (inline python -c,
+# heredocs, page scripts).
+_CODE_HTTP_WRITE = re.compile(
+    r"\b(requests|httpx|aiohttp\.ClientSession\(\)|session|client)\.(post|put|patch|delete)\s*\("
+    r"|urllib\.request\.urlopen\([^)]*data\s*="
+    r"|\bfetch\s*\([^)]*method\s*:\s*['\"](POST|PUT|PATCH|DELETE)"
+    r"|XMLHttpRequest[\s\S]*\.send\s*\(\s*[^)\s]"
+    r"|\.submit\s*\(\s*\)|\.requestSubmit\s*\(",
+    re.IGNORECASE)
+_CODE_DELETE = re.compile(
+    r"\b(os\.(remove|unlink|rmdir|removedirs)|shutil\.rmtree|send2trash)\s*\("
+    r"|\b(system|run|call|check_call|check_output|Popen|popen)\s*\(\s*\[?\s*['\"]\s*(rm|rmdir|trash)\b")
+
+
+def _short(text: str, limit: int = 160) -> str:
+    one_line = " ".join(text.split())
+    return one_line if len(one_line) <= limit else one_line[: limit - 1] + "…"
+
+
+def _key(category: str, rule: str, subject: str) -> str:
+    """The "always allow" grain: this rule for THIS command or recipient,
+    never a whole category — one "always" on a curl POST must not allow every
+    future POST."""
+    digest = hashlib.sha256(" ".join(subject.split()).encode("utf-8")).hexdigest()[:16]
+    return f"vertus-guard:{category}:{rule}:{digest}"
+
+
+def _all_text(args: dict) -> str:
     parts: list[str] = []
     for value in args.values():
         if isinstance(value, str):
             parts.append(value)
         elif isinstance(value, (list, tuple)):
             parts.extend(v for v in value if isinstance(v, str))
+        elif isinstance(value, dict):
+            parts.append(_all_text(value))
     return "\n".join(parts)
-
-
-def _short(text: str, limit: int = 160) -> str:
-    one_line = " ".join(text.split())
-    return one_line if len(one_line) <= limit else one_line[: limit - 1] + "…"
 
 
 def decide(tool_name: str, args: dict | None,
@@ -120,15 +235,22 @@ def decide(tool_name: str, args: dict | None,
     stop this shell command; when it will, the guard stays out of the way."""
     args = args if isinstance(args, dict) else {}
     name = (tool_name or "").strip()
+    text = _all_text(args)
+
+    if _APPROVAL_CHANNEL.search(text):
+        return Verdict("approval-channel",
+                       "Blocked: approvals are answered by the person, never by an agent.",
+                       "vertus-guard:approval-channel", block=True)
 
     if name in _ALWAYS_ASK_TOOLS:
         category, what = _ALWAYS_ASK_TOOLS[name]
-        target = args.get("target") or args.get("to") or args.get("chat_id") or args.get("platform") or ""
-        reason = f"VERTUS wants to {what}" + (f" to {_short(str(target), 60)}" if target else "")
-        return Verdict(category, reason, f"vertus-guard:{category}:{name}")
+        target = str(args.get("target") or args.get("to") or args.get("chat_id")
+                     or args.get("platform") or "")
+        reason = f"VERTUS wants to {what}" + (f" to {_short(target, 60)}" if target else "")
+        return Verdict(category, reason, _key(category, name, target or name))
 
-    if name in _COMMAND_TOOLS:
-        command = _command_text(args)
+    if name in _SHELL_TOOLS:
+        command = next((args[k] for k in _SHELL_KEYS if isinstance(args.get(k), str) and args[k].strip()), "")
         if not command:
             return None
         if name == "terminal" and engine_asks is not None:
@@ -137,16 +259,22 @@ def decide(tool_name: str, args: dict | None,
                     return None
             except Exception:  # noqa: BLE001 — a broken detector must not unguard
                 pass
-        for category, rule, what, pattern in _COMMAND_RULES:
-            if pattern.search(command):
+        for segment in _segments(command):
+            found = _shell_verdict(segment)
+            if found:
+                category, rule, what = found
                 return Verdict(category, f"VERTUS wants to {what}: {_short(command)}",
-                               f"vertus-guard:{category}:{rule}")
+                               _key(category, rule, command))
+        if _CODE_HTTP_WRITE.search(command):
+            return Verdict("post", f"VERTUS wants to send data to a web service: {_short(command)}",
+                           _key("post", "http-write", command))
+        if _CODE_DELETE.search(command):
+            return Verdict("delete", f"VERTUS wants to delete files: {_short(command)}",
+                           _key("delete", "remove-files", command))
         return None
 
-    if name.startswith("browser") and _BROWSER_ACTING.search(name + " " + str(args.get("action", ""))):
-        text = _browser_text(args)
-        for category, rule, what, pattern in _BROWSER_COMMIT:
-            if pattern.search(text):
-                return Verdict(category, f"VERTUS wants to {what}: {_short(text)}",
-                               f"vertus-guard:{category}:{rule}")
+    if name in _PAGE_SCRIPT_TOOLS and _CODE_HTTP_WRITE.search(text):
+        return Verdict("post", f"VERTUS wants to submit or send data from a web page: {_short(text)}",
+                       _key("post", "page-write", text))
+
     return None

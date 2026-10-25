@@ -259,6 +259,22 @@ def test_turn_waiting_on_an_approval_is_not_stalled(_fast_supervision, tmp_path)
     store.stop()
 
 
+def test_a_turn_that_ends_withdraws_its_open_approvals(tmp_path):
+    # A turn cancelled while it waits on a human: no engine waits on the
+    # approval any more, so the ledger must stop offering it.
+    store = RunStore(tmp_path / "fleet.db")
+    b = _bridge(store, stall=0)
+    run_id = _run(store, b, "send the report")
+    assert _wait_until(lambda: b.status()["state"] == "running")
+    b._on_pi_event({"type": "approval_request", "approval_id": "ap-9", "command": "git push"})
+    assert _wait_until(lambda: store.get_approval("ap-9") is not None)
+    b.cancel_run(run_id)
+    assert _wait_until(lambda: (store.get_run(run_id) or {})["state"] in ("cancelled", "error", "done"))
+    assert _wait_until(lambda: store.get_approval("ap-9")["decision"] == "withdrawn")
+    b.close()
+    store.stop()
+
+
 def test_hard_timeout_fires_on_endless_chatty_turn(monkeypatch, tmp_path):
     store = RunStore(tmp_path / "fleet.db")
     # Emits forever (stall never trips) but exceeds the hard ceiling.

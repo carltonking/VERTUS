@@ -1,4 +1,5 @@
-"""VERTUS guard — escalate sending, posting, spending and deleting to a human.
+"""VERTUS guard — escalate sending, posting and deleting to a human, and keep
+agents away from the approval channel.
 
 Registers one ``pre_tool_call`` hook. A matching call returns Hermes's
 ``{"action": "approve"}`` directive, which routes it through the same human
@@ -26,6 +27,8 @@ def _guard(tool_name: str = "", args: dict | None = None, **_: object) -> dict |
     verdict = decide(tool_name, args, engine_asks=_engine_asks)
     if verdict is None:
         return None
+    if verdict.block:
+        return {"action": "block", "message": verdict.reason}
     return {"action": "approve", "message": verdict.reason, "rule_key": verdict.rule_key}
 
 

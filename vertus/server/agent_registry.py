@@ -569,6 +569,13 @@ class AgentRegistry:
             kept = [e for e in existing["command_allowlist"] if isinstance(e, str)]
             fleet = [e for e in (cfg.get("command_allowlist") or []) if isinstance(e, str)]
             cfg["command_allowlist"] = fleet + [e for e in kept if e not in fleet]
+        # Per-agent settings the hub does not manage (an agent's own MCP
+        # servers, toolsets, display choices) stay: only keys the fleet
+        # config defines, and the ones derived below, are the hub's to set.
+        if isinstance(existing, dict):
+            for key, value in existing.items():
+                if key not in cfg and key not in _HUB_MANAGED_KEYS:
+                    cfg[key] = value
         if profile.get("model"):
             model_section = {"default": str(profile["model"])}
             if profile.get("provider"):
@@ -905,6 +912,9 @@ class AgentRegistry:
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 GUARD_PLUGIN_NAME = "vertus-guard"
+# config.yaml keys the hub derives on every materialization (from the profile
+# and policy); everything else an agent's own config carries is kept.
+_HUB_MANAGED_KEYS = frozenset({"model", "computer_use", "approvals", "plugins", "command_allowlist"})
 GUARD_PLUGIN_DIR = Path(__file__).resolve().parents[1] / "hermes-plugins" / GUARD_PLUGIN_NAME
 APPROVAL_TIMEOUT_S = 300
 

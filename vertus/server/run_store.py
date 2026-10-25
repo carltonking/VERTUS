@@ -669,6 +669,33 @@ class RunStore:
         self._submit(op, out)
         return bool(out.get("rowcount"))
 
+    def withdraw_pending_approvals(self, approval_ids: list[str] | None = None,
+                                   decided_by: str = "hub") -> int:
+        """Settle undecided rows as withdrawn: the given ids, or all of them
+        (hub boot — no engine survives a restart to answer them). Returns
+        how many were settled."""
+        out: dict = {}
+
+        def op(conn: sqlite3.Connection) -> None:
+            now = time.time()
+            if approval_ids is None:
+                cur = conn.execute(
+                    "UPDATE approvals SET decision = 'withdrawn', decided_at = ?, decided_by = ? "
+                    "WHERE decision IS NULL", (now, decided_by))
+            else:
+                if not approval_ids:
+                    out["rowcount"] = 0
+                    return
+                marks = ",".join("?" for _ in approval_ids)
+                cur = conn.execute(
+                    "UPDATE approvals SET decision = 'withdrawn', decided_at = ?, decided_by = ? "
+                    f"WHERE decision IS NULL AND approval_id IN ({marks})",
+                    (now, decided_by, *approval_ids))
+            out["rowcount"] = cur.rowcount
+
+        self._submit(op, out)
+        return int(out.get("rowcount") or 0)
+
     def get_approval(self, approval_id: str) -> dict | None:
         rows = [r for r in self.list_approvals(limit=500) if r.get("approval_id") == approval_id]
         return rows[0] if rows else None

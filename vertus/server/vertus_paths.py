@@ -78,6 +78,16 @@ def token_path() -> Path:
     return Path(env).expanduser() if env else vertus_root() / "token"
 
 
+def approver_token_path() -> Path:
+    """Approver credential. VERTUS_APPROVER_TOKEN_PATH → root/approver-token.
+
+    Answering an approval needs it on top of the bearer token. Agents are
+    told the bearer token (bot messaging) and never this one; the guard
+    plugin blocks any tool call that names it or the approvals endpoint."""
+    env = _env("VERTUS_APPROVER_TOKEN_PATH")
+    return Path(env).expanduser() if env else vertus_root() / "approver-token"
+
+
 def backups_dir() -> Path:
     """Migration backups. VERTUS_BACKUP_DIR → root/backups."""
     env = _env("VERTUS_BACKUP_DIR")
@@ -135,9 +145,11 @@ def venv_python() -> Path:
     legacy = fork_repo() / "venv" / "bin" / "python"
     if legacy.exists() or _env("VERTUS_HERMES_REPO"):
         return legacy
+    # Newest environment by the venv directory's own mtime: the python inside
+    # is a symlink to one shared interpreter, so its mtime ties for all.
     managed = sorted(
         (Path.home() / ".hermes" / "installs").glob("*/environments/*/venv/bin/python"),
-        key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+        key=lambda p: p.parents[1].lstat().st_mtime if p.exists() else 0.0,
     )
     return managed[-1] if managed else legacy
 

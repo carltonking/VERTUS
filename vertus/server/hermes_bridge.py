@@ -71,9 +71,13 @@ class _HermesSession:
         self._next_id = 0
         self._pending: dict[str, tuple[threading.Event, dict, list]] = {}
         self._pending_turn: tuple[threading.Event, list] | None = None
-        # Approval requests the gateway is waiting on: approval_id -> the
-        # gateway's own request id, which the answer frame must carry.
-        self._approvals: dict[str, str] = {}
+        # Approval requests the gateway is waiting on: approval_id -> (the
+        # gateway's own request id, which the answer frame must carry; the
+        # choices it offered).
+        self._approvals: dict[str, tuple[str, tuple[str, ...]]] = {}
+        # How recently settled approvals ended (answer or withdrawal), so a
+        # losing second answer is told what actually happened. Bounded.
+        self._settled: dict[str, str] = {}
         threading.Thread(target=self._reader, daemon=True).start()
 
     # -- public API -------------------------------------------------------
@@ -116,15 +120,33 @@ class _HermesSession:
 
     APPROVAL_CHOICES = ("once", "session", "always", "deny")
 
+    def settled_approval(self, approval_id: str) -> str | None:
+        """How an approval this session saw was settled, or None."""
+        with self._lock:
+            return self._settled.get(approval_id)
+
+    def _remember_settled(self, approval_id: str, decision: str) -> None:
+        # Caller holds _lock.
+        self._settled[approval_id] = decision
+        while len(self._settled) > 256:
+            self._settled.pop(next(iter(self._settled)))
+
     def respond_approval(self, approval_id: str, choice: str) -> bool:
         """Answer a pending approval request. False when it is unknown or
-        already settled (answered elsewhere, withdrawn, timed out)."""
+        already settled (answered elsewhere, withdrawn, timed out). A choice
+        the engine did not offer (e.g. "always" for a command it will not let
+        be allowed for good) is refused with ValueError."""
         if choice not in self.APPROVAL_CHOICES:
             raise ValueError(f"choice must be one of {self.APPROVAL_CHOICES}")
         with self._lock:
-            gateway_id = self._approvals.pop(approval_id, None)
-            if gateway_id is None or self._proc.stdin is None:
+            pending = self._approvals.get(approval_id)
+            if pending is None or self._proc.stdin is None:
                 return False
+            gateway_id, offered = pending
+            if choice not in offered:
+                raise ValueError(f"choice {choice!r} was not offered for this approval ({', '.join(offered)})")
+            del self._approvals[approval_id]
+            self._remember_settled(approval_id, choice)
             frame = {"jsonrpc": "2.0", "id": gateway_id, "result": {"choice": choice}}
             try:
                 self._proc.stdin.write(json.dumps(frame) + "\n")
@@ -416,9 +438,10 @@ class _HermesSession:
                 if payload.get("method") == "approval":
                     gateway_id = str(payload.get("id", ""))
                     with self._lock:
-                        approval_id = next((a for a, g in self._approvals.items() if g == gateway_id), None)
+                        approval_id = next((a for a, (g, _) in self._approvals.items() if g == gateway_id), None)
                         if approval_id is not None:
                             del self._approvals[approval_id]
+                            self._remember_settled(approval_id, "withdrawn")
                     if approval_id is not None:
                         self._emit({"type": "approval_resolved", "approval_id": approval_id,
                                     "decision": "withdrawn",
@@ -444,9 +467,9 @@ class _HermesSession:
         params = msg.get("params") or {}
         if msg.get("method") == "approval":
             approval_id = str(params.get("request_id") or f"gw-{gateway_id}")
-            with self._lock:
-                self._approvals[approval_id] = gateway_id
             choices = [c for c in (params.get("choices") or []) if c in self.APPROVAL_CHOICES]
+            with self._lock:
+                self._approvals[approval_id] = (gateway_id, tuple(choices or ["once", "deny"]))
             self._emit({
                 "type": "approval_request",
                 "approval_id": approval_id,

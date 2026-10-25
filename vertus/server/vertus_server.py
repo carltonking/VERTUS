@@ -43,6 +43,7 @@ import random
 # silently bug is exactly what this unifies away.
 from vertus_logging import hub_print  # type: ignore
 print = hub_print  # noqa: A001  (accepts print kwargs; logs at INFO)
+import hmac
 import secrets
 import signal
 import socket
@@ -147,6 +148,21 @@ _TEXT_FIELDS = ("title", "description", "persona")
 def ensure_token() -> str:
     """Load or create the bearer token."""
     token_file = vertus_paths.token_path()
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    if token_file.exists():
+        token = token_file.read_text().strip()
+        if token:
+            return token
+    token = secrets.token_urlsafe(32)
+    token_file.write_text(token + "\n")
+    if os.name != "nt":
+        token_file.chmod(0o600)
+    return token
+
+
+def ensure_approver_token() -> str:
+    """Load or create the approver credential (see vertus_paths)."""
+    token_file = vertus_paths.approver_token_path()
     token_file.parent.mkdir(parents=True, exist_ok=True)
     if token_file.exists():
         token = token_file.read_text().strip()
@@ -777,7 +793,7 @@ class AgentBridge:
                 with self._status_lock:
                     self._running = False
                     self._turn_started_at = None
-                    self._pending_approvals.clear()
+                    self._withdraw_leftover_approvals()
                 # Fold assistant text + set the terminal state exactly once.
                 self._end_run()
 
@@ -1160,6 +1176,23 @@ class AgentBridge:
                                            decided_by=decided_by or "engine")
         except Exception:  # noqa: BLE001
             pass
+
+    def settled_approval(self, approval_id: str) -> str | None:
+        """How the engine's session settled an approval, if it saw it."""
+        lookup = getattr(self._session, "settled_approval", None)
+        return lookup(approval_id) if lookup is not None else None
+
+    def _withdraw_leftover_approvals(self) -> None:
+        """A turn ended (or its gateway died) with approvals still open: no
+        engine waits on them any more, so the ledger must not keep offering
+        them. Caller holds _status_lock."""
+        leftover = list(self._pending_approvals)
+        self._pending_approvals.clear()
+        if leftover and self.store is not None:
+            try:
+                self.store.withdraw_pending_approvals(leftover, decided_by="hub")
+            except Exception:  # noqa: BLE001
+                pass
 
     def respond_approval(self, approval_id: str, choice: str, answered_by: str = "") -> bool:
         """Answer the engine's pending approval (POST /api/approvals/<id>).
@@ -1747,6 +1780,7 @@ class VertusHandler(BaseHTTPRequestHandler):
     server_version = "VertusServer/1.1"
     sessions: SessionManager = None  # type: ignore[assignment]
     token: str = ""
+    approver_token: str = ""
     registry: AgentRegistry = None  # type: ignore[assignment]
     store: RunStore = None  # type: ignore[assignment]
     fleet: FleetFan = None  # type: ignore[assignment]
@@ -2846,6 +2880,13 @@ class VertusHandler(BaseHTTPRequestHandler):
         Routes the answer to the agent whose engine is waiting. 404 when the
         id is unknown, 409 when it is already settled (answered on another
         surface, withdrawn, or timed out — the engine fails closed then)."""
+        # The bearer token alone is not enough: every agent can read it. An
+        # answer must carry the approver credential, which agents are never
+        # given (and the guard blocks them from reaching).
+        presented = str(self.headers.get("X-Vertus-Approver", "") or "")
+        if not self.approver_token or not hmac.compare_digest(presented, self.approver_token):
+            self._json(403, {"error": "answering an approval needs the approver credential"})
+            return
         store = self._history_store()
         if store is None:
             return
@@ -2870,10 +2911,14 @@ class VertusHandler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(exc)[:200]})
                 return
         if not answered:
-            # The engine no longer waits on it (gateway respawned, request
-            # expired): settle the row so no client keeps offering it.
-            store.decide_approval(approval_id, "withdrawn", decided_by="hub")
-            self._json(409, {"error": "approval is no longer pending"})
+            settled = bridge.settled_approval(approval_id) if bridge is not None else None
+            if settled is None:
+                # The engine no longer waits on it (gateway respawned, request
+                # expired): settle the row so no client keeps offering it.
+                store.decide_approval(approval_id, "withdrawn", decided_by="hub")
+            # Otherwise another answer won the race; its own event settles
+            # the row with the decision that actually ran.
+            self._json(409, {"error": f"approval already settled: {settled or 'withdrawn'}"})
             return
         self._json(200, {"approval_id": approval_id, "decision": choice})
 
@@ -3296,17 +3341,10 @@ def resolve_session_kwargs(registry: AgentRegistry, agent_id: str, unattended: b
     — those are popped by AgentBridge.__init__ / reconfigure so they never
     reach create_agent_session.
 
-    ``unattended``, when True, is carried as ``extra_env.VERTUS_UNAUTHORIZED = "1"``
-    so the hermes gateway and the pi engine both suppress approval prompts and
-    UI dialogs for the lifetime of the spawned gateway. Unattended runs still
-    emit errors when a tool cannot proceed without user input — the agent reads
-    the error and decides how to continue rather than blocking on a dialog.
-
-    ``unattended``, when True, is carried as ``extra_env.VERTUS_UNAUTHORIZED = "1"``
-    so the hermes gateway and the pi engine both suppress approval prompts and
-    UI dialogs for the lifetime of the spawned gateway. Unattended runs still
-    emit errors when a tool cannot proceed without user input — the agent reads
-    the error and decides how to continue rather than blocking on a dialog.
+    ``unattended``, when True, is carried as ``extra_env.VERTUS_UNAUTHORIZED = "1"``.
+    It is a marker only — nothing reads it — so unattended work (routines)
+    still stops for approval; ``HERMES_YOLO_MODE=0`` is forced for every
+    gateway so approvals can never be bypassed by the hub's environment.
     """"""Per-agent identity kwargs for engine session creation (Step 3).
 
     Returns {} when the agent carries no per-agent identity (legacy profiles
@@ -3352,11 +3390,15 @@ def resolve_session_kwargs(registry: AgentRegistry, agent_id: str, unattended: b
         # fork resolves the backend name from process env on first use
         # (tools/computer_use/tool.py) — noop never spawns cua-driver.
         extra["HERMES_COMPUTER_USE_BACKEND"] = "noop"
+    # Approvals are policy, not a fleet default: no gateway runs with the
+    # engine's approval bypass, whatever the hub's own environment carries
+    # (build_gateway_env passes HERMES_YOLO_MODE through from it).
+    extra["HERMES_YOLO_MODE"] = "0"
     if unattended:
-        # Unattended runs: suppress approval prompts and UI dialogs.
-        # The agent reads errors and decides how to continue rather than
-        # blocking on a dialog. This is carry as extra_env so it reaches
-        # both the hermes gateway and the pi engine.
+        # A marker only: nothing in the engine or the pi extensions reads it
+        # (Oct 2026). Routines therefore stop for approval like any turn,
+        # and the person answers from whichever surface is open — the
+        # island watches every run. An unanswered approval fails closed.
         extra["VERTUS_UNAUTHORIZED"] = "1"
     if extra:
         kwargs["extra_env"] = extra
@@ -3588,6 +3630,7 @@ def serve(host: str | None, port: int) -> None:
     registry = AgentRegistry()
     VertusHandler.registry = registry
     VertusHandler.token = token
+    VertusHandler.approver_token = ensure_approver_token()
     # Per-window computer-use ownership (Step: screen leases): one fleet-wide
     # manager shared by every bridge. In-memory by design — a hub restart
     # clears leases along with the gateways that held them.
@@ -3708,6 +3751,11 @@ def serve(host: str | None, port: int) -> None:
     store.listener = _composed_listener
     try:
         recovered = store.recover_interrupted()
+        # No engine survives a hub restart: approvals the previous life left
+        # undecided can never be answered, so they stop being offered.
+        withdrawn = store.withdraw_pending_approvals(decided_by="hub restart")
+        if withdrawn:
+            print(f"[vertus] withdrew {withdrawn} approval(s) left pending by the previous run")
         if recovered:
             print(f"[vertus] crash recovery: {recovered} run(s) marked interrupted")
         pruned = store.prune_events()
