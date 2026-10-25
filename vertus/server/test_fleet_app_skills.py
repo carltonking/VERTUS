@@ -81,16 +81,27 @@ def test_default_skills_land_in_every_home_with_their_category_layout(env):
             (agent_registry._REPO_ROOT / "vertus" / "extensions" / "memory-skill" / "SKILL.md").is_file()
 
 
-def test_send_and_delete_capable_skills_stay_off_by_default(env):
-    # Their CLIs are present, but the guard does not yet stop `imsg send` or
-    # `remindctl delete`; and nothing needing an account is turned on.
+def test_send_and_delete_capable_skills_are_on_because_the_guard_gates_them(env):
+    # iMessage and Reminders can send and delete; they ship enabled only
+    # because the guard asks before exactly those commands. Nothing needing
+    # an account is turned on.
     env.install("memo", "gh", "imsg", "remindctl", "openhue")
     env.registry.ensure_primary()
     skills = _skills(env.registry)
-    assert not (skills / "apple" / "imessage").exists()
-    assert not (skills / "apple" / "apple-reminders").exists()
+    assert (skills / "apple" / "imessage").is_dir()
+    assert (skills / "apple" / "apple-reminders").is_dir()
     assert not (skills / "smart-home" / "openhue").exists()
     assert not (skills / "productivity" / "google-workspace").exists()
+    import importlib.util
+    plugin = Path(agent_registry.GUARD_PLUGIN_DIR)
+    spec = importlib.util.spec_from_file_location("guard_for_skills", plugin / "__init__.py",
+                                                  submodule_search_locations=[str(plugin)])
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["guard_for_skills"] = module
+    spec.loader.exec_module(module)
+    for command in ("imsg send --to x --text hi", "imsg react --chat-id 1 love",
+                    "remindctl delete 4A83 --force", "remindctl list Work --delete", "memo notes -d"):
+        assert module._guard(tool_name="terminal", args={"command": command})["action"] == "approve", command
 
 
 def test_a_skill_whose_cli_is_missing_is_not_installed(env):
@@ -195,7 +206,7 @@ def test_the_manifest_records_what_the_hub_installed(env):
     ("NONE", []),
     ("imessage", ["imessage"]),
     ("apple-notes, imessage", ["apple-notes", "imessage"]),
-    ("+imessage", [*agent_registry.HERMES_SKILLS_DEFAULT, "imessage"]),
+    ("+openhue", [*agent_registry.HERMES_SKILLS_DEFAULT, "openhue"]),
     ("-github", [n for n in agent_registry.HERMES_SKILLS_DEFAULT if n != "github"]),
     ("imessage +openhue -imessage", ["openhue"]),
     ("../etc,apple-notes", ["apple-notes"]),  # never a path

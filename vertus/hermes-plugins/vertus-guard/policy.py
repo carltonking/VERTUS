@@ -180,6 +180,13 @@ def _shell_verdict(segment: str) -> tuple[str, str, str] | None:
     if program == "wget" and any(a.startswith(("--post-data", "--post-file", "--body-data", "--body-file"))
                                  or a.startswith("--method") for a in args):
         return ("post", "http-write", "send data to a web service")
+    if program == "imsg" and lowered and lowered[0] in ("send", "react"):
+        return ("send", "imessage", "send an iMessage or SMS")
+    if program == "remindctl" and lowered and (lowered[0] == "delete" or
+                                               (lowered[0] == "list" and "--delete" in lowered)):
+        return ("delete", "reminders-delete", "delete reminders")
+    if program == "memo" and "-d" in lowered:
+        return ("delete", "notes-delete", "delete a note")
     if program == "aws" and len(lowered) >= 2 and lowered[0] == "s3" and lowered[1] in ("rm", "rb"):
         return ("delete", "cloud-delete", "delete cloud storage")
     if program == "docker" and lowered and (lowered[0] in ("rm", "rmi") or
@@ -200,6 +207,16 @@ _CODE_HTTP_WRITE = re.compile(
 _CODE_DELETE = re.compile(
     r"\b(os\.(remove|unlink|rmdir|removedirs)|shutil\.rmtree|send2trash)\s*\("
     r"|\b(system|run|call|check_call|check_output|Popen|popen)\s*\(\s*\[?\s*['\"]\s*(rm|rmdir|trash)\b")
+
+
+_MCP_WRITE = re.compile(
+    r"(?:^|_)(send|reply|forward|post|comment|publish|share|invite|create|update|edit|write|upload|"
+    r"merge|archive|delete|remove|trash|cancel|pay|purchase|order|book|transfer|schedule)(?:_|$)",
+    re.IGNORECASE)
+_MCP_CATEGORY = {"send": "send", "reply": "send", "forward": "send", "invite": "send",
+                 "delete": "delete", "remove": "delete", "trash": "delete", "cancel": "delete",
+                 "archive": "delete", "pay": "spend", "purchase": "spend", "order": "spend",
+                 "book": "spend", "transfer": "spend"}
 
 
 def _short(text: str, limit: int = 160) -> str:
@@ -271,6 +288,16 @@ def decide(tool_name: str, args: dict | None,
         if _CODE_DELETE.search(command):
             return Verdict("delete", f"VERTUS wants to delete files: {_short(command)}",
                            _key("delete", "remove-files", command))
+        return None
+
+    if name.startswith("mcp_"):
+        # MCP connectors name their tools mcp_<server>_<tool>; a write verb
+        # in the tool part means it acts on the outside world.
+        verb = _MCP_WRITE.search(name[4:])
+        if verb:
+            category = _MCP_CATEGORY.get(verb.group(1).lower(), "post")
+            return Verdict(category, f"VERTUS wants to use {name}: {_short(text) or 'no arguments'}",
+                           _key(category, name, text))
         return None
 
     if name in _PAGE_SCRIPT_TOOLS and _CODE_HTTP_WRITE.search(text):

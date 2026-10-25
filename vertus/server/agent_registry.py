@@ -958,14 +958,13 @@ def _link_guard_plugin(home: Path) -> None:
 # inherits that PATH), so an agent never advertises an app it cannot reach.
 #
 # The default is what works on this fleet's Mac without signing in anywhere and
-# whose outward actions the approvals guard already stops: Apple Notes (memo)
-# and GitHub (gh; `gh pr create`, `gh api -X POST`… ask first). Held back on
-# purpose, opt-in with VERTUS_HERMES_SKILLS="+name":
-#   imessage, apple-reminders — their CLIs are installed, but `imsg send|react`
-#       and `remindctl delete` / `list --delete` pass the guard unasked; turn
-#       them on once the guard covers those commands.
+# whose outward actions the approvals guard stops: Apple Notes (memo; `-d`
+# asks), GitHub (gh; `gh pr create`, `gh api -X POST`… ask), iMessage (imsg;
+# `send`/`react` ask) and Reminders (remindctl; `delete`/`list --delete` ask).
+# Each still needs its macOS permission granted on first use. Held back,
+# opt-in with VERTUS_HERMES_SKILLS="+name":
 #   google-workspace, 1password, openhue — need an account/OAuth/bridge setup.
-HERMES_SKILLS_DEFAULT = ("apple-notes", "github")
+HERMES_SKILLS_DEFAULT = ("apple-notes", "github", "imessage", "apple-reminders")
 # CLIs a skill needs beyond its own frontmatter `prerequisites.commands`
 # (github's frontmatter declares none, yet every workflow in it runs gh).
 _HERMES_SKILL_COMMANDS: dict[str, tuple[str, ...]] = {

@@ -189,3 +189,32 @@ def test_malformed_calls_never_raise():
     assert policy.decide("terminal", {"command": 42}) is None
     assert policy.decide("terminal", {"command": "rm 'unbalanced"}).category == "delete"
     assert policy.decide("", {}) is None
+
+
+@pytest.mark.parametrize("command, category", [
+    ("imsg send --to '+15555550123' --text 'on my way'", "send"),
+    ("imsg react --chat-id 3 --message-id 9 love", "send"),
+    ("remindctl delete 4A83 --force", "delete"),
+    ("remindctl list Work --delete", "delete"),
+    ("memo notes -d", "delete"),
+])
+def test_app_skill_actions_that_go_out_or_destroy_ask(command, category):
+    assert _cat("terminal", {"command": command}) == category
+
+
+@pytest.mark.parametrize("command", [
+    "imsg chats --limit 10 --json", "imsg history --chat-id 1 --limit 20 --json",
+    "remindctl today --json", "remindctl add 'Buy milk'", "remindctl complete 1",
+    "memo notes", "memo notes -s groceries",
+])
+def test_app_skill_reads_and_local_edits_do_not_ask(command):
+    assert policy.decide("terminal", {"command": command}) is None
+
+
+def test_mcp_tools_that_write_ask_and_reads_do_not():
+    assert _cat("mcp_gmail_send_email", {"to": "a@b.c"}) == "send"
+    assert _cat("mcp_linear_create_issue", {"title": "x"}) == "post"
+    assert _cat("mcp_drive_delete_file", {"id": "1"}) == "delete"
+    assert _cat("mcp_shop_place_order", {"sku": "1"}) == "spend"
+    assert policy.decide("mcp_linear_list_issues", {}) is None
+    assert policy.decide("mcp_gmail_search", {"q": "send"}) is None
