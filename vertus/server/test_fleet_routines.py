@@ -356,3 +356,127 @@ def _expect_validation(payload, fn):
     except RoutineValidationError:
         return
     raise AssertionError(f"should have rejected {payload}")
+
+# ----------------------------------------------------------------------
+# Wall-clock schedules (cron / one-shot at) through the manager
+# ----------------------------------------------------------------------
+
+from datetime import datetime  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
+
+_NY = ZoneInfo("America/New_York")
+
+
+def _ny(*args) -> float:
+    return datetime(*args, tzinfo=_NY).timestamp()
+
+
+def _mk_sched(env, schedule):
+    store = env["store"]
+    r = store.create_routine(env["a"], "Wall", "brief me", schedule, None)
+    env["mgr"].arm(r["routine_id"], schedule)
+    return store.get_routine(r["routine_id"])
+
+
+def _events(store, etype):
+    return [e for e in store.events_after(0) if e.get("type") == etype]
+
+
+def test_cron_arm_targets_next_wall_time_and_advances_after_fire(tmp_path):
+    env = _env(tmp_path)
+    store, mgr, clock = env["store"], env["mgr"], env["clock"]
+    clock[0] = _ny(2026, 10, 25, 6, 0)
+    sched = {"cron": "0 8 * * *", "tz": "America/New_York"}
+    r = _mk_sched(env, sched)
+    assert store.get_routine(r["routine_id"])["next_run_at"] == _ny(2026, 10, 25, 8, 0)
+    clock[0] = _ny(2026, 10, 25, 7, 59)
+    mgr.catch_up()
+    assert store.get_routine(r["routine_id"])["last_run_id"] is None
+    clock[0] = _ny(2026, 10, 25, 8, 0, 1)
+    mgr.catch_up()
+    updated = store.get_routine(r["routine_id"])
+    assert updated["last_run_id"]
+    assert updated["next_run_at"] == _ny(2026, 10, 26, 8, 0)
+
+
+def test_cron_catch_up_after_ten_hours_fires_exactly_once(tmp_path):
+    """Hourly check-in, hub down 10 hours: ONE catch-up fire, then the next
+    future occurrence — never a backlog of the 10 missed hours."""
+    env = _env(tmp_path)
+    store, mgr, clock = env["store"], env["mgr"], env["clock"]
+    clock[0] = _ny(2026, 10, 25, 7, 30)
+    r = _mk_sched(env, {"cron": "0 * * * *", "tz": "America/New_York"})
+    assert store.get_routine(r["routine_id"])["next_run_at"] == _ny(2026, 10, 25, 8, 0)
+    clock[0] = _ny(2026, 10, 25, 17, 45)  # ~10 hours later
+    mgr.catch_up()
+    first = store.get_routine(r["routine_id"])
+    assert first["last_run_id"]
+    assert first["next_run_at"] == _ny(2026, 10, 25, 18, 0)
+    store.finish_run(first["last_run_id"], "done", error=None)
+    mgr.catch_up()
+    mgr.catch_up()
+    assert len(store.list_runs()) == 1
+    assert len(_events(store, "routine_fired")) == 1
+
+
+def test_one_shot_at_fires_once_then_disables_as_completed(tmp_path):
+    env = _env(tmp_path)
+    store, mgr, clock = env["store"], env["mgr"], env["clock"]
+    clock[0] = _ny(2026, 10, 25, 12, 0)
+    r = _mk_sched(env, {"at": "2026-10-26T09:00:00", "tz": "America/New_York"})
+    rid = r["routine_id"]
+    assert r["next_run_at"] == _ny(2026, 10, 26, 9, 0)
+    clock[0] = _ny(2026, 10, 26, 9, 0, 1)
+    mgr.catch_up()
+    done = store.get_routine(rid)
+    assert done["last_run_id"]
+    assert done["enabled"] == 0
+    assert done["next_run_at"] is None
+    disabled = _events(store, "routine_disabled")
+    assert len(disabled) == 1 and disabled[0].get("completed") is True
+    # Never fires again — not on later ticks, not even if re-enabled.
+    store.finish_run(done["last_run_id"], "done", error=None)
+    store.set_routine_enabled(rid, True)
+    clock[0] += 86400
+    mgr.catch_up()
+    assert len(store.list_runs()) == 1
+
+
+def test_one_shot_failed_fire_does_not_complete(tmp_path):
+    env = _env(tmp_path)
+    store, mgr, clock = env["store"], env["mgr"], env["clock"]
+    clock[0] = _ny(2026, 10, 25, 12, 0)
+    r = _mk_sched(env, {"at": "2026-10-26T09:00:00", "tz": "America/New_York"})
+    env["sessions"].get_or_create_session(env["a"])._degraded = "down"
+    clock[0] = _ny(2026, 10, 26, 9, 5)
+    mgr.catch_up()
+    row = store.get_routine(r["routine_id"])
+    assert row["enabled"] == 1 and row["failure_count"] == 1
+    assert row["next_run_at"] == _ny(2026, 10, 26, 9, 0)  # still due
+    env["sessions"].get_or_create_session(env["a"])._degraded = None
+    mgr.catch_up()
+    row = store.get_routine(r["routine_id"])
+    assert row["last_run_id"] and row["enabled"] == 0
+
+
+def test_manual_run_before_one_shot_time_keeps_it_pending(tmp_path):
+    env = _env(tmp_path)
+    store, mgr, clock = env["store"], env["mgr"], env["clock"]
+    clock[0] = _ny(2026, 10, 25, 12, 0)
+    r = _mk_sched(env, {"at": "2026-10-26T09:00:00", "tz": "America/New_York"})
+    mgr._fire(store.get_routine(r["routine_id"]), manual=True)
+    row = store.get_routine(r["routine_id"])
+    assert row["last_run_id"] and row["enabled"] == 1
+    assert row["next_run_at"] == _ny(2026, 10, 26, 9, 0)
+
+
+def test_cron_and_at_validation_through_parse_schedule():
+    now = _ny(2026, 10, 25, 12, 0)
+    assert parse_schedule({"cron": "0 8 * * *"}, now=now) == {"cron": "0 8 * * *"}
+    for bad in ({"cron": "0 8 * *"}, {"cron": "0 8 * * *", "tz": "No/Where"},
+                {"at": "2026-10-24T09:00:00", "tz": "America/New_York"}):
+        try:
+            parse_schedule(bad, now=now)
+        except RoutineValidationError:
+            continue
+        raise AssertionError(f"accepted invalid schedule {bad!r}")

@@ -6,15 +6,41 @@ do — see MISSED-FIRE, DEGRADED, THRESHOLD, and NEVER-CONCURRENT below.
 
 Schedule representation
 -----------------------
-``schedule`` is a JSON object ``{"interval_s": N}`` — interval seconds, NOT
-cron. Justification: the Python stdlib has no cron parser (adding a parser
-dependency for this is not worth it), intervals are fully deterministic and
-testable, and the fleet's runs are irregular-length tasks where wall-clock
-alignment (\"at 9am\") buys nothing over \"every N seconds\". One syntax, never
-two. N must be an integer >= 30s at the API (MIN_INTERVAL_S); tests use the
-internal store path to go faster — NEVER-CONCURRENT bounds the damage of a
-fast interval to one in-flight turn, but 30s keeps a mis-set routine from
-becoming a token-burn footgun.
+``schedule`` is a JSON object in exactly one of three shapes (parsing and
+next-fire math live in the pure module routine_schedule.py):
+
+    {"interval_s": N}                          every N seconds from the last fire
+    {"cron": "M H DOM MON DOW", "tz": "IANA"}  wall-clock recurring (5-field cron)
+    {"at": "<ISO 8601>", "tz": "IANA"}         one-shot; disabled after it fires
+
+This reverses an earlier "intervals only, one syntax never two" decision.
+That decision held while routines were fleet plumbing ("poll every N
+minutes"); it stopped holding when the user asked for VERTUS to be
+proactive on THEIR clock — a morning brief at 08:00, check-ins during the
+day, memory consolidation at 03:00, "remind me tomorrow at 9". None of
+those is expressible as an interval: an interval drifts with every
+restart and fire, and a laptop that slept through 08:00 has no idea when
+"08:00" was. So wall-clock schedules are user-requested, not speculative.
+The cost is contained: the cron dialect is small (no names, no macros, no
+seconds — see routine_schedule), it is stdlib-only (zoneinfo), and DST is
+handled in one tested place. Intervals stay fully supported and behave
+exactly as before. ``tz`` is optional; absent = the Mac's current local
+zone, resolved at compute time.
+
+interval_s must be an integer >= 30s at the API (MIN_INTERVAL_S); tests use
+the internal store path to go faster — NEVER-CONCURRENT bounds the damage
+of a fast interval to one in-flight turn, but 30s keeps a mis-set routine
+from becoming a token-burn footgun. A cron cannot fire more than once a
+minute by construction, so it has no extra floor.
+
+ONE-SHOT completion: when an ``at`` routine fires successfully there is no
+next time, so next_run_at is cleared (NULL) and the routine is disabled
+through the normal disable path, emitting ``routine_disabled`` with
+``"completed": true`` and reason "one-shot completed". The row and its run
+history stay (a reminder that fired is a fact, not garbage); re-enabling it
+alone does nothing until a new schedule is PATCHed, because nothing is due.
+A failed/skipped fire does NOT complete it — it stays due and the normal
+THRESHOLD policy applies.
 
 Trigger vocabulary (``trigger`` JSON; keep it SMALL and enumerable — this is
 deliberately not a rules engine):
@@ -27,9 +53,11 @@ A routine may carry schedule AND trigger (either can fire it), or just one.
 
 MISSED-FIRE (hub downtime): run once on catch-up. When the hub boots (or
 wakes from sleep) and finds next_run_at in the past, it fires ONCE and
-slides next_run_at to now + interval. A laptop sleeping 10 hours therefore
-yields exactly one catch-up run — never 40. This is the least surprising
-bound, and the next fire is a full interval away.
+slides next_run_at to the next occurrence strictly after NOW (interval:
+now + interval; cron: the next matching wall time; at: none -> completed).
+A laptop sleeping 10 hours therefore yields exactly one catch-up run —
+never 40, and never a backlog of every missed 08:00. This is the least
+surprising bound, and the next fire is a full period away.
 
 DEGRADED: a fire targeting an agent whose gateway is degraded is skipped
 and increments failure_count (the run row would 503 anyway; queuing it
@@ -66,6 +94,13 @@ import threading
 import time
 from typing import Callable, Optional
 
+try:
+    import routine_schedule  # type: ignore
+    from routine_schedule import RoutineValidationError  # type: ignore  # re-exported
+except ImportError:  # pragma: no cover - only hit under package invocation
+    from . import routine_schedule  # type: ignore
+    from .routine_schedule import RoutineValidationError  # type: ignore
+
 log = logging.getLogger("vertus.routines")
 
 DEFAULT_TICK_S = 1.0
@@ -73,15 +108,11 @@ DEFAULT_TICK_S = 1.0
 # sub-30s intervals are token-burn footguns and exist only for tests, which
 # bypass the parser entirely by creating routine rows directly on the store
 # (the internal path: store.create_routine + RoutineManager.arm).
-MIN_INTERVAL_S = 30
+MIN_INTERVAL_S = routine_schedule.MIN_INTERVAL_S
 FAILURE_THRESHOLD = 3
 
 TERMINAL_EVENT_TYPES = ("done", "error", "cancelled", "timeout")
 TRIGGER_TYPES = ("run_completed", "bot_message")
-
-
-class RoutineValidationError(ValueError):
-    """A routine payload violates the schema (400 on the wire)."""
 
 
 class RoutineManager:
@@ -149,13 +180,17 @@ class RoutineManager:
     # ------------------------------------------------------------------
 
     def arm(self, routine_id: str, schedule: dict | None) -> None:
-        """Arm a schedule: next fire time = now + interval. Called on create
-        and on schedule change (PATCH); the routine is not due until armed."""
+        """Arm a schedule: next fire time = the first occurrence strictly
+        after now (interval: now + N; cron: next matching wall time; at: the
+        instant itself). Called on create and on schedule change (PATCH);
+        the routine is not due until armed."""
         store = self._store()
         if store is None or not schedule:
             return
         try:
-            store.set_routine_next(routine_id, self._now() + int(schedule["interval_s"]))
+            store.set_routine_next(
+                routine_id, routine_schedule.next_fire(schedule, self._now())
+            )
         except Exception:  # noqa: BLE001
             log.exception("arm routine %s failed", routine_id)
 
@@ -323,17 +358,28 @@ class RoutineManager:
             self._record_failure(routine, f"fire failed: {str(exc)[:120]}")
             return {"fired": False, "reason": f"fire failed: {str(exc)[:120]}"}
 
-        # Success: advance the schedule (catch-up = one fire; the next fire
-        # is a full interval away) and clear failure history.
+        # Success: advance the schedule to the next occurrence strictly after
+        # NOW (MISSED-FIRE: a catch-up fire never leaves a backlog behind it)
+        # and clear failure history.
+        completed = False
         if routine.get("schedule"):
             try:
-                interval = int(json.loads(routine["schedule"]).get("interval_s", 0))
-            except (ValueError, TypeError, json.JSONDecodeError):
-                interval = 0
-            if interval > 0:
-                store.mark_routine_fired(rid, run_id, self._now() + interval)
+                schedule = json.loads(routine["schedule"])
+            except (ValueError, TypeError):
+                schedule = None
+            kind = routine_schedule.kind_of(schedule if isinstance(schedule, dict) else None)
+            try:
+                nxt = routine_schedule.next_fire(schedule, self._now()) if kind else None
+            except (RoutineValidationError, ValueError, TypeError):
+                nxt = None
+            if kind == "at" and nxt is None:
+                # One-shot fired: nothing is ever due again (see ONE-SHOT).
+                store.mark_routine_fired(rid, run_id, None)
+                completed = True
+            elif nxt is not None:
+                store.mark_routine_fired(rid, run_id, nxt)
             else:
-                store.mark_routine_fired(rid, run_id, self._now() + 3600)
+                store.mark_routine_fired(rid, run_id, self._now() + 3600)  # corrupt row
         else:
             store.mark_routine_fired(rid, run_id, self._now() + 3600)  # no-op arm
         self._emit({
@@ -343,6 +389,8 @@ class RoutineManager:
             "run_id": run_id,
             "manual": manual,
         })
+        if completed:
+            self._disable(rid, "one-shot completed", completed=True)
         return {"fired": True, "run_id": run_id}
 
     def _record_failure(self, routine: dict, reason: str) -> None:
@@ -366,7 +414,8 @@ class RoutineManager:
         if count >= FAILURE_THRESHOLD:
             self._disable(rid, f"{count} consecutive failures: {reason[:120]}")
 
-    def _disable(self, routine_id: str, reason: str) -> None:
+    def _disable(self, routine_id: str, reason: str,
+                 completed: bool = False) -> None:
         store = self._store()
         if store is None:
             return
@@ -378,12 +427,16 @@ class RoutineManager:
         except Exception:  # noqa: BLE001
             log.exception("disable routine %s failed", routine_id)
             return
-        self._emit({
+        event = {
             "type": "routine_disabled",
             "routine_id": routine_id,
             "agent_id": routine["agent_id"],
             "reason": reason[:300],
-        })
+        }
+        if completed:
+            # Distinguishes "done, as intended" from "broken, needs a human".
+            event["completed"] = True
+        self._emit(event)
 
     def _emit(self, event: dict) -> None:
         store = self._store()
@@ -399,18 +452,11 @@ class RoutineManager:
 # Validation helpers (shared by the HTTP layer and tests)
 # ----------------------------------------------------------------------
 
-def parse_schedule(raw) -> dict | None:
-    """Validate a schedule payload; None = trigger-only routine."""
-    if raw is None:
-        return None
-    if not isinstance(raw, dict) or set(raw) != {"interval_s"}:
-        raise RoutineValidationError("schedule must be {\"interval_s\": N}")
-    interval = raw["interval_s"]
-    if not isinstance(interval, int) or isinstance(interval, bool) or interval < MIN_INTERVAL_S:
-        raise RoutineValidationError(
-            f"schedule interval_s must be an integer >= {MIN_INTERVAL_S}"
-        )
-    return {"interval_s": interval}
+def parse_schedule(raw, now: float | None = None) -> dict | None:
+    """Validate a schedule payload; None = trigger-only routine. Accepts
+    {"interval_s": N} | {"cron": ..., "tz"?} | {"at": ..., "tz"?} — see
+    routine_schedule.parse. Raises RoutineValidationError."""
+    return routine_schedule.parse(raw, now=now)
 
 
 def parse_trigger(raw) -> dict | None:

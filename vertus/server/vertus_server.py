@@ -2448,7 +2448,12 @@ class VertusHandler(BaseHTTPRequestHandler):
             try:
                 cur_sched = json.loads(current["schedule"]) if current.get("schedule") else None
                 cur_trig = json.loads(current["trigger"]) if current.get("trigger") else None
-                schedule = parse_schedule(payload.get("schedule", cur_sched))
+                # Only an INCOMING schedule is validated: the stored one was
+                # validated when written, and re-parsing it would reject a
+                # one-shot "at" whose time has since passed (a trigger-only
+                # PATCH must not fail because a reminder already fired).
+                schedule = (parse_schedule(payload["schedule"])
+                            if "schedule" in payload else cur_sched)
                 trigger = parse_trigger(payload.get("trigger", cur_trig))
             except RoutineValidationError as exc:
                 self._json(400, {"error": str(exc)})

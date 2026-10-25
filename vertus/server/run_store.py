@@ -191,7 +191,7 @@ CREATE TABLE IF NOT EXISTS routines(
   agent_id TEXT NOT NULL,
   name TEXT NOT NULL,
   prompt TEXT NOT NULL,
-  schedule TEXT,          -- NULL (trigger-only) or JSON {"interval_s": N}
+  schedule TEXT,          -- NULL (trigger-only) or JSON (routine_schedule.py)
   trigger TEXT,           -- NULL (schedule-only) or JSON {"type": ..., ...}
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at REAL NOT NULL,
@@ -544,7 +544,7 @@ class RunStore:
         return [dict(r) for r in rows]
 
     def mark_routine_fired(self, routine_id: str, run_id: str,
-                           next_run_at: float) -> None:
+                           next_run_at: float | None) -> None:
         """Record a successful fire: last run id/at, next due time, and a
         failure_count reset (success clears consecutive-failure history)."""
 
@@ -585,8 +585,10 @@ class RunStore:
 
         self._submit(op, {})
 
-    def set_routine_next(self, routine_id: str, next_run_at: float) -> None:
-        """Arm the schedule: next fire time = now + interval."""
+    def set_routine_next(self, routine_id: str,
+                         next_run_at: float | None) -> None:
+        """Arm the schedule: next fire time (epoch s), or None = never due
+        (a completed one-shot)."""
         def op(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE routines SET next_run_at = ? WHERE routine_id = ?",

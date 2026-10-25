@@ -205,3 +205,43 @@ def test_agent_delete_disables_routines(hub):
     # The scheduler's existence gate would refuse to fire it anyway.
     result = hub["store"].get_routine(created["routine_id"])
     assert result["enabled"] == 0
+
+def test_wall_clock_schedules_over_http(hub):
+    base, store = hub["base"], hub["store"]
+    primary, scout = _agents(hub["registry"])
+    code, body = _req(base, "/api/routines", "POST", {
+        "agent_id": scout, "name": "Morning brief", "prompt": "brief",
+        "schedule": {"cron": "0 8 * * *", "tz": "America/New_York"},
+    })
+    assert code == 201, body
+    assert body["schedule"] == {"cron": "0 8 * * *", "tz": "America/New_York"}
+    assert body["next_run_at"] is not None
+    # Validation errors are 400s with a readable message.
+    for bad, needle in (
+        ({"cron": "0 8 * * *", "tz": "Mars/Base"}, "tz"),
+        ({"cron": "0 25 * * *"}, "hour"),
+        ({"at": "2020-01-01T09:00:00Z"}, "future"),
+    ):
+        code, err = _req(base, "/api/routines", "POST", {
+            "agent_id": scout, "name": "R", "prompt": "x", "schedule": bad,
+        })
+        assert code == 400 and needle in err["error"], (bad, err)
+    # One-shot: create, then simulate it having already fired (its "at" now
+    # in the past). A trigger-only PATCH must not re-validate the stored
+    # schedule and fail on "not in the future".
+    code, body = _req(base, "/api/routines", "POST", {
+        "agent_id": scout, "name": "Reminder", "prompt": "remind",
+        "schedule": {"at": "2099-01-01T09:00:00", "tz": "America/New_York"},
+    })
+    assert code == 201, body
+    rid = body["routine_id"]
+    store.update_routine(rid, schedule={"at": "2020-01-01T09:00:00Z"})
+    code, patched = _req(base, f"/api/routines/{rid}", "PATCH", {
+        "trigger": {"type": "run_completed", "agent_id": primary},
+    })
+    assert code == 200, patched
+    # But an incoming past "at" is still rejected.
+    code, err = _req(base, f"/api/routines/{rid}", "PATCH", {
+        "schedule": {"at": "2020-01-01T09:00:00Z"},
+    })
+    assert code == 400
