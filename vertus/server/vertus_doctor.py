@@ -548,7 +548,7 @@ def _spawn_throwaway_gateway(log) -> tuple[_HermesSession, Path, Path]:
     env.setdefault("PATH", os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"))
     proc = subprocess.Popen(
         [str(venv_py), "-u", "-c",
-         "import runpy, sys; sys.argv=[\"vertus-hermes-gateway\"]; "
+         "import runpy; "
          "runpy.run_module(\"tui_\" + \"gateway.entry\", run_name=\"__main__\")"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1, cwd=str(fork_repo), env=env,

@@ -41,9 +41,13 @@ READY_TIMEOUT_S = float(os.environ.get("VERTUS_HERMES_READY_TIMEOUT_S", "60"))
 # the literal "tui_gateway.entry", so that blanket pkill can't match it.
 # (The module name is built at runtime from two pieces to keep the string
 # out of the process list.)
+#
+# sys.argv stays ["-c"]: Hermes (Oct 2026) re-execs itself under a per-data-
+# root runtime for an agent home other than ~/.hermes, and only a "-c" argv
+# makes it replay this shim; any other argv[0] is run as a file path, which
+# killed every agent gateway at spawn.
 _GATEWAY_BOOT = (
-    "import runpy, sys;"
-    "sys.argv = [\"vertus-hermes-gateway\"];"
+    "import runpy;"
     "runpy.run_module(\"tui_\" + \"gateway.entry\", run_name=\"__main__\")"
 )
 

@@ -119,9 +119,27 @@ def fork_repo() -> Path:
 
 
 def venv_python() -> Path:
-    """Python interpreter inside the fork's venv."""
+    """Python interpreter inside the fork's venv.
+
+    Hermes updates (Oct 2026) stopped keeping ``venv/`` in the checkout: the
+    installer builds the environment under ``~/.hermes/installs/<id>/
+    environments/<id>/venv`` and the old path vanishes, which left every
+    gateway spawn failing and every run ending as an empty ``done``. For the
+    production fork only (no repo override), fall back to the newest managed
+    venv; an overridden fork (tests, temp hubs) keeps the strict path so a
+    missing venv still fails loudly.
+    """
     env = _env("VERTUS_HERMES_PYTHON")
-    return Path(env).expanduser() if env else fork_repo() / "venv" / "bin" / "python"
+    if env:
+        return Path(env).expanduser()
+    legacy = fork_repo() / "venv" / "bin" / "python"
+    if legacy.exists() or _env("VERTUS_HERMES_REPO"):
+        return legacy
+    managed = sorted(
+        (Path.home() / ".hermes" / "installs").glob("*/environments/*/venv/bin/python"),
+        key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+    )
+    return managed[-1] if managed else legacy
 
 
 def cua_manifest_override() -> str:
