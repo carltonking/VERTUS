@@ -72,6 +72,7 @@ try:
     )
     from fleet_memory import MemoryStore, migrate_legacy_memory  # type: ignore
     from memory_capture import MemoryCapturer  # type: ignore
+    from proactive_routines import seed_default_routines  # type: ignore
     from vertus_logging import setup_logging  # type: ignore
     from session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
 except ImportError:  # pragma: no cover - only hit under package invocation
@@ -87,6 +88,7 @@ except ImportError:  # pragma: no cover - only hit under package invocation
     )
     from .fleet_memory import MemoryStore, migrate_legacy_memory  # type: ignore
     from .memory_capture import MemoryCapturer  # type: ignore
+    from .proactive_routines import seed_default_routines  # type: ignore
     from .vertus_logging import setup_logging  # type: ignore
 
 # Token path resolution lives in vertus_paths.token_path (VERTUS_TOKEN_PATH
@@ -3769,6 +3771,16 @@ def serve(host: str | None, port: int) -> None:
         reaped = reap_orphaned_drivers()
         if reaped:
             print(f"[vertus] driver sweep: reaped {reaped} orphaned cua-driver(s)")
+        # Default proactive routines (morning brief, check-ins, nightly
+        # memory consolidation), seeded once — never over a user's edit;
+        # VERTUS_PROACTIVE_ROUTINES=0 opts out (proactive_routines.py).
+        try:
+            seeded = seed_default_routines(store, registry, routines)
+            if seeded["created"] or seeded["skipped"]:
+                print(f"[vertus] proactive routines: created={seeded['created']} "
+                      f"skipped={seeded['skipped']}")
+        except Exception as exc:  # noqa: BLE001 - never blocks catch-up
+            print(f"[vertus] proactive routine seeding failed: {exc}", file=sys.stderr)
         # Missed-fire catch-up: routines due while the hub was down fire
         # exactly once here (see fleet_routines.MISSED-FIRE).
         routines.catch_up()

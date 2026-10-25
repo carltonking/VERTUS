@@ -704,6 +704,11 @@ class AgentRegistry:
         for skill_name, source in (
             ("vertus-memory", _REPO_ROOT / "vertus" / "extensions" / "memory-skill" / "SKILL.md"),
             ("vertus-persona", _REPO_ROOT / "vertus-persona" / "SKILL.md"),
+            # Proactive procedures the seeded routines invoke by name (see
+            # proactive_routines.py). Every agent gets them, so a routine of
+            # any agent can use them, not only the primary's.
+            *((name, _REPO_ROOT / "vertus" / "skills" / name / "SKILL.md")
+              for name in PROACTIVE_SKILLS),
         ):
             try:
                 text = source.read_text(encoding="utf-8")
@@ -910,6 +915,9 @@ class AgentRegistry:
 # Repo root
 # Used only to locate the templated skill files for home materialization.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Skills under vertus/skills/<name>/SKILL.md materialized into every home.
+PROACTIVE_SKILLS = ("vertus-morning-brief", "vertus-check-in", "vertus-memory-consolidation")
 
 GUARD_PLUGIN_NAME = "vertus-guard"
 # config.yaml keys the hub derives on every materialization (from the profile
