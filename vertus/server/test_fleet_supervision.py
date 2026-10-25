@@ -240,6 +240,25 @@ def test_slow_but_chatty_turn_never_trips_stall(monkeypatch, tmp_path):
     store.stop()
 
 
+def test_turn_waiting_on_an_approval_is_not_stalled(_fast_supervision, tmp_path):
+    store = RunStore(tmp_path / "fleet.db")
+    # The engine asks a human and then says nothing until answered: a wait
+    # far longer than the stall limit must not kill the turn.
+    b = _bridge(store, stall=0.3, ignore_interrupt=True)
+    run_id = _run(store, b, "delete my notes")
+    assert _wait_until(lambda: b.status()["state"] == "running")
+    b._on_pi_event({"type": "approval_request", "approval_id": "ap-1", "command": "rm notes.txt"})
+    time.sleep(2.5)  # several watchdog ticks (1s each), far past the stall limit
+    assert (store.get_run(run_id) or {})["state"] == "running", "a turn awaiting approval is not stalled"
+    # Answered: silence counts again, so a gateway that then wedges is caught.
+    b._on_pi_event({"type": "approval_resolved", "approval_id": "ap-1", "decision": "once"})
+    assert _wait_until(lambda: (store.get_run(run_id) or {})["state"] == "timeout"), (
+        "after the approval settles, the stall watchdog is back on duty"
+    )
+    b.close()
+    store.stop()
+
+
 def test_hard_timeout_fires_on_endless_chatty_turn(monkeypatch, tmp_path):
     store = RunStore(tmp_path / "fleet.db")
     # Emits forever (stall never trips) but exceeds the hard ceiling.

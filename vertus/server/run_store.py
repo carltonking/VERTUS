@@ -642,17 +642,47 @@ class RunStore:
         ).fetchall())
         return rows[0][0] if rows else 0
 
+    def record_approval_request(self, approval_id: str, run_id: str | None, agent_id: str,
+                                action: str, target: str = "") -> None:
+        """One pending approval (idempotent: a replayed request keeps its row)."""
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT OR IGNORE INTO approvals(approval_id, run_id, agent_id, action, target, requested_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (approval_id, run_id or None, agent_id, action[:500], target[:2000], time.time()),
+            )
+
+        self._submit(op, {})
+
+    def decide_approval(self, approval_id: str, decision: str, decided_by: str = "") -> bool:
+        """Settle a pending approval EXACTLY ONCE; True when this call settled it."""
+        out: dict = {}
+
+        def op(conn: sqlite3.Connection) -> None:
+            cur = conn.execute(
+                "UPDATE approvals SET decision = ?, decided_at = ?, decided_by = ? "
+                "WHERE approval_id = ? AND decision IS NULL",
+                (decision, time.time(), decided_by or None, approval_id),
+            )
+            out["rowcount"] = cur.rowcount
+
+        self._submit(op, out)
+        return bool(out.get("rowcount"))
+
+    def get_approval(self, approval_id: str) -> dict | None:
+        rows = [r for r in self.list_approvals(limit=500) if r.get("approval_id") == approval_id]
+        return rows[0] if rows else None
+
     def list_approvals(self, state: str | None = None,
                        limit: int = 100) -> list[dict]:
         """Newest-first approval rows; ``state=pending`` = undecided rows.
 
-        READ-ONLY RECORD: nothing in the hub writes this table today. The
-        gateway's approvals fire only when a per-agent config.yaml carries
-        ``approvals.mode: manual`` (the fleet default is off) AND the request
-        reaches tools/approval.py's generic gate — which computer_use never
-        does in gateway mode. Flipping the mode would make shell/file
-        approvals reachable (see the checkpoint report); until then this
-        endpoint honestly returns an empty ledger.
+        Written by the hub since approvals went live (Oct 2026): every
+        materialized agent carries ``approvals.mode: manual`` and the
+        vertus-guard plugin, so the gateway's approval requests are recorded
+        here as they arrive (``record_approval_request``) and settled when a
+        client answers or the gateway withdraws them (``decide_approval``).
+        computer_use still never reaches the generic gate in gateway mode.
         """
         sql = "SELECT * FROM approvals WHERE 1=1"
         params: list = []

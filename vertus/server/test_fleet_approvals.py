@@ -1,10 +1,10 @@
-"""Checkpoint 3: approval ledger — read-only record, empty by design.
+"""Approvals: the engine asks, any client answers, the ledger records it.
 
-Nothing populates this table today: the fleet config materializes
-``approvals.mode: off`` and computer_use never reaches the fork's gateable
-path in gateway mode, so the hub observes zero approval requests. The
-endpoint + schema exist so the contract is fixed before any future phase
-writes rows. These tests pin that honest, empty behavior.
+Since Oct 2026 every materialized agent runs with ``approvals.mode: manual``
+and the vertus-guard plugin, so the gateway sends ``approval`` requests. The
+bridge turns them into ``approval_request`` events, POST /api/approvals/<id>
+answers them, and the ledger keeps who decided what. A hub that has seen no
+request still shows an empty ledger.
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def _req(base: str, path: str, token: str = "test-token"):
         return resp.status, json.loads(resp.read())
 
 
-def test_approvals_endpoint_is_read_only_empty_ledger(hub):
+def test_approvals_ledger_starts_empty(hub):
     # Bearer-guarded.
     req = urllib.request.Request(
         hub.base + "/api/approvals", headers={"Authorization": "Bearer wrong"}
@@ -93,3 +93,178 @@ def test_approvals_endpoint_is_read_only_empty_ledger(hub):
     # The table exists and is queryable (schema creation ran on store boot).
     assert hub.store.list_approvals(state="pending") == []
     assert hub.store.list_approvals(state="allow") == []
+
+
+# --- the bridge speaks the gateway's approval protocol --------------------
+
+class _FakeGateway:
+    """A gateway process: lines written to stdout reach the bridge's reader;
+    whatever the bridge writes to stdin is kept for inspection."""
+
+    def __init__(self):
+        import os
+        read_fd, self._write_fd = os.pipe()
+        self.stdout = os.fdopen(read_fd, "r")
+        self.written: list[dict] = []
+        outer = self
+
+        class _Stdin:
+            def write(self, text):
+                for line in text.splitlines():
+                    if line.strip():
+                        outer.written.append(json.loads(line))
+
+            def flush(self):
+                pass
+
+        self.stdin = _Stdin()
+        self.pid = 0
+
+    def send(self, frame: dict) -> None:
+        import os
+        os.write(self._write_fd, (json.dumps(frame) + "\n").encode())
+
+    def poll(self):
+        return None
+
+
+def _bridge_session():
+    import hermes_bridge as hb
+    gateway = _FakeGateway()
+    session = hb._HermesSession(gateway, lambda *a: None)
+    events: list[dict] = []
+    session.subscribe(events.append)
+    return gateway, session, events
+
+
+def _wait(predicate, timeout=3.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_gateway_approval_request_becomes_an_answerable_event():
+    gateway, session, events = _bridge_session()
+    gateway.send({"jsonrpc": "2.0", "id": "srv-7", "method": "approval", "params": {
+        "session_id": "s", "request_id": "req-1", "command": "git push origin main",
+        "description": "VERTUS wants to push to a remote repository",
+        "choices": ["once", "session", "always", "deny", "bogus"]}})
+    assert _wait(lambda: any(e["type"] == "approval_request" for e in events))
+    request = next(e for e in events if e["type"] == "approval_request")
+    assert request["approval_id"] == "req-1"
+    assert request["command"] == "git push origin main"
+    assert request["choices"] == ["once", "session", "always", "deny"]
+
+    assert session.respond_approval("req-1", "session") is True
+    assert gateway.written[-1] == {"jsonrpc": "2.0", "id": "srv-7", "result": {"choice": "session"}}
+    assert events[-1] == {"type": "approval_resolved", "approval_id": "req-1", "decision": "session"}
+    # Answered once: a second answer (another surface, a double tap) is refused.
+    assert session.respond_approval("req-1", "deny") is False
+    with pytest.raises(ValueError):
+        session.respond_approval("req-1", "maybe")
+
+
+def test_withdrawn_approval_is_announced_and_cannot_be_answered():
+    gateway, session, events = _bridge_session()
+    gateway.send({"jsonrpc": "2.0", "id": "srv-9", "method": "approval",
+                  "params": {"session_id": "s", "request_id": "req-2", "command": "rm notes.txt"}})
+    assert _wait(lambda: any(e["type"] == "approval_request" for e in events))
+    gateway.send({"jsonrpc": "2.0", "method": "event", "params": {
+        "type": "request.cancel", "payload": {"id": "srv-9", "method": "approval", "reason": "timeout"}}})
+    assert _wait(lambda: events[-1]["type"] == "approval_resolved")
+    assert events[-1]["decision"] == "withdrawn" and events[-1]["approval_id"] == "req-2"
+    assert session.respond_approval("req-2", "once") is False
+
+
+def test_requests_the_hub_cannot_show_are_declined_at_once():
+    gateway, session, events = _bridge_session()
+    gateway.send({"jsonrpc": "2.0", "id": "srv-3", "method": "clarify", "params": {"session_id": "s"}})
+    assert _wait(lambda: gateway.written)
+    assert gateway.written[-1]["id"] == "srv-3"
+    assert gateway.written[-1]["error"]["code"] == -32601
+    assert not any(e["type"].startswith("approval") for e in events)
+
+
+# --- HTTP: answering routes to the waiting agent and settles the ledger ---
+
+def _post(base: str, path: str, body: dict, token: str = "test-token"):
+    req = urllib.request.Request(base + path, data=json.dumps(body).encode(), method="POST",
+                                 headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/json",
+                                          "X-Vertus-Client": "island"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as err:
+        return err.code, json.loads(err.read())
+
+
+def test_answering_an_approval_reaches_the_engine_and_the_ledger(hub):
+    bridge = hub.mgr.get_or_create_session("primary")
+    bridge.store = hub.store   # the hub binds it per prompt; approvals arrive mid-run
+    answered: list[tuple[str, str]] = []
+
+    class _Engine:
+        def respond_approval(self, approval_id, choice):
+            answered.append((approval_id, choice))
+            bridge._on_pi_event({"type": "approval_resolved", "approval_id": approval_id, "decision": choice})
+            return True
+
+    bridge._session = _Engine()
+    bridge._on_pi_event({"type": "approval_request", "approval_id": "a1", "command": "rm notes.txt",
+                         "description": "VERTUS wants to delete files", "choices": ["once", "deny"]})
+    assert _wait(lambda: hub.store.list_approvals(state="pending"))
+
+    assert _post(hub.base, "/api/approvals/a1", {"choice": "nope"})[0] == 400
+    assert _post(hub.base, "/api/approvals/unknown", {"choice": "once"})[0] == 404
+    status, body = _post(hub.base, "/api/approvals/a1", {"choice": "deny"})
+    assert status == 200 and body == {"approval_id": "a1", "decision": "deny"}
+    assert answered == [("a1", "deny")]
+    assert _wait(lambda: hub.store.get_approval("a1")["decision"] == "deny")
+    row = hub.store.get_approval("a1")
+    assert row["decided_by"] == "island" and row["target"] == "rm notes.txt"
+    # Settled: nothing is offered again, and a late answer is refused.
+    assert hub.store.list_approvals(state="pending") == []
+    assert _post(hub.base, "/api/approvals/a1", {"choice": "once"})[0] == 409
+
+
+def test_an_approval_the_engine_forgot_is_settled_not_left_pending(hub):
+    bridge = hub.mgr.get_or_create_session("primary")
+    bridge.store = hub.store   # the hub binds it per prompt; approvals arrive mid-run
+
+    class _Engine:
+        def respond_approval(self, approval_id, choice):
+            return False   # gateway respawned; nothing waits any more
+
+    bridge._session = _Engine()
+    bridge._on_pi_event({"type": "approval_request", "approval_id": "a2", "command": "git push"})
+    assert _wait(lambda: hub.store.get_approval("a2") is not None)
+    assert _post(hub.base, "/api/approvals/a2", {"choice": "once"})[0] == 409
+    assert _wait(lambda: hub.store.get_approval("a2")["decision"] == "withdrawn")
+
+
+# --- every agent home is materialized with approvals on --------------------
+
+def test_agents_are_materialized_with_approvals_and_the_guard(hub):
+    import agent_registry
+    home = hub.registry.agent_home("primary")
+    cfg = agent_registry._yaml_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert cfg["approvals"]["mode"] == "manual"
+    assert cfg["approvals"]["timeout"] == agent_registry.APPROVAL_TIMEOUT_S
+    assert "vertus-guard" in cfg["plugins"]["enabled"]
+    plugin = home / "plugins" / "vertus-guard"
+    assert plugin.is_symlink() and (plugin / "plugin.yaml").is_file()
+    assert plugin.resolve() == agent_registry.GUARD_PLUGIN_DIR.resolve()
+
+
+def test_existing_agents_pick_up_the_policy_at_boot(hub):
+    import agent_registry
+    home = hub.registry.agent_home("primary")
+    # A home written before approvals existed.
+    (home / "config.yaml").write_text("approvals:\n  mode: false\n  timeout: 15\n", encoding="utf-8")
+    assert hub.registry.rematerialize_all() == []
+    cfg = agent_registry._yaml_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert cfg["approvals"]["mode"] == "manual"

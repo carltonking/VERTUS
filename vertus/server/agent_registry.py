@@ -288,6 +288,22 @@ class AgentRegistry:
         agents.sort(key=lambda a: (a.get("created_at") or "", a.get("id") or ""))
         return agents
 
+    def rematerialize_all(self) -> list[str]:
+        """Re-derive every agent home from its profile (hub boot).
+
+        Homes are derived state; a hub whose materialization changed (the
+        approvals policy, Oct 2026) must not leave existing agents on the old
+        config until their profile happens to be edited. Returns the ids that
+        failed, best-effort like every other materialization."""
+        failed: list[str] = []
+        with self._lock:
+            for agent_id in self._scan_ids():
+                try:
+                    self._materialize_home_locked(agent_id, self._load(agent_id))
+                except (OSError, KeyError):
+                    failed.append(agent_id)
+        return failed
+
     def get_agent(self, agent_id: str) -> dict:
         """One agent by id; raises KeyError when unknown.
 
@@ -575,6 +591,20 @@ class AgentRegistry:
             cfg["computer_use"] = cu_cfg
         else:
             cfg.pop("computer_use", None)
+        # Approvals (Oct 2026): every agent asks before it sends, posts,
+        # spends or deletes. The engine's own gate turns on (mode manual —
+        # the fleet config carries it off for the stand-alone CLI), the
+        # vertus-guard plugin adds the categories that gate does not consider
+        # dangerous, and the timeout leaves time to answer from the island
+        # before the engine fails the action closed.
+        cfg["approvals"] = {**(cfg.get("approvals") if isinstance(cfg.get("approvals"), dict) else {}),
+                            "mode": "manual", "timeout": APPROVAL_TIMEOUT_S}
+        plugins = cfg.get("plugins") if isinstance(cfg.get("plugins"), dict) else {}
+        enabled = [p for p in (plugins.get("enabled") or []) if isinstance(p, str)]
+        if GUARD_PLUGIN_NAME not in enabled:
+            enabled.append(GUARD_PLUGIN_NAME)
+        cfg["plugins"] = {**plugins, "enabled": enabled}
+        _link_guard_plugin(home)
         (home / "config.yaml").write_text(_yaml_dump(cfg), encoding="utf-8")
 
         # SOUL.md — the bot's persona, plus a hub-generated fleet-context
@@ -864,3 +894,22 @@ class AgentRegistry:
 # Repo root
 # Used only to locate the templated skill files for home materialization.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+GUARD_PLUGIN_NAME = "vertus-guard"
+GUARD_PLUGIN_DIR = Path(__file__).resolve().parents[1] / "hermes-plugins" / GUARD_PLUGIN_NAME
+APPROVAL_TIMEOUT_S = 300
+
+
+def _link_guard_plugin(home: Path) -> None:
+    """Point <home>/plugins/vertus-guard at the repo's plugin, so a policy
+    change ships with the next gateway spawn rather than a re-copy. An
+    existing real directory (a user's own copy) is left alone."""
+    target = home / "plugins" / GUARD_PLUGIN_NAME
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink():
+        if target.resolve() == GUARD_PLUGIN_DIR.resolve():
+            return
+        target.unlink()
+    elif target.exists():
+        return
+    target.symlink_to(GUARD_PLUGIN_DIR, target_is_directory=True)

@@ -245,6 +245,13 @@ class AgentBridge:
         # because prompt.submit has no per-turn context field. Sticky: once a
         # remote prompt is seen, this agent's gateways keep approvals on.
         self._remote_seen = False
+        # approval_id -> the client that answered it, until the engine's
+        # approval_resolved event settles the ledger row.
+        self._approval_answerers: dict[str, str] = {}
+        # Approvals the engine is waiting on this turn. A turn parked on a
+        # human is not stalled: the watchdog leaves it alone, and the
+        # engine's own approval deadline (approvals.timeout) bounds the wait.
+        self._pending_approvals: set[str] = set()
         self.subscribers: list[Queue] = []
         self._queue: Queue = Queue()
         self._create_session = create_session_factory
@@ -723,6 +730,7 @@ class AgentBridge:
                 if not cancelled and not closed:
                     self._running = True
                     self._turn_started_at = time.monotonic()
+                    self._pending_approvals.clear()
             if closed:
                 # A close raced the enqueue (DELETE refuses busy bridges, so
                 # this is defensive): the run never started — mark it so.
@@ -769,6 +777,7 @@ class AgentBridge:
                 with self._status_lock:
                     self._running = False
                     self._turn_started_at = None
+                    self._pending_approvals.clear()
                 # Fold assistant text + set the terminal state exactly once.
                 self._end_run()
 
@@ -1050,6 +1059,15 @@ class AgentBridge:
             if etype in ("text", "activity", "done"):
                 self._emit(event)
                 return
+            if etype in ("approval_request", "approval_resolved") and isinstance(event, dict):
+                with self._status_lock:
+                    if etype == "approval_request":
+                        self._pending_approvals.add(str(event.get("approval_id")))
+                    else:
+                        self._pending_approvals.discard(str(event.get("approval_id")))
+                self._record_approval(event)
+                self._emit(event)
+                return
             # Streaming assistant text: message_update wraps an
             # assistantMessageEvent with type text_delta.
             if etype == "message_update":
@@ -1123,6 +1141,40 @@ class AgentBridge:
     # ------------------------------------------------------------------
     # Step A: turn introspection + lifecycle (reconfigure / close)
     # ------------------------------------------------------------------
+
+    def _record_approval(self, event: dict) -> None:
+        """Mirror an approval into the ledger (best-effort: the event itself
+        is what clients act on, and it is stored with the run by _emit)."""
+        if self.store is None:
+            return
+        try:
+            if event["type"] == "approval_request":
+                with self._status_lock:
+                    run_id = self._current_run_id
+                self.store.record_approval_request(
+                    event["approval_id"], run_id, self.agent_id,
+                    event.get("description") or "approval", event.get("command") or "")
+            else:
+                decided_by = self._approval_answerers.pop(event["approval_id"], "")
+                self.store.decide_approval(event["approval_id"], str(event.get("decision") or "withdrawn"),
+                                           decided_by=decided_by or "engine")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def respond_approval(self, approval_id: str, choice: str, answered_by: str = "") -> bool:
+        """Answer the engine's pending approval (POST /api/approvals/<id>).
+        False when nothing is waiting on that id any more. The ledger row is
+        settled by the engine's approval_resolved event, credited to
+        ``answered_by``."""
+        session = self._session
+        respond = getattr(session, "respond_approval", None)
+        if respond is None:
+            return False
+        self._approval_answerers[approval_id] = answered_by
+        answered = bool(respond(approval_id, choice))
+        if not answered:
+            self._approval_answerers.pop(approval_id, None)
+        return answered
 
     def steer(self, text: str) -> str:
         """Inject a mid-turn correction into the live turn (POST /api/steer).
@@ -1542,13 +1594,14 @@ class AgentBridge:
                 last_event = self._last_event_at
                 stall = self._stall_timeout_s
                 hard = self._hard_timeout_s
+                awaiting_human = bool(self._pending_approvals)
             if not running:
                 self._health_check()
                 continue
             if escalating:
                 continue
             now = time.monotonic()
-            if stall > 0 and last_event is not None and now - last_event > stall:
+            if stall > 0 and not awaiting_human and last_event is not None and now - last_event > stall:
                 msg = (
                     f"stall timeout: no agent events for {now - last_event:.0f}s "
                     f"(stall_timeout_s={stall:g})"
@@ -1849,6 +1902,8 @@ class VertusHandler(BaseHTTPRequestHandler):
             })
         elif route == "/api/steer":
             self._handle_steer(payload)
+        elif route.startswith("/api/approvals/"):
+            self._handle_approval_respond(route[len("/api/approvals/"):].strip("/"), payload)
         elif route == "/api/messages":
             self._handle_message_send(payload)
         elif route == "/api/routines":
@@ -2772,13 +2827,11 @@ class VertusHandler(BaseHTTPRequestHandler):
         self._json(200, {"marked": marked, "thread_id": thread_id})
 
     def _handle_approvals_list(self) -> None:
-        """GET /api/approvals?state= — read-only approval ledger.
+        """GET /api/approvals?state= — the approval ledger, newest first.
 
-        Honest scope: the hub cannot see per-action approval requests today
-        (approvals are off in the fleet config and computer_use never reaches
-        the fork's gateable path in gateway mode), so this ledger is empty
-        until a future phase populates it. The endpoint exists now so the
-        contract — and the client UI — don't have to be invented later.
+        Rows arrive as the engine asks (the vertus-guard plugin and Hermes's
+        own dangerous-command gate) and settle when a client answers through
+        POST /api/approvals/<id> or the engine withdraws the request.
         """
         store = self._history_store()
         if store is None:
@@ -2786,6 +2839,43 @@ class VertusHandler(BaseHTTPRequestHandler):
         state = self._query_param("state") or None
         limit = self._limit_param("limit", 100, 500)
         self._json(200, {"approvals": store.list_approvals(state=state, limit=limit)})
+
+    def _handle_approval_respond(self, approval_id: str, payload: dict) -> None:
+        """POST /api/approvals/<id> {"choice": once|session|always|deny}.
+
+        Routes the answer to the agent whose engine is waiting. 404 when the
+        id is unknown, 409 when it is already settled (answered on another
+        surface, withdrawn, or timed out — the engine fails closed then)."""
+        store = self._history_store()
+        if store is None:
+            return
+        choice = str(payload.get("choice") or "").strip()
+        if choice not in ("once", "session", "always", "deny"):
+            self._json(400, {"error": "choice must be once, session, always or deny"})
+            return
+        row = store.get_approval(approval_id)
+        if row is None:
+            self._json(404, {"error": f"approval not found: {approval_id}"})
+            return
+        if row.get("decision"):
+            self._json(409, {"error": f"approval already settled: {row['decision']}"})
+            return
+        bridge = self.sessions.get_session(row["agent_id"])
+        answered = False
+        if bridge is not None:
+            source = str(self.headers.get("X-Vertus-Client", "local") or "local")
+            try:
+                answered = bridge.respond_approval(approval_id, choice, answered_by=source)
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)[:200]})
+                return
+        if not answered:
+            # The engine no longer waits on it (gateway respawned, request
+            # expired): settle the row so no client keeps offering it.
+            store.decide_approval(approval_id, "withdrawn", decided_by="hub")
+            self._json(409, {"error": "approval is no longer pending"})
+            return
+        self._json(200, {"approval_id": approval_id, "decision": choice})
 
     def _handle_fleet_activity(self) -> None:
         """GET /api/fleet/activity — newest runs across ALL agents (roster UI)."""
@@ -3509,6 +3599,11 @@ def serve(host: str | None, port: int) -> None:
     try:
         primary = registry.ensure_primary()
         print(f"[vertus] agents root: {registry.root} (primary: {primary['id']})")
+        # Homes are derived: re-derive them so a materialization change (the
+        # approvals policy) reaches existing agents, not only new ones.
+        stale = registry.rematerialize_all()
+        if stale:
+            print(f"[vertus] agent homes not re-materialized: {', '.join(stale)}", file=sys.stderr)
         # Fleet message bus: store-backed bot-to-bot messaging + delegation.
         # Built BEFORE the session manager so every bridge's on_run_terminal
         # callback is the messenger's; its store/session providers are

@@ -71,6 +71,9 @@ class _HermesSession:
         self._next_id = 0
         self._pending: dict[str, tuple[threading.Event, dict, list]] = {}
         self._pending_turn: tuple[threading.Event, list] | None = None
+        # Approval requests the gateway is waiting on: approval_id -> the
+        # gateway's own request id, which the answer frame must carry.
+        self._approvals: dict[str, str] = {}
         threading.Thread(target=self._reader, daemon=True).start()
 
     # -- public API -------------------------------------------------------
@@ -110,6 +113,26 @@ class _HermesSession:
         done.wait()
         if errors:
             raise AgentSessionError(errors[-1])
+
+    APPROVAL_CHOICES = ("once", "session", "always", "deny")
+
+    def respond_approval(self, approval_id: str, choice: str) -> bool:
+        """Answer a pending approval request. False when it is unknown or
+        already settled (answered elsewhere, withdrawn, timed out)."""
+        if choice not in self.APPROVAL_CHOICES:
+            raise ValueError(f"choice must be one of {self.APPROVAL_CHOICES}")
+        with self._lock:
+            gateway_id = self._approvals.pop(approval_id, None)
+            if gateway_id is None or self._proc.stdin is None:
+                return False
+            frame = {"jsonrpc": "2.0", "id": gateway_id, "result": {"choice": choice}}
+            try:
+                self._proc.stdin.write(json.dumps(frame) + "\n")
+                self._proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                return False
+        self._emit({"type": "approval_resolved", "approval_id": approval_id, "decision": choice})
+        return True
 
     def slash_catalog(self) -> dict:
         """Fetch the slash-command + skill catalog (registry + skills + quick
@@ -387,6 +410,19 @@ class _HermesSession:
                 self._emit({"type": "activity", "text": f"running {name}…"})
             elif ptype == "tool.complete":
                 pass  # activity spam; clients only need the start marker
+            elif ptype == "request.cancel":
+                # The gateway withdrew a request (approval timed out,
+                # answered on another surface, turn interrupted).
+                if payload.get("method") == "approval":
+                    gateway_id = str(payload.get("id", ""))
+                    with self._lock:
+                        approval_id = next((a for a, g in self._approvals.items() if g == gateway_id), None)
+                        if approval_id is not None:
+                            del self._approvals[approval_id]
+                    if approval_id is not None:
+                        self._emit({"type": "approval_resolved", "approval_id": approval_id,
+                                    "decision": "withdrawn",
+                                    "reason": str(payload.get("reason") or "")[:200]})
             elif ptype == "error":
                 msg = payload.get("text") or payload.get("message") or "agent error"
                 self._emit({"type": "error", "message": str(msg)[:500]})
@@ -396,6 +432,40 @@ class _HermesSession:
             # done, and error.
         except Exception:
             pass
+
+    def _handle_server_request(self, msg: dict) -> None:
+        """An approval becomes a hub event any client can answer (the island,
+        today); the gateway keeps its own deadline and fails closed on it.
+
+        Any other request (clarify, secrets, …) has no hub surface yet, so it
+        is answered "method not found" at once: the gateway then withdraws it
+        instead of parking the agent until its timeout."""
+        gateway_id = str(msg.get("id"))
+        params = msg.get("params") or {}
+        if msg.get("method") == "approval":
+            approval_id = str(params.get("request_id") or f"gw-{gateway_id}")
+            with self._lock:
+                self._approvals[approval_id] = gateway_id
+            choices = [c for c in (params.get("choices") or []) if c in self.APPROVAL_CHOICES]
+            self._emit({
+                "type": "approval_request",
+                "approval_id": approval_id,
+                "command": str(params.get("command") or "")[:2000],
+                "description": str(params.get("description") or "")[:500],
+                "choices": choices or ["once", "deny"],
+            })
+            return
+        with self._lock:
+            if self._proc.stdin is None:
+                return
+            try:
+                self._proc.stdin.write(json.dumps({
+                    "jsonrpc": "2.0", "id": msg.get("id"),
+                    "error": {"code": -32601, "message": "the VERTUS hub cannot answer this yet"},
+                }) + "\n")
+                self._proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
 
     def _reader(self) -> None:
         try:
@@ -415,6 +485,11 @@ class _HermesSession:
                         self._ready.set()
                     elif ptype:
                         self._handle_event(ptype, params.get("payload") or {})
+                    continue
+                # Server -> client requests (the gateway asking the client
+                # something and waiting): a method AND an id.
+                if msg.get("method") and msg.get("id") is not None:
+                    self._handle_server_request(msg)
                     continue
                 # RPC responses (matched by id).
                 rid = str(msg.get("id", ""))
