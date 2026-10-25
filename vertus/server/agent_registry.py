@@ -715,6 +715,15 @@ class AgentRegistry:
             skill_dir.mkdir(parents=True, exist_ok=True)
             (skill_dir / "SKILL.md").write_text(text, encoding="utf-8")
 
+        # App skills Hermes already ships (Notes, GitHub, …). The hub spawns
+        # the gateway directly, so the engine's own bundled-skill seeding
+        # never runs for an agent home — without this, no agent sees any of
+        # them. Best-effort like the rest: a missing checkout installs none.
+        try:
+            _materialize_hermes_skills(home / "skills")
+        except OSError:
+            pass
+
         # Seed per-bot credentials once from the fleet home. Never overwrite:
         # a bot's keys may have been edited per-bot after creation.
         for secret in ("auth.json", ".env", "email-creds.json"):
@@ -932,3 +941,147 @@ def _link_guard_plugin(home: Path) -> None:
     elif target.exists():
         return
     target.symlink_to(GUARD_PLUGIN_DIR, target_is_directory=True)
+
+
+# --- Hermes-shipped app skills (step 4: connect apps) --------------------------
+#
+# Skills the hub copies from the Hermes checkout into every agent home. A skill
+# is installed only when the CLI it drives is on the hub's PATH (the gateway
+# inherits that PATH), so an agent never advertises an app it cannot reach.
+#
+# The default is what works on this fleet's Mac without signing in anywhere and
+# whose outward actions the approvals guard already stops: Apple Notes (memo)
+# and GitHub (gh; `gh pr create`, `gh api -X POST`… ask first). Held back on
+# purpose, opt-in with VERTUS_HERMES_SKILLS="+name":
+#   imessage, apple-reminders — their CLIs are installed, but `imsg send|react`
+#       and `remindctl delete` / `list --delete` pass the guard unasked; turn
+#       them on once the guard covers those commands.
+#   google-workspace, 1password, openhue — need an account/OAuth/bridge setup.
+HERMES_SKILLS_DEFAULT = ("apple-notes", "github")
+# CLIs a skill needs beyond its own frontmatter `prerequisites.commands`
+# (github's frontmatter declares none, yet every workflow in it runs gh).
+_HERMES_SKILL_COMMANDS: dict[str, tuple[str, ...]] = {
+    "apple-notes": ("memo",),
+    "apple-reminders": ("remindctl",),
+    "imessage": ("imsg",),
+    "github": ("gh",),
+    "openhue": ("openhue",),
+    "1password": ("op",),
+}
+# Which skills the hub installed into a home, so it removes only its own copies
+# (an agent's own skill of the same name is never touched).
+HERMES_SKILLS_MANIFEST = ".vertus-hermes-skills.json"
+_SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+_SKILLS_OFF = {"off", "none", "0", "false", "no"}
+
+
+def hermes_skill_selection(spec: str | None) -> list[str]:
+    """Names selected by VERTUS_HERMES_SKILLS. Pure.
+
+    None → the default set. "off"/"none" (or empty) → nothing. A plain list
+    ("apple-notes,imessage") replaces the default; "+name"/"-name" entries add
+    to or drop from it (or from the plain list when both appear).
+    """
+    if spec is None:
+        return list(HERMES_SKILLS_DEFAULT)
+    tokens = [t for t in re.split(r"[\s,]+", spec.strip().lower()) if t]
+    if not tokens or (len(tokens) == 1 and tokens[0] in _SKILLS_OFF):
+        return []
+    plain = [t for t in tokens if t[0] not in "+-"]
+    chosen = plain if plain else list(HERMES_SKILLS_DEFAULT)
+    for token in tokens:
+        name = token[1:]
+        if token[0] == "+" and name not in chosen:
+            chosen.append(name)
+        elif token[0] == "-":
+            chosen = [n for n in chosen if n != name]
+    seen: list[str] = []
+    for name in chosen:
+        if _SKILL_NAME_RE.match(name) and name not in seen:
+            seen.append(name)
+    return seen
+
+
+def _find_hermes_skill(name: str) -> tuple[Path, Path] | None:
+    """(source dir, path relative to the skills root) for a shipped skill.
+
+    Bundled skills first, then the official optional ones. The category
+    layout is kept because skills address their own scripts as
+    ``$HERMES_HOME/skills/<category>/<name>/scripts``."""
+    repo = vertus_paths.fork_repo()
+    for root in (repo / "skills", repo / "optional-skills"):
+        for candidate in (root / name, *sorted(root.glob(f"*/{name}"))):
+            if (candidate / "SKILL.md").is_file():
+                return candidate, candidate.relative_to(root)
+    return None
+
+
+def _skill_commands(name: str, skill_md: Path) -> list[str]:
+    commands = list(_HERMES_SKILL_COMMANDS.get(name, ()))
+    try:
+        text = skill_md.read_text(encoding="utf-8")
+    except OSError:
+        return commands
+    if text.startswith("---"):
+        front = _yaml_load(text.split("---", 2)[1]) if text.count("---") >= 2 else None
+        prereq = front.get("prerequisites") if isinstance(front, dict) else None
+        listed = prereq.get("commands") if isinstance(prereq, dict) else None
+        if isinstance(listed, list):
+            commands += [str(c) for c in listed if str(c) not in commands]
+    return commands
+
+
+def _materialize_hermes_skills(skills_dir: Path) -> list[str]:
+    """Copy the selected, usable Hermes skills into ``skills_dir``; remove the
+    ones this hub installed earlier that are no longer selected or usable.
+    Returns the installed names. Copies, not links: an agent may edit its
+    skills, and an edit must never write into the Hermes checkout."""
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = skills_dir / HERMES_SKILLS_MANIFEST
+    try:
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        previous = {}
+    if not isinstance(previous, dict):
+        previous = {}
+
+    wanted: dict[str, tuple[Path, Path]] = {}
+    for name in hermes_skill_selection(vertus_paths.hermes_skills_override()):
+        found = _find_hermes_skill(name)
+        if found is None:
+            continue
+        if all(shutil.which(cmd) for cmd in _skill_commands(name, found[0] / "SKILL.md")):
+            wanted[name] = found
+
+    root = skills_dir.resolve()
+    for name, rel in previous.items():
+        if name in wanted and str(wanted[name][1]) == rel:
+            continue
+        stale = (skills_dir / str(rel)).resolve()
+        if stale.is_relative_to(root) and stale != root and stale.is_dir():
+            shutil.rmtree(stale, ignore_errors=True)
+            if stale.parent != root:
+                try:
+                    stale.parent.rmdir()  # the category dir, only once empty
+                except OSError:
+                    pass
+
+    installed: dict[str, str] = {}
+    for name, (source, rel) in wanted.items():
+        dest = skills_dir / rel
+        if dest.exists() and name not in previous:
+            continue  # the agent's own skill by that name wins
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        staging = dest.with_name(f".{dest.name}.{uuid.uuid4().hex[:8]}.tmp")
+        shutil.copytree(source, staging, symlinks=False,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"))
+        if dest.exists():
+            shutil.rmtree(dest)
+        os.replace(staging, dest)
+        installed[name] = str(rel)
+
+    if installed or previous:
+        tmp = manifest_path.with_name(f"{manifest_path.name}.{uuid.uuid4().hex[:8]}.tmp")
+        tmp.write_text(json.dumps(installed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, manifest_path)
+    return sorted(installed)

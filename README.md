@@ -360,6 +360,7 @@ Wire events: `text`, `activity`, `done`, `error`, `cancelled`, `lagged`,
 | Env var | Meaning |
 |---|---|
 | `VERTUS_HERMES_REPO` / `VERTUS_HERMES_PYTHON` | gateway repo / python (default `~/.hermes/hermes-agent` + its venv) |
+| `VERTUS_HERMES_SKILLS` | Hermes-shipped app skills copied into every agent home at boot (default `apple-notes,github`; each only when its CLI is on PATH). `off` = none; a list replaces the default; `+imessage` / `-github` adjust it. Per agent, Hermes's own `skills.disabled` in the home's config.yaml survives re-materialization |
 | `VERTUS_AGENTS_DIR` / `VERTUS_DB_PATH` / `VERTUS_LOG_DIR` | where state lives (defaults under `~/.vertus`) |
 | `VERTUS_HOST` / `VERTUS_PORT` | hub bind (default 8787) |
 | `VERTUS_EVENT_TTL_DAYS` | event retention (default 30) |
