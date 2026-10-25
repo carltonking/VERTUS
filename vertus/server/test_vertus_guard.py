@@ -107,10 +107,15 @@ def test_background_processes_are_judged_like_commands():
     assert policy.decide("process_manage", {"action": "list"}) is None
 
 
-def test_code_execution_is_left_to_the_engines_whole_script_gate():
-    # With approvals on, Hermes asks before every execute_code script; the
-    # guard asking too would show one action as two cards.
-    assert policy.decide("execute_code", {"code": "import os\nos.remove('x')"}) is None
+def test_code_execution_is_refused_with_a_pointer_to_the_terminal():
+    # The engine asks before every execute_code script, which parked an
+    # unattended routine for the whole approval timeout; the terminal runs
+    # the same Python with each command checked.
+    for code in ("print(sum(range(10)))", "import os\nos.remove('x')"):
+        verdict = policy.decide("execute_code", {"code": code})
+        assert verdict.block and "terminal" in verdict.reason
+    directive = guard._guard(tool_name="execute_code", args={"code": "print(1)"})
+    assert directive["action"] == "block"
 
 
 def test_outward_tools_always_ask_and_name_the_target():

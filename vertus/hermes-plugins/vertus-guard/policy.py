@@ -17,9 +17,12 @@ prefixes — never by words appearing anywhere in the text. ``echo "rm"`` and
 line two are deleting.
 
 What the guard deliberately leaves to the engine: Hermes's own
-dangerous-command gate (``engine_asks``) and its whole-script gate on
-``execute_code``, which with approvals on already asks before every script.
-Asking again would show one action twice.
+dangerous-command gate (``engine_asks``). ``execute_code`` is refused with a
+pointer to the terminal: with approvals on the engine asks before every
+script as a whole, which parked unattended routines for the full approval
+timeout (Oct 2026), and a script's own subprocesses never pass either gate,
+while the same Python run through the terminal (``python3 -c``, a heredoc)
+is checked command by command.
 
 What it cannot see, stated plainly: a browser click carries only an element
 reference (``@e12``), not the button's label, so a purchase or a post made by
@@ -64,9 +67,8 @@ _ALWAYS_ASK_TOOLS: dict[str, tuple[str, str]] = {
 # Tools that run a shell command, and the argument keys that carry it.
 _SHELL_TOOLS = {"terminal", "process", "process_manage"}
 _SHELL_KEYS = ("command", "cmd", "data", "script")
-# Tools whose arguments are code: scanned only for the approval channel and,
-# for page scripts, for requests that send data. execute_code is gated by the
-# engine as a whole script.
+# execute_code is refused (see the module docstring); page scripts are
+# scanned for requests that send data.
 _CODE_TOOLS = {"execute_code"}
 _PAGE_SCRIPT_TOOLS = {"browser_cdp", "browser_console"}
 
@@ -258,6 +260,12 @@ def decide(tool_name: str, args: dict | None,
         return Verdict("approval-channel",
                        "Blocked: approvals are answered by the person, never by an agent.",
                        "vertus-guard:approval-channel", block=True)
+
+    if name in _CODE_TOOLS:
+        return Verdict("code", "Blocked: run this through the terminal tool instead "
+                       "(python3 -c or a heredoc), where each command is checked; "
+                       "execute_code needs a person to approve every script.",
+                       "vertus-guard:code:execute_code", block=True)
 
     if name in _ALWAYS_ASK_TOOLS:
         category, what = _ALWAYS_ASK_TOOLS[name]
