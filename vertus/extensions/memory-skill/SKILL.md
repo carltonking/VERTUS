@@ -13,7 +13,8 @@ the hub detects every change and broadcasts it to the whole fleet.
   - `facts.md` — HUB-MAINTAINED. Durable facts about the user and your work,
     captured automatically at the end of every conversation by the hub. Read
     it; NEVER edit it (your edits would be overwritten by the next automatic
-    capture).
+    capture). The one exception is the nightly `vertus-memory-consolidation`
+    skill, which merges and prunes it under its own record-keeping rules.
   - `profile.md` — stable facts about the user you handle. Read at the start
     of every session. Update only with durable, unlikely-to-change facts.
   - `notes/` — dated task notes, one file per topic, named
