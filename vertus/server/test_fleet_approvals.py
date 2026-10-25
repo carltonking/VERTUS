@@ -268,3 +268,18 @@ def test_existing_agents_pick_up_the_policy_at_boot(hub):
     assert hub.registry.rematerialize_all() == []
     cfg = agent_registry._yaml_load((home / "config.yaml").read_text(encoding="utf-8"))
     assert cfg["approvals"]["mode"] == "manual"
+
+
+def test_always_allow_answers_survive_rematerialization(hub):
+    # "Always allow" is written by the engine into the agent's own config;
+    # re-deriving the home (every hub boot) must keep it.
+    import agent_registry
+    home = hub.registry.agent_home("primary")
+    cfg_path = home / "config.yaml"
+    cfg = agent_registry._yaml_load(cfg_path.read_text(encoding="utf-8"))
+    cfg["command_allowlist"] = ["delete in root path"]
+    cfg_path.write_text(agent_registry._yaml_dump(cfg), encoding="utf-8")
+    assert hub.registry.rematerialize_all() == []
+    again = agent_registry._yaml_load(cfg_path.read_text(encoding="utf-8"))
+    assert again["command_allowlist"] == ["delete in root path"]
+    assert again["approvals"]["mode"] == "manual"

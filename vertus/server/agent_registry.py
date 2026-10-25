@@ -560,6 +560,15 @@ class AgentRegistry:
         if not isinstance(cfg, dict):
             cfg = {}
         cfg.pop("model_aliases", None)  # aliases resolve against fleet credentials we may not copy
+        # The engine writes "always allow" answers into THIS home's config
+        # (command_allowlist). Re-deriving the file must not forget them, or
+        # every hub boot would silently revoke the user's standing approvals.
+        existing_path = home / "config.yaml"
+        existing = _yaml_load(existing_path.read_text(encoding="utf-8")) if existing_path.is_file() else None
+        if isinstance(existing, dict) and isinstance(existing.get("command_allowlist"), list):
+            kept = [e for e in existing["command_allowlist"] if isinstance(e, str)]
+            fleet = [e for e in (cfg.get("command_allowlist") or []) if isinstance(e, str)]
+            cfg["command_allowlist"] = fleet + [e for e in kept if e not in fleet]
         if profile.get("model"):
             model_section = {"default": str(profile["model"])}
             if profile.get("provider"):
