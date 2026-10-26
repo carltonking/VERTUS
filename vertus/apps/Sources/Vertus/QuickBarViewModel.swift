@@ -305,8 +305,13 @@ final class QuickBarViewModel: ObservableObject {
     }
 
     /// Clear the local view (the server-side run keeps going — the bar's
-    /// "new session" is a view reset, not a cancellation).
+    /// "new session" is a view reset, not a cancellation). The cut is applied
+    /// against the store's live transcript FIRST, so the next mirror sync
+    /// keeps hiding the pre-reset history instead of letting it pop back.
     func reset() {
+        if let state = store.live[selectedAgentID] {
+            viewCut.cut(entries: state.transcript, isRunning: state.isRunning)
+        }
         transcript.removeAll()
         currentActivity = nil
         turnHasText = false
@@ -314,15 +319,32 @@ final class QuickBarViewModel: ObservableObject {
         sentAtLeastOnce = false
     }
 
-    /// New session — in the multi-window app this opens a new session WINDOW
-    /// for the selected agent (via the app delegate), so each session is its own
-    /// macOS window with its own view. The bar's own view keeps its transcript;
-    /// the new window starts fresh. If the user wants a bare view reset without
-    /// a new window they can use the bar's pencil/⌘N while only one window is
-    /// open — but the intended path now is: one window per session.
+    /// New session on the bar: stop whatever the selected agent is doing now,
+    /// then reset the bar's local conversation context so the user starts a fresh
+    /// conversation with Vertus. This does NOT open the Vertus app or any new
+    /// macOS window — it stays in the notch panel, clears the transcript/activity
+    /// state on the bar, and leaves the agent idle so the next prompt is a clean
+    /// conversation start.
+    ///
+    /// The stop is best-effort: if the agent is already idle the call is a no-op
+    /// (the hub returns 409), and we still reset the local view so the bar is a
+    /// blank slate either way.
     func newSession() {
         let id = selectedAgentID
-        AppDelegate.shared?.openSessionWindow(agentID: id)
+        Task { [weak self] in
+            guard let self else { return }
+            // Best-effort: stop the active turn on the hub so the new
+            // conversation starts from idle. If the agent is already idle we
+            // still want the local reset — ignore the error.
+            do {
+                try await self.store.stopAgent(id)
+            } catch {
+                // 409 idle (and any other failure) is fine here: the user
+                // asked for a fresh conversation, and the local reset below
+                // is the part they see.
+            }
+            self.reset()
+        }
     }
 
     // MARK: - Demo seeds (--demo-output / --demo-long)

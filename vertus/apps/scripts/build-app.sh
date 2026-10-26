@@ -68,10 +68,10 @@ cat > "${APP}/Contents/Info.plist" <<'PLIST'
     <string>NSApplication</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
-    <!-- No LSUIElement: a regular app with a Dock icon. The QuickBar panel's
-         non-stealing behavior is window-level, not policy-level. -->
 </dict>
 </plist>
 PLIST

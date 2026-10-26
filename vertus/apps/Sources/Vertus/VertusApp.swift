@@ -22,17 +22,6 @@ func vertusTrace(_ message: String) {
     }
 }
 
-/// VERTUS — one app, one process: the full window (roster, chat, memory,
-/// threads, screens, activity, bot editor) AND the notch QuickBar menubar
-/// extra (⇧⌘J). One FleetStore, one fleet-stream connection, one health
-/// poll, one memory index — the pre-merge VertusBar/VertusFleet pair ran
-/// two processes and two of everything.
-///
-/// Activation policy: .regular (the default for a SwiftUI app). The QuickBar
-/// panel keeps its window-level protections — .nonactivatingPanel,
-/// .statusBar level, .canJoinAllSpaces/.fullScreenAuxiliary — so its
-/// not-stealing behavior is identical under a regular app; see Checkpoint 0
-/// of the merge prompt for the analysis.
 @main
 struct VertusApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -40,14 +29,7 @@ struct VertusApp: App {
     var body: some Scene {
         Settings { EmptyView() }
             .commands {
-                // Replacing .newItem keeps ⌘N out (no second window concept).
                 CommandGroup(replacing: .newItem) { }
-                CommandMenu("Vertus") {
-                    Button("Open Vertus Window") {
-                        AppDelegate.shared?.openMainWindow()
-                    }
-                    .keyboardShortcut("o", modifiers: [.command])
-                }
             }
     }
 }
@@ -77,14 +59,12 @@ private var hotKeyRef: EventHotKeyRef?
 final class AppDelegate: NSObject, NSApplicationDelegate {
     static var shared: AppDelegate?
 
-    /// ONE store for the whole process: the main window and the QuickBar
-    /// panel observe the same fleet stream, health poll, and memory index.
     let store: FleetStore
 
     private var panel: KeyablePanel?
     private var host: NSHostingView<QuickBarRootView>?
     private var localMonitor: Any?
-    private var windowCloseMonitor: Any?
+    private var panelQuitMonitor: Any?
     private var statusItem: NSStatusItem?
     private var menubarIcon: NSImage?
     private var isHiding = false
@@ -92,7 +72,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var heightObserver: AnyCancellable?
     private var currentWidgetHeight = NotchPanelMetrics.idleHeight()
     private let expansionState = ExpansionState()
-    private var mainWindow: NSWindow?
     private var notifier: CompletionNotifier?
     /// Bug B9: an Escape press issued a stop while the run unwinds — the
     /// NEXT Escape closes the panel regardless of the (still true) running
@@ -116,11 +95,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Self.shared = self
-        // Regular app by default (the SwiftUI @main App policy); set it
-        // explicitly so the intent survives refactors. The Dock icon and
-        // ⌘Tab presence are the accepted cost of one app with a real window;
-        // nothing about the panel's non-stealing behavior depends on policy.
-        NSApp.setActivationPolicy(.regular)
+        NSApp.setActivationPolicy(.accessory)
         vertusTrace("activation policy → \(NSApp.activationPolicy().rawValue)")
         loadIcons()
         buildPanel()
@@ -129,10 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerLaunchAtLogin()
         installNotifications()
         installPanelQuitMonitor()
-        installWindowCloseMonitor()
-        vertusTrace("launch: about to openMainWindow")
-        openMainWindow()
-        vertusTrace("launch: openMainWindow returned; sessions=\(store.sessions.count) selectedSession=\(store.foregroundSessionID?.prefix(8) ?? "nil")")
+        store.foregroundAgentID = nil
 
         if CommandLine.arguments.contains("--verify-nub") {
             renderPanel(progress: 0)
@@ -152,6 +124,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // (No --show flag: showing the panel is ⇧⌘J's job, and a launch-time
         // auto-show made GUI verification loops hard to reason about. Render
         // verification uses --verify*, which captures and exits on its own.)
+    }
+
+    // MARK: - Notifications (bundle-only)
+
+    /// UNUserNotificationCenter.current() raises NSInternalInconsistencyException
+    /// ("bundleProxyForCurrentProcess is nil") when the process has no app bundle
+    /// — i.e. a bare binary launched straight from .build/ during development.
+    /// Degrade cleanly: notifications off, everything else works. The bundled
+    /// VERTUS.app always gets real banners.
+    var notificationsAvailable: Bool {
+        Bundle.main.bundleURL.pathExtension == "app"
+    }
+
+    /// Background completion is the point of the fleet: when a run reaches a
+    /// terminal state for an agent that is NOT in the foreground, post a user
+    /// notification. Clicking it selects that agent and shows the QuickBar.
+    final class CompletionNotifier: NSObject, UNUserNotificationCenterDelegate {
+        private let store: FleetStore
+
+        @MainActor
+        init(store: FleetStore) {
+            self.store = store
+            super.init()
+            guard AppDelegate.shared?.notificationsAvailable == true else { return }
+            UNUserNotificationCenter.current().delegate = self
+            store.onBackgroundCompletion = { [weak self] agent, event in
+                self?.notify(agent: agent, event: event)
+            }
+        }
+
+        @MainActor
+        private func notify(agent: Agent, event: WireEvent) {
+            guard AppDelegate.shared?.notificationsAvailable == true else { return }
+            let muted = SharedUIState.mutedAgentIDs().contains(agent.id)
+            guard !muted else { return }
+            let content = UNMutableNotificationContent()
+            content.title = "Vertus has finished"
+            content.subtitle = event.type == "error" ? "Error" : agent.rosterLabel
+            if event.type == "error" {
+                content.body = event.message ?? "run failed"
+            } else {
+                let activity = store.latestActivityText(for: agent.id) ?? "run completed"
+                content.body = String(activity.prefix(120))
+            }
+            content.userInfo = ["agent_id": agent.id]
+            content.sound = .default
+            let request = UNNotificationRequest(
+                identifier: "vertus-completion-\(agent.id)-\(event.runId ?? UUID().uuidString)",
+                content: content,
+                trigger: nil
+            )
+            UNUserNotificationCenter.current().add(request)
+        }
+
+        // Show while the app is frontmost (banner), don't stack duplicates.
+        func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                    willPresent notification: UNNotification,
+                                    withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+            completionHandler([.banner, .sound])
+        }
+
+        func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                    didReceive response: UNNotificationResponse,
+                                    withCompletionHandler completionHandler: @escaping () -> Void) {
+            if let agentID = response.notification.request.content.userInfo["agent_id"] as? String {
+                Task { @MainActor in
+                    AppDelegate.shared?.selectAgentAndShowPanel(agentID: agentID)
+                }
+            }
+            completionHandler()
+        }
+    }
+
+    @MainActor
+    func selectAgentAndShowPanel(agentID: String) {
+        store.selectedAgentID = agentID
+        store.foregroundAgentID = agentID
+        NotificationCenter.default.post(
+            name: .vertusSelectAgent, object: agentID
+        )
+        showPanel()
     }
 
     // MARK: - Icons
@@ -299,154 +352,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             width: NotchPanelMetrics.windowWidth,
             height: h
         )
-    }
-
-    // MARK: - Main window (owned by the delegate, so "Open in Fleet" is an
-    // in-process activation, never a second process)
-
-    // MARK: - Session windows
-
-    /// A window that belongs to one session. The delegate holds the session id
-    /// so we can close the session (and its store entry) when the window closes,
-    /// and so we can keep the window title in sync with the session title.
-    private final class SessionWindowDelegate: NSObject, NSWindowDelegate {
-        let sessionID: String
-        weak var store: FleetStore?
-        weak var app: AppDelegate?
-        private var cancellable: AnyCancellable?
-        weak var window: NSWindow?
-
-        init(sessionID: String, store: FleetStore, app: AppDelegate, window: NSWindow) {
-            self.sessionID = sessionID
-            self.store = store
-            self.app = app
-            self.window = window
-            super.init()
-            Task { @MainActor in subscribeToSessionTitle() }
-        }
-
-        @MainActor private func subscribeToSessionTitle() {
-            cancellable = store?.$sessions
-                .map { sessions -> String? in
-                    sessions.first(where: { $0.id == self.sessionID })?.title
-                }
-                .removeDuplicates()
-                .sink { [weak self] title in
-                    self?.window?.title = title ?? "Vertus"
-                }
-        }
-
-        func windowShouldClose(_ sender: NSWindow) -> Bool {
-            sender.orderOut(nil)
-            return false
-        }
-
-        func windowWillClose(_ notification: Notification) {
-            store?.closeSession(sessionID)
-            app?.sessionWindows[sessionID] = nil
-        }
-    }
-
-    /// Open (or bring forward) a session window for one agent. If a session
-    /// window for that agent is already open, bring the newest one forward;
-    /// otherwise create a new session (and window). Closing a window hides it
-    /// and removes its session from the store; the menubar + panel stay.
-    /// Synchronous: the first-time store session is created best-effort from the
-    /// in-memory roster (the async finalize is a no-op if the roster isn't there
-    /// yet — the user can rename the window title to fix it).
-    func openSessionWindow(agentID: String, title: String? = nil) {
-        NSApp.activate(ignoringOtherApps: true)
-        let agent = store.agent(agentID)
-        let displayName = agent?.displayName ?? agentID
-        let initialTitle = title ?? displayName
-
-        // Reuse an existing session window for this agent if one exists.
-        let existing = store.sessions(for: agentID).last
-        let sessionID: String
-        if let e = existing {
-            sessionID = e.id
-            sessionWindows[sessionID]?.makeKeyAndOrderFront(nil)
-        } else {
-            // Open the store session SYNCHRONOUSLY first so the session id is
-            // stable before we build the window. openSession is async only
-            // because it fetches the agent displayName best-effort; if the hub
-            // is unreachable we still create the session with a provisional
-            // title and retry the displayName shortly after.
-            let sid = openSessionSync(agentID: agentID, title: initialTitle)
-            sessionID = sid
-            let w = makeSessionWindow(sessionID: sid)
-            w.title = initialTitle
-            sessionWindows[sid] = w
-            w.makeKeyAndOrderFront(nil)
-            store.selectedAgentID = agentID
-            // Best-effort: refresh the session title from the hub once it's
-            // reachable (so the window title reflects the agent displayName even
-            // if we fell back to a provisional title above).
-            Task { @MainActor in
-                try? await refreshSessionTitle(sessionID: sid, agentID: agentID)
-            }
-        }
-        store.foregroundSessionID = sessionID
-    }
-
-    /// Synchronous session creation: use a provisional title when the hub is
-    /// unreachable; the async refresh above corrects it once the hub is back.
-    /// Uses the store's own append path (openSessionSync mirrors the behaviour
-    /// of openSession but without the async hub fetch).
-    private func openSessionSync(agentID: String, title: String) -> String {
-        let sid = UUID().uuidString
-        let session = FleetStore.WindowSession(id: sid, agentID: agentID, title: title)
-        store._appendSession(session)
-        return sid
-    }
-
-    /// Best-effort refresh of a session's title from the hub agent profile.
-    private func refreshSessionTitle(sessionID: String, agentID: String) async {
-        guard let agent = try? await store.client.agent(agentID) else { return }
-        store.renameSession(sessionID, title: agent.displayName)
-    }
-
-    /// Build one session window. Each window is its own NavigationSplitView
-    /// whose detail is bound to its session's agent.
-    private func makeSessionWindow(sessionID: String) -> NSWindow {
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1180, height: 760),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.center()
-        let root = FleetRootView(sessionID: sessionID)
-            .environmentObject(store)
-        window.contentView = NSHostingView(rootView: root)
-        window.setFrameAutosaveName("VERTUSMainWindow")
-        let delegate = SessionWindowDelegate(sessionID: sessionID, store: store, app: self, window: window)
-        window.delegate = delegate
-        return window
-    }
-
-    /// Windows keyed by their session id. Cleared when the window closes.
-    var sessionWindows: [String: NSWindow] = [:]
-
-    // MARK: - Main window (legacy single-window path)
-
-    /// Legacy helper kept for the menubar "Open Vertus Window" item and the
-    /// first-launch path: open a session window for the first known agent (or
-    /// primary). With multiple windows now supported, this just opens/creates
-    /// a session the same way as openSessionWindow.
-    @objc func openMainWindow() {
-        NSApp.activate(ignoringOtherApps: true)
-        // First session: the primary agent, or the first in the roster.
-        let agentID: String
-        if let primary = store.agents.first(where: { $0.isPrimary }) {
-            agentID = primary.id
-        } else if let first = store.agents.first {
-            agentID = first.id
-        } else {
-            // No agents yet — open for a placeholder; the user can create one.
-            agentID = "primary"
-        }
-        openSessionWindow(agentID: agentID)
     }
 
     // MARK: - Show / hide transitions
@@ -646,8 +551,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(withTitle: "Toggle Vertus (⇧⌘J)", action: #selector(togglePanel), keyEquivalent: "j")
             .target = self
-        menu.addItem(withTitle: "Open Vertus Window", action: #selector(openMainWindow), keyEquivalent: "o")
-            .target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit Vertus", action: #selector(quitApp), keyEquivalent: "q").target = self
         item.menu = menu
@@ -658,7 +561,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - ⌘Q while the panel is key
 
-    /// The QuickBar panel is a .nonactivatingPanel (VertusApp.swift:77-78):
+    /// The QuickBar panel is a .nonactivatingPanel:
     /// using it never activates VERTUS, and key-equivalent dispatch (⌘Q)
     /// belongs to the ACTIVE app — so while another app is frontmost, the
     /// standard menu's "Quit VERTUS" (⌘Q) is unreachable and ⌘Q would quit
@@ -669,7 +572,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// an external menu bar owning ⌘Q, so we pass the event through and the
     /// standard menu handles it — exactly one path fires in every state.
     private func installPanelQuitMonitor() {
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        panelQuitMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
             let hasCmd = event.modifierFlags.contains(.command)
             let hasShift = event.modifierFlags.contains(.shift)
@@ -678,29 +581,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let panel = self.panel, panel.isKeyWindow else { return event }
             vertusTrace("⌘Q intercepted while QuickBar panel is key — terminating")
             NSApp.terminate(nil)
-            return nil
-        }
-    }
-
-    // MARK: - ⌘W for manually-created windows
-
-    /// SwiftUI's generated Window > Close (⌘W) command only acts on
-    /// scene-managed windows; both our windows are created by the delegate
-    /// (main + Memory), so the shortcut no-ops while the menu item's click
-    /// works. Intercept ⌘W and performClose on the key window ourselves:
-    /// the main window hides (windowShouldClose -> orderOut), the Memory
-    /// window closes. The panel is not a closable window — ⌘W while the
-    /// panel is key passes through (⇧⌘J is its close).
-    private func installWindowCloseMonitor() {
-        windowCloseMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self else { return event }
-            let hasCmd = event.modifierFlags.contains(.command)
-            let hasShift = event.modifierFlags.contains(.shift)
-            let isW = event.charactersIgnoringModifiers?.lowercased() == "w"
-            guard hasCmd && !hasShift && isW else { return event }
-            guard let key = NSApp.keyWindow, key !== self.panel else { return event }
-            vertusTrace("⌘W intercepted for key window \(key.title) — closing")
-            key.performClose(nil)
             return nil
         }
     }
@@ -755,7 +635,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: - Notifications (bundle-only, as before the merge)
+    // MARK: - Notifications (bundle-only)
 
     private func installNotifications() {
         guard notificationsAvailable else { return }
@@ -783,8 +663,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Lifecycle
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        // Closing the main window must not quit the app: the menubar item
-        // and ⇧⌘J stay. Quit from the menubar quits everything.
         false
     }
 
@@ -840,19 +718,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// MARK: - Window delegate: closing the main window hides it (object stays)
-
-extension AppDelegate: NSWindowDelegate {
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
-        sender.orderOut(nil)
-        return false
-    }
-}
-
 // MARK: - Notifications
 
 extension Notification.Name {
     static let vertusFocusInput = Notification.Name("vertusFocusInput")
     static let vertusAppendPrompt = Notification.Name("vertusAppendPrompt")
     static let vertusNewSession = Notification.Name("vertusNewSession")
+    static let vertusSelectAgent = Notification.Name("vertusSelectAgent")
 }

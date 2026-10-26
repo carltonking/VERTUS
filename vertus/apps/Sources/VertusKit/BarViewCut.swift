@@ -1,11 +1,15 @@
 import Foundation
 
-/// The QuickBar panel's "new session" is a VIEW reset, never a server-side
-/// one: the hub keeps each agent's full transcript and run history, and the
-/// panel transcript is a live mirror of the store's per-agent state. This
-/// type owns the cut applied to that mirror.
+/// The QuickBar panel's transcript mirror: store entries minus a local
+/// conversation cut. The bar's "new session" is no longer just a view reset
+/// over this mirror — it stops the selected agent's current turn on the hub
+/// (best-effort) and then clears the bar's local conversation context, so the
+/// user starts a fresh conversation with Vertus in the notch panel itself.
+/// This type still owns the local cut applied to the store mirror (the bar
+/// clears the transcript locally via QuickBarViewModel.reset), and it is still
+/// pure value logic with no AppKit: unit-tested in VertusKitTests.
 ///
-/// Cut semantics (see QuickBarViewModel.newSession):
+/// Cut semantics (applied when the bar resets its local conversation):
 ///   - everything on screen when the cut is made is hidden from the mirror;
 ///   - if a reply is mid-stream (isRunning with a trailing assistant entry),
 ///     that reply is NOT hidden — it is re-anchored so only the text that

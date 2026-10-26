@@ -641,7 +641,7 @@ final class FleetStoreTests: XCTestCase {
         let defs = ServerConfig.load(environment: [:])
         XCTAssertEqual(defs.baseURL, "http://defaults-host:1111")
 
-        // Neither present -> built-in default.
+        // Neither present -> built-in default (the local Python hub).
         defaults.removeObject(forKey: "vertus.baseURL")
         let fallback = ServerConfig.load(environment: [:])
         XCTAssertEqual(fallback.baseURL, "http://127.0.0.1:8787")

@@ -156,7 +156,7 @@ struct NotchPanelShape: Shape {
         // Chamfer bends (lerp from the nub where they are degenerate).
         let kx = lerp(0, NotchPanelMetrics.chamferKneeInset)
         let ky = lerp(0, NotchPanelMetrics.chamferKneeHeight)
-        let cx = lerp(0, NotchPanelMetrics.chamferInset)
+        let _ = lerp(0, NotchPanelMetrics.chamferInset)
         let cy = lerp(0, NotchPanelMetrics.chamferHeight)
 
         let midX  = rect.midX
@@ -213,12 +213,23 @@ struct NotchPanelContent: View {
 
     @State private var prompt = ""
 
-    /// Measured width of the agent-picker chip's visible capsule. Seeded 0;
-    /// the chip's GeometryReader reports the real width on first layout. The
-    /// panel window is built (hidden, nub-sized) at launch, so the measure
-    /// lands long before the first ⇧⌘J. The editor's left edge derives from
-    /// this, so the chip→text gap stays constant for any agent name.
-    @State private var chipWidth: CGFloat = 0
+    /// Width of the agent-picker chip's visible capsule, derived from the
+    /// same text the chip renders (emoji + truncated name + chevron +
+    /// padding). Deliberately NOT a GeometryReader: measuring a Menu's
+    /// label from inside its own layout folds into an AppKit button cell
+    /// that never lays SwiftUI content out — the custom label silently
+    /// fails to draw (chevron only) and the editor geometry derives from
+    /// a bogus width. Text measurement is deterministic and has no layout
+    /// feedback loop.
+    private var chipWidth: CGFloat {
+        let emoji = model.agents.first { $0.id == model.selectedAgentID }?.emoji ?? ""
+        let name = selectedAgentShortName
+        let emojiW: CGFloat = emoji.isEmpty ? 0 : (emoji as NSString).size(
+            withAttributes: [.font: NSFont.systemFont(ofSize: 9.5)]).width + 4
+        let nameW = (name as NSString).size(
+            withAttributes: [.font: NSFont.systemFont(ofSize: 10, weight: .medium)]).width
+        return 6 + emojiW + nameW + 4 + 10 + 6
+    }
 
     /// Editor left edge: chip (its measured width) + a fixed gap. Right edge
     /// pinned at `editorRight` — a long agent name widens the chip, which
@@ -240,9 +251,9 @@ struct NotchPanelContent: View {
 
     /// The output window is needed when there's a live math result, a math
     /// expression in progress, an existing conversation, or a reply still
-    /// streaming (a fresh new-session cut can leave the transcript empty
-    /// while the re-anchored reply is between deltas); idle+plain-text
-    /// = no window.
+    /// streaming; idle+plain-text = no window. A new session now stops the
+    /// current turn on the hub and clears the local transcript, so the output
+    /// pane goes away together with the conversation.
     private var showOutputWindow: Bool {
         mathPreview != nil || isMathInProgress || model.isStreaming || !model.transcript.isEmpty
     }
@@ -371,10 +382,12 @@ struct NotchPanelContent: View {
             .frame(width: 14, height: 14)
             .position(x: logoCenterX, y: 12.5)
 
-            // New session: small square with a pencil. A VIEW reset — the
-            // hub keeps the agent's full transcript and run history. If a
-            // reply is mid-stream it is not discarded: the run continues
-            // and the reply keeps streaming into the cleared view.
+            // New session: small square with a pencil. Stops the selected
+            // agent's current turn on the hub (best-effort) and then resets
+            // the bar's local conversation context, so the next prompt starts
+            // a fresh conversation with Vertus in the notch panel itself.
+            // It does NOT open the Vertus app window — the bar keeps its
+            // current view and just clears its transcript/activity state.
             Button(action: onNewSession) {
                 Image(systemName: "square.and.pencil")
                     .font(.system(size: 11, weight: .regular))
@@ -382,7 +395,7 @@ struct NotchPanelContent: View {
                     .foregroundStyle(.white)
             }
             .buttonStyle(.plain)
-            .help("New session — clears this view; a running reply keeps streaming here (history stays in VERTUS)")
+            .help("New session — stops the current turn and clears this conversation on the bar")
             .frame(width: 14, height: 14)
             .position(x: pencilCenterX, y: 13.75)
         }
@@ -449,26 +462,34 @@ struct NotchPanelContent: View {
     }
 
     /// The agent picker: emoji + short name; remembers the last used agent.
+    /// A plain Button over a native NSMenu — a SwiftUI Menu's custom label
+    /// does not draw its Text content in this host (chevron only), so the
+    /// popup is AppKit while the chip face stays SwiftUI.
     private var agentChip: some View {
-        Menu {
-            ForEach(model.agents) { agent in
-                Button(agent.rosterLabel) {
-                    model.selectAgent(agent.id)
-                }
-            }
-        } label: {
+        Button(action: showAgentMenu) {
             chipLabel
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
         .fixedSize()
         .help("Agent: \(selectedAgentShortName)")
-        // Measure the whole control's laid-out width. NOTE: the reader must
-        // sit on the Menu itself — attached to the label inside `label:` it
-        // reported 0 (SwiftUI folds Menu labels into an AppKit button cell
-        // that never lays the background out), which collapsed the editor
-        // onto the chip.
-        .background(chipWidthReader)
+    }
+
+    /// Native agent popup at the mouse: checkmarked roster, one item per
+    /// agent. Menu tracking is modal on the main thread, so installing the
+    /// pick handler just before popup cannot race.
+    private func showAgentMenu() {
+        let menu = NSMenu()
+        for agent in model.agents {
+            let item = NSMenuItem(title: agent.rosterLabel,
+                                  action: #selector(AgentMenuTarget.pick(_:)),
+                                  keyEquivalent: "")
+            item.target = AgentMenuTarget.shared
+            item.representedObject = agent.id
+            item.state = agent.id == model.selectedAgentID ? .on : .off
+            menu.addItem(item)
+        }
+        AgentMenuTarget.shared.onPick = { [model] in model.selectAgent($0) }
+        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
     }
 
     /// The chip's visible content: emoji, short name (truncated to 14 chars
@@ -486,17 +507,6 @@ struct NotchPanelContent: View {
         .padding(.horizontal, 6)
         .padding(.vertical, 2)
         .background(Capsule().fill(Color(white: 0.2)))
-    }
-
-    /// Zero-size reporter behind the chip control: reports its rendered
-    /// width so the editor can start just right of it (see `editorLeft`).
-    /// Fires on first layout and whenever the agent name/emoji resizes it.
-    private var chipWidthReader: some View {
-        GeometryReader { geo in
-            Color.clear
-                .onAppear { chipWidth = geo.size.width }
-                .onChange(of: geo.size.width) { chipWidth = $0 }
-        }
     }
 
     private var selectedAgentShortName: String {
@@ -517,9 +527,9 @@ struct NotchPanelContent: View {
             } else if !model.transcript.isEmpty {
                 chatPane
             } else if model.isThinking {
-                // Fresh view (new-session cut), reply not started: the
-                // Working indicator sits in the session window, in the
-                // position the reply will occupy.
+                // Fresh conversation (new session cleared the local transcript),
+                // reply not started: no output pane yet — the next prompt will
+                // start a clean conversation on the bar.
                 thinkingBubble
             } else {
                 Color.clear
@@ -943,10 +953,15 @@ struct QuickBarRootView: View {    @ObservedObject var expansionState: Expansion
             }
         }
         // ⌘N while the panel is key = new session for the selected agent,
-        // exactly the top-right pencil button (Bug B8) — same code path.
+        // exactly the top-right pencil button — same code path (stop the
+        // current turn on the hub, then reset the bar's local conversation).
         .onReceive(NotificationCenter.default.publisher(for: .vertusNewSession)) { _ in
             vertusTrace("new session via ⌘N")
             model.newSession()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .vertusSelectAgent)) { note in
+            guard let id = note.object as? String else { return }
+            model.selectAgent(id)
         }
     }
 
@@ -1004,7 +1019,7 @@ struct QuickBarRootView: View {    @ObservedObject var expansionState: Expansion
         return max(window, NotchPanelMetrics.chatTopPad + NotchPanelMetrics.outputBottomInset)
     }
 
-    /// AppKit line height (the iOS-only `lineHeight` doesn't exist here).
+    /// AppKit line height: ascender − descender + leading.
     private func lineHeight(of font: NSFont) -> CGFloat {
         font.ascender - font.descender + font.leading
     }
@@ -1185,6 +1200,18 @@ struct TranscriptBubbleView: View {
                 interpretedSyntax: .inlineOnlyPreservingWhitespace
             )
         )) ?? AttributedString(text))
+    }
+}
+
+// MARK: - Agent picker popup target
+
+/// Target for the agent-picker NSMenu (see agentChip): one shared instance;
+/// the pick handler is installed immediately before each modal popup.
+final class AgentMenuTarget: NSObject {
+    static let shared = AgentMenuTarget()
+    var onPick: ((String) -> Void)?
+    @objc func pick(_ item: NSMenuItem) {
+        if let id = item.representedObject as? String { onPick?(id) }
     }
 }
 

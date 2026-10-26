@@ -31,7 +31,7 @@ public struct ServerConfig: Equatable {
 
     /// Base URL resolution precedence: VERTUS_HUB_URL (env, dev builds and
     /// launchd-smoke runs point at a temp hub) > UserDefaults "vertus.baseURL"
-    /// > http://127.0.0.1:8787. Token resolution is unchanged below.
+    /// > the local Python hub on 8787. Token resolution is unchanged below.
     public static func load() -> ServerConfig {
         load(environment: ProcessInfo.processInfo.environment)
     }
