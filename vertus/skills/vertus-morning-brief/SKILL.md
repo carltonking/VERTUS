@@ -121,9 +121,14 @@ Suggested actions
 - A clear day is worth saying in one line ("Nothing on the calendar and no
   mail that needs you, sir.").
 
-### 7. Record it
+### 7. Record it, then reply with the brief itself
 
-Write the brief you sent to `{{AGENT_MEMORY_DIR}}/proactive/briefs/<YYYY-MM-DD>.md`
+Write the brief to `{{AGENT_MEMORY_DIR}}/proactive/briefs/<YYYY-MM-DD>.md`
 (create the folder if needed). The check-in routine reads it so it does not
 repeat this morning's items. Do not write the brief into `facts.md` or
 `notes/`.
+
+Your final reply IS the brief, word for word — it is what the user sees in
+the island. Never reply with only a file path or "the brief has been saved";
+if a brief for today already exists, still build today's brief again from
+fresh data and reply with it.
