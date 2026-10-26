@@ -223,3 +223,52 @@ def test_mcp_tools_that_write_ask_and_reads_do_not():
     assert _cat("mcp_shop_place_order", {"sku": "1"}) == "spend"
     assert policy.decide("mcp_linear_list_issues", {}) is None
     assert policy.decide("mcp_gmail_search", {"q": "send"}) is None
+
+
+@pytest.mark.parametrize("command", [
+    "imsg send-rich --to x --text hi", "imsg send-attachment --to x --file a.png",
+    "imsg send-multipart --to x", "imsg send-sticker --to x", "imsg poll --chat-id 1 --question q",
+    "imsg tapback --chat-id 1 --message-id 2 love", "imsg edit --message-id 2 --text x",
+    "imsg unsend --message-id 2", "imsg delete-message --message-id 2", "imsg chat-delete --chat-id 1",
+    "imsg chat-leave --chat-id 1", "imsg chat-create --to a,b", "imsg chat-add-member --chat-id 1 --to x",
+    "echo '{}' | imsg rpc",
+])
+def test_every_imsg_subcommand_that_is_not_a_read_asks(command):
+    assert _cat("terminal", {"command": command}) == "send"
+
+
+@pytest.mark.parametrize("command", [
+    "imsg search --query lunch", "imsg stats", "imsg whois +15555550123", "imsg chats --json",
+])
+def test_imsg_reads_do_not_ask(command):
+    assert policy.decide("terminal", {"command": command}) is None
+
+
+@pytest.mark.parametrize("command", [
+    "remindctl list Work -d", "memo notes --delete", "memo notes -r",
+])
+def test_every_delete_spelling_asks(command):
+    assert _cat("terminal", {"command": command}) == "delete"
+
+
+@pytest.mark.parametrize("command, category", [
+    ("osascript -l JavaScript <<'JXA'\nconst Mail = Application('Mail');\nconst m = Mail.OutgoingMessage({subject: 'x'});\nm.send();\nJXA", "send"),
+    ("osascript <<'EOF'\ntell application \"Messages\" to send \"hi\" to buddy \"x\"\nEOF", "send"),
+    ("osascript -l JavaScript <<'JXA'\nconst Mail = Application('Mail');\nMail.delete(Mail.inbox.messages[0]);\nJXA", "delete"),
+    ("python3 -c \"import subprocess; subprocess.run(['imsg', 'send', '--to', 'x', '--text', 'hi'])\"", "send"),
+    ("python3 -c \"import smtplib; s = smtplib.SMTP('smtp.x'); s.sendmail('a', 'b', 'hi')\"", "send"),
+])
+def test_scripts_in_heredocs_and_inline_code_are_judged_whole(command, category):
+    assert _cat("terminal", {"command": command}) == category
+
+
+def test_reading_mail_through_a_heredoc_does_not_ask():
+    read_only = ("osascript -l JavaScript <<'JXA'\nconst Mail = Application('Mail');\n"
+                 "const q = Mail.inbox.messages.whose({readStatus: false});\n"
+                 "JSON.stringify({subjects: q.subject(), senders: q.sender(), replied: q.wasRepliedTo()});\nJXA")
+    assert policy.decide("terminal", {"command": read_only}) is None
+
+
+def test_the_execute_code_refusal_does_not_recommend_what_the_engine_also_gates():
+    reason = policy.decide("execute_code", {"code": "print(1)"}).reason
+    assert "python3 -c or a heredoc" not in reason and "terminal" in reason

@@ -17,12 +17,11 @@ prefixes — never by words appearing anywhere in the text. ``echo "rm"`` and
 line two are deleting.
 
 What the guard deliberately leaves to the engine: Hermes's own
-dangerous-command gate (``engine_asks``). ``execute_code`` is refused with a
-pointer to the terminal: with approvals on the engine asks before every
-script as a whole, which parked unattended routines for the full approval
-timeout (Oct 2026), and a script's own subprocesses never pass either gate,
-while the same Python run through the terminal (``python3 -c``, a heredoc)
-is checked command by command.
+dangerous-command gate (``engine_asks``). ``execute_code`` is refused: with approvals on the engine asks before every script as a
+whole, which parked unattended routines for the full approval timeout (Oct
+2026), and a script's own subprocesses pass neither gate. The refusal points
+the agent at running programs directly through the terminal; inline scripts
+there (``python3 -c``, heredocs) are themselves gated by the engine.
 
 What it cannot see, stated plainly: a browser click carries only an element
 reference (``@e12``), not the button's label, so a purchase or a post made by
@@ -80,6 +79,9 @@ _PREFIXES = {"sudo", "env", "xargs", "nohup", "time", "command", "exec", "nice",
 _DELETE_PROGRAMS = {"rm", "rmdir", "srm", "shred", "trash", "unlink"}
 _MAIL_PROGRAMS = {"sendmail", "msmtp", "mutt", "neomutt"}
 _HTTP_WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+# imsg subcommands that only read; every other one can act on a conversation.
+_IMSG_READS = {"chats", "history", "search", "stats", "group", "account", "whois", "status",
+               "scheduled", "watch", "help", "version", "--help", "--version"}
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
@@ -109,6 +111,24 @@ def _program(words: list[str]) -> tuple[str, list[str]]:
     return "", []
 
 
+def _osascript_verdict(text: str) -> tuple[str, str, str] | None:
+    """AppleScript/JXA judged as a whole: the script often lives in a heredoc
+    body or -e strings that the per-command split cannot attribute."""
+    if re.search(r"\b(send|reply|forward)\b|\.send\s*\(", text, re.IGNORECASE):
+        return ("send", "applescript-send", "send a message or email from Mail/Messages")
+    if re.search(r"\bdelete\b|\.delete\s*\(|\bmove\b[^\n]*\btrash\b", text, re.IGNORECASE):
+        return ("delete", "applescript-delete", "delete items through AppleScript")
+    return None
+
+
+# Outward actions written inside code (python -c, node -e, heredocs) rather
+# than as a command line.
+_CODE_SEND = re.compile(
+    r"\bsmtplib\b|\bsendmail\s*\("
+    r"|\bimsg\b['\",\s\]]+['\"]?(send[\w-]*|react|tapback|poll|edit|unsend|delete-message|chat-[\w-]+|rpc)\b",
+    re.IGNORECASE)
+
+
 def _segments(command: str) -> list[str]:
     return [s.strip() for s in _SEPARATORS.split(command) if s.strip()]
 
@@ -125,12 +145,7 @@ def _shell_verdict(segment: str) -> tuple[str, str, str] | None:
     if program == "find" and ("-delete" in args or any(a in ("rm", "/bin/rm") for a in args)):
         return ("delete", "find-delete", "delete files")
     if program == "osascript":
-        text = " ".join(lowered)
-        if re.search(r"\b(send|reply|forward)\b", text):
-            return ("send", "applescript-send", "send a message or email from Mail/Messages")
-        if re.search(r"\bdelete\b", text):
-            return ("delete", "applescript-delete", "delete items through AppleScript")
-        return None
+        return _osascript_verdict(" ".join(lowered))
     if program in _MAIL_PROGRAMS or (program == "mail" and "-s" in args):
         return ("send", "cli-mail", "send an email")
     if program == "himalaya" and any(a in ("send", "reply", "forward", "write") for a in lowered):
@@ -182,13 +197,18 @@ def _shell_verdict(segment: str) -> tuple[str, str, str] | None:
     if program == "wget" and any(a.startswith(("--post-data", "--post-file", "--body-data", "--body-file"))
                                  or a.startswith("--method") for a in args):
         return ("post", "http-write", "send data to a web service")
-    if program == "imsg" and lowered and lowered[0] in ("send", "react"):
-        return ("send", "imessage", "send an iMessage or SMS")
+    if program == "imsg":
+        # Every subcommand that is not a known read can send, react, edit,
+        # unsend or delete (send-rich, tapback, unsend, chat-delete, rpc…).
+        sub = next((a for a in lowered if not a.startswith("-")), "")
+        if sub and sub not in _IMSG_READS:
+            return ("send", "imessage", "send, change or delete iMessages")
+        return None
     if program == "remindctl" and lowered and (lowered[0] == "delete" or
-                                               (lowered[0] == "list" and "--delete" in lowered)):
+                                               (lowered[0] == "list" and any(a in ("-d", "--delete") for a in lowered))):
         return ("delete", "reminders-delete", "delete reminders")
-    if program == "memo" and "-d" in lowered:
-        return ("delete", "notes-delete", "delete a note")
+    if program == "memo" and any(a in ("-d", "--delete", "-r", "--remove") for a in lowered):
+        return ("delete", "notes-delete", "delete notes or folders")
     if program == "aws" and len(lowered) >= 2 and lowered[0] == "s3" and lowered[1] in ("rm", "rb"):
         return ("delete", "cloud-delete", "delete cloud storage")
     if program == "docker" and lowered and (lowered[0] in ("rm", "rmi") or
@@ -262,9 +282,10 @@ def decide(tool_name: str, args: dict | None,
                        "vertus-guard:approval-channel", block=True)
 
     if name in _CODE_TOOLS:
-        return Verdict("code", "Blocked: run this through the terminal tool instead "
-                       "(python3 -c or a heredoc), where each command is checked; "
-                       "execute_code needs a person to approve every script.",
+        return Verdict("code", "Blocked: execute_code needs a person to approve every script. "
+                       "Use the terminal tool to run the program you need directly "
+                       "(osascript -e, remindctl, gh, curl, …). Inline scripts (python3 -c, "
+                       "node -e, heredocs) also need approval, so avoid them in unattended work.",
                        "vertus-guard:code:execute_code", block=True)
 
     if name in _ALWAYS_ASK_TOOLS:
@@ -284,6 +305,15 @@ def decide(tool_name: str, args: dict | None,
                     return None
             except Exception:  # noqa: BLE001 — a broken detector must not unguard
                 pass
+        if re.search(r"\bosascript\b", command):
+            found = _osascript_verdict(command)
+            if found:
+                category, rule, what = found
+                return Verdict(category, f"VERTUS wants to {what}: {_short(command)}",
+                               _key(category, rule, command))
+        if _CODE_SEND.search(command):
+            return Verdict("send", f"VERTUS wants to send a message: {_short(command)}",
+                           _key("send", "code-send", command))
         for segment in _segments(command):
             found = _shell_verdict(segment)
             if found:
