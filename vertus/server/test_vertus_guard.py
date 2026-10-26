@@ -121,7 +121,8 @@ def test_code_execution_is_refused_with_a_pointer_to_the_terminal():
 def test_outward_tools_always_ask_and_name_the_target():
     verdict = policy.decide("send_message", {"target": "telegram:Mom", "message": "hi"})
     assert verdict.category == "send" and "telegram:Mom" in verdict.reason
-    assert _cat("react_to_message", {"chat_id": "123", "emoji": "👍"}) == "send"
+    # A tapback lands in the conversation the agent is already in, with the user.
+    assert policy.decide("react_to_message", {"emoji": "👍"}) is None
 
 
 def test_page_scripts_that_submit_or_send_data_ask():
@@ -272,3 +273,9 @@ def test_reading_mail_through_a_heredoc_does_not_ask():
 def test_the_execute_code_refusal_does_not_recommend_what_the_engine_also_gates():
     reason = policy.decide("execute_code", {"code": "print(1)"}).reason
     assert "python3 -c or a heredoc" not in reason and "terminal" in reason
+
+
+def test_cancelling_a_calendar_event_asks_but_reading_and_creating_do_not():
+    assert _cat("terminal", {"command": "~/.vertus/agent/bin/vertus-events cancel-event --id X"}) == "delete"
+    assert policy.decide("terminal", {"command": "~/.vertus/agent/bin/vertus-events events --from 2026-10-26 --to 2026-10-27"}) is None
+    assert policy.decide("terminal", {"command": "~/.vertus/agent/bin/vertus-events create-event --title x --start 2026-10-27T19:00"}) is None

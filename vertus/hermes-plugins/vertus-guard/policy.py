@@ -57,10 +57,10 @@ _APPROVAL_CHANNEL = re.compile(r"api/approvals|approver[-_]token|X-Vertus-Approv
 # --- tools whose every call goes outward -------------------------------------
 
 # send_message is Hermes's cross-platform messenger (reachable through MCP and
-# platform plugins); react_to_message posts a reaction someone else sees.
+# platform plugins). react_to_message is not here: it only tapbacks a message
+# in the conversation the agent is already in — with the user.
 _ALWAYS_ASK_TOOLS: dict[str, tuple[str, str]] = {
     "send_message": ("send", "send a message"),
-    "react_to_message": ("send", "react to a message"),
 }
 
 # Tools that run a shell command, and the argument keys that carry it.
@@ -209,6 +209,8 @@ def _shell_verdict(segment: str) -> tuple[str, str, str] | None:
         return ("delete", "reminders-delete", "delete reminders")
     if program == "memo" and any(a in ("-d", "--delete", "-r", "--remove") for a in lowered):
         return ("delete", "notes-delete", "delete notes or folders")
+    if program == "vertus-events" and lowered and lowered[0] == "cancel-event":
+        return ("delete", "calendar-cancel", "cancel a calendar event")
     if program == "aws" and len(lowered) >= 2 and lowered[0] == "s3" and lowered[1] in ("rm", "rb"):
         return ("delete", "cloud-delete", "delete cloud storage")
     if program == "docker" and lowered and (lowered[0] in ("rm", "rmi") or

@@ -99,6 +99,18 @@ def approver_token_path() -> Path:
     return Path(env).expanduser() if env else vertus_root() / "approver-token"
 
 
+def sites_dir() -> Path:
+    """Pages agents build for the user to open on their phone (served
+    read-only at /sites/). VERTUS_SITES_DIR → root/sites."""
+    env = _env("VERTUS_SITES_DIR")
+    return Path(env).expanduser() if env else vertus_root() / "sites"
+
+
+def sites_url() -> str:
+    """The link prefix for those pages. VERTUS_SITES_URL, else loopback."""
+    return _env("VERTUS_SITES_URL") or "http://127.0.0.1:8787/sites/"
+
+
 def backups_dir() -> Path:
     """Migration backups. VERTUS_BACKUP_DIR → root/backups."""
     env = _env("VERTUS_BACKUP_DIR")

@@ -371,3 +371,27 @@ def test_no_gateway_runs_with_the_approval_bypass(hub, monkeypatch):
     for unattended in (False, True):
         kwargs = vs.resolve_session_kwargs(hub.registry, "primary", unattended=unattended)
         assert kwargs["extra_env"]["HERMES_YOLO_MODE"] == "0"
+
+
+def test_sites_are_served_without_the_token_and_never_outside_their_folder(hub, tmp_path, monkeypatch):
+    sites = tmp_path / "sites"
+    (sites / "trip-1a2b3c4d").mkdir(parents=True)
+    (sites / "trip-1a2b3c4d" / "index.html").write_text("<h1>Lisbon</h1>")
+    (tmp_path / "secret.txt").write_text("nope")
+    monkeypatch.setenv("VERTUS_SITES_DIR", str(sites))
+    with urllib.request.urlopen(hub.base + "/sites/trip-1a2b3c4d/", timeout=10) as resp:
+        assert resp.status == 200 and b"Lisbon" in resp.read()
+        assert resp.headers["Content-Type"].startswith("text/html")
+    for bad in ("/sites/../secret.txt", "/sites/%2e%2e/secret.txt", "/sites/missing/"):
+        with pytest.raises(urllib.error.HTTPError) as err:
+            urllib.request.urlopen(hub.base + bad, timeout=10)
+        assert err.value.code == 404
+
+
+def test_calendar_and_sites_skills_reach_every_agent_with_the_link(hub, monkeypatch):
+    monkeypatch.setenv("VERTUS_SITES_URL", "http://100.1.2.3:8787/sites/")
+    assert hub.registry.rematerialize_all() == []
+    skills = hub.registry.agent_home("primary") / "skills"
+    assert "vertus-events" in (skills / "vertus-calendar" / "SKILL.md").read_text()
+    sites = (skills / "vertus-sites" / "SKILL.md").read_text()
+    assert "http://100.1.2.3:8787/sites/" in sites and "{{" not in sites

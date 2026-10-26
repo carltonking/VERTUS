@@ -704,6 +704,8 @@ class AgentRegistry:
             # consolidation snapshots live beside (not inside) memory/, so no
             # digest, index, search or other agent ever reads them.
             "{{SKILLS_DIR}}": str(home / "skills"),
+            "{{SITES_DIR}}": str(vertus_paths.sites_dir()),
+            "{{SITES_URL}}": vertus_paths.sites_url(),
             "{{AGENT_SNAPSHOT_DIR}}": str(
                 self.root / agent_id / CONSOLIDATION_SNAPSHOT_DIRNAME),
         }
@@ -714,7 +716,7 @@ class AgentRegistry:
             # proactive_routines.py). Every agent gets them, so a routine of
             # any agent can use them, not only the primary's.
             *((name, _REPO_ROOT / "vertus" / "skills" / name / "SKILL.md")
-              for name in PROACTIVE_SKILLS),
+              for name in (*PROACTIVE_SKILLS, *CAPABILITY_SKILLS)),
         ):
             try:
                 text = source.read_text(encoding="utf-8")
@@ -944,6 +946,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Skills under vertus/skills/<name>/SKILL.md materialized into every home.
 PROACTIVE_SKILLS = ("vertus-morning-brief", "vertus-check-in", "vertus-memory-consolidation")
+# What the user asks for in conversation (calendar, pages to view on the phone).
+CAPABILITY_SKILLS = ("vertus-calendar", "vertus-sites")
 
 # Per-agent dir (sibling of memory/ and home/) holding the nightly
 # consolidation's pre-change copies of facts/profile. Outside memory/ on

@@ -1841,6 +1841,9 @@ class VertusHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
+        if urlsplit(self.path).path.startswith("/sites/"):
+            self._serve_site()
+            return
         if not self._authed():
             self._json(401, {"error": "unauthorized"})
             return
@@ -2963,6 +2966,29 @@ class VertusHandler(BaseHTTPRequestHandler):
         limit = self._limit_param("limit", 100, 500)
         self._json(200, {"approvals": store.list_approvals(state=state, limit=limit)})
 
+    def _serve_site(self) -> None:
+        """GET /sites/<folder>/<file> — pages agents built for the user, served
+        read-only and without the bearer token so a phone can open the link.
+        Folders carry a random part (see the vertus-sites skill); nothing
+        outside sites_dir() is reachable."""
+        import mimetypes
+        from urllib.parse import unquote
+        root = vertus_paths.sites_dir().resolve()
+        rel = unquote(urlsplit(self.path).path[len("/sites/"):])
+        target = (root / rel).resolve()
+        if target.is_dir():
+            target = target / "index.html"
+        if root not in target.parents or not target.is_file():
+            self._json(404, {"error": "not found"})
+            return
+        body = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(target.name)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _handle_approval_respond(self, approval_id: str, payload: dict) -> None:
         """POST /api/approvals/<id> {"choice": once|session|always|deny}.
 
@@ -3807,6 +3833,12 @@ def serve(host: str | None, port: int) -> None:
         ip = tailnet_ip()
         if ip and ip not in bind_hosts:
             bind_hosts.append(ip)
+    # Pages agents build are linked through the tailnet address when there is
+    # one, so they open on the user's phone; the skills read this at
+    # materialization.
+    tailnet = next((h for h in bind_hosts if h.startswith("100.")), None)
+    if tailnet and not os.environ.get("VERTUS_SITES_URL"):
+        os.environ["VERTUS_SITES_URL"] = f"http://{tailnet}:{port}/sites/"
     registry = AgentRegistry()
     VertusHandler.registry = registry
     VertusHandler.token = token
