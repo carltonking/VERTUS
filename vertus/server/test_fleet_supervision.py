@@ -275,6 +275,25 @@ def test_a_turn_that_ends_withdraws_its_open_approvals(tmp_path):
     store.stop()
 
 
+def test_a_long_silent_tool_is_not_a_stall(monkeypatch, tmp_path):
+    # A mail query or a build can run for minutes without an event; while
+    # the engine reports a tool running, the watchdog allows TOOL_STALL_S.
+    monkeypatch.setattr(vs, "TOOL_STALL_S", 30.0)
+    store = RunStore(tmp_path / "fleet.db")
+    b = _bridge(store, stall=0.3, ignore_interrupt=True)
+    run_id = _run(store, b, "check my mail")
+    assert _wait_until(lambda: b.status()["state"] == "running")
+    b._on_pi_event({"type": "activity", "text": "running terminal…"})
+    time.sleep(2.5)  # several watchdog ticks, far past the 0.3s stall limit
+    assert (store.get_run(run_id) or {})["state"] == "running", "a running tool is not a hang"
+    b._on_pi_event({"type": "activity", "text": "finished terminal"})
+    assert _wait_until(lambda: (store.get_run(run_id) or {})["state"] == "timeout"), (
+        "once the tool finished, silence counts against the stall limit again"
+    )
+    b.close()
+    store.stop()
+
+
 def test_hard_timeout_fires_on_endless_chatty_turn(monkeypatch, tmp_path):
     store = RunStore(tmp_path / "fleet.db")
     # Emits forever (stall never trips) but exceeds the hard ceiling.

@@ -117,6 +117,8 @@ RESPAWN_BACKOFF = (1.0, 4.0, 16.0)
 # to the next. Worst-case cancel latency is 3× this (interrupt → SIGTERM →
 # SIGKILL). Env-tunable for tests and for hosts where interrupt is known slow.
 ESCALATION_GRACE_S = float(os.environ.get("VERTUS_ESCALATION_GRACE_S", "10"))
+# Silence allowed while a tool runs (see AgentBridge._tool_running).
+TOOL_STALL_S = 900.0
 
 # Idle-gateway health check: while an agent is IDLE (no turn, no queue), the
 # supervisor pings its gateway at this interval with a cheap RPC and closes
@@ -270,6 +272,11 @@ class AgentBridge:
         # human is not stalled: the watchdog leaves it alone, and the
         # engine's own approval deadline (approvals.timeout) bounds the wait.
         self._pending_approvals: set[str] = set()
+        # A tool the engine started and has not reported finished. A tool can
+        # run silently for minutes (a mail query, a build, a download), so the
+        # watchdog allows TOOL_STALL_S of silence while one runs instead of
+        # the turn's stall_timeout_s; the hard timeout still bounds the turn.
+        self._tool_running = False
         self.subscribers: list[Queue] = []
         self._queue: Queue = Queue()
         self._create_session = create_session_factory
@@ -749,6 +756,7 @@ class AgentBridge:
                     self._running = True
                     self._turn_started_at = time.monotonic()
                     self._pending_approvals.clear()
+                    self._tool_running = False
             if closed:
                 # A close raced the enqueue (DELETE refuses busy bridges, so
                 # this is defensive): the run never started — mark it so.
@@ -1075,6 +1083,16 @@ class AgentBridge:
         try:
             etype = getattr(event, "type", None) or (event.get("type") if isinstance(event, dict) else None)
             if etype in ("text", "activity", "done"):
+                if etype == "activity" and isinstance(event, dict):
+                    text = str(event.get("text") or "")
+                    with self._status_lock:
+                        if text.startswith("running ") and text not in ("running tools…",):
+                            self._tool_running = True
+                        elif text.startswith("finished "):
+                            self._tool_running = False
+                elif etype in ("text", "done"):
+                    with self._status_lock:
+                        self._tool_running = False
                 self._emit(event)
                 return
             if etype in ("approval_request", "approval_resolved") and isinstance(event, dict):
@@ -1630,6 +1648,8 @@ class AgentBridge:
                 stall = self._stall_timeout_s
                 hard = self._hard_timeout_s
                 awaiting_human = bool(self._pending_approvals)
+                if self._tool_running and stall > 0:
+                    stall = max(stall, TOOL_STALL_S)
             if not running:
                 self._health_check()
                 continue

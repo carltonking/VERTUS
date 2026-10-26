@@ -431,7 +431,10 @@ class _HermesSession:
                 name = (payload.get("name") or payload.get("tool") or "tool").split(".")[-1]
                 self._emit({"type": "activity", "text": f"running {name}…"})
             elif ptype == "tool.complete":
-                pass  # activity spam; clients only need the start marker
+                # Clients only show the start marker; the hub's watchdog needs
+                # the end too, so a long silent tool is not mistaken for a hang.
+                name = (payload.get("name") or payload.get("tool") or "tool").split(".")[-1]
+                self._emit({"type": "activity", "text": f"finished {name}"})
             elif ptype == "request.cancel":
                 # The gateway withdrew a request (approval timed out,
                 # answered on another surface, turn interrupted).
