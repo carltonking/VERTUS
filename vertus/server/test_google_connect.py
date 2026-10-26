@@ -58,3 +58,26 @@ def test_no_client_file_fails_in_chat_not_on_the_phone(env):
     (env / "google_client_secret.json").unlink()
     with pytest.raises(gc.ConnectError):
         gc.mint_link()
+
+
+@pytest.mark.parametrize("text", ["connect my google account", "Link my Gmail please",
+                                  "can you sign in to google for me", "gmail connect", "set up google calendar"])
+def test_connect_requests_get_the_real_link(env, text):
+    out = gc.rewrite_prompt(text)
+    assert "Do not use any tools" in out and "https://mac.tail.ts.net/connect/google/start?s=" in out
+
+
+@pytest.mark.parametrize("text", ["what's on my calendar", "search google for ramen near nyu",
+                                  "summarize my unread email"])
+def test_other_requests_pass_through(env, text):
+    assert gc.rewrite_prompt(text) == text
+
+
+def test_imessage_plugin_matches_the_same_requests():
+    import importlib.util
+    plugin = Path(__file__).resolve().parents[1] / "hermes-plugins" / "vertus-intents" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("vi", plugin)
+    vi = importlib.util.module_from_spec(spec); spec.loader.exec_module(vi)
+    assert vi.wants_google_connect("connect my google account")
+    assert not vi.wants_google_connect("search google for ramen")
+    assert "Tap to connect your Google account: https://x" in vi.instruction("https://x", None)

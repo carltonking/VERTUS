@@ -623,6 +623,7 @@ class AgentRegistry:
         cfg["plugins"] = {**plugins, "enabled": enabled}
         _link_guard_plugin(home)
         _link_plugin(home, JOURNAL_PLUGIN_NAME, JOURNAL_PLUGIN_DIR)
+        _link_plugin(home, INTENTS_PLUGIN_NAME, INTENTS_PLUGIN_DIR)
         (home / "config.yaml").write_text(_yaml_dump(cfg), encoding="utf-8")
 
         # SOUL.md — the bot's persona, plus a hub-generated fleet-context
@@ -988,7 +989,9 @@ APPROVAL_TIMEOUT_S = 300
 # One conversation journal across surfaces (island, iMessage) in shared memory.
 JOURNAL_PLUGIN_NAME = "vertus-journal"
 JOURNAL_PLUGIN_DIR = Path(__file__).resolve().parents[1] / "hermes-plugins" / JOURNAL_PLUGIN_NAME
-HUB_PLUGINS = (GUARD_PLUGIN_NAME, JOURNAL_PLUGIN_NAME)
+INTENTS_PLUGIN_NAME = "vertus-intents"
+INTENTS_PLUGIN_DIR = Path(__file__).resolve().parents[1] / "hermes-plugins" / INTENTS_PLUGIN_NAME
+HUB_PLUGINS = (GUARD_PLUGIN_NAME, JOURNAL_PLUGIN_NAME, INTENTS_PLUGIN_NAME)
 
 
 def _link_plugin(home: Path, name: str, source: Path) -> None:

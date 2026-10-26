@@ -184,3 +184,24 @@ def page(title: str, body: str) -> bytes:
     return (f"<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
             f"<title>{title}</title><body style='font:17px -apple-system;padding:40px;"
             f"background:#000;color:#fff'><h2>{title}</h2><p>{body}</p></body>").encode()
+
+
+# The island's prompts go through the hub, not a messaging gateway, so the
+# hub applies the same rewrite the vertus-intents plugin does for iMessage.
+_INTENT = __import__("re").compile(
+    r"\b(connect|link|sign\s*in|log\s*in|hook\s*up|set\s*up|add|authori[sz]e|integrate)\b"
+    r"[\s\S]{0,40}\b(google|gmail|g-?mail|google\s+calendar|google\s+drive)\b"
+    r"|\b(google|gmail)\b[\s\S]{0,20}\b(connect|link|sign\s*in|log\s*in|access)\b",
+    __import__("re").IGNORECASE)
+
+
+def rewrite_prompt(text: str) -> str:
+    """The prompt to run instead, when the user asks to connect Google."""
+    if not text or len(text) >= 300 or not _INTENT.search(text):
+        return text
+    try:
+        line = f"Tap to connect your Google account: {mint_link()}"
+    except ConnectError as exc:
+        line = f"I couldn't make a Google link: {exc}"
+    return ("The user asked to connect a Google account. Do not use any tools. "
+            f"Reply with exactly this one line and nothing else:\n{line}")

@@ -1939,6 +1939,7 @@ class VertusHandler(BaseHTTPRequestHandler):
             if not text:
                 self._json(400, {"error": "text required"})
                 return
+            text = google_connect.rewrite_prompt(text)
             source = str(self.headers.get("X-Vertus-Client", "local") or "local")
             remote = source.lower() != "local"
             agent_id = str(payload.get("agent_id") or DEFAULT_AGENT_ID)
