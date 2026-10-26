@@ -414,3 +414,11 @@ def test_every_agent_journals_its_conversations_to_shared_memory(hub, tmp_path):
     vj.append(vj.entry("and friday?", "Free, sir.", "tui", now=0), now=0, directory=tmp_path)
     text = path.read_text()
     assert text.startswith("# Conversations") and "(island) Carlton: and friday?" in text
+
+
+def test_the_persona_carries_the_capabilities_cheat_sheet(hub, monkeypatch):
+    monkeypatch.setenv("VERTUS_SITES_URL", "http://100.1.2.3:8787/sites/")
+    assert hub.registry.rematerialize_all() == []
+    soul = (hub.registry.agent_home("primary") / "SOUL.md").read_text()
+    assert "google_api.py gmail search" in soul and "NO \"connectors\"" in soul
+    assert "http://100.1.2.3:8787/sites/" in soul and "{{" not in soul

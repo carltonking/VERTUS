@@ -645,9 +645,21 @@ class AgentRegistry:
             "delegating to another bot — it documents the message API, the "
             "handoff convention, and how results come back."
         )
+        # A capabilities cheat sheet with the exact commands, in the persona
+        # itself: a small local model does not reliably load skills and
+        # otherwise invents "connectors" instead of using its tools.
+        try:
+            capabilities = (_REPO_ROOT / "vertus" / "skills" / "CAPABILITIES.md").read_text(encoding="utf-8")
+            for marker, value in (("{{SKILLS_DIR}}", str(home / "skills")),
+                                  ("{{SITES_DIR}}", str(vertus_paths.sites_dir())),
+                                  ("{{SITES_URL}}", vertus_paths.sites_url())):
+                capabilities = capabilities.replace(marker, value)
+        except OSError:
+            capabilities = ""
         soul = home / "SOUL.md"
         persona = str(profile.get("persona") or "").strip()
-        soul.write_text((persona + "\n" if persona else "# " + str(profile.get("name") or agent_id) + "\n") + fleet_block + "\n", encoding="utf-8")
+        soul.write_text((persona + "\n" if persona else "# " + str(profile.get("name") or agent_id) + "\n") + fleet_block + "\n"
+                        + ("\n" + capabilities if capabilities else ""), encoding="utf-8")
 
         # FLEET.md — the inter-bot protocol for THIS bot, spelled out so the
         # model can follow it with curl. Derived state: rewritten on every
