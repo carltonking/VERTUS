@@ -10,9 +10,12 @@ disabling. HTTP surface lives in test_fleet_routines_http.py.
 from __future__ import annotations
 
 from agent_registry import AgentRegistry
+import threading
+import time
+
 from fleet_routines import (
-    FAILURE_THRESHOLD, RoutineManager, RoutineValidationError,
-    parse_schedule, parse_trigger,
+    CATCH_UP_STALE_S, FAILURE_THRESHOLD, RETRY_BASE_S, RETRY_MAX_S,
+    RoutineManager, RoutineValidationError, parse_schedule, parse_trigger,
 )
 from run_store import RunStore
 
@@ -452,8 +455,10 @@ def test_one_shot_failed_fire_does_not_complete(tmp_path):
     mgr.catch_up()
     row = store.get_routine(r["routine_id"])
     assert row["enabled"] == 1 and row["failure_count"] == 1
-    assert row["next_run_at"] == _ny(2026, 10, 26, 9, 0)  # still due
+    # Still pending, retried after the backoff (not completed, not dropped).
+    assert row["next_run_at"] == clock[0] + RETRY_BASE_S
     env["sessions"].get_or_create_session(env["a"])._degraded = None
+    clock[0] += RETRY_BASE_S
     mgr.catch_up()
     row = store.get_routine(r["routine_id"])
     assert row["last_run_id"] and row["enabled"] == 0
@@ -480,3 +485,244 @@ def test_cron_and_at_validation_through_parse_schedule():
         except RoutineValidationError:
             continue
         raise AssertionError(f"accepted invalid schedule {bad!r}")
+
+
+# ----------------------------------------------------------------------
+# Retry backoff (failed scheduled fires)
+# ----------------------------------------------------------------------
+
+def _tick_for(mgr, clock, seconds, step=1.0):
+    """Drive the scheduler like the live 1s tick for ``seconds``."""
+    for _ in range(int(seconds / step)):
+        clock[0] += step
+        mgr.catch_up()
+
+
+def test_degraded_gateway_backs_off_instead_of_retrying_every_tick(tmp_path):
+    """A gateway blip must not burn THRESHOLD in ~3 one-second ticks: the
+    retries are RETRY_BASE_S, then 2x apart, and the third strike still
+    disables — just minutes later."""
+    env = _env(tmp_path)
+    store, mgr, clock = env["store"], env["mgr"], env["clock"]
+    r = _mk_routine(env, interval=86400)
+    rid = r["routine_id"]
+    mgr.arm(rid, {"interval_s": 86400})
+    store.set_routine_next(rid, clock[0])  # due now
+    env["sessions"].get_or_create_session(env["a"])._degraded = "gateway down"
+
+    _tick_for(mgr, clock, 10)
+    row = store.get_routine(rid)
+    assert row["failure_count"] == 1 and row["enabled"] == 1
+    first_fail = clock[0] - 9
+    assert row["next_run_at"] == first_fail + RETRY_BASE_S
+
+    _tick_for(mgr, clock, RETRY_BASE_S)  # second strike at +60s
+    row = store.get_routine(rid)
+    assert row["failure_count"] == 2 and row["enabled"] == 1
+    assert row["next_run_at"] == first_fail + RETRY_BASE_S + 2 * RETRY_BASE_S
+
+    _tick_for(mgr, clock, 2 * RETRY_BASE_S)  # third strike at +180s
+    row = store.get_routine(rid)
+    assert row["failure_count"] == FAILURE_THRESHOLD and row["enabled"] == 0
+    assert store.list_runs() == []
+
+
+def _set_failures(store, rid, n):
+    store._submit(lambda c: c.execute(
+        "UPDATE routines SET failure_count = ? WHERE routine_id = ?", (n, rid)), {})
+
+
+def test_backoff_is_capped_and_never_passes_the_next_regular_occurrence(tmp_path, monkeypatch):
+    import fleet_routines
+
+    # Raise the threshold so the doubling can reach the cap in this test.
+    monkeypatch.setattr(fleet_routines, "FAILURE_THRESHOLD", 100)
+    env = _env(tmp_path)
+    store, mgr, clock = env["store"], env["mgr"], env["clock"]
+    env["sessions"].get_or_create_session(env["a"])._degraded = "down"
+    # Daily cron: the 9th strike would be 60 * 2**8 s uncapped; it is 15 min.
+    clock[0] = _ny(2026, 10, 25, 8, 0, 1)
+    cron = _mk_sched(env, {"cron": "0 8 * * *", "tz": "America/New_York"})
+    store.set_routine_next(cron["routine_id"], clock[0])
+    _set_failures(store, cron["routine_id"], 8)
+    mgr.catch_up()
+    row = store.get_routine(cron["routine_id"])
+    assert row["failure_count"] == 9
+    assert row["next_run_at"] == clock[0] + RETRY_MAX_S
+    # A 45s interval: its next regular occurrence comes before the 60s retry.
+    short = _mk_routine(env, interval=45)
+    store.set_routine_next(short["routine_id"], clock[0])
+    mgr.catch_up()
+    assert store.get_routine(short["routine_id"])["next_run_at"] == clock[0] + 45
+    # An hourly cron at 08:59:30: the retry lands on 09:00, not 09:00:30.
+    clock[0] = _ny(2026, 10, 25, 8, 59, 30)
+    hourly = _mk_sched(env, {"cron": "0 * * * *", "tz": "America/New_York"})
+    store.set_routine_next(hourly["routine_id"], clock[0])
+    mgr.catch_up()
+    assert store.get_routine(hourly["routine_id"])["next_run_at"] == _ny(2026, 10, 25, 9, 0)
+
+
+def test_failed_manual_run_of_a_routine_not_due_keeps_its_schedule(tmp_path):
+    env = _env(tmp_path)
+    store, mgr, clock = env["store"], env["mgr"], env["clock"]
+    r = _mk_routine(env, interval=3600)
+    mgr.arm(r["routine_id"], {"interval_s": 3600})
+    armed = store.get_routine(r["routine_id"])["next_run_at"]
+    env["sessions"].get_or_create_session(env["a"])._degraded = "down"
+    mgr._fire(store.get_routine(r["routine_id"]), manual=True)
+    row = store.get_routine(r["routine_id"])
+    assert row["failure_count"] == 1
+    assert row["next_run_at"] == armed  # not pulled in to now + 60s
+
+
+def test_never_concurrent_skip_does_not_spin_or_count_as_failure(tmp_path):
+    """A routine blocked by its own in-flight turn is re-checked each tick
+    but writes nothing, emits nothing and never trips THRESHOLD — then fires
+    on the first tick after the turn ends."""
+    env = _env(tmp_path)
+    store, mgr, clock = env["store"], env["mgr"], env["clock"]
+    r = _mk_routine(env, interval=30)
+    rid = r["routine_id"]
+    mgr.arm(rid, {"interval_s": 30})
+    clock[0] += 31
+    mgr.catch_up()
+    first = store.get_routine(rid)
+    assert first["last_run_id"]
+    events_before = len(store.events_after(0))
+    _tick_for(mgr, clock, 300)  # 5 minutes of 1s ticks while in flight
+    row = store.get_routine(rid)
+    assert row["failure_count"] == 0 and row["enabled"] == 1
+    assert row["next_run_at"] == first["next_run_at"]  # due time not advanced
+    assert len(store.events_after(0)) == events_before
+    assert len(store.list_runs()) == 1
+    store.finish_run(first["last_run_id"], "done", error=None)
+    clock[0] += 1
+    mgr.catch_up()
+    assert len(store.list_runs()) == 2
+
+
+# ----------------------------------------------------------------------
+# Stale catch-up (wall-clock kinds)
+# ----------------------------------------------------------------------
+
+def test_stale_daily_cron_is_not_caught_up_hours_later(tmp_path):
+    """Asleep from before 08:00 until 21:00: the 08:00 brief does NOT fire at
+    21:00 — it is armed for tomorrow's 08:00 instead."""
+    env = _env(tmp_path)
+    store, mgr, clock = env["store"], env["mgr"], env["clock"]
+    clock[0] = _ny(2026, 10, 25, 6, 0)
+    r = _mk_sched(env, {"cron": "0 8 * * *", "tz": "America/New_York"})
+    clock[0] = _ny(2026, 10, 25, 21, 0)
+    mgr.catch_up()
+    row = store.get_routine(r["routine_id"])
+    assert row["last_run_id"] is None and store.list_runs() == []
+    assert row["enabled"] == 1 and row["failure_count"] == 0
+    assert row["next_run_at"] == _ny(2026, 10, 26, 8, 0)
+
+
+def test_recent_missed_cron_still_catches_up_once(tmp_path):
+    env = _env(tmp_path)
+    store, mgr, clock = env["store"], env["mgr"], env["clock"]
+    clock[0] = _ny(2026, 10, 25, 6, 0)
+    r = _mk_sched(env, {"cron": "0 8 * * *", "tz": "America/New_York"})
+    clock[0] = _ny(2026, 10, 25, 8, 0) + CATCH_UP_STALE_S - 60  # inside window
+    mgr.catch_up()
+    row = store.get_routine(r["routine_id"])
+    assert row["last_run_id"]
+    assert row["next_run_at"] == _ny(2026, 10, 26, 8, 0)
+
+
+def test_stale_one_shot_is_disabled_as_missed_not_fired(tmp_path):
+    env = _env(tmp_path)
+    store, mgr, clock = env["store"], env["mgr"], env["clock"]
+    clock[0] = _ny(2026, 10, 25, 12, 0)
+    r = _mk_sched(env, {"at": "2026-10-26T09:00:00", "tz": "America/New_York"})
+    clock[0] = _ny(2026, 10, 26, 9, 0) + CATCH_UP_STALE_S + 60
+    mgr.catch_up()
+    row = store.get_routine(r["routine_id"])
+    assert store.list_runs() == []
+    assert row["enabled"] == 0 and row["next_run_at"] is None
+    disabled = _events(store, "routine_disabled")
+    assert len(disabled) == 1 and not disabled[0].get("completed")
+    assert "missed" in disabled[0]["reason"]
+
+
+def test_interval_catch_up_has_no_staleness_window(tmp_path):
+    env = _env(tmp_path)
+    store, mgr, clock = env["store"], env["mgr"], env["clock"]
+    r = _mk_routine(env, interval=3600)
+    mgr.arm(r["routine_id"], {"interval_s": 3600})
+    clock[0] += 3 * 86400
+    mgr.catch_up()
+    assert store.get_routine(r["routine_id"])["last_run_id"]
+
+
+# ----------------------------------------------------------------------
+# Boot: one thread owns every fire
+# ----------------------------------------------------------------------
+
+class _LockstepStore:
+    """Store proxy that makes two concurrent scheduler passes meet: each of
+    routines_due/active_routine_run waits (briefly) for a second caller, so
+    a boot-thread catch_up racing the manager thread's own tick reliably
+    reads the routine as due and idle in BOTH. Serialized passes never meet;
+    the barrier times out once and stays broken (no further waiting)."""
+
+    def __init__(self, store):
+        self._inner = store
+        self._due = threading.Barrier(2, timeout=0.5)
+        self._active = threading.Barrier(2, timeout=0.5)
+
+    def routines_due(self, now):
+        rows = self._inner.routines_due(now)
+        if rows:
+            try:
+                self._due.wait()
+            except threading.BrokenBarrierError:
+                pass
+        return rows
+
+    def active_routine_run(self, rid):
+        out = self._inner.active_routine_run(rid)
+        try:
+            self._active.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return out
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_due_routine_fires_exactly_once_at_boot_with_a_live_thread(tmp_path):
+    registry = AgentRegistry(root=str(tmp_path / "agents"))
+    aid = registry.create_agent("Alpha")["id"]
+    store = RunStore(path=tmp_path / "fleet.db")
+    r = store.create_routine(aid, "Due", "do it", {"interval_s": 3600}, None)
+    store.set_routine_next(r["routine_id"], time.time() - 600)  # missed
+    proxy = _LockstepStore(store)
+    mgr = RoutineManager(lambda: proxy, registry, lambda: FakeSessions(),
+                         tick_s=0.01)  # thread running, ticking
+    try:
+        mgr.catch_up()  # the boot catch-up, from the boot thread
+        time.sleep(1.5)  # let the manager thread tick past the barriers
+    finally:
+        mgr.stop()
+    try:
+        assert len(store.list_runs()) == 1
+        assert len([e for e in store.events_after(0)
+                    if e.get("type") == "routine_fired"]) == 1
+    finally:
+        store.stop()
+
+
+def test_start_is_deferred_until_asked(tmp_path):
+    env = _env(tmp_path)
+    mgr = env["mgr"]
+    assert mgr._thread is None
+    mgr.start()
+    mgr.start()  # idempotent
+    try:
+        assert mgr._thread.is_alive()
+    finally:
+        mgr.stop()

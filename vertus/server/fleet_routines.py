@@ -39,8 +39,15 @@ through the normal disable path, emitting ``routine_disabled`` with
 ``"completed": true`` and reason "one-shot completed". The row and its run
 history stay (a reminder that fired is a fact, not garbage); re-enabling it
 alone does nothing until a new schedule is PATCHed, because nothing is due.
-A failed/skipped fire does NOT complete it — it stays due and the normal
-THRESHOLD policy applies.
+A failed/skipped fire does NOT complete it — it is retried on the RETRY
+BACKOFF below and the normal THRESHOLD policy applies.
+
+RE-ENABLE: turning a disabled routine back on (PATCH enabled false -> true)
+re-arms it from NOW — the next future occurrence (interval: now + N; cron:
+the next matching wall time; at: its instant if still ahead, else nothing,
+so a past one-shot stays completed until a new ``at`` is PATCHed). The
+next_run_at it carried while disabled is stale by however long it was off,
+and honoring it would fire the moment the user flips the switch.
 
 Trigger vocabulary (``trigger`` JSON; keep it SMALL and enumerable — this is
 deliberately not a rules engine):
@@ -59,10 +66,37 @@ A laptop sleeping 10 hours therefore yields exactly one catch-up run —
 never 40, and never a backlog of every missed 08:00. This is the least
 surprising bound, and the next fire is a full period away.
 
+STALENESS (wall-clock kinds only): a cron or one-shot catch-up runs only if
+the most recent missed occurrence is within CATCH_UP_STALE_S (2 hours) of
+now. Older than that, the fire is dropped — a cron is armed for its next
+occurrence, a one-shot is disabled with reason "missed" (not "completed":
+it never ran). A wall-clock schedule is a promise about WHEN: a "good
+morning" brief delivered at 21:00 after a day asleep is wrong, not late.
+"Most recent" matters: an hourly cron after 10 hours down still runs once,
+because its 17:00 occurrence is 45 minutes old even if its 08:00 one is
+not. 2 hours covers a lid closed through a commute or a lunch break and
+excludes "the whole morning". Intervals keep the plain run-once catch-up:
+they promise a cadence, not a time of day. The check runs on every tick,
+not only at boot, so it covers waking from sleep with the hub still alive
+(and a run blocked for more than the window by its own in-flight turn —
+see NEVER-CONCURRENT — likewise yields to the next occurrence).
+
 DEGRADED: a fire targeting an agent whose gateway is degraded is skipped
 and increments failure_count (the run row would 503 anyway; queuing it
 would just store a doomed run). A fire targeting a deleted agent disables
 the routine outright.
+
+RETRY BACKOFF: a failed scheduled fire (degraded gateway, delivery or
+create failure) is retried at now + RETRY_BASE_S * 2**(failures-1), capped
+at RETRY_MAX_S — 60s, 120s, 240s ... 15 min — and never later than the
+schedule's next regular occurrence (cron/interval; a one-shot has none).
+Without it next_run_at stays in the past, the 1s tick refires every
+second, and THRESHOLD disables a routine within ~3 seconds of a gateway
+blip — long before a restarting gateway is back. With it, the three
+strikes are minutes apart, which is what "three in a row is a broken
+routine" meant. Only a routine that was actually DUE is pushed back: a
+failed manual run or trigger fire of a routine not yet due leaves its
+schedule alone (pulling it earlier would add a fire).
 
 THRESHOLD: failure_count >= 3 disables the routine and emits
 ``routine_disabled``. 3 = one flake is transient (model/gateway hiccup),
@@ -74,12 +108,18 @@ in-flight run (state queued|running) carrying this routine_id and skips if
 found — a routine can never fire while its own previous turn is still
 alive. The due time is NOT advanced on a skip, so the routine re-fires as
 soon as the in-flight turn ends: cadence is \"interval measured from fire,
-never overlapping\".
+never overlapping\". A skip is not a failure: it writes nothing, emits
+nothing and leaves failure_count alone, so a long turn costs one indexed
+read per tick and never trips THRESHOLD or the retry backoff.
 
 Threading
 ---------
-One manager thread owns ALL fires (ticks and trigger checks alike), so two
-fires can never race each other. The store's event listener runs on the
+One manager thread owns ALL fires (ticks, the boot catch-up, and trigger
+checks alike), so two fires can never race each other. ``catch_up()`` hands
+its pass to that thread when it is running; hub boot constructs the manager
+with autostart=False and calls ``start()`` only after seeding and catch-up,
+so nothing ticks against a half-booted hub (store listener unset, previous
+life's runs not yet marked interrupted). The store's event listener runs on the
 STORE WRITER thread: on_event() only pushes a check onto the manager's
 queue (put_nowait, never blocking the writer) — all store writes happen on
 the manager thread. This mirrors the messenger's writer/worker split.
@@ -110,6 +150,13 @@ DEFAULT_TICK_S = 1.0
 # (the internal path: store.create_routine + RoutineManager.arm).
 MIN_INTERVAL_S = routine_schedule.MIN_INTERVAL_S
 FAILURE_THRESHOLD = 3
+# RETRY BACKOFF: first retry 60s after a failed scheduled fire, doubling,
+# never more than 15 min apart (and never past the next regular occurrence).
+RETRY_BASE_S = 60.0
+RETRY_MAX_S = 15 * 60.0
+# STALENESS: a missed cron/at occurrence older than this is dropped, not
+# caught up (see MISSED-FIRE). Intervals have no staleness window.
+CATCH_UP_STALE_S = 2 * 60 * 60.0
 
 TERMINAL_EVENT_TYPES = ("done", "error", "cancelled", "timeout")
 TRIGGER_TYPES = ("run_completed", "bot_message")
@@ -133,13 +180,9 @@ class RoutineManager:
         self._now = now_fn or time.time
         self._queue: queue.Queue = queue.Queue()
         self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
         if autostart:
-            self._thread = threading.Thread(
-                target=self._loop, daemon=True, name="fleet-routines"
-            )
-            self._thread.start()
-        else:
-            self._thread = None
+            self.start()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -160,6 +203,16 @@ class RoutineManager:
 
     _STOP = object()
 
+    def start(self) -> None:
+        """Start the manager thread (idempotent). Hub boot calls this after
+        seeding and catch_up(), so the first tick sees a fully booted hub."""
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="fleet-routines"
+        )
+        self._thread.start()
+
     def stop(self) -> None:
         self._stop_event.set()
         try:
@@ -172,8 +225,24 @@ class RoutineManager:
     def catch_up(self) -> None:
         """One immediate scheduler pass at hub boot: routines whose next_run_at
         is in the past (hub was down / laptop slept) fire exactly ONCE here —
-        the missed-fire policy. Harmless when nothing is due."""
-        self._tick()
+        the missed-fire policy. Harmless when nothing is due.
+
+        When the manager thread is running the pass is queued onto it and
+        waited for, never run here: a boot-thread pass concurrent with a
+        thread tick could both read the routine as due and both fire it."""
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            self._tick()
+            return
+        done = threading.Event()
+        self._queue.put((self._catch_up_on_thread, done))
+        done.wait(timeout=30)
+
+    def _catch_up_on_thread(self, done: threading.Event) -> None:
+        try:
+            self._tick()
+        finally:
+            done.set()
 
     # ------------------------------------------------------------------
     # Public API (thread-safe entry points)
@@ -250,9 +319,44 @@ class RoutineManager:
             return
         for routine in due:
             try:
+                if self._drop_if_stale(routine):
+                    continue
                 self._fire(routine)
             except Exception:  # noqa: BLE001
                 log.exception("routine %s fire failed", routine["routine_id"])
+
+    def _drop_if_stale(self, routine: dict) -> bool:
+        """STALENESS (see MISSED-FIRE): True when a due cron/at routine's most
+        recent missed occurrence is older than CATCH_UP_STALE_S — the fire is
+        dropped and the routine armed for its next occurrence (cron) or
+        disabled as missed (one-shot). Intervals are never stale."""
+        schedule = _load_schedule(routine.get("schedule"))
+        kind = routine_schedule.kind_of(schedule)
+        if kind not in ("cron", "at"):
+            return False
+        now = self._now()
+        try:
+            # Any occurrence inside (now - window, now] is a recent miss.
+            recent = routine_schedule.next_fire(schedule, now - CATCH_UP_STALE_S)
+        except (RoutineValidationError, ValueError, TypeError):
+            return False  # corrupt row: let _fire's own handling decide
+        if recent is not None and recent <= now:
+            return False
+        store = self._store()
+        rid = routine["routine_id"]
+        if kind == "cron":
+            try:
+                nxt = routine_schedule.next_fire(schedule, now)
+            except (RoutineValidationError, ValueError, TypeError):
+                nxt = None
+            store.set_routine_next(rid, nxt)
+            log.info("routine %s: missed occurrence older than %ds dropped; "
+                     "next fire %s", rid, int(CATCH_UP_STALE_S), nxt)
+            return True
+        store.set_routine_next(rid, None)
+        self._disable(rid, "one-shot missed: hub was not running at its time "
+                           f"(more than {int(CATCH_UP_STALE_S // 3600)}h ago)")
+        return True
 
     def _scan_triggers(self, payload: dict) -> None:
         """One store event arrived: fire every enabled routine whose trigger
@@ -413,6 +517,31 @@ class RoutineManager:
         })
         if count >= FAILURE_THRESHOLD:
             self._disable(rid, f"{count} consecutive failures: {reason[:120]}")
+            return
+        self._back_off(routine, count)
+
+    def _back_off(self, routine: dict, count: int) -> None:
+        """RETRY BACKOFF: push a DUE routine's next attempt out after a
+        failure. A routine not yet due (manual run, trigger fire) keeps its
+        schedule — moving it would only ever add a fire."""
+        now = self._now()
+        due_at = routine.get("next_run_at")
+        if due_at is None or due_at > now:
+            return
+        delay = min(RETRY_BASE_S * (2 ** max(count - 1, 0)), RETRY_MAX_S)
+        retry = now + delay
+        schedule = _load_schedule(routine.get("schedule"))
+        if routine_schedule.kind_of(schedule) in ("cron", "interval"):
+            try:
+                regular = routine_schedule.next_fire(schedule, now)
+            except (RoutineValidationError, ValueError, TypeError):
+                regular = None
+            if regular is not None:
+                retry = min(retry, regular)
+        try:
+            self._store().set_routine_next(routine["routine_id"], retry)
+        except Exception:  # noqa: BLE001
+            log.exception("routine %s retry arm failed", routine["routine_id"])
 
     def _disable(self, routine_id: str, reason: str,
                  completed: bool = False) -> None:
@@ -488,6 +617,17 @@ def parse_trigger(raw) -> dict | None:
         "from_agent": from_agent,
         "thread_id": thread_id,
     }
+
+
+def _load_schedule(raw) -> dict | None:
+    """A stored (JSON-string) schedule as a dict; None if absent/corrupt."""
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _parse_trigger(raw) -> dict | None:
