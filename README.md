@@ -40,6 +40,9 @@ agent. Agents are **not** sandboxes — they are identities with honest limits
 │   │   ├── fleet_routines.py     # scheduler + triggers + caps
 │   │   ├── fleet_messaging.py    # bot-to-bot bus, delegation, auto-results
 │   │   ├── screen_lease.py       # declared-target ownership policy
+│   │   ├── guest_manager.py      # disposable Linux VM per agent (QEMU)
+│   │   ├── vnc_rfb.py            # pure-stdlib RFB client + PNG encoder
+│   │   ├── seed_iso.py           # cloud-init NoCloud seed (pure ISO9660)
 │   │   ├── vertus_logging.py     # one rotating log for the whole hub
 │   │   └── test_*.py             # ~160 pytest tests, no engine spawned
 │   ├── apps/                     # one Swift Package, two targets
@@ -385,13 +388,18 @@ Read this before trusting the fleet with anything consequential.
   read-only; flipping `approvals.mode` in a per-agent config.yaml would
   make *shell/file* approvals hub-answerable, at the cost of a much wider
   blast radius.
-- **One desktop means no per-agent screen isolation.** Two drivers on
-  distinct windows work in parallel and never move the real cursor or steal
-  focus, but they share your GUI session. The driver refuses background
-  keyboard input when the target pid owns several top-level windows
-  (`same_pid_keyboard_ambiguity`) — clicks work, typing into such apps may
-  not. True isolation would mean VM-per-agent or headless displays, which
-  this repo does not provide.
+- **One desktop means no per-agent screen isolation — unless the agent has
+  a guest.** Two drivers on distinct windows work in parallel and never
+  move the real cursor or steal focus, but they share your GUI session.
+  The driver refuses background keyboard input when the target pid owns
+  several top-level windows (`same_pid_keyboard_ambiguity`) — clicks work,
+  typing into such apps may not. The fleet now ALSO ships a disposable
+  guest path (`/api/fleet/guests`, `vertus-guest`): each agent can get its
+  own QEMU Linux VM with its own disk, identity, and screen, streamed as
+  PNG frames over the hub (multipart). Real per-agent isolation is
+  VM-per-agent, and this is the first slice of exactly that — currently
+  boot/stop/reset + live screen; input injection and desktop provisioning
+  inside the guest are the next slices.
 - **Model compliance with delegation conventions is not guaranteed.** The
   hub makes the *return path* deterministic (auto-results), but the
   outbound decision — whether a model actually curls the handoff — is model

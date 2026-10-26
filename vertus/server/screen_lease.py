@@ -47,7 +47,9 @@ SCREEN_POLICY_CAVEAT = (
     "agents from running turns that declare the same app/window at once. "
     "The hub cannot see which window an agent actually drives mid-turn, and "
     "an agent can target something it never declared. This policy provides "
-    "no isolation — real isolation needs a VM or headless display per agent."
+    "no isolation — real isolation needs a VM or headless display per agent "
+    "(the fleet's disposable-guest path, /api/fleet/guests, is that: a "
+    "per-agent Linux VM with its own screen, streamed over the hub)."
 )
 
 

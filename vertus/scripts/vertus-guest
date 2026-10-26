@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# vertus-guest — drive the fleet's disposable guests, from any cwd.
+#
+# Thin shim over `python3 vertus/server/vertus_server.py guest` (the hub's
+# own entry point). Install to ~/.local/bin/vertus-guest the same way the
+# existing ~/.local/bin/vertus and vertus-doctor wrappers are installed.
+#
+#   vertus-guest status                    # every agent's guest + runtime
+#   vertus-guest boot <agent>              # start (and provision if needed)
+#   vertus-guest stop <agent>              # stop, keep the disk
+#   vertus-guest reset <agent>             # destroy the disk, boot fresh
+#   vertus-guest url <agent>               # browser stream URL for the screen
+
+# Resolve the real script path through the ~/.local/bin symlink so the repo
+# root is found no matter how the command was reached.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+	DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+	SOURCE="$(readlink "$SOURCE")"
+	[[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+REPO_DIR="$(cd -P "$(dirname "$SOURCE")/../.." && pwd)"
+
+exec /usr/bin/python3 "$REPO_DIR/vertus/server/vertus_server.py" guest "$@"

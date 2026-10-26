@@ -167,8 +167,39 @@ targets, holders, waiters, and the driver-process inventory.
 `tool.start` with a tool name — never the args, never the window an agent
 actually touches. An agent can target a window it never declared and the hub
 cannot see it. This is said in the code, in the `/api/fleet/screens` payload,
-in the app UI, and in README LIMITS. Per-agent screen *isolation* would
-require VM-per-agent or headless displays; this repo does not provide it.
+in the app UI, and in README LIMITS. Per-agent screen *isolation* requires
+VM-per-agent or headless displays — the fleet now ships the first slice of
+that as **disposable guests** (§5a below): a per-agent QEMU Linux VM with
+its own disk, cloud-init identity, and a VNC-exported screen streamed as PNG
+frames over the hub. Guest isolation is *total* (it is a separate machine);
+it does not cover the legacy cua-driver path, which remains declaration-
+gated.
+
+## 5a. Disposable guests (slice 1 — what exists today)
+
+`guest_manager.py` owns one Linux VM per agent (`brew install qemu` is the
+only host prerequisite; the base image is Ubuntu's free cloud image,
+provisioned automatically on first boot):
+
+- per-agent disk = copy-on-write qcow2 overlay on the shared base; the
+  cloud-init seed (pure-stdlib ISO9660, `seed_iso.py`) sets the guest's
+  hostname and a generated ssh password — a per-guest identity chosen by
+  the hub, stored in `~/.vertus/agents/<id>/guest/state.json`;
+- lifecycle: `POST /api/fleet/guests/<id>/boot|stop|reset` — reset
+  destroys the disk and boots fresh (a new identity), the disposable
+  promise;
+- the screen: `GET /api/fleet/guests/<id>/frame` (one PNG) and `/stream`
+  (multipart PNG stream; `vnc_rfb.py` is a pure-stdlib RFB client, no
+  viewer dependency);
+- hub-owned: a hub boot reaps any guest a previous hub life left running;
+- CLI: `vertus-guest status|boot|stop|reset|url <agent>` (shim over
+  `vertus_server.py guest`).
+
+Cost: $0. RAM is the only budget (default 2 GB per guest). Slice 2 is
+input injection + a desktop inside the guest (openbox + browser via
+cloud-init user-data); slice 3 is rendering the stream inside VERTUS.app
+and VertusPhone. Agents operate inside the guest today via ssh (password
+from `state.json`) and, later, guest-scoped tools.
 
 Approval: **no per-action GUI approval exists.** In gateway mode the fork
 never registers its approval callback for computer-use actions
@@ -454,12 +485,14 @@ the parts users can act on.
   conflicts between agents, not what an agent actually touches.
 - **No per-action GUI approval** without a fork change; autonomy is a
   spawn-time permission mode, not per-action consent.
-- **One desktop means no per-agent screen isolation.** Distinct windows run
-  in parallel without disturbing the real cursor or focus, but the
-  `same_pid_keyboard_ambiguity` guard means background typing is refused
-  when the target pid owns several top-level windows. Clicks are unaffected;
-  typing into such apps may fail. VM-per-agent or headless displays would
-  provide real isolation; this repo does not.
+- **One desktop means no per-agent screen isolation — for the cua path.**
+  Distinct windows run in parallel without disturbing the real cursor or
+  focus, but the `same_pid_keyboard_ambiguity` guard means background
+  typing is refused when the target pid owns several top-level windows.
+  Clicks are unaffected; typing into such apps may fail. VM-per-agent
+  isolation now exists as the disposable-guest path (§5a) — but the guest
+  path is still slice 1: no input injection, no desktop inside the guest,
+  and no app rendering yet.
 - **Model compliance with delegation conventions is not guaranteed.** The
   return path is deterministic; the outbound decision is model behavior, and
   models flake (observed). Depth/rate caps bound the damage.
@@ -478,7 +511,8 @@ The fleet was built in ordered, individually-testable commits. The lineage,
 oldest to newest: identity/spawn isolation → HTTP surface + status + lock
 discipline → run history + replay → macOS clients → computer use + approvals
 ledger → driver reaping + messaging + delegation → hub URL override +
-routines → observability + interval floor + packaging + docs. Every commit
+routines → observability + interval floor + packaging + docs → disposable
+guests (QEMU VM per agent: boot/stop/reset + live screen, slice 1). Every commit
 has a green full test run (Python suite currently 157 tests; Swift suite
 19 tests). Tests live beside the code: `vertus/server/test_*.py` and
 `vertus/apps/Tests/VertusKitTests/`. Run either suite from the repo root:

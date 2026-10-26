@@ -66,6 +66,7 @@ try:
     )
     from run_store import RunStore, RUN_STATES, TERMINAL_STATES  # type: ignore
     from screen_lease import ScreenLeaseManager, SCREEN_POLICY_CAVEAT  # type: ignore
+    from guest_manager import GuestManager, GuestError  # type: ignore
     from fleet_messaging import BotMessenger, BotMessageError  # type: ignore
     from fleet_routines import (  # type: ignore
         RoutineManager, RoutineValidationError, parse_schedule, parse_trigger,
@@ -83,6 +84,7 @@ except ImportError:  # pragma: no cover - only hit under package invocation
     )
     from .run_store import RunStore, RUN_STATES, TERMINAL_STATES  # type: ignore
     from .screen_lease import ScreenLeaseManager, SCREEN_POLICY_CAVEAT  # type: ignore
+    from .guest_manager import GuestManager, GuestError  # type: ignore
     from .session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
     from .fleet_routines import (  # type: ignore
         RoutineManager, RoutineValidationError, parse_schedule, parse_trigger,
@@ -1820,6 +1822,7 @@ class VertusHandler(BaseHTTPRequestHandler):
     store: RunStore = None  # type: ignore[assignment]
     fleet: FleetFan = None  # type: ignore[assignment]
     screen_leases: ScreenLeaseManager = None  # type: ignore[assignment]
+    guests: GuestManager = None  # type: ignore[assignment]
     routines: RoutineManager = None  # type: ignore[assignment]
     # Boot self-check snapshot (name -> {ok, reason}); /api/health re-probes
     # the live subsystems and merges this for anything without a live probe.
@@ -1888,6 +1891,16 @@ class VertusHandler(BaseHTTPRequestHandler):
             self._handle_fleet_activity()
         elif path == "/api/fleet/screens":
             self._handle_fleet_screens()
+        elif path == "/api/fleet/guests":
+            self._handle_fleet_guests()
+        elif path.startswith("/api/fleet/guests/"):
+            rest = path[len("/api/fleet/guests/"):].strip("/")
+            if rest.endswith("/frame"):
+                self._handle_guest_frame(rest[: -len("/frame")])
+            elif rest.endswith("/stream"):
+                self._handle_guest_stream(rest[: -len("/stream")])
+            else:
+                self._json(404, {"error": "not found"})
         elif path == "/api/memory":
             self._handle_memory_list()
         elif path.startswith("/api/memory/search"):
@@ -1982,6 +1995,28 @@ class VertusHandler(BaseHTTPRequestHandler):
             self._handle_routine_run_now(rid)
         elif route.startswith("/api/threads/") and route.endswith("/read"):
             self._handle_thread_read(route[len("/api/threads/"):-len("/read")].strip("/"))
+        elif route.startswith("/api/fleet/guests/"):
+            rest = route[len("/api/fleet/guests/"):].strip("/")
+            agent_id, _, action = rest.rpartition("/")
+            if not agent_id or action not in ("boot", "stop", "reset"):
+                self._json(404, {"error": "not found"})
+                return
+            try:
+                self.registry.get_agent(agent_id)  # 404 for unknown agents
+            except KeyError:
+                self._json(404, {"error": f"agent not found: {agent_id}"})
+                return
+            try:
+                if self.guests is None:
+                    self._json(503, {"error": "guest manager not wired"})
+                    return
+                result = {"boot": self.guests.boot,
+                          "stop": self.guests.stop,
+                          "reset": self.guests.reset}[action](agent_id)
+            except GuestError as exc:
+                self._json(409, {"error": str(exc)})
+                return
+            self._json(200, result)
         elif route == "/api/agents":
             raw_name = payload.get("name")
             if not isinstance(raw_name, str) or not raw_name.strip():
@@ -3127,6 +3162,97 @@ class VertusHandler(BaseHTTPRequestHandler):
              "drivers": {"owned": owned, "orphaned": orphaned}},
         )
 
+    def _guest_agent_ids(self) -> list[str]:
+        """Agent ids for the guests listing: the registry roster, plus any
+        guest dir that outlived its agent (archived/deleted) so the state is
+        visible and cleanable."""
+        ids: list[str] = []
+        try:
+            ids = [a["id"] for a in self.registry.list_agents()]
+        except Exception:  # noqa: BLE001 — roster is best-effort
+            ids = []
+        if self.guests is not None:
+            try:
+                for guest_dir in self.guests.agents_root.glob("*/guest"):
+                    aid = guest_dir.parent.name
+                    if aid not in ids:
+                        ids.append(aid)
+            except Exception:  # noqa: BLE001
+                pass
+        return ids
+
+    def _handle_fleet_guests(self) -> None:
+        """GET /api/fleet/guests — the fleet's disposable guests + runtime.
+
+        One entry per agent: state (none|running|stopped), VNC/ssh ports,
+        the generated login password, and boot diagnostics on failure. The
+        runtime block reports the two host prerequisites (qemu binary, base
+        image) with install/download hints, so a fresh machine is diagnosed
+        from the same endpoint that drives the guests.
+        """
+        if self.guests is None:
+            self._json(200, {"guests": {}, "runtime": {"qemu": "missing",
+                                                        "base": {"state": "missing"}}})
+            return
+        self._json(200, self.guests.fleet_status(self._guest_agent_ids()))
+
+    def _handle_guest_frame(self, agent_id: str) -> None:
+        """GET /api/fleet/guests/<id>/frame — one PNG of the guest screen."""
+        try:
+            self.registry.get_agent(agent_id)
+        except KeyError:
+            self._json(404, {"error": f"agent not found: {agent_id}"})
+            return
+        if self.guests is None:
+            self._json(503, {"error": "guest manager not wired"})
+            return
+        try:
+            png = self.guests.frame(agent_id)
+        except GuestError as exc:
+            self._json(409, {"error": str(exc)})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(png)))
+        self.end_headers()
+        try:
+            self.wfile.write(png)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _handle_guest_stream(self, agent_id: str) -> None:
+        """GET /api/fleet/guests/<id>/stream — live screen as multipart PNGs.
+
+        multipart/x-mixed-replace: every part is one PNG frame. Any <img>
+        tag or video element pointed at this URL shows the guest's screen
+        live — the browser-native "see the bot's computer" channel.
+        """
+        try:
+            self.registry.get_agent(agent_id)
+        except KeyError:
+            self._json(404, {"error": f"agent not found: {agent_id}"})
+            return
+        if self.guests is None:
+            self._json(503, {"error": "guest manager not wired"})
+            return
+        boundary = "vertusframe"
+        self.send_response(200)
+        self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={boundary}")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        try:
+            for png in self.guests.stream(agent_id, interval_s=0.5):
+                self.wfile.write(
+                    f"--{boundary}\r\n".encode()
+                    + b"Content-Type: image/png\r\n"
+                    + f"Content-Length: {len(png)}\r\n\r\n".encode()
+                    + png + b"\r\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client went away — the stream simply ends
+        except Exception as exc:  # noqa: BLE001
+            print(f"[vertus] guest stream {agent_id} ended: {exc}", file=sys.stderr)
+
     # ------------------------------------------------------------------
     # Fleet memory (hub-owned canonical store — see fleet_memory.py)
     # ------------------------------------------------------------------
@@ -3690,6 +3816,19 @@ def serve(host: str | None, port: int) -> None:
     # clears leases along with the gateways that held them.
     screen_leases = ScreenLeaseManager()
     VertusHandler.screen_leases = screen_leases
+    # Disposable guests (guest_manager.py): one Linux VM per agent — its own
+    # disk, identity, and screen. The hub owns them: a hub boot reaps any VM
+    # a previous hub life left running (disposable by definition, like the
+    # in-memory screen leases).
+    guests = GuestManager()
+    VertusHandler.guests = guests
+    try:
+        reaped_guests = guests.reap_orphans()
+        if reaped_guests:
+            print(f"[vertus] guest sweep: reaped {len(reaped_guests)} "
+                  f"orphaned guest VM(s): {', '.join(reaped_guests)}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vertus] guest sweep failed: {exc}", file=sys.stderr)
     # ensure_primary() MUST run before the session manager seeds the primary
     # bridge: on a fresh store the seed factory resolves the sandbox via
     # get_agent("primary"), which raises KeyError until the agent exists.
@@ -3904,6 +4043,11 @@ def main() -> None:
         "doctor", help="diagnose the fleet (env, gateway dialect, hub, store, registry, launchd)"
     )
     p_doc.add_argument("--json", action="store_true", help="machine-readable output")
+    p_guest = sub.add_parser(
+        "guest", help="drive the fleet's disposable guests (status/boot/stop/reset/url)"
+    )
+    p_guest.add_argument("guest_args", nargs=argparse.REMAINDER,
+                         help="forwarded to the guest CLI verbatim")
     args = parser.parse_args()
     if args.command == "serve":
         serve(args.host, args.port)
@@ -3914,6 +4058,11 @@ def main() -> None:
         # slow the serving path. Exit code is 1 when any check failed.
         from vertus_doctor import run
         sys.exit(run(json_out=args.json))
+    elif args.command == "guest":
+        # Lazy import: guest_manager is only needed on the guest path. The
+        # outer parser swallows the rest via REMAINDER; hand it over whole.
+        from guest_manager import _cli
+        _cli(args.guest_args)
 
 
 if __name__ == "__main__":

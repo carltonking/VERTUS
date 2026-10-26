@@ -66,6 +66,17 @@ def agents_dir() -> Path:
     return Path(env).expanduser() if env else vertus_root() / "agents"
 
 
+def guests_dir() -> Path:
+    """Fleet-wide guest-virtualization root. VERTUS_GUESTS_DIR → root/guests.
+
+    Holds the SHARED base disk image (one per arch) and the port registry;
+    per-agent guest state (overlay disk, seed, pid/state) lives under
+    agents/<id>/guest so agent deletion archives it with the agent.
+    """
+    env = _env("VERTUS_GUESTS_DIR")
+    return Path(env).expanduser() if env else vertus_root() / "guests"
+
+
 def fleet_db_path() -> Path:
     """Run store. VERTUS_DB_PATH → root/fleet.db."""
     env = _env("VERTUS_DB_PATH")
