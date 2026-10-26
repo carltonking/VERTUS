@@ -72,6 +72,7 @@ try:
     )
     from fleet_memory import MemoryStore, migrate_legacy_memory  # type: ignore
     from memory_capture import MemoryCapturer  # type: ignore
+    from routine_delivery import PhoneDelivery  # type: ignore
     from proactive_routines import seed_default_routines  # type: ignore
     from vertus_logging import setup_logging  # type: ignore
     from session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
@@ -88,6 +89,7 @@ except ImportError:  # pragma: no cover - only hit under package invocation
     )
     from .fleet_memory import MemoryStore, migrate_legacy_memory  # type: ignore
     from .memory_capture import MemoryCapturer  # type: ignore
+    from .routine_delivery import PhoneDelivery  # type: ignore
     from .proactive_routines import seed_default_routines  # type: ignore
     from .vertus_logging import setup_logging  # type: ignore
 
@@ -162,6 +164,17 @@ def ensure_token() -> str:
     if os.name != "nt":
         token_file.chmod(0o600)
     return token
+
+
+def _both(*hooks):
+    """One on_run_done callback that runs several, each isolated."""
+    def call(*args, **kwargs):
+        for hook in hooks:
+            try:
+                hook(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[vertus] run hook failed: {exc}", file=sys.stderr)
+    return call
 
 
 def ensure_approver_token() -> str:
@@ -3714,7 +3727,7 @@ def serve(host: str | None, port: int) -> None:
         sessions = build_session_manager(
             registry, screen_leases=screen_leases,
             on_run_terminal=messenger.run_terminal,
-            on_run_done=capturer.on_run_done,
+            on_run_done=_both(capturer.on_run_done, PhoneDelivery(lambda: store).on_run_done),
         )
         VertusHandler.sessions = sessions
         print("[vertus] agent session prewarm starting (primary)…", file=sys.stderr)
