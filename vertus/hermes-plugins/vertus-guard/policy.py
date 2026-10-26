@@ -301,6 +301,11 @@ def decide(tool_name: str, args: dict | None,
                        "node -e, heredocs) also need approval, so avoid them in unattended work.",
                        "vertus-guard:code:execute_code", block=True)
 
+    if name == "react_to_message":
+        # The user asked for no emoji reactions to their messages, ever.
+        return Verdict("reaction", "Blocked: the user does not want emoji reactions. Reply in words instead.",
+                       "vertus-guard:reaction", block=True)
+
     if name in _ALWAYS_ASK_TOOLS:
         category, what = _ALWAYS_ASK_TOOLS[name]
         target = str(args.get("target") or args.get("to") or args.get("chat_id")

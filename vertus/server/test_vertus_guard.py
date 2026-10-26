@@ -121,8 +121,8 @@ def test_code_execution_is_refused_with_a_pointer_to_the_terminal():
 def test_outward_tools_always_ask_and_name_the_target():
     verdict = policy.decide("send_message", {"target": "telegram:Mom", "message": "hi"})
     assert verdict.category == "send" and "telegram:Mom" in verdict.reason
-    # A tapback lands in the conversation the agent is already in, with the user.
-    assert policy.decide("react_to_message", {"emoji": "👍"}) is None
+    # The user wants no emoji reactions at all.
+    assert policy.decide("react_to_message", {"emoji": "👍"}).block
 
 
 def test_page_scripts_that_submit_or_send_data_ask():
