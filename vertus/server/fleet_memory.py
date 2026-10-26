@@ -28,7 +28,10 @@ canonical, never a second source.
 
 Concurrency (cannot silently lose a write): every hub-initiated write goes
 through a per-file fcntl advisory lock plus temp-file + os.replace, so two
-hub writers can never interleave or truncate each other. When the watcher
+hub writers can never interleave or truncate each other; the facts.md fold
+holds that lock across its whole read-modify-write, and the nightly
+consolidation's helper (vertus/skills/vertus-memory-consolidation/scripts)
+takes the same lock, so neither can overwrite the other. When the watcher
 sees a fork/home file change whose canonical target ALSO changed since the
 last observation, it stages the incoming content as ``<name>.conflict-<ts>``
 next to the target instead of overwriting — a write is never dropped
@@ -45,6 +48,7 @@ that expectation is deleted from the skill.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -425,21 +429,34 @@ class MemoryStore:
     # -- canonical writes (hub-only) ---------------------------------------
 
     @staticmethod
-    def _locked_atomic_write(path: Path, content: bytes) -> None:
-        """Per-file fcntl lock + temp file + os.replace: atomic, never
-        interleaved, never truncated. Mirrors the fork's own discipline."""
+    @contextlib.contextmanager
+    def _file_lock(path: Path):
+        """Hold ``<name>.lock`` (fcntl, exclusive) for ``path``. The same
+        lock file the consolidation skill's facts helper takes, so an
+        out-of-process read-modify-write and a hub one never interleave."""
         path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = path.with_name(path.name + ".lock")
-        fd = open(lock_path, "a+", encoding="utf-8")
-        try:
-            import fcntl
+        import fcntl
+        with open(lock_path, "a+", encoding="utf-8") as fd:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            tmp = path.with_name(path.name + ".tmp")
-            tmp.write_bytes(content)
-            os.replace(tmp, path)
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            fd.close()
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _atomic_replace(path: Path, content: bytes) -> None:
+        """Temp file + os.replace. Caller holds the file lock."""
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(content)
+        os.replace(tmp, path)
+
+    @classmethod
+    def _locked_atomic_write(cls, path: Path, content: bytes) -> None:
+        """Per-file fcntl lock + temp file + os.replace: atomic, never
+        interleaved, never truncated. Mirrors the fork's own discipline."""
+        with cls._file_lock(path):
+            cls._atomic_replace(path, content)
 
     def _scope_root(self, scope: str, agent_id: str | None) -> Path:
         if scope == "shared":
@@ -492,9 +509,14 @@ class MemoryStore:
         """Atomic hub write + index update + fleet event."""
         rel = _safe_relpath(rel)
         path = self._scope_root(scope, agent_id) / rel
+        self._locked_atomic_write(path, content)
+        return self._record_write(scope, agent_id, rel, path, writer)
+
+    def _record_write(self, scope: str, agent_id: str | None, rel: str,
+                      path: Path, writer: str) -> dict:
+        """Index + fleet event for a canonical write that just landed."""
         with self._lock:
             existed = self._key(scope, agent_id, rel) in self._index
-        self._locked_atomic_write(path, content)
         meta = self._observe(path, writer)
         with self._lock:
             self._index[self._key(scope, agent_id, rel)] = meta
@@ -579,14 +601,21 @@ class MemoryStore:
         """Fold facts into ``<scope>/facts.md`` (dedupe, dated, capped) and
         write through the canonical path: atomic, indexed, broadcast.
         Returns the number of facts actually added (0 = all duplicates)."""
-        with self._lock:  # serialize read-modify-write across hub writers
-            existing = self.read(scope, agent_id, FACTS_FILE) or b""
-            body, added = fold_facts(
-                existing.decode("utf-8", errors="replace"), facts, at)
-            if not added:
-                return 0
-            self.write(scope, agent_id, FACTS_FILE, body.encode("utf-8") + b"\n",
-                       writer=writer)
+        path = self._scope_root(scope, agent_id) / FACTS_FILE
+        # The thread lock serializes hub writers; the file lock is held
+        # across the WHOLE read-modify-write (not just the replace), so the
+        # nightly consolidation — a separate process rewriting facts.md
+        # under the same lock — can never be overwritten by a fold computed
+        # from the file it just replaced, nor drop a fact folded here.
+        with self._lock:
+            with self._file_lock(path):
+                existing = self.read(scope, agent_id, FACTS_FILE) or b""
+                body, added = fold_facts(
+                    existing.decode("utf-8", errors="replace"), facts, at)
+                if not added:
+                    return 0
+                self._atomic_replace(path, body.encode("utf-8") + b"\n")
+            self._record_write(scope, agent_id, FACTS_FILE, path, writer)
             return added
 
     def build_digest(self, agent_id: str,

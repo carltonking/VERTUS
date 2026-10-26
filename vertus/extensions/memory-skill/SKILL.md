@@ -14,7 +14,8 @@ the hub detects every change and broadcasts it to the whole fleet.
     captured automatically at the end of every conversation by the hub. Read
     it; NEVER edit it (your edits would be overwritten by the next automatic
     capture). The one exception is the nightly `vertus-memory-consolidation`
-    skill, which merges and prunes it under its own record-keeping rules.
+    skill, which merges and prunes it under its own record-keeping rules —
+    only through its helper script, which takes the hub's `facts.md.lock`.
   - `profile.md` — stable facts about the user you handle. Read at the start
     of every session. Update only with durable, unlikely-to-change facts.
   - `notes/` — dated task notes, one file per topic, named
