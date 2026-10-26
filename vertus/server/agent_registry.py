@@ -949,7 +949,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # Skills under vertus/skills/<name>/SKILL.md materialized into every home.
 PROACTIVE_SKILLS = ("vertus-morning-brief", "vertus-check-in", "vertus-memory-consolidation")
 # What the user asks for in conversation (calendar, pages to view on the phone).
-CAPABILITY_SKILLS = ("vertus-calendar", "vertus-sites", "vertus-rsvp")
+CAPABILITY_SKILLS = ("vertus-calendar", "vertus-sites", "vertus-rsvp", "vertus-google")
 
 # Per-agent dir (sibling of memory/ and home/) holding the nightly
 # consolidation's pre-change copies of facts/profile. Outside memory/ on

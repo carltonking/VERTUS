@@ -44,6 +44,7 @@ import random
 from vertus_logging import hub_print  # type: ignore
 print = hub_print  # noqa: A001  (accepts print kwargs; logs at INFO)
 import hmac
+import urllib.parse
 import secrets
 import signal
 import socket
@@ -74,6 +75,7 @@ try:
     from fleet_memory import MemoryStore, migrate_legacy_memory  # type: ignore
     from memory_capture import MemoryCapturer  # type: ignore
     from routine_delivery import PhoneDelivery  # type: ignore
+    import google_connect  # type: ignore
     from proactive_routines import seed_default_routines  # type: ignore
     from vertus_logging import setup_logging  # type: ignore
     from session_manager import SessionManager, DEFAULT_AGENT_ID  # type: ignore
@@ -92,6 +94,7 @@ except ImportError:  # pragma: no cover - only hit under package invocation
     from .fleet_memory import MemoryStore, migrate_legacy_memory  # type: ignore
     from .memory_capture import MemoryCapturer  # type: ignore
     from .routine_delivery import PhoneDelivery  # type: ignore
+    from . import google_connect  # type: ignore
     from .proactive_routines import seed_default_routines  # type: ignore
     from .vertus_logging import setup_logging  # type: ignore
 
@@ -1844,6 +1847,9 @@ class VertusHandler(BaseHTTPRequestHandler):
         if urlsplit(self.path).path.startswith("/sites/"):
             self._serve_site()
             return
+        if urlsplit(self.path).path.startswith("/connect/google/"):
+            self._google_connect_page()
+            return
         if not self._authed():
             self._json(401, {"error": "unauthorized"})
             return
@@ -1851,6 +1857,13 @@ class VertusHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/api/health":
             self._handle_health()
+        elif path == "/api/connect/google":
+            # A one-time sign-in link for the agent to text (GET, so the guard
+            # does not treat fetching it as sending data).
+            try:
+                self._json(200, {"url": google_connect.mint_link()})
+            except google_connect.ConnectError as exc:
+                self._json(409, {"error": str(exc)})
         elif path == "/api/skills":
             agent_id = self._query_param("agent_id")
             self._json(200, self.sessions.get_or_create_session(agent_id).slash_catalog())
@@ -2965,6 +2978,36 @@ class VertusHandler(BaseHTTPRequestHandler):
         state = self._query_param("state") or None
         limit = self._limit_param("limit", 100, 500)
         self._json(200, {"approvals": store.list_approvals(state=state, limit=limit)})
+
+    def _google_connect_page(self) -> None:
+        """GET /connect/google/start|callback — the one-tap Google sign-in
+        (google_connect.py). No bearer token: the one-time state is the key."""
+        parts = urlsplit(self.path)
+        query = dict(urllib.parse.parse_qsl(parts.query))
+        try:
+            if parts.path == "/connect/google/start":
+                self.send_response(302)
+                self.send_header("Location", google_connect.consent_url(query.get("s", "")))
+                self.end_headers()
+                return
+            if parts.path == "/connect/google/callback":
+                if query.get("error"):
+                    raise google_connect.ConnectError("Google sign-in was cancelled.")
+                homes = [self.registry.agent_home(a["id"]) for a in self.registry.list_agents()]
+                email = google_connect.complete(query.get("state", ""), query.get("code", ""), homes)
+                body = google_connect.page("Connected", f"VERTUS can now use {email}. You can close this page.")
+            else:
+                raise google_connect.ConnectError("Unknown page.")
+            status = 200
+        except google_connect.ConnectError as exc:
+            body, status = google_connect.page("Not connected", str(exc)), 400
+        except Exception as exc:  # noqa: BLE001
+            body, status = google_connect.page("Not connected", f"Google sign-in failed: {exc}"[:300]), 502
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _serve_site(self) -> None:
         """GET /sites/<folder>/<file> — pages agents built for the user, served
