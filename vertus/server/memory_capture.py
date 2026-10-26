@@ -19,9 +19,10 @@ all log-and-skip. Capture never touches the run's event stream, never fails a
 run, and never blocks a worker (flush runs on its own daemon thread).
 
 Policy: per-agent ``memory_capture`` profile field ("automatic" default, "off"
-disables) plus a hub-wide ``VERTUS_MEMORY_CAPTURE=0`` kill switch. Autonomous
-turns (bot messages, handoffs, routines) use the autonomous extraction
-addendum: operational facts only, never preferences about a person.
+disables) plus a hub-wide ``VERTUS_MEMORY_CAPTURE=0`` kill switch. Routine runs
+are never captured (see ``UNCAPTURED_RUN_KINDS``). Other autonomous turns (bot
+messages, handoffs) use the autonomous extraction addendum: operational facts
+only, never preferences about a person.
 """
 
 from __future__ import annotations
@@ -139,6 +140,17 @@ def fork_extract_facts(agent_home: Path, transcript: str,
     return parse_facts_text(res.get("text") or "")
 
 
+# Run kinds never captured. A routine run (morning brief, check-in, nightly
+# consolidation, any user routine) is the agent reading the outside world —
+# mail senders and subjects, calendar titles, web pages — with no human in the
+# turn. Folding its transcript into facts.md would make that text a "fact" in
+# every later digest (and, via SHARED:, in every agent's), a persistence path
+# for instructions injected through a mail subject. What a routine must keep
+# it writes itself (the brief's own record, the check-in log), outside the
+# digest.
+UNCAPTURED_RUN_KINDS = frozenset({"routine"})
+
+
 class MemoryCapturer:
     """Burst-buffered, best-effort capture of durable facts at run end.
 
@@ -185,6 +197,8 @@ class MemoryCapturer:
         completed turns capture; everything after this point runs on a
         background thread."""
         if state != "done":
+            return
+        if run_kind in UNCAPTURED_RUN_KINDS:
             return
         if not self.enabled(agent_id):
             return
