@@ -245,3 +245,52 @@ def test_wall_clock_schedules_over_http(hub):
         "schedule": {"at": "2020-01-01T09:00:00Z"},
     })
     assert code == 400
+
+
+def test_reenable_rearms_from_now_instead_of_firing_at_once(hub):
+    """Disabled for a while, then switched back on: the routine waits for its
+    next future occurrence — it does not fire on the stale due time."""
+    import time
+
+    base, store = hub["base"], hub["store"]
+    _, scout = _agents(hub["registry"])
+    code, created = _req(base, "/api/routines", "POST", {
+        "agent_id": scout, "name": "Hourly", "prompt": "x",
+        "schedule": {"interval_s": 3600},
+    })
+    rid = created["routine_id"]
+    _req(base, f"/api/routines/{rid}", "PATCH", {"enabled": False})
+    store.set_routine_next(rid, time.time() - 7200)  # it was off for hours
+    before = time.time()
+    code, body = _req(base, f"/api/routines/{rid}", "PATCH", {"enabled": True})
+    assert code == 200, body
+    assert body["enabled"] is True
+    assert body["next_run_at"] >= before + 3600
+    time.sleep(0.3)  # several 0.05s ticks
+    assert store.runs_for_routine(rid) == []
+    # Already enabled -> enabled: no re-arm, the cadence is untouched.
+    store.set_routine_next(rid, before + 9999)
+    code, body = _req(base, f"/api/routines/{rid}", "PATCH", {"enabled": True})
+    assert body["next_run_at"] == before + 9999
+
+
+def test_reenabling_a_past_one_shot_keeps_it_completed(hub):
+    import time
+
+    base, store = hub["base"], hub["store"]
+    _, scout = _agents(hub["registry"])
+    # A reminder whose time has passed while it sat disabled (written on the
+    # internal path: the API rejects a past "at").
+    row = store.create_routine(scout, "Reminder", "remind",
+                               {"at": "2020-01-01T09:00:00Z"}, None, enabled=False)
+    rid = row["routine_id"]
+    store.set_routine_next(rid, time.time() - 60)
+    code, body = _req(base, f"/api/routines/{rid}", "PATCH", {"enabled": True})
+    assert code == 200, body
+    assert body["next_run_at"] is None
+    time.sleep(0.3)
+    assert store.runs_for_routine(rid) == []
+    # A new future "at" arms it again.
+    code, body = _req(base, f"/api/routines/{rid}", "PATCH",
+                      {"schedule": {"at": "2099-01-01T09:00:00Z"}})
+    assert code == 200 and body["next_run_at"] is not None

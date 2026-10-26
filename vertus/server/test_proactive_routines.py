@@ -1,11 +1,9 @@
 """Proactive routines: default seeding, the skills behind them, the sentinel.
 
-Seeding is exercised against a REAL RunStore + AgentRegistry. The schedule
-validator is injected (the clock-time parser lives in fleet_routines and is
-changing on another branch), so these tests pin the stored schedule JSON —
-the contract — and never cron-parsing internals. One test runs the real
-validator and accepts either outcome, as long as seeding is all-or-nothing
-per routine and never crashes.
+Seeding is exercised against a REAL RunStore + AgentRegistry. Most tests
+inject an accept-all validator and pin the stored schedule JSON — the
+contract — never cron-parsing internals; one runs the real parser and
+requires all three defaults to be accepted and created.
 """
 
 from __future__ import annotations
@@ -19,7 +17,7 @@ import pytest
 from agent_registry import PROACTIVE_SKILLS, AgentRegistry
 from proactive_routines import (
     CHECK_IN_SENTINEL, DEFAULT_ROUTINES, LEDGER_FILE, OPT_OUT_ENV,
-    is_nothing_to_report, local_timezone, seed_default_routines,
+    is_nothing_to_report, seed_default_routines,
 )
 from run_store import RunStore
 
@@ -57,7 +55,6 @@ def hub(tmp_path, monkeypatch):
 
 
 def _seed(hub, **kw):
-    kw.setdefault("tz", TZ)
     kw.setdefault("validate_schedule", _accept)
     kw.setdefault("env", {})
     return seed_default_routines(hub["store"], hub["registry"], kw.pop("manager", None), **kw)
@@ -80,7 +77,8 @@ def test_seeding_creates_the_three_defaults_once(hub):
     for name, cron in EXPECTED.items():
         row = rows[name]
         assert row["agent_id"] == hub["primary"]
-        assert json.loads(row["schedule"]) == {"cron": cron, "tz": TZ}
+        # No tz: the routine follows the Mac's CURRENT zone at compute time.
+        assert json.loads(row["schedule"]) == {"cron": cron}
         assert row["trigger"] is None
         assert row["enabled"] == 1
     assert sorted(rid for rid, _ in mgr.armed) == sorted(r["routine_id"] for r in rows.values())
@@ -90,6 +88,21 @@ def test_seeding_creates_the_three_defaults_once(hub):
     assert again["created"] == [] and sorted(again["kept"]) == sorted(EXPECTED)
     assert len(hub["store"].list_routines()) == 3
     assert mgr2.armed == []
+
+
+def test_seeding_never_pins_the_boot_time_zone(hub, monkeypatch):
+    """Even with a resolvable local zone, nothing is frozen into the row;
+    pinning happens only when a caller passes tz explicitly."""
+    monkeypatch.setenv("TZ", "Europe/Paris")
+    _seed(hub)
+    for row in hub["store"].list_routines():
+        assert "tz" not in json.loads(row["schedule"])
+
+
+def test_explicit_tz_is_pinned(hub):
+    _seed(hub, tz=TZ)
+    for name, cron in EXPECTED.items():
+        assert json.loads(_rows(hub)[name]["schedule"]) == {"cron": cron, "tz": TZ}
 
 
 def test_each_routine_prompt_invokes_its_materialized_skill(hub):
@@ -153,7 +166,7 @@ def test_existing_user_routine_with_a_default_name_is_adopted(hub):
 def test_opt_out_env_seeds_nothing(hub, monkeypatch, value):
     monkeypatch.setenv(OPT_OUT_ENV, value)
     out = seed_default_routines(hub["store"], hub["registry"], None,
-                                tz=TZ, validate_schedule=_accept)
+                                validate_schedule=_accept)
     assert out["opted_out"] is True
     assert hub["store"].list_routines() == []
     assert not hub["ledger"].exists()
@@ -177,22 +190,23 @@ def test_unsupported_schedule_is_skipped_then_seeded_by_a_later_build(hub):
     assert sorted(later["created"]) == sorted(EXPECTED)
 
 
-def test_seeding_with_the_running_parser_is_all_or_nothing(hub):
-    """Whatever schedule shapes this build's parser accepts, seeding never
-    crashes and never stores a routine the scheduler rejects."""
-    out = seed_default_routines(hub["store"], hub["registry"], FakeManager(),
-                                tz=TZ, env={})
-    assert len(out["created"]) + len(out["skipped"]) == 3
-    assert len(hub["store"].list_routines()) == len(out["created"])
+def test_seeding_with_the_running_parser_creates_all_three(hub):
+    """The real scheduler parser (cron supported) accepts every default:
+    all three are created, armed, and stored exactly as the parser
+    normalizes them — none silently skipped."""
+    from fleet_routines import parse_schedule
 
-
-def test_local_timezone_is_a_valid_iana_name(monkeypatch):
-    from zoneinfo import ZoneInfo
-
-    monkeypatch.setenv("TZ", "Europe/Paris")
-    assert local_timezone() == "Europe/Paris"
-    monkeypatch.setenv("TZ", "Not/AZone")
-    ZoneInfo(local_timezone())  # falls back to the system zone or UTC
+    mgr = FakeManager()
+    out = seed_default_routines(hub["store"], hub["registry"], mgr, env={})
+    assert out["skipped"] == []
+    assert sorted(out["created"]) == sorted(EXPECTED)
+    rows = _rows(hub)
+    assert set(rows) == set(EXPECTED)
+    for name, cron in EXPECTED.items():
+        stored = json.loads(rows[name]["schedule"])
+        assert stored == {"cron": cron}
+        assert parse_schedule(stored) == stored
+    assert len(mgr.armed) == 3
 
 
 # --------------------------------------------------------------------------

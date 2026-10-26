@@ -10,7 +10,12 @@ every agent home by agent_registry) where the actual procedure lives:
     memory-consolidation  03:00 daily          vertus-memory-consolidation
 
 Schedules use the clock-time schedule contract of fleet_routines
-(``{"cron": "M H DOM MON DOW", "tz": "<IANA>"}``), in the Mac's local zone.
+(``{"cron": "M H DOM MON DOW"}``) with ``tz`` OMITTED: an omitted zone
+follows the Mac's current zone at compute time (routine_schedule), so the
+08:00 brief stays 08:00 after the user travels or changes System Settings.
+Pinning the boot-time zone would freeze it to wherever the hub first ran.
+Routines seeded by older builds with a pinned ``tz`` are left as they are —
+seeding never rewrites user state; PATCH the schedule to unpin one.
 
 Prepare and suggest, never act outward. Routines run unattended, and every
 hub agent asks before sending, posting or deleting (vertus-guard + approvals
@@ -128,38 +133,10 @@ def routine_prompt(default: DefaultRoutine) -> str:
     )
 
 
-def local_timezone() -> str:
-    """IANA name of the Mac's zone: ``TZ`` if it names a zone, else the
-    /etc/localtime symlink target, else UTC. Validated with zoneinfo."""
-    candidates = []
-    env_tz = os.environ.get("TZ", "").strip().lstrip(":")
-    if env_tz:
-        candidates.append(env_tz)
-    try:
-        target = os.path.realpath("/etc/localtime")
-        if "zoneinfo/" in target:
-            candidates.append(target.split("zoneinfo/", 1)[1])
-    except OSError:
-        pass
-    try:
-        from zoneinfo import ZoneInfo
-    except ImportError:  # pragma: no cover - stdlib since 3.9
-        ZoneInfo = None  # type: ignore[assignment]
-    for name in candidates:
-        if not name or name.startswith("/"):
-            continue
-        if ZoneInfo is None:
-            return name
-        try:
-            ZoneInfo(name)
-            return name
-        except Exception:  # noqa: BLE001 - unknown/invalid zone name
-            continue
-    return "UTC"
-
-
-def default_schedule(default: DefaultRoutine, tz: str) -> dict:
-    return {"cron": default.cron, "tz": tz}
+def default_schedule(default: DefaultRoutine, tz: Optional[str] = None) -> dict:
+    """The seeded schedule: no ``tz`` (follow the Mac's zone) unless a caller
+    explicitly pins one."""
+    return {"cron": default.cron, "tz": tz} if tz else {"cron": default.cron}
 
 
 def seeding_enabled(env: Optional[dict] = None) -> bool:
@@ -230,7 +207,6 @@ def seed_default_routines(store, registry, manager=None, *,
     if agent_id is None:
         agent_id = registry.ensure_primary()["id"]
     summary["agent_id"] = agent_id
-    tz = tz or local_timezone()
     validate = validate_schedule or _default_validator()
     path = ledger_path or _ledger_path_for(store)
     ledger = _read_ledger(path)

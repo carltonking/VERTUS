@@ -2415,7 +2415,8 @@ class VertusHandler(BaseHTTPRequestHandler):
     def _handle_routine_patch(self, routine_id: str, payload: dict) -> None:
         """PATCH /api/routines/<id> — partial update (name/prompt/schedule/
         trigger/enabled). Changing the schedule re-arms next_run_at; enabling
-        clears failure history."""
+        clears failure history and, from disabled, re-arms from now
+        (fleet_routines RE-ENABLE)."""
         store = self._routines_store()
         if store is None:
             return
@@ -2474,6 +2475,17 @@ class VertusHandler(BaseHTTPRequestHandler):
                 fields["trigger"] = trigger
         if "enabled" in payload:
             fields["enabled"] = bool(payload["enabled"])
+        if (fields.get("enabled") and not current.get("enabled")
+                and "schedule" not in fields and current.get("schedule")):
+            # RE-ENABLE: the next_run_at it kept while off is in the past;
+            # honoring it would fire the instant the switch flips. Armed
+            # BEFORE enabling so no tick can see the stale due time.
+            try:
+                stored = json.loads(current["schedule"])
+            except (ValueError, TypeError):
+                self._json(500, {"error": "stored routine schedule/trigger is corrupt"})
+                return
+            self.routines.arm(routine_id, stored)
         try:
             updated = store.update_routine(routine_id, **fields)
         except Exception as exc:  # noqa: BLE001
@@ -2481,6 +2493,8 @@ class VertusHandler(BaseHTTPRequestHandler):
             return
         if "schedule" in fields:
             self.routines.arm(routine_id, fields["schedule"])
+            # Re-read so the response carries the armed next_run_at.
+            updated = store.get_routine(routine_id) or updated
         self._json(200, self._routine_wire(updated))
 
     def _handle_routine_delete(self, routine_id: str) -> None:
@@ -3705,7 +3719,10 @@ def serve(host: str | None, port: int) -> None:
     # on_event() only queues work (never blocks, never writes).
     # Provider callables, not instances: the manager resolves the store and
     # session manager lazily (mirrors BotMessenger's construction pattern).
-    routines = RoutineManager(lambda: store, registry, lambda: sessions)
+    # autostart=False: the thread starts after seeding + catch-up below, so
+    # no tick runs against a half-booted hub or races the boot catch-up pass.
+    routines = RoutineManager(lambda: store, registry, lambda: sessions,
+                              autostart=False)
     VertusHandler.routines = routines
     # Fleet memory: hub-owned canonical store + fork mirror + index + watcher
     # (fleet_memory.py). Boot migration is idempotent (legacy pre-fleet
@@ -3786,6 +3803,10 @@ def serve(host: str | None, port: int) -> None:
         routines.catch_up()
     except Exception as exc:  # noqa: BLE001
         print(f"[vertus] run-store boot maintenance failed: {exc}", file=sys.stderr)
+    # Only now does the scheduler thread exist: from here on it owns every
+    # fire (fleet_routines Threading). Started even if boot maintenance
+    # failed — a dead scheduler would be worse than a missed catch-up.
+    routines.start()
 
     # Boot self-check: one explicit line per subsystem. A subsystem that
     # failed to start must be LOUD here and visible in GET /api/health, not
