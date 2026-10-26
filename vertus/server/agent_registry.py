@@ -617,10 +617,12 @@ class AgentRegistry:
                             "mode": "manual", "timeout": APPROVAL_TIMEOUT_S}
         plugins = cfg.get("plugins") if isinstance(cfg.get("plugins"), dict) else {}
         enabled = [p for p in (plugins.get("enabled") or []) if isinstance(p, str)]
-        if GUARD_PLUGIN_NAME not in enabled:
-            enabled.append(GUARD_PLUGIN_NAME)
+        for name in HUB_PLUGINS:
+            if name not in enabled:
+                enabled.append(name)
         cfg["plugins"] = {**plugins, "enabled": enabled}
         _link_guard_plugin(home)
+        _link_plugin(home, JOURNAL_PLUGIN_NAME, JOURNAL_PLUGIN_DIR)
         (home / "config.yaml").write_text(_yaml_dump(cfg), encoding="utf-8")
 
         # SOUL.md — the bot's persona, plus a hub-generated fleet-context
@@ -947,7 +949,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # Skills under vertus/skills/<name>/SKILL.md materialized into every home.
 PROACTIVE_SKILLS = ("vertus-morning-brief", "vertus-check-in", "vertus-memory-consolidation")
 # What the user asks for in conversation (calendar, pages to view on the phone).
-CAPABILITY_SKILLS = ("vertus-calendar", "vertus-sites")
+CAPABILITY_SKILLS = ("vertus-calendar", "vertus-sites", "vertus-rsvp")
 
 # Per-agent dir (sibling of memory/ and home/) holding the nightly
 # consolidation's pre-change copies of facts/profile. Outside memory/ on
@@ -983,6 +985,23 @@ GUARD_PLUGIN_NAME = "vertus-guard"
 _HUB_MANAGED_KEYS = frozenset({"model", "computer_use", "approvals", "plugins", "command_allowlist"})
 GUARD_PLUGIN_DIR = Path(__file__).resolve().parents[1] / "hermes-plugins" / GUARD_PLUGIN_NAME
 APPROVAL_TIMEOUT_S = 300
+# One conversation journal across surfaces (island, iMessage) in shared memory.
+JOURNAL_PLUGIN_NAME = "vertus-journal"
+JOURNAL_PLUGIN_DIR = Path(__file__).resolve().parents[1] / "hermes-plugins" / JOURNAL_PLUGIN_NAME
+HUB_PLUGINS = (GUARD_PLUGIN_NAME, JOURNAL_PLUGIN_NAME)
+
+
+def _link_plugin(home: Path, name: str, source: Path) -> None:
+    """Point <home>/plugins/<name> at the repo's plugin (see _link_guard_plugin)."""
+    target = home / "plugins" / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink():
+        if target.resolve() == source.resolve():
+            return
+        target.unlink()
+    elif target.exists():
+        return
+    target.symlink_to(source, target_is_directory=True)
 
 
 def _link_guard_plugin(home: Path) -> None:

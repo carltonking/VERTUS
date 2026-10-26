@@ -395,3 +395,22 @@ def test_calendar_and_sites_skills_reach_every_agent_with_the_link(hub, monkeypa
     assert "vertus-events" in (skills / "vertus-calendar" / "SKILL.md").read_text()
     sites = (skills / "vertus-sites" / "SKILL.md").read_text()
     assert "http://100.1.2.3:8787/sites/" in sites and "{{" not in sites
+
+
+def test_every_agent_journals_its_conversations_to_shared_memory(hub, tmp_path):
+    import agent_registry, importlib.util, sys as _sys
+    home = hub.registry.agent_home("primary")
+    cfg = agent_registry._yaml_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert "vertus-journal" in cfg["plugins"]["enabled"]
+    plugin = home / "plugins" / "vertus-journal"
+    assert plugin.is_symlink() and (plugin / "plugin.yaml").is_file()
+    spec = importlib.util.spec_from_file_location("vj", plugin / "__init__.py")
+    vj = importlib.util.module_from_spec(spec); spec.loader.exec_module(vj)
+    line = vj.entry("what is on tomorrow?", "Calc II at 9, sir.", "photon", now=0)
+    assert "(iMessage) Carlton: what is on tomorrow?" in line and "VERTUS: Calc II at 9" in line
+    assert vj.entry("[vertus-proactive:check-in] run", "NOTHING_TO_REPORT", "tui") is None
+    assert vj.entry("hi", "", "tui") is None
+    path = vj.append(line, now=0, directory=tmp_path)
+    vj.append(vj.entry("and friday?", "Free, sir.", "tui", now=0), now=0, directory=tmp_path)
+    text = path.read_text()
+    assert text.startswith("# Conversations") and "(island) Carlton: and friday?" in text
