@@ -209,6 +209,17 @@ def _shell_verdict(segment: str) -> tuple[str, str, str] | None:
         return ("delete", "reminders-delete", "delete reminders")
     if program == "memo" and any(a in ("-d", "--delete", "-r", "--remove") for a in lowered):
         return ("delete", "notes-delete", "delete notes or folders")
+    if program in ("python3", "python") and any(a.endswith("google_api.py") for a in args):
+        # Hermes's Google Workspace skill: python3 …/google_api.py <service> <action> …
+        i = next(i for i, a in enumerate(args) if a.endswith("google_api.py"))
+        service, action = (lowered[i + 1:i + 3] + ["", ""])[:2]
+        if service == "gmail" and action in ("send", "reply"):
+            return ("send", "gmail-send", "send an email from Gmail")
+        if action == "delete":
+            return ("delete", "google-delete", f"delete from Google {service.title() or 'Workspace'}")
+        if service == "drive" and action in ("share", "upload"):
+            return ("post", "drive-share", "share or upload to Google Drive")
+        return None
     if program == "vertus-events" and lowered and lowered[0] == "cancel-event":
         return ("delete", "calendar-cancel", "cancel a calendar event")
     if program == "aws" and len(lowered) >= 2 and lowered[0] == "s3" and lowered[1] in ("rm", "rb"):

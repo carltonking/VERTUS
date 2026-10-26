@@ -1031,8 +1031,11 @@ def _link_guard_plugin(home: Path) -> None:
 # `send`/`react` ask) and Reminders (remindctl; `delete`/`list --delete` ask).
 # Each still needs its macOS permission granted on first use. Held back,
 # opt-in with VERTUS_HERMES_SKILLS="+name":
-#   google-workspace, 1password, openhue — need an account/OAuth/bridge setup.
-HERMES_SKILLS_DEFAULT = ("apple-notes", "github", "imessage", "apple-reminders")
+# google-workspace ships enabled too: until the user connects an account
+# (its sign-in link is texted from chat) it simply reports it is not set up;
+# Gmail sends/replies and deletes ask first.
+#   1password, openhue — need an account/bridge setup.
+HERMES_SKILLS_DEFAULT = ("apple-notes", "github", "imessage", "apple-reminders", "google-workspace")
 # CLIs a skill needs beyond its own frontmatter `prerequisites.commands`
 # (github's frontmatter declares none, yet every workflow in it runs gh).
 _HERMES_SKILL_COMMANDS: dict[str, tuple[str, ...]] = {

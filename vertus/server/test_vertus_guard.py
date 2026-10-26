@@ -279,3 +279,24 @@ def test_cancelling_a_calendar_event_asks_but_reading_and_creating_do_not():
     assert _cat("terminal", {"command": "~/.vertus/agent/bin/vertus-events cancel-event --id X"}) == "delete"
     assert policy.decide("terminal", {"command": "~/.vertus/agent/bin/vertus-events events --from 2026-10-26 --to 2026-10-27"}) is None
     assert policy.decide("terminal", {"command": "~/.vertus/agent/bin/vertus-events create-event --title x --start 2026-10-27T19:00"}) is None
+
+
+@pytest.mark.parametrize("command, category", [
+    ("python3 ~/.vertus/agents/primary/home/skills/productivity/google-workspace/scripts/google_api.py gmail send --to a@b.c --subject x --body y", "send"),
+    ("python3 $GSK/scripts/google_api.py gmail reply 18c --body thanks", "send"),
+    ("python3 google_api.py calendar delete EVT1", "delete"),
+    ("python3 google_api.py drive delete FILE", "delete"),
+    ("python3 google_api.py drive share FILE --email a@b.c", "post"),
+])
+def test_google_workspace_outward_actions_ask(command, category):
+    assert _cat("terminal", {"command": command}) == category
+
+
+@pytest.mark.parametrize("command", [
+    "python3 google_api.py gmail search 'is:unread newer_than:1d' --max 20",
+    "python3 google_api.py gmail get 18c", "python3 google_api.py calendar list",
+    "python3 google_api.py calendar create --summary Dinner --start 2026-10-27T19:00",
+    "python3 google_api.py gmail modify 18c --remove-labels UNREAD",
+])
+def test_google_workspace_reads_and_own_calendar_edits_do_not_ask(command):
+    assert policy.decide("terminal", {"command": command}) is None

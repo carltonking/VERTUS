@@ -91,7 +91,8 @@ def test_send_and_delete_capable_skills_are_on_because_the_guard_gates_them(env)
     assert (skills / "apple" / "imessage").is_dir()
     assert (skills / "apple" / "apple-reminders").is_dir()
     assert not (skills / "smart-home" / "openhue").exists()
-    assert not (skills / "productivity" / "google-workspace").exists()
+    # Google Workspace ships on: unconnected it only says so; sends ask.
+    assert (skills / "productivity" / "google-workspace").is_dir()
     import importlib.util
     plugin = Path(agent_registry.GUARD_PLUGIN_DIR)
     spec = importlib.util.spec_from_file_location("guard_for_skills", plugin / "__init__.py",
@@ -196,7 +197,8 @@ def test_the_manifest_records_what_the_hub_installed(env):
     manifest = json.loads((_skills(env.registry) / agent_registry.HERMES_SKILLS_MANIFEST)
                           .read_text(encoding="utf-8"))
     assert manifest == {"apple-notes": "apple/apple-notes",
-                        "github": "software-development/github"}
+                        "github": "software-development/github",
+                        "google-workspace": "productivity/google-workspace"}
 
 
 @pytest.mark.parametrize("spec, expected", [
